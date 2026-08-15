@@ -663,6 +663,28 @@ class MainActivity : AppCompatActivity() {
             restartVideoPath()
         }
 
+        // Live VSR param sliders — no restart needed (renderer recompiles shader on the fly)
+        val vsrSharpnessSlider = view.findViewById<Slider>(R.id.vsrSharpnessSlider)
+        val vsrSharpnessValue = view.findViewById<TextView>(R.id.vsrSharpnessValue)
+        val vsrEdgeSlider = view.findViewById<Slider>(R.id.vsrEdgeSlider)
+        val vsrEdgeValue = view.findViewById<TextView>(R.id.vsrEdgeValue)
+
+        vsrSharpnessSlider.value = prefs.vsrSharpness
+        vsrSharpnessValue.text = "%.2f".format(prefs.vsrSharpness)
+        vsrEdgeSlider.value = prefs.vsrEdgeThreshold
+        vsrEdgeValue.text = "%.3f".format(prefs.vsrEdgeThreshold)
+
+        vsrSharpnessSlider.addOnChangeListener { _, value, _ ->
+            prefs.vsrSharpness = value
+            vsrSharpnessValue.text = "%.2f".format(value)
+            sgsrRenderer?.setSharpness(value)
+        }
+        vsrEdgeSlider.addOnChangeListener { _, value, _ ->
+            prefs.vsrEdgeThreshold = value
+            vsrEdgeValue.text = "%.3f".format(value)
+            sgsrRenderer?.setEdgeThreshold(value)
+        }
+
         opacitySlider.addOnChangeListener { _, value, _ ->
             prefs.overlayOpacity = value
             updateOverlayOpacity(value)
