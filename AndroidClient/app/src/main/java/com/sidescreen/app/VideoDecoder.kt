@@ -60,10 +60,10 @@ class VideoDecoder(
     var onKeyframeRequired: ((force: Boolean, reason: String) -> Unit)? = null
     /** Decoder pipeline latency (avg/max ms over the last ~60 frames). */
     var onDecodeLatency: ((avgMs: Double, maxMs: Double) -> Unit)? = null
-    /** Actual decoded stream size (from the codec output format — the TRUE frame size,
-     *  which can differ from the configured size when the sender's display message
-     *  carries logical dims while the SPS carries physical dims). */
-    var onDecodedFormat: ((width: Int, height: Int) -> Unit)? = null
+    /** Actual decoded stream size + crop (from the codec output format — the TRUE frame
+     *  geometry, which can differ from the configured size when the sender's display
+     *  message carries logical dims while the SPS carries physical dims). */
+    var onDecodedFormat: ((width: Int, height: Int, cropL: Int, cropR: Int, cropT: Int, cropB: Int) -> Unit)? = null
 
     /** Fired once when the decoder has accepted many frames but never output any —
      *  the black-screen-with-live-stats signature (stream above the device's
@@ -141,10 +141,13 @@ class VideoDecoder(
                 ) {
                     diagLog("Output format changed: $format")
                     runCatching {
-                        onDecodedFormat?.invoke(
-                            format.getInteger(MediaFormat.KEY_WIDTH),
-                            format.getInteger(MediaFormat.KEY_HEIGHT),
-                        )
+                        val w = format.getInteger(MediaFormat.KEY_WIDTH)
+                        val h = format.getInteger(MediaFormat.KEY_HEIGHT)
+                        val cl = runCatching { format.getInteger("crop-left") }.getOrDefault(0)
+                        val cr = runCatching { format.getInteger("crop-right") }.getOrDefault(0)
+                        val ct = runCatching { format.getInteger("crop-top") }.getOrDefault(0)
+                        val cb = runCatching { format.getInteger("crop-bottom") }.getOrDefault(0)
+                        onDecodedFormat?.invoke(w, h, cl, cr, ct, cb)
                     }
                 }
             }

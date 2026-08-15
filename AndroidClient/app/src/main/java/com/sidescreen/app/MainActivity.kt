@@ -3,6 +3,7 @@ package com.sidescreen.app
 import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.Dialog
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -32,6 +33,7 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.constraintlayout.widget.ConstraintSet
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.slider.Slider
@@ -43,6 +45,10 @@ import java.net.InetSocketAddress
 import java.net.Socket
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
+
+// Debug A/B hook action: adb shell am broadcast -a com.sidescreen.app.VSR_CMD
+//   --ez enabled true --es mode sgsr [--ef sharpness 0.8] [--ef edge_threshold 0.03]
+private const val VSR_CMD_ACTION = "com.sidescreen.app.VSR_CMD"
 
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
@@ -113,6 +119,7 @@ class MainActivity : AppCompatActivity() {
         startChecklistUpdates()
         setupModeToggle()
         setupWirelessController()
+        setupVsrCommandReceiver()
     }
 
     private fun setupModeToggle() {
@@ -982,6 +989,34 @@ class MainActivity : AppCompatActivity() {
         initializeDecoderForCurrentSurface()
     }
 
+    private var vsrCmdReceiver: BroadcastReceiver? = null
+
+    /** Debug A/B hook: adb broadcast to switch VSR modes headlessly (no UI taps, no reconnect). */
+    private fun setupVsrCommandReceiver() {
+        if (vsrCmdReceiver != null) return
+        val receiver =
+            object : BroadcastReceiver() {
+                override fun onReceive(
+                    context: Context?,
+                    intent: Intent?,
+                ) {
+                    val i = intent ?: return
+                    if (i.action != VSR_CMD_ACTION) return
+                    val mode = i.getStringExtra("mode")
+                    val enabled = i.getBooleanExtra("enabled", mode != null)
+                    mode?.let { prefs.vsrMode = it }
+                    i.getFloatExtra("sharpness", -1f).takeIf { it >= 0f }?.let { prefs.vsrSharpness = it }
+                    i.getFloatExtra("edge_threshold", -1f).takeIf { it >= 0f }?.let { prefs.vsrEdgeThreshold = it }
+                    prefs.vsrEnabled = enabled
+                    mainDiag("VSR_CMD: enabled=$enabled mode=${prefs.vsrMode}")
+                    restartVideoPath()
+                }
+            }
+        val filter = IntentFilter(VSR_CMD_ACTION)
+        ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+        vsrCmdReceiver = receiver
+    }
+
     private fun activeVideoSurface(): Pair<Surface, Boolean>? {
         return if (shouldUseTextureView()) {
             currentTextureSurface?.takeIf { it.isValid }?.let { it to true }
@@ -1070,9 +1105,9 @@ class MainActivity : AppCompatActivity() {
             videoDecoder?.onDecodeLatency = { avgMs, maxMs ->
                 mainDiag("decode latency avg=" + "%.1f".format(avgMs) + "ms max=" + "%.1f".format(maxMs) + "ms")
             }
-            videoDecoder?.onDecodedFormat = { w, h ->
-                mainDiag("decoder output format ${w}x$h")
-                sgsrRenderer?.resizeStream(w, h)
+            videoDecoder?.onDecodedFormat = { w, h, cl, cr, ct, cb ->
+                mainDiag("decoder output format ${w}x$h crop=$cl,$cr,$ct,$cb")
+                sgsrRenderer?.resizeStream(w, h, cl, cr, ct, cb)
             }
             videoDecoder?.onFrameDecoded = { buffer ->
                 streamClient?.releaseBuffer(buffer)

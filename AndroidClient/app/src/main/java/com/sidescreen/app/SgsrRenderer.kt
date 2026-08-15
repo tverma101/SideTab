@@ -44,8 +44,15 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         CAS;         // AMD FidelityFX CAS, sharpen-only (native-resolution use)
 
         companion object {
-            fun from(name: String?): Mode =
-                entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: SGSR1
+            fun from(name: String?): Mode {
+                val n = name?.trim()?.uppercase()?.replace("_", "")?.replace("-", "") ?: return SGSR1
+                return when {
+                    n.contains("BRIDGE") -> BRIDGE_ONLY
+                    n.contains("CAS") -> CAS
+                    n.contains("SGSR") -> SGSR1
+                    else -> SGSR1
+                }
+            }
         }
     }
 
@@ -393,13 +400,20 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     }
 
     /**
-     * Called when the decoder reports its real output size (SPS-driven). Reallocates the
-     * FBO texture and recompiles the post shader with new size defines. Thread-safe —
-     * applied on the render thread.
+     * Called when the decoder reports its real output size (SPS-driven). The crop rect is
+     * deliberately IGNORED: the QTI decoder on this tablet reports crop in rotated
+     * coordinates (observed: 0,2799,0,1751 for a 2800x1760 landscape stream) and pre-crops
+     * the surface output itself, so the coded dims are the effective texture size
+     * (verified empirically — proportions render correctly at coded dims).
+     * Thread-safe — applied on the render thread.
      */
     fun resizeStream(
         w: Int,
         h: Int,
+        cropL: Int,
+        cropR: Int,
+        cropT: Int,
+        cropB: Int,
     ) {
         if (w <= 0 || h <= 0) return
         pendingStreamW = w
@@ -628,7 +642,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         val fragmentSource =
             when (mode) {
                 Mode.BRIDGE_ONLY -> BRIDGE_POST_FRAGMENT_SHADER
-                Mode.CAS -> CAS_POST_FRAGMENT_SHADER
+                Mode.CAS -> CAS_POST_FRAGMENT_SHADER.replaceFirst(Regex("#version 310 es"), "#version 310 es$defines")
                 Mode.SGSR1 -> {
                     val raw = loadAsset("sgsr1_shader_mobile_edge_direction.frag")
                     if (raw == null) {
