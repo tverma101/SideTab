@@ -1025,7 +1025,12 @@ class MainActivity : AppCompatActivity() {
                     val i = intent ?: return
                     if (i.action != VSR_CMD_ACTION) return
                     val mode = i.getStringExtra("mode")
-                    val enabled = i.getBooleanExtra("enabled", mode != null)
+                    val enabled =
+                        if (i.hasExtra("enabled")) {
+                            i.getBooleanExtra("enabled", false)
+                        } else {
+                            mode != null || prefs.vsrEnabled
+                        }
                     mode?.let { prefs.vsrMode = it }
                     i.getFloatExtra("sharpness", -1f).takeIf { it >= 0f }?.let { prefs.vsrSharpness = it }
                     i.getFloatExtra("edge_threshold", -1f).takeIf { it >= 0f }?.let { prefs.vsrEdgeThreshold = it }
