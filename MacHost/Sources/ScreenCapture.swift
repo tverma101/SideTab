@@ -402,6 +402,22 @@ class ScreenCapture {
 
             if isFirst {
                 debugLog("First frame received from SCStream (\(label))")
+                let bufferSize = CMSampleBufferGetImageBuffer(sampleBuffer).map {
+                    "\(CVPixelBufferGetWidth($0))x\(CVPixelBufferGetHeight($0))"
+                } ?? "none"
+                let frameInfo =
+                    (CMSampleBufferGetSampleAttachmentsArray(
+                        sampleBuffer,
+                        createIfNecessary: false
+                    ) as? [[SCStreamFrameInfo: Any]])?.first
+                let contentRect = frameInfo?[.contentRect] ?? "missing"
+                let contentScale = frameInfo?[.contentScale] ?? "missing"
+                let scaleFactor = frameInfo?[.scaleFactor] ?? "missing"
+                debugLog(
+                    "SCStream frame geometry: buffer=\(bufferSize), " +
+                    "contentRect=\(contentRect), contentScale=\(contentScale), " +
+                    "scaleFactor=\(scaleFactor)"
+                )
                 self.onCaptureMethodChanged?("SCStream")
             }
 

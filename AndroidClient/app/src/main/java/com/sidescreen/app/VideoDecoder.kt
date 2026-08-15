@@ -38,7 +38,7 @@ class VideoDecoder(
     // checks the queue. Treating that normal hand-off race as frame loss is
     // especially destructive for HEVC: one discarded P-frame invalidates the
     // reference chain and the forced IDR used to recover creates another large
-    // decode burst. Wait for at most one 60-Hz frame period instead. The wait
+    // decode burst. Wait for at most three 120-Hz frame periods instead. The wait
     // also provides bounded backpressure to the socket when a producer burst
     // briefly outruns the hardware decoder.
     private var inputBufferWaitCount = 0L
@@ -603,7 +603,7 @@ class VideoDecoder(
         private const val STALL_DETECT_INPUT_FRAMES = 120L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 1_000_000_000L
         private const val FORCE_KEYFRAME_REQUEST_INTERVAL_NS = 200_000_000L
-        private const val INPUT_BUFFER_WAIT_MS = 17L
+        private const val INPUT_BUFFER_WAIT_MS = 25L
         private const val MAX_RENDER_LATENCY_NS = 100_000_000L
         private const val MAX_REASONABLE_LATENCY_NS = 2_000_000_000L
     }

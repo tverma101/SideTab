@@ -65,7 +65,15 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         val renderedFps: Double,
     ) {
         fun summary(): String =
-            String.format(Locale.US, "%s PP%.1fms G%.1f bk%d", mode.name, cpuAvgMs, gpuMs, backlog)
+            String.format(
+                Locale.US,
+                "%s %.0ffps PP%.1fms G%.1f bk%d",
+                mode.name,
+                renderedFps,
+                cpuAvgMs,
+                gpuMs,
+                backlog,
+            )
     }
 
     /** Invoked from the render thread every STAT_WINDOW frames. */
@@ -650,10 +658,14 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
                         BRIDGE_POST_FRAGMENT_SHADER
                     } else {
                         // Inject stream size right after #version for compile-time constant folding.
-                        // EdgeThreshold/EdgeSharpness lines are replaced with runtime-tunable values.
+                        // The Qualcomm reference shader uses EdgeSharpness 2.0. The shared UI
+                        // control is normalized to 0..1 for CAS, so map it to the SGSR1
+                        // algorithm's full 0..2 range instead of silently limiting SGSR1 to
+                        // half strength.
+                        val effectiveSharpness = sharpness * SGSR1_EDGE_SHARPNESS_MAX
                         raw.replaceFirst(Regex("#version 310 es"), "#version 310 es$defines")
                             .replaceFirst(Regex("#define EdgeThreshold .*"), "#define EdgeThreshold $edgeThreshold")
-                            .replaceFirst(Regex("#define EdgeSharpness .*"), "#define EdgeSharpness $sharpness")
+                            .replaceFirst(Regex("#define EdgeSharpness .*"), "#define EdgeSharpness $effectiveSharpness")
                     }
                 }
             }
@@ -668,7 +680,13 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         postSTex = GLES31.glGetUniformLocation(postProgram, "ps0")
         if (postSTex < 0) postSTex = GLES31.glGetUniformLocation(postProgram, "sTexture")
         postSharpness = GLES31.glGetUniformLocation(postProgram, "uSharpness")
-        DiagLog.log("SGSR", "post program compiled: mode=$mode sharpness=$sharpness edgeThreshold=$edgeThreshold")
+        val effectiveSharpness =
+            if (mode == Mode.SGSR1) sharpness * SGSR1_EDGE_SHARPNESS_MAX else sharpness
+        DiagLog.log(
+            "SGSR",
+            "post program compiled: mode=$mode sharpness=$sharpness " +
+                "effectiveSharpness=$effectiveSharpness edgeThreshold=$edgeThreshold",
+        )
     }
 
     private fun loadAsset(fileName: String): String? {
@@ -781,6 +799,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         private const val TAG = "SgsrRenderer"
         private const val STAT_WINDOW = 60
         private const val MAX_DRAIN = 8
+        private const val SGSR1_EDGE_SHARPNESS_MAX = 2.0f
 
         // EXT_disjoint_timer_query constants (reuse core ES3 query entry points)
         private const val GL_TIME_ELAPSED_EXT = 0x88BF

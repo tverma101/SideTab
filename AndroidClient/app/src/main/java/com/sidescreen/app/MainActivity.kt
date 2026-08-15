@@ -1008,7 +1008,45 @@ class MainActivity : AppCompatActivity() {
         videoDecoder = null
         sgsrRenderer?.release()
         sgsrRenderer = null
+        applyDirectPixelMapping(displayWidth, displayHeight)
         initializeDecoderForCurrentSurface()
+    }
+
+    /**
+     * Preserve a one-stream-pixel-to-one-panel-pixel mapping for near-native
+     * direct streams. Stretching a 98-99% stream across the whole panel makes
+     * SurfaceFlinger resample every pixel and visibly softens text. Centering
+     * the surface at its encoded size leaves only a tiny black border while
+     * keeping the decoded image pixel exact. Lower-resolution streams and VSR
+     * modes continue filling the panel as before.
+     */
+    private fun applyDirectPixelMapping(
+        streamWidth: Int,
+        streamHeight: Int,
+    ) {
+        binding.surfaceView.post {
+            val panelWidth = binding.root.width
+            val panelHeight = binding.root.height
+            val nearNative =
+                !prefs.vsrEnabled &&
+                    !shouldUseTextureView() &&
+                    streamWidth in 1..panelWidth &&
+                    streamHeight in 1..panelHeight &&
+                    streamWidth.toFloat() / panelWidth >= DIRECT_PIXEL_MIN_SCALE &&
+                    streamHeight.toFloat() / panelHeight >= DIRECT_PIXEL_MIN_SCALE
+            val targetWidth = if (nearNative) streamWidth else 0
+            val targetHeight = if (nearNative) streamHeight else 0
+            val params = binding.surfaceView.layoutParams as ConstraintLayout.LayoutParams
+            if (params.width != targetWidth || params.height != targetHeight) {
+                params.width = targetWidth
+                params.height = targetHeight
+                binding.surfaceView.layoutParams = params
+            }
+            mainDiag(
+                "Surface mapping: ${if (nearNative) "1:1" else "fill"} " +
+                    "stream=${streamWidth}x$streamHeight panel=${panelWidth}x$panelHeight",
+            )
+        }
     }
 
     private var vsrCmdReceiver: BroadcastReceiver? = null
@@ -1111,6 +1149,10 @@ class MainActivity : AppCompatActivity() {
                     renderer.setSharpness(prefs.vsrSharpness)
                     renderer.setEdgeThreshold(prefs.vsrEdgeThreshold)
                     renderer.onStats = { s ->
+                        mainDiag(
+                            "VSR stats: ${s.summary()} " +
+                                "p95=${"%.1f".format(s.cpuP95Ms)}ms",
+                        )
                         runOnUiThread { binding.vsrText.text = s.summary() }
                     }
                     sgsrRenderer = renderer
@@ -1265,6 +1307,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 binding.resolutionText.text = "${width}x$height"
                 applyRotation(rotation, flipHorizontal, flipVertical)
+                applyDirectPixelMapping(width, height)
                 initializeDecoderForCurrentSurface()
             }
             log("Display: ${width}x$height @ $rotation°")
@@ -1425,6 +1468,7 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         binding.resolutionText.text = "${width}x$height"
                         applyRotation(rotation, flipHorizontal, flipVertical)
+                        applyDirectPixelMapping(width, height)
                         initializeDecoderForCurrentSurface()
                     }
                     log("Display: ${width}x$height @ $rotation°")
@@ -1475,6 +1519,7 @@ class MainActivity : AppCompatActivity() {
         displayFlipHorizontal = false
         displayFlipVertical = false
         runOnUiThread {
+            applyDirectPixelMapping(0, 0)
             binding.textureView.visibility = View.GONE
             applyTextureTransform()
         }
@@ -1790,5 +1835,9 @@ class MainActivity : AppCompatActivity() {
                 // ignore
             }
         }
+    }
+
+    private companion object {
+        const val DIRECT_PIXEL_MIN_SCALE = 0.97f
     }
 }
