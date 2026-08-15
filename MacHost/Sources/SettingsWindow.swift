@@ -788,15 +788,27 @@ struct SettingsView: View {
                                             : "Required to capture the virtual display.")
                                             .font(.system(size: 11))
                                             .foregroundColor(.secondary)
-                                        Button(action: {
-                                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-                                        }) {
-                                            HStack {
-                                                Image(systemName: "gear")
-                                                Text("Open System Settings")
+                                        HStack(spacing: 8) {
+                                            Button(action: {
+                                                settings.requestScreenRecordingPermission()
+                                            }) {
+                                                HStack {
+                                                    Image(systemName: "record.circle")
+                                                    Text("Request Access")
+                                                }
                                             }
+                                            .buttonStyle(.borderedProminent)
+
+                                            Button(action: {
+                                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                                            }) {
+                                                HStack {
+                                                    Image(systemName: "gear")
+                                                    Text("Open Settings")
+                                                }
+                                            }
+                                            .buttonStyle(.bordered)
                                         }
-                                        .buttonStyle(.borderedProminent)
                                         .controlSize(.small)
                                     }
                                     .padding(10)
@@ -1213,6 +1225,7 @@ class DisplaySettings: ObservableObject {
     @Published var captureMethod: String = "Initializing..."
 
     var onToggleServer: (() -> Void)?
+    var onRequestScreenRecordingPermission: (() -> Void)?
 
     init() {
         self.resolution = defaults.string(forKey: keyPrefix + "resolution") ?? "1920x1200"
@@ -1294,6 +1307,10 @@ class DisplaySettings: ObservableObject {
 
     func toggleServer() {
         onToggleServer?()
+    }
+
+    func requestScreenRecordingPermission() {
+        onRequestScreenRecordingPermission?()
     }
 
     func resetToDefaults() {

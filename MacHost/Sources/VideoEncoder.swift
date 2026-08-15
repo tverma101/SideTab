@@ -71,15 +71,22 @@ class VideoEncoder {
         // (Baseline/Main/High all accept Main-constrained streams' feature
         // set we use). High adds 8x8 transform that some low-end vendor OMX
         // decoders reject — not worth the marginal gain for screen content.
+        // EXP-FORK knobs (SideScreen_exp_*; absent = current production behavior):
+        //   SideScreen_exp_profile  "main10" -> HEVC Main10 (10-bit) profile
+        //   SideScreen_exp_bitrate  Int Mbps  -> override the 60Mbps floor (ladder tests)
+        //   SideScreen_exp_gop      Int frames -> keyframe interval override
+        //   SideScreen_exp_bframes  Bool       -> allow B-frames (default false)
+        let expProfile = UserDefaults.standard.string(forKey: "SideScreen_exp_profile")
         let profile: CFString = codec == .hevc
-            ? kVTProfileLevel_HEVC_Main_AutoLevel
+            ? (expProfile == "main10" ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
             : kVTProfileLevel_H264_Main_AutoLevel
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
 
         // Dynamic bitrate - remove strict rate limiting for smoother streaming
         // All-intra needs higher bitrate for text sharpness
         // USB-C supports 5Gbps, so 80-100Mbps is fine
-        let effectiveBitrate = gamingBoost ? bitrateMbps : max(bitrateMbps, 60)
+        let expBitrate = UserDefaults.standard.object(forKey: "SideScreen_exp_bitrate") as? Int
+        let effectiveBitrate = gamingBoost ? bitrateMbps : (expBitrate ?? max(bitrateMbps, 60))
         let bitrateBps = effectiveBitrate * 1_000_000
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
         // Removed DataRateLimits - was causing bursty traffic and buffer stalls
@@ -93,11 +100,14 @@ class VideoEncoder {
         // starving Mac WindowServer with encoder load. Short-GOP IPP gives 99% of
         // the resilience (frame loss recovery within 1 second) at a fraction of
         // the per-frame cost. TCP over USB-C rarely drops, so 1s GOP is safe.
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: frameRate as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 1.0 as CFNumber)
+        let expGop = UserDefaults.standard.object(forKey: "SideScreen_exp_gop") as? Int
+        let gopFrames = expGop ?? frameRate
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: Double(gopFrames) / Double(frameRate) as CFNumber)
 
         // Critical for low latency - NO frame reordering (no B-frames)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        let expBFrames = UserDefaults.standard.object(forKey: "SideScreen_exp_bframes") as? Bool ?? false
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: (expBFrames ? kCFBooleanTrue : kCFBooleanFalse))
 
         // ALWAYS zero frame delay for real-time streaming (not just gaming boost)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)

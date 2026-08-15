@@ -365,7 +365,23 @@ class ScreenCapture {
         config.width = width
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        // EXP-FORK knobs (absent = current production behavior):
+        //   SideScreen_exp_pixelFormat "10bit" -> 420YpCbCr10BiPlanarVideoRange (Main10 source)
+        //   SideScreen_exp_colorSpace   "displayP3" | "bt2020" -> explicit color space
+        let expPixelFormat = UserDefaults.standard.string(forKey: "SideScreen_exp_pixelFormat")
+        config.pixelFormat = expPixelFormat == "10bit"
+            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        switch UserDefaults.standard.string(forKey: "SideScreen_exp_colorSpace") {
+        case "displayP3":
+            config.colorSpaceName = "kCGColorSpaceDisplayP3" as CFString
+        case "bt2020":
+            config.colorSpaceName = "kCGColorSpaceITUR_2020" as CFString
+        case "srgb":
+            config.colorSpaceName = "kCGColorSpaceSRGB" as CFString
+        default:
+            break // leave SCKit's default (current production behavior)
+        }
         config.showsCursor = true
         config.queueDepth = 4
         config.capturesAudio = false

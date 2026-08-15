@@ -344,6 +344,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+
+        settings.onRequestScreenRecordingPermission = { [weak self] in
+            Task { @MainActor [weak self] in
+                await self?.requestScreenRecordingPermission()
+            }
+        }
     }
 
     @objc func showSettings() {
@@ -372,6 +378,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Check Accessibility permission (required for touch/mouse injection)
         await checkAccessibilityPermission()
+    }
+
+    /// Request access only after an explicit user action. This keeps launch
+    /// non-blocking and, unlike the old force-start path, never starts capture
+    /// while macOS is still resolving its native privacy prompt.
+    @MainActor
+    func requestScreenRecordingPermission() async {
+        let coreGraphicsGranted = CGRequestScreenCaptureAccess()
+        debugLog("CoreGraphics Screen Recording request completed: \(coreGraphicsGranted ? "granted" : "not granted")")
+
+        if !coreGraphicsGranted {
+            do {
+                // macOS 26's privacy pane is "Screen & System Audio Recording".
+                // A single explicit ScreenCaptureKit discovery request creates
+                // that newer TCC entry without constructing the virtual display,
+                // server, or capture pipeline.
+                _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                debugLog("ScreenCaptureKit access request completed")
+            } catch {
+                debugLog("ScreenCaptureKit access request did not grant access: \(error.localizedDescription)")
+            }
+        }
+
+        settings.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+        if !settings.hasScreenRecordingPermission {
+            showSettings()
+        }
     }
 
     func checkAccessibilityPermission() async {
