@@ -49,6 +49,8 @@ class StreamClient(
     private var bytesReceived = 0L
     private var framesReceived = 0L
     private var diagFrameCount = 0L
+    private var frameCallbackAccumNs = 0L
+    private var frameCallbackSamples = 0
     private var lastStatsTime = System.currentTimeMillis()
     private val keyframeRequestLock = Any()
     private var lastKeyframeRequestNs = 0L
@@ -350,6 +352,7 @@ class StreamClient(
                             input.readFully(buf)
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                             val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
+                            diagLog(String.format("PONG rtt=%.2fms", rtt))
                             onLatencyMeasured?.invoke(rtt)
                         }
 
@@ -461,12 +464,15 @@ class StreamClient(
      */
     fun sendPing() {
         if (!isConnected) return
+        val queuedAt = System.nanoTime()
         touchScope.launch {
             try {
                 socket?.getOutputStream()?.let { out ->
                     val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
+                    val writeTime = System.nanoTime()
+                    diagLog(String.format("PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6))
                     buffer.put(4.toByte()) // Type 4: ping
-                    buffer.putLong(System.nanoTime())
+                    buffer.putLong(writeTime)
                     out.write(buffer.array())
                     out.flush()
                 }
@@ -528,15 +534,24 @@ class StreamClient(
             )
         }
         if (diagFrameCount % 60L == 0L) {
-            diagLog("Frames received: $diagFrameCount")
+            val avgCallbackMs = if (frameCallbackSamples > 0) frameCallbackAccumNs / 1e6 / frameCallbackSamples else 0.0
+            diagLog(
+                "Frames received: $diagFrameCount, readLoop callback avg=" +
+                    String.format("%.2fms", avgCallbackMs),
+            )
+            frameCallbackAccumNs = 0
+            frameCallbackSamples = 0
         }
 
+        val cbStart = System.nanoTime()
         val callback = onFrameReceived
         if (callback != null) {
             callback.invoke(frameData, frameSize, receiveTimestamp, isKeyframe)
         } else {
             releaseBuffer(frameData)
         }
+        frameCallbackAccumNs += System.nanoTime() - cbStart
+        frameCallbackSamples++
         updateStats(frameSize)
     }
 
