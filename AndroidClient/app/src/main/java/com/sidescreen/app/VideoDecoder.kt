@@ -58,6 +58,12 @@ class VideoDecoder(
     var onFrameStats: ((fps: Double, variance: Double) -> Unit)? = null
     var onFrameDecoded: ((ByteArray) -> Unit)? = null
     var onKeyframeRequired: ((force: Boolean, reason: String) -> Unit)? = null
+    /** Decoder pipeline latency (avg/max ms over the last ~60 frames). */
+    var onDecodeLatency: ((avgMs: Double, maxMs: Double) -> Unit)? = null
+    /** Actual decoded stream size (from the codec output format — the TRUE frame size,
+     *  which can differ from the configured size when the sender's display message
+     *  carries logical dims while the SPS carries physical dims). */
+    var onDecodedFormat: ((width: Int, height: Int) -> Unit)? = null
 
     /** Fired once when the decoder has accepted many frames but never output any —
      *  the black-screen-with-live-stats signature (stream above the device's
@@ -134,6 +140,12 @@ class VideoDecoder(
                     format: MediaFormat,
                 ) {
                     diagLog("Output format changed: $format")
+                    runCatching {
+                        onDecodedFormat?.invoke(
+                            format.getInteger(MediaFormat.KEY_WIDTH),
+                            format.getInteger(MediaFormat.KEY_HEIGHT),
+                        )
+                    }
                 }
             }
         codec.setCallback(callback, decoderHandler)
@@ -462,6 +474,7 @@ class VideoDecoder(
                         "max=${"%.1f".format(maxMs)}ms over $latencySamples samples, " +
                         "input bufs avail=$inBufs, dropped=$droppedFrames",
                 )
+                onDecodeLatency?.invoke(avgMs, maxMs)
                 latencySumNs = 0
                 latencySamples = 0
                 latencyMaxNs = 0

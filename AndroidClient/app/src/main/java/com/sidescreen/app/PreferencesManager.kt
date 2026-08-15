@@ -44,4 +44,21 @@ class PreferencesManager(
     var connectionMode: ConnectionMode
         get() = ConnectionMode.fromName(prefs.getString("connection_mode", null))
         set(value) = prefs.edit().putString("connection_mode", value.name).apply()
+
+    // Video Super Resolution (receiver-side GPU postprocess)
+    var vsrEnabled: Boolean
+        get() = prefs.getBoolean("vsr_enabled", false)
+        set(value) = prefs.edit().putBoolean("vsr_enabled", value).apply()
+
+    var vsrMode: String
+        get() = prefs.getString("vsr_mode", "sgsr") ?: "sgsr"
+        set(value) = prefs.edit().putString("vsr_mode", value).apply()
+
+    var vsrSharpness: Float
+        get() = prefs.getFloat("vsr_sharpness", 0.8f)
+        set(value) = prefs.edit().putFloat("vsr_sharpness", value).apply()
+
+    var vsrEdgeThreshold: Float
+        get() = prefs.getFloat("vsr_edge_threshold", 8.0f / 255.0f)
+        set(value) = prefs.edit().putFloat("vsr_edge_threshold", value).apply()
 }

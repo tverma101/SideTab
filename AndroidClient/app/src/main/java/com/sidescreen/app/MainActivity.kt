@@ -1,6 +1,7 @@
 package com.sidescreen.app
 
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.app.Dialog
 import android.content.Context
 import android.content.Intent
@@ -50,6 +51,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
+    private var sgsrRenderer: SgsrRenderer? = null
     private var streamClient: StreamClient? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
@@ -309,6 +311,8 @@ class MainActivity : AppCompatActivity() {
                     if (!decoderUsingTextureView) {
                         videoDecoder?.release()
                         videoDecoder = null
+                        sgsrRenderer?.release()
+                        sgsrRenderer = null
                     }
                     currentSurfaceHolder = null
                 }
@@ -341,6 +345,8 @@ class MainActivity : AppCompatActivity() {
                     if (decoderUsingTextureView) {
                         videoDecoder?.release()
                         videoDecoder = null
+                        sgsrRenderer?.release()
+                        sgsrRenderer = null
                     }
                     currentTextureSurface?.release()
                     currentTextureSurface = null
@@ -600,6 +606,54 @@ class MainActivity : AppCompatActivity() {
                         android.widget.Toast.LENGTH_LONG,
                     ).show()
             }
+        }
+
+        // ---- Video Super Resolution ----
+        val vsrSwitch = view.findViewById<SwitchMaterial>(R.id.vsrSwitch)
+        val vsrModeBridge = view.findViewById<MaterialButton>(R.id.vsrModeBridge)
+        val vsrModeSgsr = view.findViewById<MaterialButton>(R.id.vsrModeSgsr)
+        val vsrModeCas = view.findViewById<MaterialButton>(R.id.vsrModeCas)
+        val vsrStatus = view.findViewById<TextView>(R.id.vsrStatus)
+
+        vsrSwitch.isChecked = prefs.vsrEnabled
+        vsrSwitch.isEnabled = supportsGles31()
+        if (!supportsGles31()) {
+            vsrStatus.text = "Requires OpenGL ES 3.1"
+        }
+
+        fun updateVsrModeSelection() {
+            val current = SgsrRenderer.Mode.from(prefs.vsrMode)
+            val map =
+                mapOf(
+                    vsrModeBridge to SgsrRenderer.Mode.BRIDGE_ONLY,
+                    vsrModeSgsr to SgsrRenderer.Mode.SGSR1,
+                    vsrModeCas to SgsrRenderer.Mode.CAS,
+                )
+            map.forEach { (btn, m) ->
+                btn.backgroundTintList =
+                    if (m == current) android.content.res.ColorStateList.valueOf(0x334CAF50) else null
+            }
+        }
+        updateVsrModeSelection()
+
+        vsrSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.vsrEnabled = isChecked
+            restartVideoPath()
+        }
+        vsrModeBridge.setOnClickListener {
+            prefs.vsrMode = SgsrRenderer.Mode.BRIDGE_ONLY.name
+            updateVsrModeSelection()
+            restartVideoPath()
+        }
+        vsrModeSgsr.setOnClickListener {
+            prefs.vsrMode = SgsrRenderer.Mode.SGSR1.name
+            updateVsrModeSelection()
+            restartVideoPath()
+        }
+        vsrModeCas.setOnClickListener {
+            prefs.vsrMode = SgsrRenderer.Mode.CAS.name
+            updateVsrModeSelection()
+            restartVideoPath()
         }
 
         opacitySlider.addOnChangeListener { _, value, _ ->
@@ -913,6 +967,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun shouldUseTextureView(): Boolean = displayFlipHorizontal || displayFlipVertical
 
+    private fun supportsGles31(): Boolean {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        return am.deviceConfigurationInfo.reqGlEsVersion >= 0x30001
+    }
+
+    /** Recreate the video path (decoder + optional VSR renderer) with current prefs. */
+    private fun restartVideoPath() {
+        if (!isConnected) return
+        videoDecoder?.release()
+        videoDecoder = null
+        sgsrRenderer?.release()
+        sgsrRenderer = null
+        initializeDecoderForCurrentSurface()
+    }
+
     private fun activeVideoSurface(): Pair<Surface, Boolean>? {
         return if (shouldUseTextureView()) {
             currentTextureSurface?.takeIf { it.isValid }?.let { it to true }
@@ -941,13 +1010,15 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-        if (videoDecoder != null && decoderUsingTextureView == useTextureView) {
+        if (videoDecoder != null && decoderUsingTextureView == useTextureView && sgsrRenderer == null) {
             videoDecoder?.updateResolution(displayWidth, displayHeight)
             return
         }
 
         videoDecoder?.release()
         videoDecoder = null
+        sgsrRenderer?.release()
+        sgsrRenderer = null
         decoderUsingTextureView = useTextureView
 
         mainDiag(
@@ -968,7 +1039,41 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     MediaFormat.MIMETYPE_VIDEO_HEVC
                 }
-            videoDecoder = VideoDecoder(surface, displayObj, displayWidth, displayHeight, mime)
+            var decoderSurface = surface
+            val vsrOn = prefs.vsrEnabled && supportsGles31() && !useTextureView
+            if (vsrOn) {
+                try {
+                    val renderer = SgsrRenderer(applicationContext)
+                    renderer.initialize(surface, displayWidth, displayHeight)
+                    renderer.setMode(SgsrRenderer.Mode.from(prefs.vsrMode))
+                    renderer.setSharpness(prefs.vsrSharpness)
+                    renderer.setEdgeThreshold(prefs.vsrEdgeThreshold)
+                    renderer.onStats = { s ->
+                        runOnUiThread { binding.vsrText.text = s.summary() }
+                    }
+                    sgsrRenderer = renderer
+                    decoderSurface = renderer.decoderSurfaceRef ?: surface
+                    mainDiag("VSR active: mode=${prefs.vsrMode} sharpness=${prefs.vsrSharpness}")
+                } catch (e: Exception) {
+                    mainDiag("VSR init failed (${e.message}) — falling back to direct surface")
+                    sgsrRenderer?.release()
+                    sgsrRenderer = null
+                    runOnUiThread { binding.vsrText.text = "fallback" }
+                }
+            } else {
+                runOnUiThread {
+                    binding.vsrText.text =
+                        if (prefs.vsrEnabled) "n/a" else "off"
+                }
+            }
+            videoDecoder = VideoDecoder(decoderSurface, displayObj, displayWidth, displayHeight, mime)
+            videoDecoder?.onDecodeLatency = { avgMs, maxMs ->
+                mainDiag("decode latency avg=" + "%.1f".format(avgMs) + "ms max=" + "%.1f".format(maxMs) + "ms")
+            }
+            videoDecoder?.onDecodedFormat = { w, h ->
+                mainDiag("decoder output format ${w}x$h")
+                sgsrRenderer?.resizeStream(w, h)
+            }
             videoDecoder?.onFrameDecoded = { buffer ->
                 streamClient?.releaseBuffer(buffer)
             }
@@ -1324,6 +1429,8 @@ class MainActivity : AppCompatActivity() {
             disconnect()
             videoDecoder?.release()
             videoDecoder = null
+            sgsrRenderer?.release()
+            sgsrRenderer = null
             currentTextureSurface?.release()
             currentTextureSurface = null
 
@@ -1521,8 +1628,12 @@ class MainActivity : AppCompatActivity() {
             val port =
                 binding.portInput.text
                     .toString()
-                    .toIntOrNull() ?: 54321
-            val isServerRunning = checkServerRunning("127.0.0.1", port)
+                    .toIntOrNull() ?: 54326
+            val host =
+                binding.hostInput.text
+                    .toString()
+                    .ifEmpty { "10.77.0.1" }
+            val isServerRunning = checkServerRunning(host, port)
             runOnUiThread {
                 // Final check before updating UI
                 if (isConnected) return@runOnUiThread
