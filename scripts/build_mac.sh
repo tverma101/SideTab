@@ -96,9 +96,9 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-# Ad-hoc code sign to prevent Gatekeeper "damaged" error
-echo "Code signing (ad-hoc)..."
-codesign --force --deep --sign - --entitlements "$ROOT_DIR/MacHost/SideScreen.entitlements" "$APP_DIR"
+# Keep a stable designated requirement so TCC approval survives rebuilds.
+echo "Code signing (stable local identity)..."
+"$SCRIPT_DIR/sign_mac_app.sh" "$APP_DIR"
 echo "  ✓ App signed"
 
 echo ""

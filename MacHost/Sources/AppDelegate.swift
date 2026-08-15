@@ -58,7 +58,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
     private var currentWirelessDevice: String?
     private var cancellables = Set<AnyCancellable>()
-    private var permissionCheckTimer: Timer?
     private var statusRefreshTimer: Timer?
     /// Reentrancy latch for startServer() — a second Start (double-clicked menu
     /// item, auto-start racing a manual click) must not build a second virtual
@@ -112,23 +111,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.autoStartStreamingOnLaunch {
             settings.connectionMode = settings.startupMode
             Task {
-                // FORCE-START override (campaign fork-lite): CGPreflight can lie
-                // and checkPermissions can HANG on macOS 26 (untimed
-                // SCShareableContent, FB12114396), so when forcing we skip the
-                // whole permission check — the real test is SCStream start.
-                // Enable with: defaults write com.sidescreen.app SideScreen_forceStart -bool true
-                let forceStart = UserDefaults.standard.bool(forKey: "SideScreen_forceStart")
-                if forceStart {
-                    debugLog("FORCE-START active — bypassing permission checks entirely")
-                    CGRequestScreenCaptureAccess() // explicit prompt so a stale/denied TCC record can be re-decided
+                await self.checkPermissions()
+                if self.settings.hasScreenRecordingPermission {
                     await self.startServer()
                 } else {
-                    await self.checkPermissions()
-                    if self.settings.hasScreenRecordingPermission {
-                        await self.startServer()
-                    } else {
-                        debugLog("Auto-start skipped: Screen Recording permission not granted")
-                    }
+                    debugLog("Auto-start skipped: Screen Recording permission not granted")
                 }
             }
         }
@@ -143,6 +130,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func refreshStatusIndicators() {
+        // Keep the inline permission state current after the user returns from
+        // System Settings, without generating another native prompt.
+        settings.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
         settings.adbInstalled = StatusDetector.adbInstalled()
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
@@ -342,7 +332,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.stopServer()
             } else {
                 Task { [weak self] in
-                    await self?.startServer()
+                    guard let self else { return }
+                    await self.checkPermissions()
+                    if self.settings.hasScreenRecordingPermission {
+                        await self.startServer()
+                    } else {
+                        await MainActor.run {
+                            self.showSettings()
+                        }
+                    }
                 }
             }
         }
@@ -353,6 +351,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Refresh permission state without opening a system prompt. Screen capture
+    /// permission is granted in System Settings; starting capture while the
+    /// native prompt is unresolved makes ScreenCaptureKit fail and can stack a
+    /// second app alert over the system dialog.
     func checkPermissions() async {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         debugLog("checkPermissions — macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)")
@@ -364,20 +366,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if hasScreenCapture {
             debugLog("Screen recording permission granted (CGPreflight)")
-
-            // On macOS 26+, also verify ScreenCaptureKit is actually functional
-            if version.majorVersion >= 26 {
-                do {
-                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                    debugLog("SCShareableContent verification OK — \(content.displays.count) displays found")
-                } catch {
-                    debugLog("WARNING: CGPreflight OK but SCShareableContent failed on macOS 26: \(error.localizedDescription)")
-                    debugLog("CGDisplayStream fallback will likely activate at capture time")
-                }
-            }
         } else {
             debugLog("Screen recording permission not granted yet")
-            CGRequestScreenCaptureAccess()
         }
 
         // Check Accessibility permission (required for touch/mouse injection)
@@ -509,29 +499,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }.value
     }
 
-    @MainActor
-    func showPermissionAlert() {
-        let version = ProcessInfo.processInfo.operatingSystemVersion
-        let isMacOS26 = version.majorVersion >= 26
-
-        let alert = NSAlert()
-        if isMacOS26 {
-            alert.messageText = "Screen & System Audio Recording Permission Required"
-            alert.informativeText = "Please grant Screen & System Audio Recording permission in System Settings > Privacy & Security."
-        } else {
-            alert.messageText = "Screen Recording Permission Required"
-            alert.informativeText = "Please grant Screen Recording permission in System Settings > Privacy & Security."
-        }
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Later")
-
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-        }
-    }
-
     func startServer() async {
         let canStart = await MainActor.run { () -> Bool in
             guard !isStartingServer, !settings.isRunning else { return false }
@@ -545,11 +512,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         defer {
             Task { @MainActor [weak self] in self?.isStartingServer = false }
         }
-        let forceStart = UserDefaults.standard.bool(forKey: "SideScreen_forceStart")
-        debugLog("🚀 startServer() invoked. Check permission: \(settings.hasScreenRecordingPermission)\(forceStart ? " (FORCED)" : "")")
-        guard settings.hasScreenRecordingPermission || forceStart else {
+        let hasScreenCapture = CGPreflightScreenCaptureAccess()
+        await MainActor.run {
+            settings.hasScreenRecordingPermission = hasScreenCapture
+        }
+        debugLog("🚀 startServer() invoked. Screen Recording permission: \(hasScreenCapture)")
+        guard hasScreenCapture else {
             debugLog("❌ startServer aborted: Missing Screen Recording permission")
-            await showPermissionAlert()
+            await MainActor.run {
+                showSettings()
+            }
             return
         }
 
@@ -695,15 +667,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             print("✅ Server started on port \(settings.port)")
         } catch {
             print("❌ Failed to start: \(error)")
+            let errorDescription = error.localizedDescription
+            let permissionDenied = !CGPreflightScreenCaptureAccess()
+                || errorDescription.localizedCaseInsensitiveContains("TCC")
+                || errorDescription.localizedCaseInsensitiveContains("declined")
+                || errorDescription.localizedCaseInsensitiveContains("not authorized")
             await MainActor.run {
                 settings.isRunning = false
                 settings.displayCreated = false
 
-                let alert = NSAlert()
-                alert.messageText = "Failed to Start Server"
-                alert.informativeText = error.localizedDescription
-                alert.alertStyle = .critical
-                alert.runModal()
+                if permissionDenied {
+                    // TCC denial belongs in the existing inline permission card.
+                    // Do not stack a blocking app alert over macOS's own prompt.
+                    settings.hasScreenRecordingPermission = false
+                    showSettings()
+                } else {
+                    let alert = NSAlert()
+                    alert.messageText = "Failed to Start Server"
+                    alert.informativeText = errorDescription
+                    alert.alertStyle = .critical
+                    alert.runModal()
+                }
             }
         }
     }

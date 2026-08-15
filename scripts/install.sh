@@ -73,11 +73,17 @@ cat > "$APP_DIR/Info.plist" << 'PLIST'
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Side Screen needs screen recording access to capture your virtual display and stream it to your Android device.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Side Screen needs Local Network access so your Android tablet can connect to the Mac.</string>
     <key>LSUIElement</key>
     <false/>
 </dict>
 </plist>
 PLIST
+
+"$SCRIPT_DIR/sign_mac_app.sh" "$ROOT_DIR/$APP_NAME"
 
 echo "  ✓ macOS .app bundle created: $APP_NAME"
 echo ""
