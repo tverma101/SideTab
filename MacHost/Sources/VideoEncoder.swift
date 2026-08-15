@@ -111,7 +111,11 @@ class VideoEncoder {
             case "ultralow": 0.5  // Still fast but better text readability
             case "low": 0.65
             case "medium": 0.8   // Sharp text for productivity
-            case "high": 0.9     // Very sharp, higher bitrate
+            // Keep a wide margin below 1.0: VideoToolbox documents 1.0 as
+            // potentially lossless. A live 0.95 trial overloaded this USB
+            // tunnel/decoder path; 0.92 is the bounded first increment above
+            // the restored 0.90 baseline.
+            case "high": 0.92
             default: 0.5
             }
         }
