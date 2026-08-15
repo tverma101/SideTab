@@ -152,15 +152,26 @@ class ScreenCapture {
         // encoding the logical would upscale 2x on the panel (soft). self.width/
         // height return the virtual display's physical size (see above).
         let logical = (width: displayWidth, height: displayHeight)
+        // PHASE-3 PATCH (2026-08-14): optional linear encode downscale for the
+        // S8+ SGSR1-upscale experiment (0.75 -> 2100x1314 from 2800x1752).
+        // SideScreen_encodeScale (UserDefaults, double); 1.0 = native physical.
+        // Even-rounded: HEVC 4:2:0 needs even dims.
+        let encodeScale = UserDefaults.standard.object(forKey: "SideScreen_encodeScale") as? Double ?? 1.0
+        let scale = min(max(encodeScale, 0.25), 1.0)
+        var base = logical
+        if scale < 1.0 {
+            base = (width: (Int((Double(logical.0) * scale).rounded()) & ~1),
+                    height: (Int((Double(logical.1) * scale).rounded()) & ~1))
+        }
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
         if let limit = clientDecodeLimit {
-            return CodecLimits.clamp(width: logical.0, height: logical.1,
+            return CodecLimits.clamp(width: base.0, height: base.1,
                                      maxWidth: limit.width, maxHeight: limit.height)
         }
         switch codec {
-        case .hevc: return logical
-        case .h264: return CodecLimits.clampForAvc(width: logical.0, height: logical.1)
+        case .hevc: return base
+        case .h264: return CodecLimits.clampForAvc(width: base.0, height: base.1)
         }
     }
 
