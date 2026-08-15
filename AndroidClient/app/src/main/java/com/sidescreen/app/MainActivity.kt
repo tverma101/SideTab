@@ -1316,7 +1316,18 @@ class MainActivity : AppCompatActivity() {
             try {
                 log("Connecting to $host:$port...")
 
-                streamClient = StreamClient(host, port)
+                // E3 carries bulk video through 10.77.0.1:54326. Keep tiny
+                // latency/control packets on their dedicated adb-reverse port
+                // so they cannot sit behind raw video packets in the E3 pipe.
+                val usesE3VideoPath = host == "10.77.0.1" && port == 54326
+                streamClient =
+                    StreamClient(
+                        host,
+                        port,
+                        applicationContext,
+                        controlHost = if (usesE3VideoPath) "127.0.0.1" else host,
+                        controlPort = if (usesE3VideoPath) 54322 else port + 1,
+                    )
                 streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
                     val dec = videoDecoder
                     if (dec != null) {

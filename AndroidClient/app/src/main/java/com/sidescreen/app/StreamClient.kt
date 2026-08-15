@@ -22,11 +22,20 @@ class StreamClient(
     private val host: String,
     private val port: Int,
     private val context: Context? = null,
+    controlHost: String = host,
+    controlPort: Int = port + 1,
 ) {
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
     private var isConnected = false
+
+    /**
+     * Dedicated out-of-band control channel (ping/pong + keyframe requests).
+     * Pongs are answered on this connection, so measured RTT never waits on
+     * the video read loop. Falls back to in-band ping/pong when unavailable.
+     */
+    private val controlChannel = ControlChannel(controlHost, controlPort)
 
     // Callback includes actual frame size (may differ from buffer.size due to pooling),
     // receive timestamp, and whether the frame can restart HEVC decoding.
@@ -140,6 +149,7 @@ class StreamClient(
                 diagLog("Connected to $host:$port")
                 onConnectionStatus?.invoke(true)
 
+                connectControlChannel()
                 receiveData()
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Connection error", e)
@@ -263,6 +273,7 @@ class StreamClient(
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
                 onConnectionStatus?.invoke(true)
+                connectControlChannel()
                 receiveData()
             }
             AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
@@ -280,6 +291,25 @@ class StreamClient(
                 throw WirelessConnectError.ProtocolError
             }
         }
+    }
+
+    /** Best-effort: opens the out-of-band control channel after the video
+     *  connection is up. Failure is non-fatal — ping/pong falls back in-band.
+     *  Runs fire-and-forget on its own thread so the video receive loop is
+     *  never delayed by a slow control-channel connect. */
+    private fun connectControlChannel() {
+        controlChannel.onLatencyMeasured = { rttMs ->
+            onLatencyMeasured?.invoke(rttMs)
+        }
+        Thread({
+            try {
+                controlChannel.connect()
+            } catch (_: Exception) {
+            }
+        }, "ControlConnect").apply {
+            isDaemon = true
+            priority = Thread.MAX_PRIORITY
+        }.start()
     }
 
     private fun advertiseFrameMetadataSupport() {
@@ -393,6 +423,9 @@ class StreamClient(
         if (!isConnected) return
 
         touchScope.launch {
+            if (controlChannel.sendTouch(x, y, action, pointerCount, x2, y2)) {
+                return@launch
+            }
             try {
                 socket?.getOutputStream()?.let { out ->
                     val count = pointerCount.coerceIn(1, 2)
@@ -448,6 +481,9 @@ class StreamClient(
 
         val flags = if (force) KEYFRAME_REQUEST_FLAG_FORCE else 0
         diagLog("Requesting keyframe: reason=$reason, force=$force")
+        if (controlChannel.requestKeyframe(force)) {
+            return
+        }
         touchScope.launch {
             try {
                 outputStream?.let { out ->
@@ -460,10 +496,15 @@ class StreamClient(
     }
 
     /**
-     * Send a ping to measure round-trip latency through the USB connection
+     * Send a ping to measure round-trip latency. Prefers the dedicated control
+     * channel (pong comes back on its own connection, never queued behind
+     * video frames); falls back to the in-band path when control is down.
      */
     fun sendPing() {
         if (!isConnected) return
+        if (controlChannel.sendPing()) {
+            return
+        }
         val queuedAt = System.nanoTime()
         touchScope.launch {
             try {
@@ -587,6 +628,7 @@ class StreamClient(
             outputStream?.close()
             inputStream?.close()
             socket?.close()
+            controlChannel.disconnect()
 
             // Properly shutdown executor with timeout to prevent orphaned threads
             touchExecutor.shutdown()

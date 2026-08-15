@@ -43,6 +43,19 @@ class StreamingServer {
     private let port: UInt16
     private var listener: NWListener?
     private var connection: NWConnection?
+
+    // Dedicated out-of-band control channel (ping/pong + keyframe requests).
+    // Pongs are answered on this connection so they never queue behind video
+    // frames on the main NWConnection — measured RTT reflects the transport,
+    // not the video send/read scheduling.
+    private let controlPort: UInt16
+    private var controlListener: NWListener?
+    private var controlConnection: NWConnection?
+    private var controlInputBuffer = Data()
+    private var controlTouchCount = 0
+    private var lastControlTouchNs: UInt64 = 0
+    private var maxControlTouchGapMs = 0.0
+    private let controlQueue = DispatchQueue(label: "controlQueue", qos: .userInteractive)
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
     /// Fired once per connection during protocol startup, BEFORE the display
@@ -86,8 +99,9 @@ class StreamingServer {
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
     private var inputBuffer = Data()
 
-    init(port: UInt16) {
+    init(port: UInt16, controlPort: UInt16? = nil) {
         self.port = port
+        self.controlPort = controlPort ?? port + 1
     }
 
     func start() {
@@ -119,8 +133,182 @@ class StreamingServer {
             }
 
             listener?.start(queue: networkQueue)
+
+            startControlListener()
         } catch {
             debugLog("Failed to start server: \(error)")
+        }
+    }
+
+    /// Dedicated control-channel listener: ping/pong + keyframe requests on
+    /// their own connection, so pongs never contend with video frames.
+    private func startControlListener() {
+        do {
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+                tcpOptions.noDelay = true
+            }
+            controlListener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: controlPort))
+            controlListener?.newConnectionHandler = { [weak self] newConnection in
+                self?.handleControlConnection(newConnection)
+            }
+            controlListener?.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    debugLog("Control listener ready on port \(self.controlPort)")
+                case .failed(let error):
+                    debugLog("Control listener failed: \(error)")
+                default:
+                    break
+                }
+            }
+            controlListener?.start(queue: controlQueue)
+        } catch {
+            debugLog("Failed to start control listener: \(error)")
+        }
+    }
+
+    private func handleControlConnection(_ newConnection: NWConnection) {
+        debugLog("Control connection incoming")
+        if let old = controlConnection {
+            old.cancel()
+        }
+        controlInputBuffer.removeAll(keepingCapacity: true)
+        controlTouchCount = 0
+        lastControlTouchNs = 0
+        maxControlTouchGapMs = 0
+        controlConnection = newConnection
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
+            guard let self, let newConnection else { return }
+            // A terminal callback from a cancelled/replaced connection must
+            // never clear the newer live connection.
+            guard self.controlConnection === newConnection else {
+                switch state {
+                case .failed, .cancelled:
+                    debugLog("Control state STALE terminal callback")
+                default:
+                    break
+                }
+                return
+            }
+            switch state {
+            case .ready:
+                debugLog("Control connection READY — arming receive")
+                self.startReceivingControl()
+            case .failed(let error):
+                debugLog("Control connection failed: \(error)")
+                self.controlConnection = nil
+                newConnection.cancel()
+            case .cancelled:
+                self.controlConnection = nil
+            default:
+                break
+            }
+        }
+        newConnection.start(queue: controlQueue)
+    }
+
+    private func startReceivingControl() {
+        guard let connection = controlConnection else { return }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
+            // Identity guard: a stale completion from a replaced connection must
+            // neither clobber the live connection nor re-arm a receive on it.
+            guard let self = self, let current = self.controlConnection, current === connection else {
+                debugLog("Control receive STALE completion (connection replaced)")
+                return
+            }
+            if let error = error {
+                debugLog("Control receive error: \(error) — closing")
+                self.controlConnection = nil
+                connection.cancel()
+                return
+            }
+            if isComplete {
+                debugLog("Control receive EOF — closing")
+                self.controlConnection = nil
+                connection.cancel()
+                return
+            }
+            if let data = data, !data.isEmpty {
+                debugLog("Control receive \(data.count)B")
+                self.controlInputBuffer.append(data)
+                self.processControlBuffer(connection: connection)
+            }
+            self.startReceivingControl()
+        }
+    }
+
+    private func processControlBuffer(connection: NWConnection) {
+        while let msgType = controlInputBuffer.first {
+            switch msgType {
+            case WireMessage.touchEvent:
+                // Same payload as the legacy in-band path: type, pointer
+                // count, normalized points, action. Keeping it on this socket
+                // prevents cursor movement from queueing behind video frames.
+                guard controlInputBuffer.count >= 2 else { return }
+                let pointerCount = Int(controlInputBuffer[controlInputBuffer.index(after: controlInputBuffer.startIndex)])
+                guard pointerCount == 1 || pointerCount == 2 else {
+                    debugLog("Invalid control touch pointer count: \(pointerCount)")
+                    controlInputBuffer.removeFirst()
+                    continue
+                }
+                let expectedSize = 2 + pointerCount * 8 + 4
+                guard controlInputBuffer.count >= expectedSize else { return }
+                let message = Data(controlInputBuffer.prefix(expectedSize))
+                controlInputBuffer.removeSubrange(0..<expectedSize)
+
+                let now = DispatchTime.now().uptimeNanoseconds
+                let actionOffset = 2 + pointerCount * 8
+                let action = message.withUnsafeBytes {
+                    $0.loadUnaligned(fromByteOffset: actionOffset, as: Int32.self)
+                }
+                if action == 0 {
+                    controlTouchCount = 0
+                    lastControlTouchNs = now
+                    maxControlTouchGapMs = 0
+                } else if lastControlTouchNs > 0 {
+                    let gapMs = Double(now - lastControlTouchNs) / 1_000_000.0
+                    maxControlTouchGapMs = max(maxControlTouchGapMs, gapMs)
+                    lastControlTouchNs = now
+                }
+                controlTouchCount += 1
+                if controlTouchCount % 120 == 0 {
+                    debugLog(String(format: "CTRL touch: count=%d maxGap=%.2fms", controlTouchCount, maxControlTouchGapMs))
+                    maxControlTouchGapMs = 0
+                }
+
+                if touchEnabled {
+                    handleTouchMessage(message, pointerCount: pointerCount)
+                }
+
+            case WireMessage.ping:
+                // [type 4][clientTs 8 LE] -> pong [type 5][clientTs 8][serverSendTs 8]
+                guard controlInputBuffer.count >= 9 else { return }
+                let clientTs = controlInputBuffer.withUnsafeBytes {
+                    $0.loadUnaligned(fromByteOffset: 1, as: UInt64.self)
+                }
+                controlInputBuffer.removeSubrange(0..<9)
+                let receivedAt = DispatchTime.now().uptimeNanoseconds
+                var pong = Data(capacity: 17)
+                pong.append(WireMessage.pong)
+                withUnsafeBytes(of: clientTs) { pong.append(contentsOf: $0) }
+                var sendTs = DispatchTime.now().uptimeNanoseconds
+                withUnsafeBytes(of: &sendTs) { pong.append(contentsOf: $0) }
+                let procDelayMs = Double(sendTs - receivedAt) / 1_000_000.0
+                debugLog(String(format: "CTRL pong: procDelay=%.3fms", procDelayMs))
+                connection.send(content: pong, completion: .contentProcessed { _ in })
+
+            case WireMessage.keyframeRequest:
+                guard controlInputBuffer.count >= 2 else { return }
+                let flags = controlInputBuffer[controlInputBuffer.index(controlInputBuffer.startIndex, offsetBy: 1)]
+                controlInputBuffer.removeSubrange(0..<2)
+                onKeyframeRequested?((flags & 1) != 0)
+
+            default:
+                debugLog("Unknown control type: \(msgType)")
+                controlInputBuffer.removeFirst()
+            }
         }
     }
 
@@ -330,7 +518,10 @@ class StreamingServer {
         }
 
         connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
-            guard let self = self, self.isReceiving, !self.isStopped else { return }
+            // Identity guard: a stale completion from a replaced connection must
+            // not kill the live connection's receive loop (isReceiving=false on
+            // an old connection would starve the new client's input path).
+            guard let self = self, self.isReceiving, !self.isStopped, self.connection === connection else { return }
 
             if error != nil || isComplete {
                 self.isReceiving = false
@@ -573,10 +764,15 @@ class StreamingServer {
         // Wait for pending operations before cancelling
         frameQueue.sync {}
         receiveQueue.sync {}
+        controlQueue.sync {}
 
         connection?.cancel()
         listener?.cancel()
+        controlConnection?.cancel()
+        controlListener?.cancel()
         connection = nil
         listener = nil
+        controlConnection = nil
+        controlListener = nil
     }
 }

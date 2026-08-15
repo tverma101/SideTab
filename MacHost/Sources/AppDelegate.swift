@@ -157,9 +157,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let port = Int(settings.port)
+        let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
+        let controlPort = controlOverride > 0 ? controlOverride : port + 1
         Task.detached { [weak self] in
             let devices = StatusDetector.usbDevices()
             let reverseOK = StatusDetector.adbReverseConfigured(port: port)
+                && StatusDetector.adbReverseConfigured(port: controlPort)
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
                 
@@ -408,8 +411,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Setup ADB reverse port forwarding for USB connection
     func setupADBReverse() async {
         let port = settings.port
-        print("🔌 Setting up ADB reverse for port \(port)...")
-        debugLog("🔌 setupADBReverse() invoked for port \(port)...")
+        let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
+        let controlPort = controlOverride > 0 ? UInt16(controlOverride) : port + 1
+        let ports = [port, controlPort]
+        print("🔌 Setting up ADB reverse for ports \(ports)...")
+        debugLog("🔌 setupADBReverse() invoked for ports \(ports)...")
 
         await Task.detached(priority: .utility) {
             // Try common adb paths
@@ -459,41 +465,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             print("📱 Found ADB at: \(finalAdbPath)")
 
-            // Retry adb reverse up to 3 times — handles first-install authorization delay
-            for attempt in 1...3 {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: finalAdbPath)
-                process.arguments = ["reverse", "tcp:\(port)", "tcp:\(port)"]
+            // Configure both bulk video and the dedicated control channel.
+            // Retry each mapping up to 3 times so USB cannot be left in a
+            // half-working state after an authorization delay.
+            for reversePort in ports {
+                var configured = false
+                for attempt in 1...3 {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: finalAdbPath)
+                    process.arguments = ["reverse", "tcp:\(reversePort)", "tcp:\(reversePort)"]
 
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
+                    let pipe = Pipe()
+                    process.standardOutput = pipe
+                    process.standardError = pipe
 
-                do {
-                    try process.run()
-                    process.waitUntilExit()
+                    do {
+                        try process.run()
+                        process.waitUntilExit()
 
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
+                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                        let output = String(data: data, encoding: .utf8) ?? ""
 
-                    if process.terminationStatus == 0 {
-                        print("✅ ADB reverse setup successful: tcp:\(port) -> tcp:\(port)")
-                        return
-                    } else {
-                        print("⚠️  ADB reverse attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
-                        if attempt < 3 {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        if process.terminationStatus == 0 {
+                            print("✅ ADB reverse setup successful: tcp:\(reversePort) -> tcp:\(reversePort)")
+                            configured = true
+                            break
                         }
+                        print("⚠️  ADB reverse tcp:\(reversePort) attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    } catch {
+                        print("⚠️  Failed to configure adb reverse tcp:\(reversePort) (attempt \(attempt)/3): \(error.localizedDescription)")
                     }
-                } catch {
-                    print("⚠️  Failed to run ADB (attempt \(attempt)/3): \(error.localizedDescription)")
+
                     if attempt < 3 {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
                     }
                 }
-            }
 
-            print("💡 Make sure Android device is connected via USB with debugging enabled")
+                if !configured {
+                    print("💡 Make sure Android device is connected via USB with debugging enabled")
+                    return
+                }
+            }
         }.value
     }
 
@@ -597,8 +609,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
 
-            // Setup server
-            streamingServer = StreamingServer(port: settings.port)
+            // Setup server. Control channel (out-of-band ping/pong + keyframe
+            // requests) runs on its own port: settings.port + 1, overridable
+            // via `defaults write com.sidescreen.app SideScreen_controlPort -int N`.
+            let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
+            let controlPort: UInt16 = controlOverride > 0 ? UInt16(controlOverride) : settings.port + 1
+            streamingServer = StreamingServer(port: settings.port, controlPort: controlPort)
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
@@ -723,6 +739,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var accessibilityWarningShown = false
     private var gestureState: GestureState = .idle
     private var lastTouchTime: UInt64 = 0
+    private var handledTouchCount = 0
+    private var lastHandledTouchNs: UInt64 = 0
+    private var maxHandledTouchGapMs = 0.0
 
     // Touch tracking
     private var touchStartPosition: CGPoint = .zero
@@ -753,6 +772,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
         guard settings.touchEnabled else { return }
+
+        let handledAt = DispatchTime.now().uptimeNanoseconds
+        if action == 0 {
+            handledTouchCount = 0
+            lastHandledTouchNs = handledAt
+            maxHandledTouchGapMs = 0
+        } else if lastHandledTouchNs > 0 {
+            let gapMs = Double(handledAt - lastHandledTouchNs) / 1_000_000.0
+            maxHandledTouchGapMs = max(maxHandledTouchGapMs, gapMs)
+            lastHandledTouchNs = handledAt
+        }
+        handledTouchCount += 1
+        if handledTouchCount % 120 == 0 {
+            debugLog(String(format: "TOUCH handled: count=%d maxGap=%.2fms", handledTouchCount, maxHandledTouchGapMs))
+            maxHandledTouchGapMs = 0
+        }
 
         if !AXIsProcessTrusted() {
             if !accessibilityWarningShown {
