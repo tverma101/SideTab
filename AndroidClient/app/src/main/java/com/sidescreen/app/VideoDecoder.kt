@@ -9,7 +9,8 @@ import android.os.Process
 import android.util.Log
 import android.view.Display
 import android.view.Surface
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 private fun diagLog(msg: String) = DiagLog.log("VD", msg)
 
@@ -32,6 +33,18 @@ class VideoDecoder(
     private var lastStatsTime = System.currentTimeMillis()
     private var inputFrameCount = 0L
     private var outputFrameCount = 0L
+
+    // A MediaCodec input buffer can be returned just after the socket thread
+    // checks the queue. Treating that normal hand-off race as frame loss is
+    // especially destructive for HEVC: one discarded P-frame invalidates the
+    // reference chain and the forced IDR used to recover creates another large
+    // decode burst. Wait for at most one 60-Hz frame period instead. The wait
+    // also provides bounded backpressure to the socket when a producer burst
+    // briefly outruns the hardware decoder.
+    private var inputBufferWaitCount = 0L
+    private var inputBufferWaitSumNs = 0L
+    private var inputBufferWaitMaxNs = 0L
+    private var inputBufferWaitTimeouts = 0L
 
     // Decoder pipeline latency (input enqueue -> output buffer available),
     // accumulated over ~60 frames then logged. High values indicate the codec
@@ -74,7 +87,7 @@ class VideoDecoder(
     private var queuedInputCount = 0L
 
     // Available input buffer indices — fed by onInputBufferAvailable callback
-    private val availableInputBuffers = ConcurrentLinkedQueue<Int>()
+    private val availableInputBuffers = LinkedBlockingQueue<Int>()
 
     init {
         setupDecoder()
@@ -355,19 +368,35 @@ class VideoDecoder(
             return
         }
 
-        // Direct feed: grab an available input buffer and queue immediately.
-        val index = availableInputBuffers.poll()
+        // Fast path is still non-blocking. Only wait when the callback hand-off
+        // queue is momentarily empty, and never for longer than one 60-Hz frame.
+        var index = availableInputBuffers.poll()
         if (index == null) {
-            // Decoder input pool exhausted (typically a WiFi burst saturating
-            // MediaCodec). Do NOT pause the pipeline — keep feeding so the
-            // cursor tracks live. Reference state diverges briefly (cursor
-            // trail visible), but a force-keyframe request bypasses every
-            // layer's throttle and rebuilds the reference within ~100-200 ms,
-            // which feels better than a 1-2 s freeze waiting on the next
-            // throttled request to land.
+            val waitStartedNs = System.nanoTime()
+            index =
+                try {
+                    availableInputBuffers.poll(INPUT_BUFFER_WAIT_MS, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    null
+                }
+            val waitedNs = System.nanoTime() - waitStartedNs
+            inputBufferWaitCount++
+            inputBufferWaitSumNs += waitedNs
+            if (waitedNs > inputBufferWaitMaxNs) inputBufferWaitMaxNs = waitedNs
+        }
+        if (index == null) {
+            // This is genuine decoder pressure, not the callback race above.
+            // Do not feed later P-frames against a missing reference: that is
+            // the visible cursor tear/glitch. Pause until the requested IDR.
             droppedFrames++
+            inputBufferWaitTimeouts++
+            needsKeyframe = true
             if (droppedFrames <= 3L || droppedFrames % 60L == 0L) {
-                diagLog("Dropping frame (no input buffer, dropped=$droppedFrames)")
+                diagLog(
+                    "Dropping frame (no input buffer after ${INPUT_BUFFER_WAIT_MS}ms, " +
+                        "dropped=$droppedFrames, timeouts=$inputBufferWaitTimeouts)",
+                )
             }
             requestKeyframe("no input buffer", force = true)
             onFrameDecoded?.invoke(frameData)
@@ -471,16 +500,29 @@ class VideoDecoder(
             if (outputFrameCount % 60L == 0L) {
                 val avgMs = if (latencySamples > 0) latencySumNs / latencySamples / 1_000_000.0 else 0.0
                 val maxMs = latencyMaxNs / 1_000_000.0
+                val inputWaitAvgMs =
+                    if (inputBufferWaitCount > 0) {
+                        inputBufferWaitSumNs / inputBufferWaitCount / 1_000_000.0
+                    } else {
+                        0.0
+                    }
+                val inputWaitMaxMs = inputBufferWaitMaxNs / 1_000_000.0
                 val inBufs = availableInputBuffers.size
                 diagLog(
                     "Output #$outputFrameCount: decoder latency avg=${"%.1f".format(avgMs)}ms " +
                         "max=${"%.1f".format(maxMs)}ms over $latencySamples samples, " +
-                        "input bufs avail=$inBufs, dropped=$droppedFrames",
+                        "input bufs avail=$inBufs, dropped=$droppedFrames, " +
+                        "inputWait avg=${"%.2f".format(inputWaitAvgMs)}ms " +
+                        "max=${"%.2f".format(inputWaitMaxMs)}ms timeouts=$inputBufferWaitTimeouts",
                 )
                 onDecodeLatency?.invoke(avgMs, maxMs)
                 latencySumNs = 0
                 latencySamples = 0
                 latencyMaxNs = 0
+                inputBufferWaitCount = 0
+                inputBufferWaitSumNs = 0
+                inputBufferWaitMaxNs = 0
+                inputBufferWaitTimeouts = 0
             }
 
             val shouldRender =
@@ -561,6 +603,7 @@ class VideoDecoder(
         private const val STALL_DETECT_INPUT_FRAMES = 120L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 1_000_000_000L
         private const val FORCE_KEYFRAME_REQUEST_INTERVAL_NS = 200_000_000L
+        private const val INPUT_BUFFER_WAIT_MS = 17L
         private const val MAX_RENDER_LATENCY_NS = 100_000_000L
         private const val MAX_REASONABLE_LATENCY_NS = 2_000_000_000L
     }
