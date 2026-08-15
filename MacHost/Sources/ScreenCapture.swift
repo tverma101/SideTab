@@ -140,22 +140,39 @@ class ScreenCapture {
     /// legacy clients that report nothing.
     private var clientDecodeLimit: (width: Int, height: Int)?
 
-    /// Encode dimensions for a codec: physical display pixels, clamped to the
-    /// client's reported decoder limit when known, else to the conservative
-    /// AVC floor when streaming H.264. SCStream/CGDisplayStream scale the
-    /// capture into this size, so no virtual-display change is needed.
+    /// Encode dimensions for a codec: LOGICAL display pixels for HEVC (so SCK
+    /// downscales a HiDPI 2x backing raster — the encoder must never chew 4x
+    /// pixels; GATE-422-EXP 2026-08-14), clamped to the client's reported
+    /// decoder limit when known, else to the conservative AVC floor when
+    /// streaming H.264. SCStream/CGDisplayStream scale the capture into this
+    /// size, so no virtual-display change is needed. At 1x, logical == physical.
     func encodeSize(for codec: StreamCodec) -> (width: Int, height: Int) {
-        let phys = (displayWidth, displayHeight)
+        // CAMPAIGN PATCH (2026-08-14): encode the PHYSICAL pixel size, not the
+        // logical. The tablet panel is the native physical res (2800x1752);
+        // encoding the logical would upscale 2x on the panel (soft). self.width/
+        // height return the virtual display's physical size (see above).
+        let logical = (width: displayWidth, height: displayHeight)
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
         if let limit = clientDecodeLimit {
-            return CodecLimits.clamp(width: phys.0, height: phys.1,
+            return CodecLimits.clamp(width: logical.0, height: logical.1,
                                      maxWidth: limit.width, maxHeight: limit.height)
         }
         switch codec {
-        case .hevc: return phys
-        case .h264: return CodecLimits.clampForAvc(width: phys.0, height: phys.1)
+        case .hevc: return logical
+        case .h264: return CodecLimits.clampForAvc(width: logical.0, height: logical.1)
         }
+    }
+
+    /// Logical pixel dimensions of the captured display (CGDisplayPixelsWide
+    /// returns LOGICAL pixels on HiDPI displays; physicalSize uses the mode's
+    /// pixel dims). Falls back to physical when the display ID is unknown.
+    var logicalSize: (width: Int, height: Int) {
+        let id = virtualDisplayID ?? display?.displayID ?? 0
+        let w = CGDisplayPixelsWide(id)
+        let h = CGDisplayPixelsHigh(id)
+        if w > 0 && h > 0 { return (Int(w), Int(h)) }
+        return (displayWidth, displayHeight)
     }
 
     /// Returns physical pixel dimensions for a display ID.

@@ -112,11 +112,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.autoStartStreamingOnLaunch {
             settings.connectionMode = settings.startupMode
             Task {
-                await self.checkPermissions()
-                if self.settings.hasScreenRecordingPermission {
+                // FORCE-START override (campaign fork-lite): CGPreflight can lie
+                // and checkPermissions can HANG on macOS 26 (untimed
+                // SCShareableContent, FB12114396), so when forcing we skip the
+                // whole permission check — the real test is SCStream start.
+                // Enable with: defaults write com.sidescreen.app SideScreen_forceStart -bool true
+                let forceStart = UserDefaults.standard.bool(forKey: "SideScreen_forceStart")
+                if forceStart {
+                    debugLog("FORCE-START active — bypassing permission checks entirely")
+                    CGRequestScreenCaptureAccess() // explicit prompt so a stale/denied TCC record can be re-decided
                     await self.startServer()
                 } else {
-                    debugLog("Auto-start skipped: Screen Recording permission not granted")
+                    await self.checkPermissions()
+                    if self.settings.hasScreenRecordingPermission {
+                        await self.startServer()
+                    } else {
+                        debugLog("Auto-start skipped: Screen Recording permission not granted")
+                    }
                 }
             }
         }
@@ -521,8 +533,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         defer {
             Task { @MainActor [weak self] in self?.isStartingServer = false }
         }
-        debugLog("🚀 startServer() invoked. Check permission: \(settings.hasScreenRecordingPermission)")
-        guard settings.hasScreenRecordingPermission else {
+        let forceStart = UserDefaults.standard.bool(forKey: "SideScreen_forceStart")
+        debugLog("🚀 startServer() invoked. Check permission: \(settings.hasScreenRecordingPermission)\(forceStart ? " (FORCED)" : "")")
+        guard settings.hasScreenRecordingPermission || forceStart else {
             debugLog("❌ startServer aborted: Missing Screen Recording permission")
             await showPermissionAlert()
             return
