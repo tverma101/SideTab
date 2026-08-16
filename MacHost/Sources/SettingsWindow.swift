@@ -438,10 +438,31 @@ struct SettingsView: View {
                                     }
                                 }
 
+                                // Custom rate (issue #41): budget tablets can be
+                                // artifact-free below a preset but not at it —
+                                // let users find their panel's sweet spot.
+                                HStack(spacing: 8) {
+                                    Text("Custom")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                    Slider(
+                                        value: Binding(
+                                            get: { Double(settings.refreshRate) },
+                                            set: { settings.refreshRate = Int($0.rounded()) }
+                                        ),
+                                        in: 15...120,
+                                        step: 1
+                                    )
+                                }
+
                                 if settings.refreshRate >= 90 {
                                     Text("High refresh rate for smooth experience")
                                         .font(.system(size: 10))
                                         .foregroundColor(.green)
+                                } else if ![30, 60].contains(settings.refreshRate) {
+                                    Text("Custom rate — handy when a tablet shows artifacts above a certain FPS")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
                                 }
                             }
                         }

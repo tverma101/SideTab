@@ -274,6 +274,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             .store(in: &cancellables)
+
+        // Refresh rate shapes the virtual display mode AND the capture
+        // interval, so it needs the same rebuild as a resolution change.
+        // Debounced: the custom-FPS slider (issue #41) emits continuously
+        // while dragging — restart once the value settles.
+        settings.$refreshRate
+            .dropFirst()
+            .removeDuplicates()
+            .debounce(for: .seconds(1.2), scheduler: RunLoop.main)
+            .sink { [weak self] rate in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    guard self.settings.isRunning else { return }
+                    debugLog("Refresh rate changed to \(rate) Hz — restarting server to rebuild virtual display")
+                    self.stopServer()
+                    await self.startServer()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     func setupMenuBar() {
