@@ -448,7 +448,14 @@ struct SettingsView: View {
                                     Slider(
                                         value: Binding(
                                             get: { Double(settings.refreshRate) },
-                                            set: { settings.refreshRate = Int($0.rounded()) }
+                                            set: {
+                                                let rate = Int($0.rounded())
+                                                // Same-value stores still fire didSet +
+                                                // UserDefaults writes — skip them.
+                                                if rate != settings.refreshRate {
+                                                    settings.refreshRate = rate
+                                                }
+                                            }
                                         ),
                                         in: 15...120,
                                         step: 1

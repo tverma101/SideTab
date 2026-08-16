@@ -57,8 +57,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Used to roll its `lastConnected` timestamp forward every status refresh tick so the UI
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
     private var currentWirelessDevice: String?
-    /// Failed code-pairing attempts since the last rotation (issue #35).
-    private var pairingFailureCount = 0
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
     private var statusRefreshTimer: Timer?
@@ -66,6 +64,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
     private var isStartingServer = false
+    /// The effective refresh rate the running pipeline was built with — lets
+    /// the refresh-rate observer skip restarts that would change nothing.
+    private var lastAppliedRefreshRate: Int?
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -265,34 +266,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] resolution in
-                guard let self = self else { return }
-                Task { @MainActor in
-                    guard self.settings.isRunning else { return }
-                    debugLog("Resolution changed to \(resolution) — restarting server to rebuild virtual display")
-                    self.stopServer()
-                    await self.startServer()
-                }
+                self?.restartRunningServer(reason: "Resolution changed to \(resolution)")
             }
             .store(in: &cancellables)
 
         // Refresh rate shapes the virtual display mode AND the capture
         // interval, so it needs the same rebuild as a resolution change.
         // Debounced: the custom-FPS slider (issue #41) emits continuously
-        // while dragging — restart once the value settles.
+        // while dragging — restart once the value settles. The effective-rate
+        // guard skips no-op restarts (drag ends back on the applied value, or
+        // Gaming Boost is pinning the rate to 120).
         settings.$refreshRate
             .dropFirst()
             .removeDuplicates()
             .debounce(for: .seconds(1.2), scheduler: RunLoop.main)
-            .sink { [weak self] rate in
+            .sink { [weak self] _ in
                 guard let self = self else { return }
                 Task { @MainActor in
-                    guard self.settings.isRunning else { return }
-                    debugLog("Refresh rate changed to \(rate) Hz — restarting server to rebuild virtual display")
-                    self.stopServer()
-                    await self.startServer()
+                    let effective = self.settings.effectiveRefreshRate
+                    guard effective != self.lastAppliedRefreshRate else { return }
+                    self.restartRunningServer(reason: "Refresh rate changed to \(effective) Hz")
                 }
             }
             .store(in: &cancellables)
+    }
+
+    /// Stop-and-restart the server to rebuild the virtual display and capture
+    /// pipeline. No-op while stopped.
+    private func restartRunningServer(reason: String) {
+        Task { @MainActor in
+            guard self.settings.isRunning else { return }
+            debugLog("\(reason) — restarting server to rebuild virtual display")
+            self.stopServer()
+            await self.startServer()
+        }
     }
 
     func setupMenuBar() {
@@ -603,6 +610,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.settings.captureMethod = method
                 }
             }
+            lastAppliedRefreshRate = settings.effectiveRefreshRate
             try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
 
             // Setup server
@@ -710,31 +718,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Code pairing (issue #35): issue a fresh one-time code for this wireless
-    /// session and rotate it after every successful pairing or after 5 failed
-    /// attempts (brute-force guard).
+    /// session. The server consumes/invalidates the code atomically on its
+    /// network queue (one-time use, 5-attempt budget); these callbacks only
+    /// install the replacement.
     private func configurePairingCode(on server: StreamingServer?) {
         guard let server = server else { return }
-        pairingFailureCount = 0
         rotatePairingCode(on: server)
         server.pairingMacName = Host.current().localizedName ?? "Mac"
         server.onPairingSuccess = { [weak self, weak server] deviceName in
             guard let self = self else { return }
+            self.rotatePairingCode(on: server)
             Task { @MainActor in
-                self.pairingFailureCount = 0
-                self.rotatePairingCode(on: server)
                 self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
             }
         }
-        server.onPairingFailure = { [weak self, weak server] in
-            guard let self = self else { return }
-            Task { @MainActor in
-                self.pairingFailureCount += 1
-                if self.pairingFailureCount >= 5 {
-                    debugLog("5 failed pairing attempts — rotating code")
-                    self.pairingFailureCount = 0
-                    self.rotatePairingCode(on: server)
-                }
-            }
+        server.onPairingCodeExhausted = { [weak self, weak server] in
+            debugLog("Pairing attempt budget exhausted — rotating code")
+            self?.rotatePairingCode(on: server)
         }
     }
 
@@ -742,6 +742,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let code = PairingCode.generate()
         server?.expectedPairingCode = code
         Task { @MainActor in
+            // A rotation queued just before Stop must not resurrect the code
+            // in the UI after stopServer() cleared it.
+            guard self.settings.isRunning || self.isStartingServer else { return }
             self.settings.pairingCode = code
         }
     }
@@ -750,6 +753,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Save display position before destroying
         virtualDisplayManager?.saveDisplayPosition()
         settings.pairingCode = nil
+        streamingServer?.expectedPairingCode = nil
 
         screenCapture?.stopStreaming()
         streamingServer?.stop()

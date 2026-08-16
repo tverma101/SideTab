@@ -152,12 +152,20 @@ class StreamClient(
         object TokenRejected : WirelessConnectError("Token rejected — re-pair required")
 
         object ProtocolError : WirelessConnectError("Connection error, please rescan QR")
+    }
 
-        /** Code pairing (issue #35): the Mac rejected the typed one-time code. */
-        object CodeRejected : WirelessConnectError("Pairing code not accepted")
+    /**
+     * Code-pairing failures (issue #35). Kept OUT of [WirelessConnectError] on
+     * purpose: these can only be thrown by [pairWithCode] and are handled in
+     * the pairing dialog, so putting them in the shared sealed class would just
+     * grow dead branches in every exhaustive `when` over connect errors.
+     */
+    sealed class PairingError(msg: String) : Exception(msg) {
+        /** The Mac rejected the typed one-time code. */
+        object CodeRejected : PairingError("Pairing code not accepted")
 
-        /** Code pairing: the Mac runs a version that predates code pairing. */
-        object HostTooOld : WirelessConnectError("Update Side Screen on the Mac to use code pairing")
+        /** The Mac runs a version that predates code pairing. */
+        object HostTooOld : PairingError("Update Side Screen on the Mac to use code pairing")
     }
 
     data class PairingSuccess(val token: ByteArray, val macName: String)
@@ -219,7 +227,9 @@ class StreamClient(
      * Code pairing (issue #35): send the typed one-time code, receive the real
      * 32-byte token + Mac name, then close. The caller stores the result and
      * reconnects through the normal [connectWireless] handshake.
-     * Throws [WirelessConnectError] on any failure.
+     * Throws [WirelessConnectError] or [PairingError] on failure. `use {}`
+     * guarantees the socket closes on every path, including coroutine
+     * cancellation and unexpected exceptions.
      */
     suspend fun pairWithCode(
         code: String,
@@ -227,66 +237,51 @@ class StreamClient(
     ): PairingSuccess =
         withContext(Dispatchers.IO) {
             Log.i(TAG, "pairWithCode: trying $host:$port (device=$deviceName)")
-            val s = openWirelessSocket()
+            openWirelessSocket().use { s ->
+                // A silent listener (user typed the wrong port) must not hang
+                // the dialog forever: bound every blocking read.
+                s.soTimeout = PAIRING_READ_TIMEOUT_MS
 
-            fun closeQuietly() {
                 try {
-                    s.close()
-                } catch (_: IOException) {
+                    s.getOutputStream().write(AuthHandshake.encodePairingRequest(code, deviceName))
+                    s.getOutputStream().flush()
+                } catch (e: IOException) {
+                    throw WirelessConnectError.NetworkUnreachable
                 }
-            }
 
-            try {
-                s.getOutputStream().write(AuthHandshake.encodePairingRequest(code, deviceName))
-                s.getOutputStream().flush()
-            } catch (e: IOException) {
-                closeQuietly()
-                throw WirelessConnectError.NetworkUnreachable
-            }
-
-            val header = ByteArray(5)
-            if (!readFully(s, header)) {
-                closeQuietly()
-                throw WirelessConnectError.ProtocolError
-            }
-            val parsed =
-                AuthHandshake.parsePairingResponseHeader(header) ?: run {
-                    closeQuietly()
+                val header = ByteArray(5)
+                if (!readFully(s, header)) {
                     throw WirelessConnectError.ProtocolError
                 }
-            when (parsed) {
-                is AuthHandshake.PairingHeader.LegacyHost -> {
-                    closeQuietly()
-                    throw WirelessConnectError.HostTooOld
-                }
-                is AuthHandshake.PairingHeader.Pairing -> {
-                    if (parsed.status != AuthHandshake.PairingStatus.OK) {
-                        closeQuietly()
-                        throw WirelessConnectError.CodeRejected
+                val parsed =
+                    AuthHandshake.parsePairingResponseHeader(header)
+                        ?: throw WirelessConnectError.ProtocolError
+                when (parsed) {
+                    is AuthHandshake.PairingHeader.LegacyHost -> throw PairingError.HostTooOld
+                    is AuthHandshake.PairingHeader.Pairing -> {
+                        if (parsed.status != AuthHandshake.PairingStatus.OK) {
+                            throw PairingError.CodeRejected
+                        }
                     }
                 }
-            }
 
-            val token = ByteArray(32)
-            val nameLenBuf = ByteArray(1)
-            if (!readFully(s, token) || !readFully(s, nameLenBuf)) {
-                closeQuietly()
-                throw WirelessConnectError.ProtocolError
+                val token = ByteArray(32)
+                val nameLenBuf = ByteArray(1)
+                if (!readFully(s, token) || !readFully(s, nameLenBuf)) {
+                    throw WirelessConnectError.ProtocolError
+                }
+                val nameLen = nameLenBuf[0].toInt() and 0xFF
+                if (nameLen !in 1..64) {
+                    throw WirelessConnectError.ProtocolError
+                }
+                val nameBuf = ByteArray(nameLen)
+                if (!readFully(s, nameBuf)) {
+                    throw WirelessConnectError.ProtocolError
+                }
+                val macName = String(nameBuf, Charsets.UTF_8)
+                Log.i(TAG, "pairWithCode: token issued by $macName")
+                PairingSuccess(token, macName)
             }
-            val nameLen = nameLenBuf[0].toInt() and 0xFF
-            if (nameLen !in 1..64) {
-                closeQuietly()
-                throw WirelessConnectError.ProtocolError
-            }
-            val nameBuf = ByteArray(nameLen)
-            if (!readFully(s, nameBuf)) {
-                closeQuietly()
-                throw WirelessConnectError.ProtocolError
-            }
-            closeQuietly()
-            val macName = String(nameBuf, Charsets.UTF_8)
-            Log.i(TAG, "pairWithCode: token issued by $macName")
-            PairingSuccess(token, macName)
         }
 
     /**
@@ -699,6 +694,7 @@ class StreamClient(
     companion object {
         private const val TAG = "StreamClient"
         private const val MAX_FRAME_SIZE = 5 * 1024 * 1024 // 5MB
+        private const val PAIRING_READ_TIMEOUT_MS = 10_000
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
         private const val MESSAGE_VIDEO_FRAME = 0

@@ -37,6 +37,8 @@ import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -51,6 +53,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
+
+    /** In-flight code-pairing attempt (issue #35); cancelled when its dialog closes. */
+    private var pairingJob: Job? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
     private var decoderUsingTextureView = false
@@ -1170,34 +1175,57 @@ class MainActivity : AppCompatActivity() {
                 pairButton.isEnabled = false
                 pairButton.text = "Pairing…"
 
-                val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
-                lifecycleScope.launch(Dispatchers.IO) {
-                    try {
-                        val client = StreamClient(host, port!!, applicationContext)
-                        val result = client.pairWithCode(code, deviceName)
-                        runOnUiThread {
-                            dialog.dismiss()
-                            wirelessController.onCodePairComplete(host, port, result.token, result.macName)
-                        }
-                    } catch (e: StreamClient.WirelessConnectError) {
-                        runOnUiThread {
-                            pairButton.isEnabled = true
-                            pairButton.text = "Pair"
-                            errorText.text =
+                fun showPairError(message: String) {
+                    runOnUiThread {
+                        pairButton.isEnabled = true
+                        pairButton.text = "Pair"
+                        errorText.text = message
+                        errorText.visibility = View.VISIBLE
+                    }
+                }
+
+                val deviceName = WirelessTabController.defaultDeviceName()
+                pairingJob =
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            val client = StreamClient(host, port!!, applicationContext)
+                            val result = client.pairWithCode(code, deviceName)
+                            // Dialog dismissed mid-flight (Cancel/back): drop the
+                            // token instead of silently connecting.
+                            ensureActive()
+                            runOnUiThread {
+                                dialog.dismiss()
+                                wirelessController.onCodePairComplete(host, port, result.token, result.macName)
+                            }
+                        } catch (e: StreamClient.PairingError) {
+                            showPairError(
                                 when (e) {
-                                    is StreamClient.WirelessConnectError.CodeRejected ->
+                                    is StreamClient.PairingError.CodeRejected ->
                                         "Code not accepted. Codes change after each use — check the Mac for the current one."
-                                    is StreamClient.WirelessConnectError.HostTooOld ->
+                                    is StreamClient.PairingError.HostTooOld ->
                                         "Update Side Screen on the Mac to use code pairing."
+                                },
+                            )
+                        } catch (e: StreamClient.WirelessConnectError) {
+                            showPairError(
+                                when (e) {
                                     is StreamClient.WirelessConnectError.NetworkUnreachable ->
                                         "No response from $host:$port. Check both devices are on the same WiFi and the Mac app is running."
                                     else -> "Connection error — try again."
-                                }
-                            errorText.visibility = View.VISIBLE
+                                },
+                            )
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            log("Code pairing failed unexpectedly: ${e.message}")
+                            showPairError("Pairing failed — try again.")
                         }
                     }
-                }
             }
+        }
+        dialog.setOnDismissListener {
+            pairingJob?.cancel()
+            pairingJob = null
         }
         dialog.show()
     }

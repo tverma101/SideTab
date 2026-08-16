@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 
 private enum WireMessage {
     static let legacyVideoFrame: UInt8 = 0
@@ -68,13 +69,38 @@ class StreamingServer {
     // carrying this one-time code is answered with the real auth token, and
     // the client reconnects through the normal SSWA handshake. Only honored
     // while wireless mode is active (expectedAuthToken != nil).
-    var expectedPairingCode: String?
+    //
+    // The code is written from the main thread (rotation) and read on
+    // networkQueue (validation), so state lives behind a lock — and
+    // validate-and-consume is a single critical section, so a code can never
+    // be redeemed twice and pipelined guesses can never exceed the attempt
+    // budget before the invalidation lands.
+    private struct PairingState {
+        var code: String?
+        var failedAttempts = 0
+    }
+
+    private let pairingStateLock = OSAllocatedUnfairLock(initialState: PairingState())
+    private static let maxPairingAttempts = 5
+
+    var expectedPairingCode: String? {
+        get { pairingStateLock.withLock { $0.code } }
+        set {
+            pairingStateLock.withLock { state in
+                state.code = newValue
+                state.failedAttempts = 0
+            }
+        }
+    }
+
     var pairingMacName: String = "Mac"
     /// Fired with the device name after a code was accepted and the token
-    /// issued. The owner should rotate the code (one-time use).
+    /// issued. The code is already consumed (nil); the owner should install a
+    /// fresh one.
     var onPairingSuccess: ((String) -> Void)?
-    /// Fired on every rejected code attempt so the owner can rate-limit.
-    var onPairingFailure: (() -> Void)?
+    /// Fired when the attempt budget is exhausted. The code is already
+    /// invalidated (nil); the owner should install a fresh one.
+    var onPairingCodeExhausted: (() -> Void)?
 
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
@@ -247,23 +273,9 @@ class StreamingServer {
                 self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
                 return
             }
-            let nameLen = Int(prefixBytes[36])
-            guard (1...64).contains(nameLen) else {
+            self.receiveNameSuffix(on: conn, prefix: prefix, onInvalid: {
                 self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
-                return
-            }
-            // Read variable name.
-            conn.receive(minimumIncompleteLength: nameLen, maximumLength: nameLen) { nameData, _, _, error in
-                if let error = error {
-                    debugLog("Auth name read error: \(error)")
-                    conn.cancel()
-                    return
-                }
-                guard let nameData = nameData, nameData.count == nameLen else {
-                    self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
-                    return
-                }
-                let full = prefix + nameData
+            }) { full in
                 do {
                     let parsed = try HandshakeCodec.parseRequest(full)
                     if WirelessAuth.validate(parsed.token, expected: expectedToken) {
@@ -286,45 +298,93 @@ class StreamingServer {
         }
     }
 
-    /// Handles a pre-auth "SSPC" code-pairing request (issue #35). On a valid
-    /// one-time code, answers with the real 32-byte token + Mac name and closes;
-    /// the client then reconnects through the normal SSWA handshake.
-    private func runPairingExchange(connection conn: NWConnection, prefix: Data) {
-        let prefixBytes = Array(prefix)
-        let nameLen = Int(prefixBytes[36])
+    /// Reads the variable `[name N]` tail shared by SSWA and SSPC requests and
+    /// hands back the full request bytes. `onInvalid` fires for a bad name
+    /// length or a short read; read errors cancel the connection.
+    private func receiveNameSuffix(
+        on conn: NWConnection,
+        prefix: Data,
+        onInvalid: @escaping () -> Void,
+        completion: @escaping (Data) -> Void
+    ) {
+        let nameLen = Int(Array(prefix)[36])
         guard (1...64).contains(nameLen) else {
-            sendPairingResponse(conn, status: .invalidCode)
+            onInvalid()
             return
         }
-        conn.receive(minimumIncompleteLength: nameLen, maximumLength: nameLen) { [weak self] nameData, _, _, error in
-            guard let self = self else { return }
+        conn.receive(minimumIncompleteLength: nameLen, maximumLength: nameLen) { nameData, _, _, error in
             if let error = error {
-                debugLog("Pairing name read error: \(error)")
+                debugLog("Handshake name read error: \(error)")
                 conn.cancel()
                 return
             }
             guard let nameData = nameData, nameData.count == nameLen else {
-                self.sendPairingResponse(conn, status: .invalidCode)
+                onInvalid()
                 return
             }
+            completion(prefix + nameData)
+        }
+    }
+
+    /// Handles a pre-auth "SSPC" code-pairing request (issue #35). On a valid
+    /// one-time code, answers with the real 32-byte token + Mac name and closes;
+    /// the client then reconnects through the normal SSWA handshake.
+    private func runPairingExchange(connection conn: NWConnection, prefix: Data) {
+        receiveNameSuffix(on: conn, prefix: prefix, onInvalid: { [weak self] in
+            self?.sendPairingResponse(conn, status: .invalidCode)
+        }) { [weak self] full in
+            guard let self = self else { return }
             do {
-                let parsed = try HandshakeCodec.parsePairingRequest(prefix + nameData)
-                guard let expectedCode = self.expectedPairingCode,
-                      let token = self.expectedAuthToken,
-                      PairingCode.validate(parsed.code, expected: expectedCode) else {
-                    debugLog("Pairing code rejected (device: attempting)")
-                    self.onPairingFailure?()
+                let parsed = try HandshakeCodec.parsePairingRequest(full)
+                switch self.consumePairingCode(candidate: parsed.code) {
+                case .issued(let token):
+                    debugLog("Pairing code accepted — issuing token to \(parsed.deviceName)")
+                    self.sendPairingResponse(conn, status: .ok, token: token)
+                    self.onPairingSuccess?(parsed.deviceName)
+                case .rejected:
+                    debugLog("Pairing code rejected")
                     self.sendPairingResponse(conn, status: .invalidCode)
-                    return
+                case .exhausted:
+                    debugLog("Pairing code rejected — attempt budget exhausted, invalidating code")
+                    self.sendPairingResponse(conn, status: .invalidCode)
+                    self.onPairingCodeExhausted?()
                 }
-                debugLog("Pairing code accepted — issuing token to \(parsed.deviceName)")
-                self.sendPairingResponse(conn, status: .ok, token: token)
-                self.onPairingSuccess?(parsed.deviceName)
             } catch {
+                // Malformed requests carry no code guess, so they don't touch
+                // the attempt budget.
                 debugLog("Malformed pairing request: \(error)")
-                self.onPairingFailure?()
                 self.sendPairingResponse(conn, status: .invalidCode)
             }
+        }
+    }
+
+    private enum PairingOutcome {
+        case issued(Data)
+        case rejected
+        case exhausted
+    }
+
+    /// Single critical section for validate-and-consume: a correct guess nils
+    /// the code before the token leaves the lock, and the attempt counter is
+    /// bumped under the same lock — so neither double redemption nor
+    /// budget-overrun is possible however requests are pipelined.
+    private func consumePairingCode(candidate: String) -> PairingOutcome {
+        pairingStateLock.withLock { state in
+            guard let expected = state.code,
+                  let token = self.expectedAuthToken,
+                  PairingCode.validate(candidate, expected: expected) else {
+                guard state.code != nil else { return .rejected }
+                state.failedAttempts += 1
+                if state.failedAttempts >= Self.maxPairingAttempts {
+                    state.code = nil
+                    state.failedAttempts = 0
+                    return .exhausted
+                }
+                return .rejected
+            }
+            state.code = nil
+            state.failedAttempts = 0
+            return .issued(token)
         }
     }
 

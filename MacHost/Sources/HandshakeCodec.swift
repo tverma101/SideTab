@@ -45,19 +45,25 @@ enum HandshakeCodec {
     static let pairingResponseMagic: [UInt8] = [0x53, 0x53, 0x50, 0x52]  // "SSPR"
     static let pairingCodeFieldLen = 32
 
+    /// Parses the `[name_len 1][name N]` tail shared by SSWA and SSPC requests.
+    private static func parseNameSuffix(_ bytes: [UInt8], totalCount: Int) throws -> String {
+        let nameLen = Int(bytes[36])
+        guard nameLen >= 1 && nameLen <= 64 else { throw HandshakeError.invalidName }
+        guard totalCount >= fixedPrefixLen + nameLen else { throw HandshakeError.truncated }
+        let nameBytes = Array(bytes[37..<(37 + nameLen)])
+        guard let name = String(bytes: nameBytes, encoding: .utf8), !name.isEmpty else {
+            throw HandshakeError.invalidName
+        }
+        return name
+    }
+
     /// Parses the variable-length request `[magic 4][token 32][name_len 1][name N]`.
     static func parseRequest(_ data: Data) throws -> ParsedHandshake {
         guard data.count >= fixedPrefixLen else { throw HandshakeError.truncated }
         let bytes = Array(data)
         guard Array(bytes[0..<4]) == requestMagic else { throw HandshakeError.invalidMagic }
         let token = Data(bytes[4..<36])
-        let nameLen = Int(bytes[36])
-        guard nameLen >= 1 && nameLen <= 64 else { throw HandshakeError.invalidName }
-        guard data.count >= fixedPrefixLen + nameLen else { throw HandshakeError.truncated }
-        let nameBytes = Array(bytes[37..<(37 + nameLen)])
-        guard let name = String(bytes: nameBytes, encoding: .utf8), !name.isEmpty else {
-            throw HandshakeError.invalidName
-        }
+        let name = try parseNameSuffix(bytes, totalCount: data.count)
         return ParsedHandshake(token: token, deviceName: name)
     }
 
@@ -76,13 +82,7 @@ enum HandshakeCodec {
         guard let code = String(bytes: codeField, encoding: .utf8), !code.isEmpty else {
             throw HandshakeError.invalidMagic
         }
-        let nameLen = Int(bytes[36])
-        guard nameLen >= 1 && nameLen <= 64 else { throw HandshakeError.invalidName }
-        guard data.count >= fixedPrefixLen + nameLen else { throw HandshakeError.truncated }
-        let nameBytes = Array(bytes[37..<(37 + nameLen)])
-        guard let name = String(bytes: nameBytes, encoding: .utf8), !name.isEmpty else {
-            throw HandshakeError.invalidName
-        }
+        let name = try parseNameSuffix(bytes, totalCount: data.count)
         return ParsedPairingRequest(code: code, deviceName: name)
     }
 

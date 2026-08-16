@@ -138,7 +138,7 @@ class WirelessTabController(
 
     fun onScanResult(url: String) {
         val parsed = PairingURL.parse(url) ?: return
-        val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+        val deviceName = defaultDeviceName()
         storage.save(PairedHostStorage.Entry(parsed.host, parsed.port, parsed.token, parsed.macName))
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
@@ -154,7 +154,7 @@ class WirelessTabController(
         token: ByteArray,
         macName: String,
     ) {
-        val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+        val deviceName = defaultDeviceName()
         storage.save(PairedHostStorage.Entry(host, port, token, macName))
         showConnecting("Connecting to $macName", "$host:$port")
         onConnectRequested(host, port, token, deviceName, macName)
@@ -190,18 +190,6 @@ class WirelessTabController(
             is StreamClient.WirelessConnectError.ProtocolError -> {
                 views.repairTitle.text = "⚠ Connection error"
                 views.repairMessage.text = "Couldn't complete the secure handshake with the Mac. Scan the QR again."
-                transition(State.REPAIR_NEEDED)
-            }
-            // Pairing-only errors; surfaced inside the code dialog, but keep the
-            // fallback exhaustive in case they ever reach this path.
-            is StreamClient.WirelessConnectError.CodeRejected -> {
-                views.repairTitle.text = "⚠ Code not accepted"
-                views.repairMessage.text = "Codes change after each use — check the Mac for the current one."
-                transition(State.REPAIR_NEEDED)
-            }
-            is StreamClient.WirelessConnectError.HostTooOld -> {
-                views.repairTitle.text = "⚠ Mac app too old"
-                views.repairMessage.text = "Update Side Screen on the Mac to use code pairing."
                 transition(State.REPAIR_NEEDED)
             }
         }
@@ -253,12 +241,26 @@ class WirelessTabController(
     }
 
     private fun attemptAutoConnect(entry: PairedHostStorage.Entry) {
-        val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+        val deviceName = defaultDeviceName()
         onConnectRequested(entry.host, entry.port, entry.token, deviceName, entry.macName)
     }
 
     companion object {
         const val REQ_SCAN = 1001
         const val REQ_CAMERA = 1002
+
+        /**
+         * The device name sent in handshakes. The wire format caps the name at
+         * 64 UTF-8 BYTES (not chars — a char-truncated non-ASCII model name can
+         * still overflow and fail the codec's require), and Build.MODEL can
+         * legally be blank on some devices.
+         */
+        fun defaultDeviceName(): String {
+            var name = android.os.Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"
+            while (name.toByteArray(Charsets.UTF_8).size > 64) {
+                name = name.dropLast(1)
+            }
+            return name
+        }
     }
 }
