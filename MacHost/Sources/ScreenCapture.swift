@@ -211,9 +211,11 @@ class ScreenCapture {
     }
 
     deinit {
-        // Defensive: stopStreaming() already unregisters, but make sure a
-        // dropped instance never leaves observer tokens behind.
+        // Defensive: stopStreaming() already unregisters and releases, but make
+        // sure a dropped instance never leaves observer tokens behind or keeps
+        // holding the display-sleep assertion for the rest of the process.
         unregisterWakeObservers()
+        releaseDisplaySleepAssertion()
     }
 
     private func handleWake() {
