@@ -45,6 +45,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
@@ -71,6 +73,16 @@ class MainActivity : AppCompatActivity() {
     private var displayFlipVertical = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
+
+    // Auto-reconnect: an interrupted session (host restart, transport blip,
+    // or failed connect) retries with capped backoff until the user
+    // explicitly disconnects. Before this, a sender restart left the app on
+    // its disconnected screen until someone tapped CONNECT — while the
+    // checklist probe hammered the Mac video port every 2s (2026-08-16).
+    private var autoReconnectJob: Job? = null
+    private var autoReconnectAttempt = 0
+
+    @Volatile private var userRequestedDisconnect = false
 
     // For dragging stats overlay
     private var isDraggingOverlay = false
@@ -130,6 +142,17 @@ class MainActivity : AppCompatActivity() {
         setupModeToggle()
         setupWirelessController()
         setupVsrCommandReceiver()
+
+        // Boot-to-stream: resume the last live session automatically (an
+        // explicit disconnect() clears it). USB/E3 path only — wireless
+        // pairing has its own controller flow.
+        val savedSession = getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
+        val savedHost = savedSession.getString("host", null)
+        val savedPort = savedSession.getInt("port", 0)
+        if (savedHost != null && savedPort > 0 && prefs.connectionMode == ConnectionMode.USB) {
+            log("🔁 Resuming last session $savedHost:$savedPort")
+            connect(savedHost, savedPort)
+        }
     }
 
     private fun setupModeToggle() {
@@ -1368,6 +1391,9 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
+        // A fresh/explicit connect re-arms auto-reconnect (it is only
+        // disarmed by an explicit user disconnect()).
+        userRequestedDisconnect = false
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
@@ -1438,6 +1464,15 @@ class MainActivity : AppCompatActivity() {
                         if (connected) {
                             // Start periodic ping for latency measurement
                             startPingTimer()
+                            autoReconnectAttempt = 0
+
+                            // Remember the live session for boot-to-stream
+                            // resume after an app/device restart.
+                            getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
+                                .edit()
+                                .putString("host", host)
+                                .putInt("port", port)
+                                .apply()
 
                             // Stop checklist updates when connected (prevents socket conflicts)
                             stopChecklistUpdates()
@@ -1466,6 +1501,10 @@ class MainActivity : AppCompatActivity() {
                             // Restart checklist updates immediately
                             log("📋 Restarting checklist updates")
                             startChecklistUpdates()
+
+                            // Session dropped without the user asking — bring
+                            // it back (host restart, transport blip).
+                            scheduleAutoReconnect(host, port)
                         }
                     }
                 }
@@ -1522,11 +1561,49 @@ class MainActivity : AppCompatActivity() {
                     }
                 updateStatus("Connection failed")
                 showError(errorMessage)
+                // Retryable failure (server restarting, transport down):
+                // schedule instead of leaving the app dead on its checklist.
+                scheduleAutoReconnect(host, port)
             }
         }
     }
 
+    /**
+     * Retry a dropped or failed session with capped exponential backoff
+     * (1s, 2s, 4s, 8s, then every 10s). Cancelled by an explicit disconnect()
+     * or a newer schedule. The reconnect attempt itself re-enters connect(),
+     * so each failure reschedules naturally until it succeeds.
+     */
+    private fun scheduleAutoReconnect(
+        host: String,
+        port: Int,
+    ) {
+        if (userRequestedDisconnect || isFinishing) return
+        autoReconnectJob?.cancel()
+        val delayMs = (1000L shl autoReconnectAttempt.coerceAtMost(3)).coerceAtMost(10_000L)
+        autoReconnectAttempt += 1
+        log("🔁 Auto-reconnect to $host:$port in ${delayMs / 1000.0}s (attempt $autoReconnectAttempt)")
+        autoReconnectJob =
+            lifecycleScope.launch(Dispatchers.Main) {
+                kotlinx.coroutines.delay(delayMs)
+                if (!userRequestedDisconnect && !isConnected && !isFinishing) {
+                    updateStatus("Reconnecting...")
+                    connect(host, port)
+                }
+            }
+    }
+
     private fun disconnect() {
+        userRequestedDisconnect = true
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
+        autoReconnectAttempt = 0
+        // Explicit disconnect ends the session for good — do not resume it
+        // on next launch.
+        getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .apply()
         stopPingTimer()
         streamClient?.disconnect()
         // Reset display config so next connect defers decoder init until config arrives
@@ -1797,7 +1874,19 @@ class MainActivity : AppCompatActivity() {
                 binding.hostInput.text
                     .toString()
                     .ifEmpty { "10.77.0.1" }
-            val isServerRunning = checkServerRunning(host, port)
+            // Probe the CONTROL listener with a PING/PONG exchange first:
+            // it never touches the video port, so it cannot disturb a live
+            // or starting video session (the old video-port probe is what
+            // fed the 2026-08-16 reset storm), and the server does not burn
+            // an IDR on it while idle. A null result (nothing answered on
+            // the control port — pre-control-channel hosts, or adbd-only
+            // listeners) falls back to the legacy video-port probe.
+            val usesE3VideoPath = host == "10.77.0.1" && port == 54326
+            val controlHost = if (usesE3VideoPath) "127.0.0.1" else host
+            val controlPort = if (usesE3VideoPath) 54322 else port + 1
+            val isServerRunning =
+                checkServerRunningControl(controlHost, controlPort)
+                    ?: checkServerRunning(host, port)
             runOnUiThread {
                 // Final check before updating UI
                 if (isConnected) return@runOnUiThread
@@ -1853,6 +1942,59 @@ class MainActivity : AppCompatActivity() {
      * Mac server sends display config (type=1) immediately upon connection.
      * ADB daemon doesn't send anything, so read will timeout → false.
      */
+    /**
+     * Server-alive probe on the dedicated CONTROL port: send PING
+     * ([4][clientTs 8] little-endian), expect PONG ([5][clientTs 8][serverTs 8]).
+     * Only a real SideScreen host answers with type 5, so this cannot be
+     * fooled by adbd listeners the way a bare TCP connect can.
+     *
+     * @return true  — control port answered with a PONG (server running)
+     *         null  — nothing usable on the control port (old host without a
+     *                 control listener, or connect refused); caller falls
+     *                 back to the legacy video-port probe
+     *         false — control port present but the exchange failed
+     */
+    private fun checkServerRunningControl(
+        host: String,
+        port: Int,
+    ): Boolean? {
+        var socket: Socket? = null
+        return try {
+            socket = Socket()
+            socket.connect(InetSocketAddress(host, port), 300)
+            socket.tcpNoDelay = true
+            socket.soTimeout = 300
+            val ping =
+                ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN).apply {
+                    put(4.toByte())
+                    putLong(System.nanoTime())
+                }
+            socket.getOutputStream().apply {
+                write(ping.array())
+                flush()
+            }
+            val input = socket.getInputStream()
+            val type = input.read()
+            if (type != 5) return null
+            // Drain the 16 payload bytes so the close is a clean FIN, not an RST.
+            val rest = ByteArray(16)
+            var read = 0
+            while (read < 16) {
+                val r = input.read(rest, read, 16 - read)
+                if (r <= 0) break
+                read += r
+            }
+            true
+        } catch (e: Exception) {
+            null
+        } finally {
+            try {
+                socket?.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     private fun checkServerRunning(
         host: String,
         port: Int,

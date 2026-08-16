@@ -499,7 +499,13 @@ class StreamingServer {
         // Give new clients a short chance to opt in before the first frame.
         // Legacy clients send no capability message, so we continue shortly
         // after this window with the old frame type.
-        networkQueue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self, weak conn] in
+        // The client's capability adverts (decoder limits, metadata support)
+        // land right after connect; a client racing a just-rebooted server
+        // can deliver them past 100ms, silently downgrading the session to
+        // the legacy no-metadata path. 250ms covers that race; the type-8
+        // handler below still short-circuits startup the moment adverts
+        // arrive, so well-behaved clients pay no extra delay.
+        networkQueue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self, weak conn] in
             guard let self = self, let conn = conn else { return }
             self.finishProtocolStartup(on: conn)
         }
