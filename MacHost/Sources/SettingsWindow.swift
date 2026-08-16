@@ -1200,6 +1200,9 @@ class DisplaySettings: ObservableObject {
     /// Device name of the wireless client currently streaming (nil when none).
     /// WirelessSection reads this to show a "Connected" badge on the matching row.
     @Published var currentWirelessDevice: String?
+    /// One-time wireless pairing code (issue #35). Non-nil only while the
+    /// server is running in wireless mode; never persisted.
+    @Published var pairingCode: String?
     @Published var hasScreenRecordingPermission = false
     @Published var hasAccessibilityPermission = false
     @Published var adbInstalled = false
@@ -1471,6 +1474,25 @@ struct WirelessSection: View {
                     Text(LANAddressResolver.primaryIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
+                    if let code = settings.pairingCode {
+                        HStack(spacing: 10) {
+                            VStack { Divider() }
+                            Text("No camera on your tablet?")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .fixedSize()
+                            VStack { Divider() }
+                        }
+                        .padding(.top, 8)
+                        Text(PairingCode.display(code))
+                            .font(.system(size: 28, weight: .bold, design: .monospaced))
+                            .kerning(3)
+                            .textSelection(.enabled)
+                        Text("Type this one-time code in the Android app instead.\nA new code is issued after each pairing.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
                 }
                 .frame(maxWidth: .infinity)
             }

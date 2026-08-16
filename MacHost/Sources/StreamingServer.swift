@@ -64,6 +64,18 @@ class StreamingServer {
     var expectedAuthToken: Data?
     var onWirelessClientPaired: ((String) -> Void)?
 
+    // Code pairing (issue #35): when non-nil, a pre-auth "SSPC" request
+    // carrying this one-time code is answered with the real auth token, and
+    // the client reconnects through the normal SSWA handshake. Only honored
+    // while wireless mode is active (expectedAuthToken != nil).
+    var expectedPairingCode: String?
+    var pairingMacName: String = "Mac"
+    /// Fired with the device name after a code was accepted and the token
+    /// issued. The owner should rotate the code (one-time use).
+    var onPairingSuccess: ((String) -> Void)?
+    /// Fired on every rejected code attempt so the owner can rate-limit.
+    var onPairingFailure: (() -> Void)?
+
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
     private let networkQueue = DispatchQueue(label: "networkQueue", qos: .userInteractive)
@@ -227,6 +239,10 @@ class StreamingServer {
                 return
             }
             let prefixBytes = Array(prefix)
+            if Array(prefixBytes[0..<4]) == HandshakeCodec.pairingRequestMagic {
+                self.runPairingExchange(connection: conn, prefix: prefix)
+                return
+            }
             guard Array(prefixBytes[0..<4]) == HandshakeCodec.requestMagic else {
                 self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
                 return
@@ -268,6 +284,57 @@ class StreamingServer {
                 }
             }
         }
+    }
+
+    /// Handles a pre-auth "SSPC" code-pairing request (issue #35). On a valid
+    /// one-time code, answers with the real 32-byte token + Mac name and closes;
+    /// the client then reconnects through the normal SSWA handshake.
+    private func runPairingExchange(connection conn: NWConnection, prefix: Data) {
+        let prefixBytes = Array(prefix)
+        let nameLen = Int(prefixBytes[36])
+        guard (1...64).contains(nameLen) else {
+            sendPairingResponse(conn, status: .invalidCode)
+            return
+        }
+        conn.receive(minimumIncompleteLength: nameLen, maximumLength: nameLen) { [weak self] nameData, _, _, error in
+            guard let self = self else { return }
+            if let error = error {
+                debugLog("Pairing name read error: \(error)")
+                conn.cancel()
+                return
+            }
+            guard let nameData = nameData, nameData.count == nameLen else {
+                self.sendPairingResponse(conn, status: .invalidCode)
+                return
+            }
+            do {
+                let parsed = try HandshakeCodec.parsePairingRequest(prefix + nameData)
+                guard let expectedCode = self.expectedPairingCode,
+                      let token = self.expectedAuthToken,
+                      PairingCode.validate(parsed.code, expected: expectedCode) else {
+                    debugLog("Pairing code rejected (device: attempting)")
+                    self.onPairingFailure?()
+                    self.sendPairingResponse(conn, status: .invalidCode)
+                    return
+                }
+                debugLog("Pairing code accepted — issuing token to \(parsed.deviceName)")
+                self.sendPairingResponse(conn, status: .ok, token: token)
+                self.onPairingSuccess?(parsed.deviceName)
+            } catch {
+                debugLog("Malformed pairing request: \(error)")
+                self.onPairingFailure?()
+                self.sendPairingResponse(conn, status: .invalidCode)
+            }
+        }
+    }
+
+    private func sendPairingResponse(_ conn: NWConnection, status: PairingStatus, token: Data? = nil) {
+        let bytes = HandshakeCodec.encodePairingResponse(status: status, token: token, macName: pairingMacName)
+        conn.send(content: bytes, completion: .contentProcessed { _ in
+            // Pairing connections never stream: close after the reply either
+            // way. On success the client reconnects with the issued token.
+            conn.cancel()
+        })
     }
 
     private func sendAuthResponse(_ conn: NWConnection, status: HandshakeStatus, thenClose: Bool) {

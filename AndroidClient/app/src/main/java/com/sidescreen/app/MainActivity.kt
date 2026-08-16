@@ -159,6 +159,9 @@ class MainActivity : AppCompatActivity() {
                         permDenied = binding.wirelessPermDenied,
                         scanButton = binding.wirelessScanButton,
                         rescanButton = binding.wirelessRescanButton,
+                        enterCodeButton = binding.wirelessEnterCodeButton,
+                        repairEnterCodeButton = binding.wirelessRepairEnterCodeButton,
+                        permDeniedEnterCodeButton = binding.wirelessPermDeniedEnterCodeButton,
                         disconnectButton = binding.wirelessDisconnectButton,
                         forgetButton = binding.wirelessForgetButton,
                         reconnectButton = binding.wirelessReconnectButton,
@@ -178,6 +181,7 @@ class MainActivity : AppCompatActivity() {
                 onConnectRequested = { host, port, token, deviceName, macName ->
                     connectWireless(host, port, token, deviceName, macName)
                 },
+                onCodePairRequested = { showCodePairingDialog() },
             )
         wirelessController.bind()
         binding.wirelessDisconnectButton.setOnClickListener { disconnect() }
@@ -1109,6 +1113,93 @@ class MainActivity : AppCompatActivity() {
                 binding.bitrateText.text = String.format("%.1f Mbps", mbps)
             }
         }
+    }
+
+    /**
+     * Code pairing (issue #35): manual host/port/code entry for tablets without
+     * a camera. On success the Mac issues the real token and we connect through
+     * the same path as a QR scan.
+     */
+    private fun showCodePairingDialog() {
+        val view = layoutInflater.inflate(R.layout.dialog_code_pairing, null)
+        val hostField = view.findViewById<android.widget.EditText>(R.id.codePairHost)
+        val portField = view.findViewById<android.widget.EditText>(R.id.codePairPort)
+        val codeField = view.findViewById<android.widget.EditText>(R.id.codePairCode)
+        val errorText = view.findViewById<android.widget.TextView>(R.id.codePairError)
+
+        // Re-pair convenience: prefill the last paired Mac so only the fresh
+        // code needs typing.
+        pairedHostStorage.load()?.let { cached ->
+            hostField.setText(cached.host)
+            portField.setText(cached.port.toString())
+        }
+
+        val dialog =
+            com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+                .setTitle("Pair with code")
+                .setView(view)
+                .setPositiveButton("Pair", null) // listener installed below so it doesn't auto-dismiss
+                .setNegativeButton("Cancel", null)
+                .create()
+
+        dialog.setOnShowListener {
+            val pairButton = dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+            pairButton.setOnClickListener {
+                val host = hostField.text.toString().trim()
+                val port = portField.text.toString().trim().toIntOrNull()
+                val code = codeField.text.toString().filter { it.isDigit() }
+
+                errorText.visibility = View.GONE
+                when {
+                    host.isEmpty() -> {
+                        errorText.text = "Enter the Mac's address (shown as \"Listening\" under the QR)."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                    port == null || port !in 1..65535 -> {
+                        errorText.text = "Port must be between 1 and 65535."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                    code.length != AuthHandshake.PAIR_CODE_LEN -> {
+                        errorText.text = "The code is ${AuthHandshake.PAIR_CODE_LEN} digits."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                }
+                pairButton.isEnabled = false
+                pairButton.text = "Pairing…"
+
+                val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        val client = StreamClient(host, port!!, applicationContext)
+                        val result = client.pairWithCode(code, deviceName)
+                        runOnUiThread {
+                            dialog.dismiss()
+                            wirelessController.onCodePairComplete(host, port, result.token, result.macName)
+                        }
+                    } catch (e: StreamClient.WirelessConnectError) {
+                        runOnUiThread {
+                            pairButton.isEnabled = true
+                            pairButton.text = "Pair"
+                            errorText.text =
+                                when (e) {
+                                    is StreamClient.WirelessConnectError.CodeRejected ->
+                                        "Code not accepted. Codes change after each use — check the Mac for the current one."
+                                    is StreamClient.WirelessConnectError.HostTooOld ->
+                                        "Update Side Screen on the Mac to use code pairing."
+                                    is StreamClient.WirelessConnectError.NetworkUnreachable ->
+                                        "No response from $host:$port. Check both devices are on the same WiFi and the Mac app is running."
+                                    else -> "Connection error — try again."
+                                }
+                            errorText.visibility = View.VISIBLE
+                        }
+                    }
+                }
+            }
+        }
+        dialog.show()
     }
 
     private fun connectWireless(

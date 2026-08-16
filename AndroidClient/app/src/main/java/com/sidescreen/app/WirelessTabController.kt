@@ -25,6 +25,8 @@ class WirelessTabController(
         deviceName: String,
         macName: String,
     ) -> Unit,
+    /** Code pairing (issue #35): open the "enter code" dialog. */
+    private val onCodePairRequested: () -> Unit,
 ) {
     data class Views(
         val connecting: View,
@@ -35,6 +37,9 @@ class WirelessTabController(
         val permDenied: View,
         val scanButton: Button,
         val rescanButton: Button,
+        val enterCodeButton: Button,
+        val repairEnterCodeButton: Button,
+        val permDeniedEnterCodeButton: Button,
         val disconnectButton: Button,
         val forgetButton: Button,
         val reconnectButton: Button,
@@ -57,6 +62,9 @@ class WirelessTabController(
     fun bind() {
         views.scanButton.setOnClickListener { triggerScan() }
         views.rescanButton.setOnClickListener { triggerScan() }
+        views.enterCodeButton.setOnClickListener { onCodePairRequested() }
+        views.repairEnterCodeButton.setOnClickListener { onCodePairRequested() }
+        views.permDeniedEnterCodeButton.setOnClickListener { onCodePairRequested() }
         views.openSettingsButton.setOnClickListener { cameraPerm.openAppSettings() }
         views.forgetButton.setOnClickListener {
             storage.clear()
@@ -136,6 +144,22 @@ class WirelessTabController(
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
     }
 
+    /**
+     * Code pairing succeeded (issue #35): the Mac issued the real token. Save it
+     * exactly like a QR scan and connect through the normal wireless handshake.
+     */
+    fun onCodePairComplete(
+        host: String,
+        port: Int,
+        token: ByteArray,
+        macName: String,
+    ) {
+        val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+        storage.save(PairedHostStorage.Entry(host, port, token, macName))
+        showConnecting("Connecting to $macName", "$host:$port")
+        onConnectRequested(host, port, token, deviceName, macName)
+    }
+
     fun onConnectError(error: StreamClient.WirelessConnectError) {
         val cached = storage.load()
         when (error) {
@@ -166,6 +190,18 @@ class WirelessTabController(
             is StreamClient.WirelessConnectError.ProtocolError -> {
                 views.repairTitle.text = "⚠ Connection error"
                 views.repairMessage.text = "Couldn't complete the secure handshake with the Mac. Scan the QR again."
+                transition(State.REPAIR_NEEDED)
+            }
+            // Pairing-only errors; surfaced inside the code dialog, but keep the
+            // fallback exhaustive in case they ever reach this path.
+            is StreamClient.WirelessConnectError.CodeRejected -> {
+                views.repairTitle.text = "⚠ Code not accepted"
+                views.repairMessage.text = "Codes change after each use — check the Mac for the current one."
+                transition(State.REPAIR_NEEDED)
+            }
+            is StreamClient.WirelessConnectError.HostTooOld -> {
+                views.repairTitle.text = "⚠ Mac app too old"
+                views.repairMessage.text = "Update Side Screen on the Mac to use code pairing."
                 transition(State.REPAIR_NEEDED)
             }
         }

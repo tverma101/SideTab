@@ -152,7 +152,142 @@ class StreamClient(
         object TokenRejected : WirelessConnectError("Token rejected — re-pair required")
 
         object ProtocolError : WirelessConnectError("Connection error, please rescan QR")
+
+        /** Code pairing (issue #35): the Mac rejected the typed one-time code. */
+        object CodeRejected : WirelessConnectError("Pairing code not accepted")
+
+        /** Code pairing: the Mac runs a version that predates code pairing. */
+        object HostTooOld : WirelessConnectError("Update Side Screen on the Mac to use code pairing")
     }
+
+    data class PairingSuccess(val token: ByteArray, val macName: String)
+
+    /**
+     * Opens a TCP socket to host:port, bound to the active WiFi network. On some
+     * Android setups (especially LG/Android 12), an app's default outbound socket
+     * may take a route that silently drops LAN traffic; binding to the WIFI
+     * Network explicitly avoids that.
+     */
+    private fun openWirelessSocket(): Socket {
+        try {
+            val sock = Socket()
+            sock.tcpNoDelay = true
+            val wifiNetwork =
+                context?.let { ctx ->
+                    val cm = ctx.getSystemService(ConnectivityManager::class.java)
+                    cm.allNetworks.firstOrNull { net ->
+                        val caps = cm.getNetworkCapabilities(net)
+                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    }
+                }
+            if (wifiNetwork != null) {
+                Log.i(TAG, "openWirelessSocket: binding socket to WiFi network $wifiNetwork")
+                wifiNetwork.bindSocket(sock)
+            } else {
+                Log.w(TAG, "openWirelessSocket: no WiFi network found, using default routing")
+            }
+            sock.connect(java.net.InetSocketAddress(host, port), 5000)
+            return sock
+        } catch (e: java.net.SocketTimeoutException) {
+            Log.e(TAG, "openWirelessSocket: TCP connect timeout to $host:$port (5s)")
+            throw WirelessConnectError.NetworkUnreachable
+        } catch (e: IOException) {
+            Log.e(TAG, "openWirelessSocket: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}")
+            throw WirelessConnectError.NetworkUnreachable
+        }
+    }
+
+    private fun readFully(
+        s: Socket,
+        buf: ByteArray,
+    ): Boolean {
+        var read = 0
+        try {
+            while (read < buf.size) {
+                val r = s.getInputStream().read(buf, read, buf.size - read)
+                if (r <= 0) break
+                read += r
+            }
+        } catch (e: IOException) {
+            return false
+        }
+        return read == buf.size
+    }
+
+    /**
+     * Code pairing (issue #35): send the typed one-time code, receive the real
+     * 32-byte token + Mac name, then close. The caller stores the result and
+     * reconnects through the normal [connectWireless] handshake.
+     * Throws [WirelessConnectError] on any failure.
+     */
+    suspend fun pairWithCode(
+        code: String,
+        deviceName: String,
+    ): PairingSuccess =
+        withContext(Dispatchers.IO) {
+            Log.i(TAG, "pairWithCode: trying $host:$port (device=$deviceName)")
+            val s = openWirelessSocket()
+
+            fun closeQuietly() {
+                try {
+                    s.close()
+                } catch (_: IOException) {
+                }
+            }
+
+            try {
+                s.getOutputStream().write(AuthHandshake.encodePairingRequest(code, deviceName))
+                s.getOutputStream().flush()
+            } catch (e: IOException) {
+                closeQuietly()
+                throw WirelessConnectError.NetworkUnreachable
+            }
+
+            val header = ByteArray(5)
+            if (!readFully(s, header)) {
+                closeQuietly()
+                throw WirelessConnectError.ProtocolError
+            }
+            val parsed =
+                AuthHandshake.parsePairingResponseHeader(header) ?: run {
+                    closeQuietly()
+                    throw WirelessConnectError.ProtocolError
+                }
+            when (parsed) {
+                is AuthHandshake.PairingHeader.LegacyHost -> {
+                    closeQuietly()
+                    throw WirelessConnectError.HostTooOld
+                }
+                is AuthHandshake.PairingHeader.Pairing -> {
+                    if (parsed.status != AuthHandshake.PairingStatus.OK) {
+                        closeQuietly()
+                        throw WirelessConnectError.CodeRejected
+                    }
+                }
+            }
+
+            val token = ByteArray(32)
+            val nameLenBuf = ByteArray(1)
+            if (!readFully(s, token) || !readFully(s, nameLenBuf)) {
+                closeQuietly()
+                throw WirelessConnectError.ProtocolError
+            }
+            val nameLen = nameLenBuf[0].toInt() and 0xFF
+            if (nameLen !in 1..64) {
+                closeQuietly()
+                throw WirelessConnectError.ProtocolError
+            }
+            val nameBuf = ByteArray(nameLen)
+            if (!readFully(s, nameBuf)) {
+                closeQuietly()
+                throw WirelessConnectError.ProtocolError
+            }
+            closeQuietly()
+            val macName = String(nameBuf, Charsets.UTF_8)
+            Log.i(TAG, "pairWithCode: token issued by $macName")
+            PairingSuccess(token, macName)
+        }
 
     /**
      * Wireless connect: opens TCP, performs auth handshake, then resumes the existing receive loop on success.
@@ -164,41 +299,7 @@ class StreamClient(
     ) = withContext(Dispatchers.IO) {
         Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
 
-        // Force the socket onto the active WiFi network. On some Android setups
-        // (especially LG/Android 12), an app's default outbound socket may take
-        // a route that silently drops LAN traffic; binding to the WIFI Network
-        // explicitly avoids that.
-        val s =
-            try {
-                val sock = Socket()
-                sock.tcpNoDelay = true
-                val wifiNetwork =
-                    context?.let { ctx ->
-                        val cm = ctx.getSystemService(ConnectivityManager::class.java)
-                        cm.allNetworks.firstOrNull { net ->
-                            val caps = cm.getNetworkCapabilities(net)
-                            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                        }
-                    }
-                if (wifiNetwork != null) {
-                    Log.i(TAG, "connectWireless: binding socket to WiFi network $wifiNetwork")
-                    wifiNetwork.bindSocket(sock)
-                } else {
-                    Log.w(TAG, "connectWireless: no WiFi network found, using default routing")
-                }
-                sock.connect(java.net.InetSocketAddress(host, port), 5000)
-                sock
-            } catch (e: java.net.SocketTimeoutException) {
-                Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port (5s)")
-                throw WirelessConnectError.NetworkUnreachable
-            } catch (e: IOException) {
-                Log.e(
-                    TAG,
-                    "connectWireless: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}",
-                )
-                throw WirelessConnectError.NetworkUnreachable
-            }
+        val s = openWirelessSocket()
         Log.i(
             TAG,
             "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",

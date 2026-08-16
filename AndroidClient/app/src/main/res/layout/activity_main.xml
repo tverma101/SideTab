@@ -546,6 +546,16 @@
                         app:cornerRadius="16dp"
                         app:backgroundTint="#4ade80"
                         android:textColor="#000000" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessEnterCodeButton"
+                        style="?attr/borderlessButtonStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="No camera? Enter code instead"
+                        android:textColor="#8ab4ff"
+                        android:textSize="13sp" />
                 </LinearLayout>
 
                 <!-- State 3: Connected -->
@@ -709,6 +719,16 @@
                         app:cornerRadius="16dp"
                         app:backgroundTint="#4ade80"
                         android:textColor="#000000" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessRepairEnterCodeButton"
+                        style="?attr/borderlessButtonStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="Enter code instead"
+                        android:textColor="#8ab4ff"
+                        android:textSize="13sp" />
                 </LinearLayout>
 
                 <!-- State 5: Permission denied permanently -->
@@ -748,6 +768,16 @@
                         android:text="Open Settings"
                         app:cornerRadius="16dp"
                         app:backgroundTint="#007AFF" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessPermDeniedEnterCodeButton"
+                        style="?attr/borderlessButtonStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="No camera? Enter code instead"
+                        android:textColor="#8ab4ff"
+                        android:textSize="13sp" />
                 </LinearLayout>
 
             </LinearLayout>

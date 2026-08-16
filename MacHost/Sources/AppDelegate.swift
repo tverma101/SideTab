@@ -57,6 +57,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Used to roll its `lastConnected` timestamp forward every status refresh tick so the UI
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
     private var currentWirelessDevice: String?
+    /// Failed code-pairing attempts since the last rotation (issue #35).
+    private var pairingFailureCount = 0
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
     private var statusRefreshTimer: Timer?
@@ -589,6 +591,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
+                configurePairingCode(on: streamingServer)
                 streamingServer?.onWirelessClientPaired = { [weak self] deviceName in
                     guard let self = self else { return }
                     Task { @MainActor in
@@ -687,9 +690,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Code pairing (issue #35): issue a fresh one-time code for this wireless
+    /// session and rotate it after every successful pairing or after 5 failed
+    /// attempts (brute-force guard).
+    private func configurePairingCode(on server: StreamingServer?) {
+        guard let server = server else { return }
+        pairingFailureCount = 0
+        rotatePairingCode(on: server)
+        server.pairingMacName = Host.current().localizedName ?? "Mac"
+        server.onPairingSuccess = { [weak self, weak server] deviceName in
+            guard let self = self else { return }
+            Task { @MainActor in
+                self.pairingFailureCount = 0
+                self.rotatePairingCode(on: server)
+                self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
+            }
+        }
+        server.onPairingFailure = { [weak self, weak server] in
+            guard let self = self else { return }
+            Task { @MainActor in
+                self.pairingFailureCount += 1
+                if self.pairingFailureCount >= 5 {
+                    debugLog("5 failed pairing attempts — rotating code")
+                    self.pairingFailureCount = 0
+                    self.rotatePairingCode(on: server)
+                }
+            }
+        }
+    }
+
+    private func rotatePairingCode(on server: StreamingServer?) {
+        let code = PairingCode.generate()
+        server?.expectedPairingCode = code
+        Task { @MainActor in
+            self.settings.pairingCode = code
+        }
+    }
+
     func stopServer() {
         // Save display position before destroying
         virtualDisplayManager?.saveDisplayPosition()
+        settings.pairingCode = nil
 
         screenCapture?.stopStreaming()
         streamingServer?.stop()
