@@ -5,6 +5,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Real panel backlight control (Settings.System.SCREEN_BRIGHTNESS).
+         Appop-granted via adb: appops set com.sidescreen.app WRITE_SETTINGS allow -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application

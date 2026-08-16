@@ -47,6 +47,9 @@ class StreamClient(
     /** Invoked when the server confirms the stream codec (true = HEVC). */
     var onCodecSelected: ((Boolean) -> Unit)? = null
 
+    /** Server→client brightness command (0..255) over the control channel. */
+    var onBrightness: ((Int) -> Unit)? = null
+
     /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
     @Volatile var streamCodecIsHevc = true
         private set
@@ -300,6 +303,9 @@ class StreamClient(
     private fun connectControlChannel() {
         controlChannel.onLatencyMeasured = { rttMs ->
             onLatencyMeasured?.invoke(rttMs)
+        }
+        controlChannel.onBrightnessCommand = { v ->
+            onBrightness?.invoke(v)
         }
         Thread({
             try {

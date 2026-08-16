@@ -49,6 +49,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var streamingServer: StreamingServer?
     var screenCapture: ScreenCapture?
     var virtualDisplayManager: VirtualDisplayManager?
+    var brightnessMonitor: BrightnessMonitor?
+    var idleSleepMonitor: IdleSleepMonitor?
     var settings = DisplaySettings()
     var settingsWindow: SettingsWindowController?
     var statusItem: NSStatusItem?
@@ -111,11 +113,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.autoStartStreamingOnLaunch {
             settings.connectionMode = settings.startupMode
             Task {
-                await self.checkPermissions()
-                if self.settings.hasScreenRecordingPermission {
+                // CAMPAIGN FORK: forceStart bypass (proven pattern) — skips the
+                // permission/SCShareableContent dance so cold starts bind fast
+                // (the experiment runner depends on deterministic startup).
+                if UserDefaults.standard.bool(forKey: "SideScreen_forceStart") {
+                    debugLog("FORCE-START active — bypassing permission checks entirely")
                     await self.startServer()
                 } else {
-                    debugLog("Auto-start skipped: Screen Recording permission not granted")
+                    await self.checkPermissions()
+                    if self.settings.hasScreenRecordingPermission {
+                        await self.startServer()
+                    } else {
+                        debugLog("Auto-start skipped: Screen Recording permission not granted")
+                    }
                 }
             }
         }
@@ -682,6 +692,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     captured?.settings.currentFPS = fps
                     captured?.settings.currentBitrate = mbps
                 }
+            }
+
+            // Brightness bridge (experiment-gated): translate BetterDisplay's
+            // software-brightness intent for this virtual display into BRIGHT
+            // commands on the control channel (client applies real backlight).
+            if UserDefaults.standard.bool(forKey: "SideScreen_exp_brightness") {
+                let monitor = BrightnessMonitor()
+                monitor.onBrightness = { [weak self] level in
+                    self?.streamingServer?.sendBrightness(level)
+                }
+                monitor.start()
+                brightnessMonitor = monitor
+                debugLog("Brightness bridge ENABLED (SideScreen_exp_brightness)")
+            } else {
+                debugLog("Brightness bridge disabled (knob unset)")
+            }
+
+            // Idle sleep (experiment-gated): when no client is connected for
+            // the grace window, pause capture+encode (CPU -> ~0). Resume is
+            // instant: onClientConnected forces a keyframe/replays the cached
+            // frame, and resumeFromIdle restarts the SCStream underneath.
+            if UserDefaults.standard.bool(forKey: "SideScreen_exp_idleSleep") {
+                let secs = UserDefaults.standard.integer(forKey: "SideScreen_exp_idleSleepSecs")
+                let grace = secs > 0 ? Double(secs) : 15.0
+                let monitor = IdleSleepMonitor(
+                    isClientConnected: { [weak self] in self?.settings.clientConnected ?? false },
+                    pause: { [weak self] in self?.screenCapture?.pauseForIdle() },
+                    resume: { [weak self] in
+                        self?.screenCapture?.resumeFromIdle()
+                        self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
+                    },
+                    graceSecs: grace
+                )
+                monitor.start()
+                idleSleepMonitor = monitor
+                debugLog("Idle-sleep monitor ENABLED (grace \(grace)s)")
+            } else {
+                debugLog("Idle-sleep monitor disabled (knob unset)")
             }
 
             streamingServer?.start()

@@ -40,6 +40,8 @@ import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -82,6 +84,14 @@ class MainActivity : AppCompatActivity() {
     private val checklistHandler = Handler(Looper.getMainLooper())
     private var checklistRunnable: Runnable? = null
     private var isConnected = false // Track connection state to prevent checklist conflicts
+
+    // Auto-disconnect: if the app stays backgrounded past the configured
+    // window (default 5 min; adb-tunable via
+    //   adb shell settings put system sidescreen_auto_disconnect_secs <N>)
+    // the session tears itself down. A killed process needs no timer — its
+    // sockets die and the host's idle-sleep takes over.
+    private var backgroundedAtMs = 0L
+    private var autoDisconnectJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1237,6 +1247,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Real panel backlight from the host (BRIGHT over control channel).
+        streamClient?.onBrightness = { v -> applyBacklight(v) }
+
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
                 isConnected = connected
@@ -1395,6 +1408,9 @@ class MainActivity : AppCompatActivity() {
                         binding.latencyText.text = String.format("%.1f ms", rttMs)
                     }
                 }
+
+                // Real panel backlight from the host (BRIGHT over control channel).
+                streamClient?.onBrightness = { v -> applyBacklight(v) }
 
                 streamClient?.onConnectionStatus = { connected ->
                     runOnUiThread {
@@ -1680,6 +1696,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // Back in the foreground — cancel any pending auto-disconnect.
+        backgroundedAtMs = 0L
+        autoDisconnectJob?.cancel()
+        autoDisconnectJob = null
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Backgrounded while streaming: arm the auto-disconnect timer.
+        if (!isConnected) return
+        backgroundedAtMs = System.currentTimeMillis()
+        val secs =
+            Settings.System.getInt(contentResolver, "sidescreen_auto_disconnect_secs", 300)
+                .coerceAtLeast(10)
+        autoDisconnectJob =
+            lifecycleScope.launch {
+                delay(secs * 1000L)
+                if (
+                    isConnected &&
+                    backgroundedAtMs > 0 &&
+                    System.currentTimeMillis() - backgroundedAtMs >= secs * 1000L
+                ) {
+                    DiagLog.log("MA", "auto-disconnect: backgrounded > ${secs}s — tearing down session")
+                    disconnect()
+                }
+            }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         stopChecklistUpdates()
@@ -1839,5 +1885,28 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val DIRECT_PIXEL_MIN_SCALE = 0.97f
+    }
+
+    /**
+     * Apply a host-issued brightness (0..255) to the REAL panel backlight.
+     * Settings.System.SCREEN_BRIGHTNESS requires WRITE_SETTINGS (appop,
+     * granted via: adb shell appops set com.sidescreen.app WRITE_SETTINGS allow).
+     * We force manual mode once per apply so the panel honors the value
+     * (auto-brightness would otherwise override it). Runs on the control
+     * thread — the writes are quick binder calls; no UI hop needed.
+     */
+    private fun applyBacklight(value: Int) {
+        val v = value.coerceIn(0, 255)
+        try {
+            Settings.System.putInt(
+                contentResolver,
+                Settings.System.SCREEN_BRIGHTNESS_MODE,
+                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL,
+            )
+            Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, v)
+            DiagLog.log("BRT", "backlight applied value=$v")
+        } catch (e: Exception) {
+            DiagLog.log("BRT", "backlight failed: ${e.message}")
+        }
     }
 }

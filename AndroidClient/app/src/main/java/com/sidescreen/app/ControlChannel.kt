@@ -22,13 +22,18 @@ import java.nio.ByteOrder
  * Wire format (little-endian):
  *   client -> server: PING     = [type 4][clientTs 8]
  *   client -> server: KEYFRAME = [type 7][flags 1]
+ *   client -> server: SUPPORT_BRIGHTNESS = [type 3]   (payload-free capability)
  *   server -> client: PONG     = [type 5][clientTs 8 (echo)][serverSendTs 8]
+ *   server -> client: BRIGHT   = [type 11][value 1]   (0..255, real backlight)
  */
 class ControlChannel(
     private val host: String,
     private val port: Int,
 ) {
     var onLatencyMeasured: ((Double) -> Unit)? = null
+
+    /** Server→client brightness command: 0..255, apply to the REAL panel. */
+    var onBrightnessCommand: ((Int) -> Unit)? = null
 
     // TCP path
     private var socket: Socket? = null
@@ -106,6 +111,7 @@ class ControlChannel(
                 // pong before declaring active deadlocks the first ping.
                 tcpActive = true
                 DiagLog.log("CC", "Control channel ACTIVE mode=tcp")
+                declareBrightnessSupport()
                 Thread({ tcpReadLoop(s) }, "ControlTcpThread")
                     .apply { isDaemon = true }
                     .start()
@@ -159,6 +165,12 @@ class ControlChannel(
                         onLatencyMeasured?.invoke(rtt)
                     }
 
+                    11 -> { // Bright: [value 1] 0..255 — REAL panel backlight
+                        val value = input.readByte().toInt() and 0xFF
+                        DiagLog.log("CC", "BRIGHT command value=$value")
+                        onBrightnessCommand?.invoke(value)
+                    }
+
                     else -> {
                         DiagLog.log("CC", "Unknown control type $type — disconnecting")
                         return
@@ -171,6 +183,20 @@ class ControlChannel(
             }
         } finally {
             markTcpInactive(s)
+        }
+    }
+
+    /** Tell the server we understand BRIGHT (type 11). Old servers log-only. */
+    private fun declareBrightnessSupport() {
+        val out = output ?: return
+        synchronized(sendLock) {
+            try {
+                out.write(byteArrayOf(3))
+                out.flush()
+                DiagLog.log("CC", "Declared brightness support")
+            } catch (e: Exception) {
+                DiagLog.log("CC", "Brightness declaration failed: ${e.message}")
+            }
         }
     }
 

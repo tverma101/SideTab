@@ -17,6 +17,12 @@ private enum WireMessage {
     /// clients that sent clientAvcOnly — old clients disconnect on unknown
     /// message types, so this must never be sent unsolicited.
     static let codecSelected: UInt8 = 10
+    /// Client→server, payload-free capability: "I understand BRIGHT (type 11)".
+    /// Old servers log unknown control types and skip — safe unsolicited.
+    static let clientSupportsBrightness: UInt8 = 3
+    /// Server→client, 1-byte payload (0..255). Sent ONLY to clients that sent
+    /// clientSupportsBrightness — old clients disconnect on unknown types.
+    static let bright: UInt8 = 11
     /// Client→server, 4-byte payload: the client's max decode size (issue
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
@@ -55,6 +61,7 @@ class StreamingServer {
     private var controlTouchCount = 0
     private var lastControlTouchNs: UInt64 = 0
     private var maxControlTouchGapMs = 0.0
+    private var clientSupportsBrightness = false
     private let controlQueue = DispatchQueue(label: "controlQueue", qos: .userInteractive)
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
@@ -174,10 +181,11 @@ class StreamingServer {
         if let old = controlConnection {
             old.cancel()
         }
-        controlInputBuffer.removeAll(keepingCapacity: true)
+        controlInputBuffer = Data()  // fresh storage — never keep poisoned inline slices
         controlTouchCount = 0
         lastControlTouchNs = 0
         maxControlTouchGapMs = 0
+        clientSupportsBrightness = false
         controlConnection = newConnection
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self, let newConnection else { return }
@@ -250,13 +258,13 @@ class StreamingServer {
                 let pointerCount = Int(controlInputBuffer[controlInputBuffer.index(after: controlInputBuffer.startIndex)])
                 guard pointerCount == 1 || pointerCount == 2 else {
                     debugLog("Invalid control touch pointer count: \(pointerCount)")
-                    controlInputBuffer.removeFirst()
+                    controlInputBuffer = Data(controlInputBuffer.dropFirst())
                     continue
                 }
                 let expectedSize = 2 + pointerCount * 8 + 4
                 guard controlInputBuffer.count >= expectedSize else { return }
                 let message = Data(controlInputBuffer.prefix(expectedSize))
-                controlInputBuffer.removeSubrange(0..<expectedSize)
+                controlInputBuffer = Data(controlInputBuffer.dropFirst(expectedSize))
 
                 let now = DispatchTime.now().uptimeNanoseconds
                 let actionOffset = 2 + pointerCount * 8
@@ -288,7 +296,7 @@ class StreamingServer {
                 let clientTs = controlInputBuffer.withUnsafeBytes {
                     $0.loadUnaligned(fromByteOffset: 1, as: UInt64.self)
                 }
-                controlInputBuffer.removeSubrange(0..<9)
+                controlInputBuffer = Data(controlInputBuffer.dropFirst(9))
                 let receivedAt = DispatchTime.now().uptimeNanoseconds
                 var pong = Data(capacity: 17)
                 pong.append(WireMessage.pong)
@@ -302,21 +310,65 @@ class StreamingServer {
             case WireMessage.keyframeRequest:
                 guard controlInputBuffer.count >= 2 else { return }
                 let flags = controlInputBuffer[controlInputBuffer.index(controlInputBuffer.startIndex, offsetBy: 1)]
-                controlInputBuffer.removeSubrange(0..<2)
+                controlInputBuffer = Data(controlInputBuffer.dropFirst(2))
                 onKeyframeRequested?((flags & 1) != 0)
+
+            case WireMessage.clientSupportsBrightness:
+                // [type 3] payload-free capability: client understands BRIGHT.
+                controlInputBuffer = Data(controlInputBuffer.dropFirst())
+                clientSupportsBrightness = true
+                debugLog("Client supports brightness (BRIGHT armed)")
 
             default:
                 debugLog("Unknown control type: \(msgType)")
-                controlInputBuffer.removeFirst()
+                controlInputBuffer = Data(controlInputBuffer.dropFirst())
             }
         }
     }
 
+    /// Send a brightness command (0..255) to the client on the control channel.
+    /// Only sent when the client declared support (type 3) — old clients
+    /// disconnect on unknown message types, so never send unsolicited.
+    /// No-op when the control connection is not ready. Call from any queue.
+    func sendBrightness(_ value: UInt8) {
+        guard clientSupportsBrightness, let connection = controlConnection else { return }
+        var msg = Data(capacity: 2)
+        msg.append(WireMessage.bright)
+        msg.append(value)
+        connection.send(content: msg, completion: .contentProcessed { _ in })
+        debugLog("BRIGHT sent: \(value)")
+    }
+
+    // Contender: a new connection that arrived while a live client is
+    // streaming. Real clients speak first (decoder-limit/metadata/AVC
+    // advertisements, or a ping) within a few ms of connecting; silent
+    // liveness probes (checkServerRunning on the client) only read. Only a
+    // contender that proves itself may take over — a silent one is rejected
+    // after the deadline WITHOUT touching the live stream. Before this gate,
+    // the client's 2s checklist probe cancelled the live video connection on
+    // every pass, producing the reset-by-peer reconnect storm (2026-08-16).
+    private var contender: NWConnection?
+    private var contenderDeadline: DispatchWorkItem?
+    private static let contenderProofWindow: TimeInterval = 1.5
+
     private func handleConnection(_ newConnection: NWConnection) {
         debugLog("New connection incoming...")
+        if connectionReady, connection != nil {
+            debugLog("Live client streaming — new connection held as contender until it speaks")
+            armContender(newConnection)
+            return
+        }
+        installConnection(newConnection)
+    }
 
+    /// Full takeover path used when no live client is streaming (or a
+    /// contender proved itself): cancels the previous connection, resets
+    /// per-connection protocol state, and waits for .ready. A promoted
+    /// contender is already started and .ready — its handler won't see the
+    /// .ready transition again, so drive startup directly instead.
+    private func installConnection(_ newConnection: NWConnection, alreadyStarted: Bool = false) {
         // Clean up old connection properly
-        if let oldConnection = connection {
+        if let oldConnection = connection, oldConnection !== newConnection {
             isReceiving = false
             oldConnection.cancel()
         }
@@ -330,23 +382,100 @@ class StreamingServer {
         connection = newConnection
         droppedFrames = 0
 
-        connection?.stateUpdateHandler = { [weak self] state in
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
+            guard let self = self else { return }
+            // Identity guard: a terminal callback from a replaced connection
+            // must not tear down the newer live one (same pattern as the
+            // control connection above).
+            guard self.connection === newConnection else {
+                if case .failed = state { debugLog("Video state STALE terminal callback (connection replaced)") }
+                return
+            }
             debugLog("Connection state: \(state)")
             switch state {
             case .ready:
-                self?.onConnectionReady(newConnection)
+                self.onConnectionReady(newConnection!)
             case .failed(let error):
                 debugLog("Connection failed: \(error)")
-                self?.onClientDisconnected?()
+                self.markDisconnected()
             case .cancelled:
                 debugLog("Connection cancelled")
-                self?.onClientDisconnected?()
+                self.markDisconnected()
             default:
                 break
             }
         }
 
-        connection?.start(queue: networkQueue)
+        if alreadyStarted {
+            if newConnection.state == .ready {
+                networkQueue.async { self.onConnectionReady(newConnection) }
+            }
+            // A started-but-not-ready contender reaches .ready through the
+            // state handler installed above, like a fresh connection.
+        } else {
+            newConnection.start(queue: networkQueue)
+        }
+    }
+
+    /// Hold a would-be client until it proves it is real. The first byte it
+    /// sends promotes it via installConnection (seeded with those bytes, so
+    /// no client advertisement is lost); silence past the window cancels it.
+    private func armContender(_ newConnection: NWConnection) {
+        clearContender(newConnection, cancelSocket: true)  // one contender at a time
+        contender = newConnection
+
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
+            guard let self = self else { return }
+            guard self.contender === newConnection else { return }
+            switch state {
+            case .failed(let error):
+                debugLog("Contender failed before proving: \(error)")
+                self.clearContender(newConnection!, cancelSocket: false)
+            case .cancelled:
+                self.clearContender(newConnection!, cancelSocket: false)
+            default:
+                break
+            }
+        }
+        newConnection.start(queue: networkQueue)
+
+        let deadline = DispatchWorkItem { [weak self, weak newConnection] in
+            guard let self = self, let newConnection = newConnection else { return }
+            guard self.contender === newConnection else { return }
+            debugLog("Contender silent \(Int(Self.contenderProofWindow * 1000))ms — rejecting (probe?), live stream untouched")
+            self.clearContender(newConnection, cancelSocket: true)
+        }
+        contenderDeadline = deadline
+        networkQueue.asyncAfter(deadline: .now() + Self.contenderProofWindow, execute: deadline)
+
+        newConnection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self, weak newConnection] data, _, _, error in
+            guard let self = self, let newConnection = newConnection else { return }
+            guard self.contender === newConnection else { return }
+            guard error == nil, let data, !data.isEmpty else { return }  // deadline handles silence
+            debugLog("Contender spoke (\(data.count)B) — promoting to client")
+            self.clearContender(newConnection, cancelSocket: false)
+            self.installConnection(newConnection, alreadyStarted: true)
+            self.inputBuffer.append(data)
+            self.processInputBuffer(connection: newConnection)
+        }
+    }
+
+    private func clearContender(_ c: NWConnection, cancelSocket: Bool) {
+        if contender === c { contender = nil }
+        contenderDeadline?.cancel()
+        contenderDeadline = nil
+        if cancelSocket { c.cancel() }
+    }
+
+    /// A client is gone: stop treating the socket as sendable so the encode
+    /// pipeline stops pushing frames into a corpse (the dropped-frame plateau
+    /// after "Connection reset by peer"), and report the disconnect once.
+    private func markDisconnected() {
+        connectionReady = false
+        isReceiving = false
+        connection = nil
+        inputBuffer.removeAll(keepingCapacity: true)
+        onClientDisconnected?()
     }
 
     private func onConnectionReady(_ conn: NWConnection) {
@@ -770,6 +899,7 @@ class StreamingServer {
         listener?.cancel()
         controlConnection?.cancel()
         controlListener?.cancel()
+        if let c = contender { clearContender(c, cancelSocket: true) }
         connection = nil
         listener = nil
         controlConnection = nil

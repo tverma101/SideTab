@@ -22,7 +22,11 @@ class VideoEncoder {
         self.width = width
         self.height = height
         self.codec = codec
-        self.bitrateMbps = gamingBoost ? 50 : bitrateMbps
+        // gamingBoost = the "ultralow" bitrate preset (6/9 Mbps bounded): the
+        // bounded-frame-size profile that keeps encode time flat under motion
+        // (the old gamingBoost overrides were no-ops once Quality took over
+        // rate control — audit Entry S).
+        self.bitrateMbps = bitrateMbps
         self.quality = gamingBoost ? "ultralow" : quality
         self.gamingBoost = gamingBoost
         self.frameRate = frameRate
@@ -30,7 +34,7 @@ class VideoEncoder {
     }
 
     func updateSettings(bitrateMbps: Int, quality: String, gamingBoost: Bool) {
-        self.bitrateMbps = gamingBoost ? 50 : bitrateMbps
+        self.bitrateMbps = bitrateMbps
         self.quality = gamingBoost ? "ultralow" : quality
         self.gamingBoost = gamingBoost
 
@@ -73,33 +77,76 @@ class VideoEncoder {
         // decoders reject — not worth the marginal gain for screen content.
         // EXP-FORK knobs (SideScreen_exp_*; absent = current production behavior):
         //   SideScreen_exp_profile  "main10" -> HEVC Main10 (10-bit) profile
-        //   SideScreen_exp_bitrate  Int Mbps  -> override the 60Mbps floor (ladder tests)
+        //   SideScreen_exp_bitrate  Int Mbps  -> override the preset bitrate target
         //   SideScreen_exp_gop      Int frames -> keyframe interval override
         //   SideScreen_exp_bframes  Bool       -> allow B-frames (default false)
         let expProfile = UserDefaults.standard.string(forKey: "SideScreen_exp_profile")
+        // EXP-FORK: HDR mode forces Main10 (10-bit HEVC) — the tablet needs it
+        // for the HDR path regardless of the profile knob.
+        let hdrMode = UserDefaults.standard.bool(forKey: "SideScreen_exp_hdr")
         let profile: CFString = codec == .hevc
-            ? (expProfile == "main10" ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
+            ? (hdrMode || expProfile == "main10" ? kVTProfileLevel_HEVC_Main10_AutoLevel
+                : (expProfile == "main42210" ? kVTProfileLevel_HEVC_Main42210_AutoLevel
+                    : kVTProfileLevel_HEVC_Main_AutoLevel))
             : kVTProfileLevel_H264_Main_AutoLevel
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
 
-        // Dynamic bitrate - remove strict rate limiting for smoother streaming
-        // All-intra needs higher bitrate for text sharpness
-        // USB-C supports 5Gbps, so 80-100Mbps is fine
+        // CUT (audit Entry S, 2026-08-16 follow-up): Quality-based rate control
+        // is unbounded on this path — with kVTCompressionPropertyKey_Quality
+        // set, VideoToolbox ignores AverageBitRate AND DataRateLimits
+        // (receipts: byte-identical output at 10 vs 60 Mbps; 73.6 Mbps
+        // measured against 30/45 limits). Motion bursts then overloaded the
+        // transport/tablet decoder (the 34-39fps collapse + drop cascades).
+        // Production now uses bitrate-based VBR: AverageBitRate as the soft
+        // target, DataRateLimits as the 1-second hard cap at 1.5x. The
+        // quality presets select the target; SideScreen_exp_bitrate (Mbps)
+        // overrides the target directly; the UI bitrate acts as a floor.
+        let presetMbps: Int
+        switch quality {
+        case "ultralow": presetMbps = 6
+        case "low": presetMbps = 12
+        case "medium": presetMbps = 20
+        case "high": presetMbps = 30
+        // EXP-FORK ultra ladder, now bitrate-bounded
+        case "extrahigh": presetMbps = 40
+        case "max": presetMbps = 50
+        case "ultra": presetMbps = 60
+        default: presetMbps = 20
+        }
         let expBitrate = UserDefaults.standard.object(forKey: "SideScreen_exp_bitrate") as? Int
-        let effectiveBitrate = gamingBoost ? bitrateMbps : (expBitrate ?? max(bitrateMbps, 60))
-        let bitrateBps = effectiveBitrate * 1_000_000
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
-        // Removed DataRateLimits - was causing bursty traffic and buffer stalls
+        // The UI bitrate (Mbps) can raise the preset target, but only within
+        // the range the settings UI actually offers (100-2000 Mbps). Stored
+        // values above that are legacy Kbps-scale junk (e.g. the paused
+        // campaign's 8000) that must not turn the target into 8 Gbps.
+        // gamingBoost pins the bounded ultralow profile — its 1000Mbps
+        // effectiveBitrate is ignored (it predates bounded rate control).
+        let uiFloor = (bitrateMbps >= 100 && bitrateMbps <= 2000) ? bitrateMbps : 0
+        let targetMbps = expBitrate ?? (gamingBoost ? presetMbps : max(presetMbps, uiFloor))
+        let avgBps = targetMbps * 1_000_000
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: avgBps as CFNumber)
+        // Hard cap: bytes over a 1s window at 1.5x target — the guarantee
+        // that keeps per-frame size (and thus decoder+transport load) bounded
+        // during complex motion. This is the property pair VideoToolbox
+        // documents for live streaming; it only works because Quality is
+        // never set on this session.
+        let capBytes = Int(Double(targetMbps) * 1.5 * 1_000_000.0 / 8.0)
+        let dataRateLimits = [capBytes, 1] as CFArray
+        let limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits)
+        debugLog("Rate control: avg=\(targetMbps)Mbps cap=\(Int(Double(targetMbps) * 1.5))Mbps/1s (DataRateLimits status=\(limitStatus))")
 
         // Frame rate settings
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
 
-        // Short-GOP IPP: 1 keyframe per second, P-frames in between.
-        // All-intra (every frame keyframe) was producing 3-5x more data than needed,
-        // saturating tablet decode/compose pipeline at high panel resolutions and
-        // starving Mac WindowServer with encoder load. Short-GOP IPP gives 99% of
-        // the resilience (frame loss recovery within 1 second) at a fraction of
-        // the per-frame cost. TCP over USB-C rarely drops, so 1s GOP is safe.
+        // IPP with a 1-second GOP, matching the deployed client's stale-
+        // keyframe contract (KEYFRAME_STALE_INTERVAL_NS = 1.5s in
+        // StreamClient.kt): natural IDRs at 1s mean the client NEVER needs to
+        // request one mid-stream, so the rate-control window is fully owned
+        // by the encoder. (GOP > 1.5s was tried 2026-08-16: the client fired
+        // stale-keyframe requests every ~1.5s regardless, desynchronizing
+        // forced IDRs from the encoder's budget. GOP between 1s and 1.5s
+        // behaves the same on static screens, where encoded-frame counting
+        // stalls.) The old unbounded-IDR-burst concern is now contained by
+        // the DataRateLimits hard cap above. SideScreen_exp_gop overrides.
         let expGop = UserDefaults.standard.object(forKey: "SideScreen_exp_gop") as? Int
         let gopFrames = expGop ?? frameRate
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
@@ -112,33 +159,32 @@ class VideoEncoder {
         // ALWAYS zero frame delay for real-time streaming (not just gaming boost)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
 
-        // Quality based on preset
-        let qualityValue: Float
-        if gamingBoost {
-            qualityValue = 0.3  // Ultra low quality for maximum speed
-        } else {
-            qualityValue = switch quality {
-            case "ultralow": 0.5  // Still fast but better text readability
-            case "low": 0.65
-            case "medium": 0.8   // Sharp text for productivity
-            // Keep a wide margin below 1.0: VideoToolbox documents 1.0 as
-            // potentially lossless. A live 0.95 trial overloaded this USB
-            // tunnel/decoder path; 0.92 is the bounded first increment above
-            // the restored 0.90 baseline.
-            case "high": 0.92
-            default: 0.5
-            }
-        }
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: qualityValue as CFNumber)
+        // Rate control note: kVTCompressionPropertyKey_Quality is deliberately
+        // NEVER set here — it overrides bitrate-based control entirely (see
+        // the rate-control block above for the receipts). Preset names map to
+        // bitrate targets; gamingBoost pins quality="ultralow" in the
+        // constructor, i.e. a fast 6/9 Mbps bounded profile.
 
-        // Use VBR (variable bitrate) instead of CBR for burst capacity during fast scene changes
-        // CBR causes over-quantization (blocky artifacts) when scene complexity spikes
-        // Removed: kVTCompressionPropertyKey_ConstantBitRate
+        // EXP-FORK: HDR signaling (SideScreen_exp_hdr=1) — write HEVC VUI
+        // colorimetry via SESSION properties (pixel-buffer attachments are
+        // ignored by VT — verified 2026-08-15). Content must match: 10-bit
+        // buffers, PQ-encoded, BT.2020. NOTE: HLG transfer breaks the HW
+        // encoder (-12902 at encode); PQ is the working combination.
+        if UserDefaults.standard.bool(forKey: "SideScreen_exp_hdr") {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ColorPrimaries,
+                                 value: kCMFormatDescriptionColorPrimaries_ITU_R_2020)
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_TransferFunction,
+                                 value: kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ)
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_YCbCrMatrix,
+                                 value: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020)
+            debugLog("HDR mode: BT.2020 primaries, PQ transfer, BT.2020 matrix (VUI)")
+        }
 
         VTCompressionSessionPrepareToEncodeFrames(session)
 
         let mode = gamingBoost ? "🎮 GAMING BOOST" : quality.uppercased()
-        debugLog("VideoToolbox encoder configured (\(codec == .hevc ? "H.265" : "H.264"), \(bitrateMbps)Mbps, \(frameRate)fps, \(mode))")
+        let codecName = codec == .hevc ? "H.265" : "H.264"
+        debugLog("VideoToolbox encoder configured (" + codecName + ", quality=" + mode + ", " + String(frameRate) + "fps)")
     }
 
     /// Force the next encoded frame to be an IDR (sync) frame.
