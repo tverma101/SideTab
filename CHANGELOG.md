@@ -17,6 +17,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+<a id="0.11.2"></a>
+## [0.11.2] - 2026-08-17
+
+Sleep/wake reliability and camera-free pairing. The Mac now survives display sleep/wake without stranding the cursor or the stream (#42, #43), tablets without a camera can pair over WiFi by typing an 8-digit code instead of scanning a QR (#35), and a custom FPS slider lets budget tablets sit exactly at their artifact-free refresh rate (#41). The Mac app can also be installed via Homebrew now (#17).
+
+### Added
+- **Pair by code — no camera needed (#35).** The Mac shows an 8-digit one-time code under the wireless QR; on the tablet, "No camera? Enter code instead" opens a dialog for the Mac's address, port and code. Built for e-ink and other camera-less tablets. The code changes after every successful pairing, after 5 wrong attempts, and on every server start — it's a front door to the same pairing token the QR carries, so everything after pairing is unchanged. *Both apps must be updated to use it*: typing a code at an older Mac app shows a clear "Update Side Screen on the Mac" message, and older tablets simply keep pairing by QR.
+- **Custom FPS (#41 follow-up).** A 15–120 Hz slider joins the 30/60/90/120 presets, for tablets that are artifact-free at, say, 45 Hz but not 60. Changing the rate while streaming rebuilds the display once the slider settles; changes that wouldn't alter the effective rate (including while Gaming Boost pins it) don't restart anything.
+- **Homebrew install (#17).** `brew tap tranvuongquocdat/sidescreen && brew install --cask --no-quarantine sidescreen` — updating is a single `brew upgrade` from now on.
+
+### Fixed
+- **Cursor and capture lost after display sleep/wake (#42).** Display sleep kills the capture stream (ScreenCaptureKit error -3815), which silently degraded the session to a cursor-less fallback for the rest of its life. The capture now restarts when the screens wake and returns to the primary path; the fallback composites the cursor too. Contributed by @cwy433-png.
+- **Display idle-sleep no longer interrupts streaming (#43).** The Mac holds a display-sleep assertion for the whole streaming session, so the sleep/wake cycle that stranded the cursor can't start while streaming; wake-triggered and stall-triggered restarts are also guarded so a stale restart can never resurrect capture after Stop. Contributed by @lhysilicon.
+- **Rare crash while starting capture.** A restart, fallback or stop racing `setupStream()` could crash the Mac app with "Unexpectedly found nil". Contributed by @techkwon.
+
+### Installation
+- **macOS (Homebrew)**: `brew tap tranvuongquocdat/sidescreen && brew install --cask --no-quarantine sidescreen`. Requires macOS 13 (Ventura) or later.
+- **macOS (manual)**: Open `SideScreen-0.11.2-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
+- **Android**: Install `SideScreen-0.11.2-android.apk` (enable "Unknown sources" if needed).
+
+---
+
 <a id="0.11.1"></a>
 ## [0.11.1] - 2026-07-19
 
