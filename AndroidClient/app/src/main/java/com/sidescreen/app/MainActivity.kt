@@ -1201,7 +1201,8 @@ class MainActivity : AppCompatActivity() {
                             showPairError(
                                 when (e) {
                                     is StreamClient.PairingError.CodeRejected ->
-                                        "Code not accepted. Codes change after each use — check the Mac for the current one."
+                                        "Code not accepted. Codes change after each use — " +
+                                            "check the Mac for the current one."
                                     is StreamClient.PairingError.HostTooOld ->
                                         "Update Side Screen on the Mac to use code pairing."
                                 },
@@ -1210,7 +1211,8 @@ class MainActivity : AppCompatActivity() {
                             showPairError(
                                 when (e) {
                                     is StreamClient.WirelessConnectError.NetworkUnreachable ->
-                                        "No response from $host:$port. Check both devices are on the same WiFi and the Mac app is running."
+                                        "No response from $host:$port. Check both devices are " +
+                                            "on the same WiFi and the Mac app is running."
                                     else -> "Connection error — try again."
                                 },
                             )
