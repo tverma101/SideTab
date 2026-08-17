@@ -22,6 +22,11 @@ class VideoDecoder(
     // Exposed so MainActivity can detect a codec-negotiation/decoder mismatch
     // and recreate the decoder (see MainActivity.onStreamCodecSelected).
     val mime: String = MediaFormat.MIMETYPE_VIDEO_HEVC,
+    /** CfL path: configure with NO output surface and hand decoded Images
+     *  to [onDecodedImage] via getOutputImage() — the only plane-accessible
+     *  output on this SoC (ImageReader surfaces deliver opaque UBWC buffers
+     *  whose plane access is a fatal JNI abort). */
+    private val bufferOutput: Boolean = false,
 ) {
     private var decoder: MediaCodec? = null
     private var decoderThread: HandlerThread? = null
@@ -71,6 +76,16 @@ class VideoDecoder(
     var onFrameStats: ((fps: Double, variance: Double) -> Unit)? = null
     var onFrameDecoded: ((ByteArray) -> Unit)? = null
     var onKeyframeRequired: ((force: Boolean, reason: String) -> Unit)? = null
+
+    // ByteBuffer-mode (CfL) hand-off. The sink consumes the Image on another
+    // thread and invokes the returned callback (which releases the output
+    // buffer) when done.
+    var onDecodedImage: ((android.media.Image, () -> Unit) -> Unit)? = null
+    var onImageOutputUnavailable: (() -> Unit)? = null
+    private var imageUnavailableSignalled = false
+
+    /** Decoded stream color range: 1 = full, 2 = limited (video swing). */
+    var onColorRange: ((Int) -> Unit)? = null
     /** Decoder pipeline latency (avg/max ms over the last ~60 frames). */
     var onDecodeLatency: ((avgMs: Double, maxMs: Double) -> Unit)? = null
     /** Actual decoded stream size + crop (from the codec output format — the TRUE frame
@@ -162,6 +177,13 @@ class VideoDecoder(
                         val cb = runCatching { format.getInteger("crop-bottom") }.getOrDefault(0)
                         onDecodedFormat?.invoke(w, h, cl, cr, ct, cb)
                     }
+                    // color-range: 1 = full, 2 = limited/video (observed on
+                    // this decoder: 8-bit SCK capture → 1, 10-bit VideoRange
+                    // capture → 2). The CfL renderer needs it to pick the
+                    // right YUV→RGB matrix.
+                    val range = runCatching { format.getInteger("color-range") }.getOrDefault(1)
+                    diagLog("color-range=$range (${if (range == 2) "limited" else "full"})")
+                    onColorRange?.invoke(range)
                 }
             }
         codec.setCallback(callback, decoderHandler)
@@ -173,6 +195,8 @@ class VideoDecoder(
                 currentHeight,
             )
 
+        val targetSurface: Surface? = if (bufferOutput) null else surface
+
         var configured = false
 
         // Attempt 1: Full low-latency config
@@ -181,9 +205,9 @@ class VideoDecoder(
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
             format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
             format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            codec.configure(format, surface, null, 0)
+            codec.configure(format, targetSurface, null, 0)
             configured = true
-            diagLog("Configured with full low-latency")
+            diagLog("Configured with full low-latency${if (bufferOutput) " (buffer output)" else ""}")
         } catch (e: Exception) {
             diagLog("Full low-latency config failed: ${e.message}")
             codec.reset()
@@ -201,7 +225,7 @@ class VideoDecoder(
                     )
                 basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
                 basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                codec.configure(basicFormat, surface, null, 0)
+                codec.configure(basicFormat, targetSurface, null, 0)
                 configured = true
                 diagLog("Configured with basic format")
             } catch (e: Exception) {
@@ -220,7 +244,7 @@ class VideoDecoder(
                         currentWidth,
                         currentHeight,
                     )
-                codec.configure(minimalFormat, surface, null, 0)
+                codec.configure(minimalFormat, targetSurface, null, 0)
                 diagLog("Configured with minimal format")
             } catch (e: Exception) {
                 diagLog("All configure attempts failed: ${e.message}")
@@ -483,6 +507,38 @@ class VideoDecoder(
             outputFrameCount++
             if (outputFrameCount == 1L) {
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
+            }
+
+            // ByteBuffer mode (CfL): hand the plane-accessible Image to the
+            // renderer; it releases the buffer from its render thread via
+            // the consumed callback.
+            if (bufferOutput) {
+                val sink = onDecodedImage
+                val img =
+                    try {
+                        if (info.size > 0) codec.getOutputImage(index) else null
+                    } catch (e: Exception) {
+                        diagLog("getOutputImage failed: ${e.message}")
+                        null
+                    }
+                if (sink != null && img != null) {
+                    sink(img) {
+                        try {
+                            codec.releaseOutputBuffer(index, false)
+                        } catch (_: Exception) {
+                        }
+                        updateStats()
+                    }
+                    return
+                }
+                if (img == null && !imageUnavailableSignalled) {
+                    imageUnavailableSignalled = true
+                    diagLog("getOutputImage unavailable — buffer-output CfL cannot run")
+                    onImageOutputUnavailable?.invoke()
+                }
+                codec.releaseOutputBuffer(index, false)
+                updateStats()
+                return
             }
 
             // Decoder latency: time from queueInputBuffer (where we encoded

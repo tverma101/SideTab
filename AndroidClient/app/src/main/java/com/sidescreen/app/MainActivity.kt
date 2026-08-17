@@ -62,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
     private var sgsrRenderer: SgsrRenderer? = null
+    private var cflRenderer: CflRenderer? = null
     private var streamClient: StreamClient? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
@@ -1041,6 +1042,8 @@ class MainActivity : AppCompatActivity() {
         videoDecoder = null
         sgsrRenderer?.release()
         sgsrRenderer = null
+        cflRenderer?.release()
+        cflRenderer = null
         applyDirectPixelMapping(displayWidth, displayHeight)
         initializeDecoderForCurrentSurface()
     }
@@ -1143,7 +1146,7 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-        if (videoDecoder != null && decoderUsingTextureView == useTextureView && sgsrRenderer == null) {
+        if (videoDecoder != null && decoderUsingTextureView == useTextureView && sgsrRenderer == null && cflRenderer == null) {
             videoDecoder?.updateResolution(displayWidth, displayHeight)
             return
         }
@@ -1152,6 +1155,8 @@ class MainActivity : AppCompatActivity() {
         videoDecoder = null
         sgsrRenderer?.release()
         sgsrRenderer = null
+        cflRenderer?.release()
+        cflRenderer = null
         decoderUsingTextureView = useTextureView
 
         mainDiag(
@@ -1173,8 +1178,40 @@ class MainActivity : AppCompatActivity() {
                     MediaFormat.MIMETYPE_VIDEO_HEVC
                 }
             var decoderSurface = surface
-            val vsrOn = prefs.vsrEnabled && supportsGles31() && !useTextureView
-            if (vsrOn) {
+            val cflOn = prefs.vsrEnabled && prefs.vsrMode.equals("cfl", true) &&
+                supportsGles31() && !useTextureView
+            val vsrOn = prefs.vsrEnabled && supportsGles31() && !useTextureView && !cflOn
+            if (cflOn) {
+                // CfL chroma reconstruction via ByteBuffer-mode decode: the
+                // decoder is configured WITHOUT a surface and hands
+                // plane-accessible Images to the renderer (the ImageReader
+                // route is dead on this SoC — opaque UBWC buffers whose
+                // plane access is a fatal JNI abort).
+                try {
+                    val renderer = CflRenderer()
+                    renderer.initialize(surface, displayWidth, displayHeight)
+                    renderer.onStats = { s ->
+                        mainDiag("VSR stats: ${s.summary()}")
+                        runOnUiThread { binding.vsrText.text = s.summary() }
+                    }
+                    val unavailable: (String) -> Unit = { reason ->
+                        mainDiag("CfL unavailable ($reason) — disabling, direct path")
+                        runOnUiThread {
+                            prefs.vsrEnabled = false
+                            binding.vsrText.text = "cfl fallback"
+                            restartVideoPath()
+                        }
+                    }
+                    renderer.onPlanesUnavailable = unavailable
+                    cflRenderer = renderer
+                    mainDiag("CfL active (luma-guided chroma reconstruction, buffer decode)")
+                } catch (e: Exception) {
+                    mainDiag("CfL init failed (${e.message}) — falling back to direct surface")
+                    cflRenderer?.release()
+                    cflRenderer = null
+                    runOnUiThread { binding.vsrText.text = "fallback" }
+                }
+            } else if (vsrOn) {
                 try {
                     val renderer = SgsrRenderer(applicationContext)
                     renderer.initialize(surface, displayWidth, displayHeight)
@@ -1203,12 +1240,27 @@ class MainActivity : AppCompatActivity() {
                         if (prefs.vsrEnabled) "n/a" else "off"
                 }
             }
-            videoDecoder = VideoDecoder(decoderSurface, displayObj, displayWidth, displayHeight, mime)
+            val useBufferOutput = cflRenderer != null
+            videoDecoder = VideoDecoder(surface, displayObj, displayWidth, displayHeight, mime, bufferOutput = useBufferOutput)
+            if (useBufferOutput) {
+                cflRenderer?.let { renderer ->
+                    videoDecoder?.onDecodedImage = { img, done -> renderer.submitImage(img, done) }
+                    videoDecoder?.onColorRange = { range -> renderer.setFullRange(range != 2) }
+                    videoDecoder?.onImageOutputUnavailable = {
+                        runOnUiThread {
+                            prefs.vsrEnabled = false
+                            binding.vsrText.text = "cfl fallback"
+                            restartVideoPath()
+                        }
+                    }
+                }
+            }
             videoDecoder?.onDecodeLatency = { avgMs, maxMs ->
                 mainDiag("decode latency avg=" + "%.1f".format(avgMs) + "ms max=" + "%.1f".format(maxMs) + "ms")
             }
             videoDecoder?.onDecodedFormat = { w, h, cl, cr, ct, cb ->
                 mainDiag("decoder output format ${w}x$h crop=$cl,$cr,$ct,$cb")
+                // CfL renderer self-sizes its textures from the first Image.
                 sgsrRenderer?.resizeStream(w, h, cl, cr, ct, cb)
             }
             videoDecoder?.onFrameDecoded = { buffer ->
@@ -1642,6 +1694,8 @@ class MainActivity : AppCompatActivity() {
             videoDecoder = null
             sgsrRenderer?.release()
             sgsrRenderer = null
+            cflRenderer?.release()
+            cflRenderer = null
             currentTextureSurface?.release()
             currentTextureSurface = null
 
