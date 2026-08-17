@@ -143,9 +143,49 @@ unbounded Quality mode, higher targets were what cascaded the decoder.
 Rollback to the 8-bit morning profile: supervisor restart without the three
 exp knobs above.
 
-### Remaining honest limits (unchanged from the pause note)
+### Remaining honest limits (updated same night — CfL lands)
 
-Text sharpness is still bounded by macOS's own rasterization (grayscale AA)
-and HEVC 4:2:0 chroma — the 10-bit path improves gradients/banding, not
-glyph edges. The materially-different options list in the pause note
-(Metal edge prefilter, semantic remoting) still stands.
+The chroma half of the "remaining limits" below is now addressed on the
+display side; the glyph-rasterization half stands.
+
+## Addendum 2: CfL chroma reconstruction (2026-08-16 night)
+
+**Goal:** fix the 4:2:0 chroma smear on colored text edges — the tablet has
+no 4:4:4 HEVC decode (verified 08-15; Apple's encoder cannot produce 4:4:4
+H.264 either, and this Mac has no AV1 encode), so the only fixable layer is
+chroma RECONSTRUCTION at display time.
+
+**Technique:** "Chroma from Luma" prediction lite — bilinear chroma plus a
+per-channel least-squares luma/chroma slope (α) over the four bilinear taps,
+reconstructing chroma detail from the full-resolution luma (after
+Artoriuz/glsl-chroma-from-luma-prediction). One GL pass, ~3 ms/frame at
+2800x1752 on the Adreno.
+
+**Dead end (receipts):** an ImageReader(YUV_420_888) decode surface gets
+opaque UBWC buffers from c2.qti.hevc.decoder — plane access is a FATAL JNI
+abort ("non-zero capacity for nullptr pointer" in nativeCreatePlanes,
+crashes #1-3 in exit-info 19:57-20:01), and image.format LIES (reports
+YUV_420_888), so only never touching .planes is safe.
+
+**Working path:** ByteBuffer-mode decode (configure surface=null,
+codec.getOutputImage()) — linear, plane-accessible Images, handed to
+CflRenderer with 1-frame bounded backpressure. Works on BOTH the 8-bit and
+10-bit profiles (decoder downshifts 10-bit planes to 8-bit).
+
+**Bug found by user eyes ("colors got washed"):** the 10-bit VideoRange
+capture is LIMITED range; the shader assumed the 8-bit path's full range —
+limited-as-full lifted blacks (menubar 26 vs correct 10). Fix: decoder's
+"color-range" MediaFormat (1=full, 2=limited, observed) drives a
+range-aware BT.709 matrix. Black-level parity restored (12 vs 10).
+
+**Verified:** circle stress 57 fps / 0 drops / ~3 ms per CfL frame;
+zoomed-crop A/B on colored text: crisper glyph edges, no cross-color
+bleed, no new artifacts (numeric: +15% mean chroma gradient).
+
+**Controls (default OFF):**
+  adb shell am broadcast -a com.sidescreen.app.VSR_CMD --ez enabled true  --es mode cfl
+  adb shell am broadcast -a com.sidescreen.app.VSR_CMD --ez enabled false
+Tradeoff: CfL renders from 8-bit planes (10-bit precision ends at the
+decoder output), so gradients lose the 10-bit panel advantage while CfL
+is on; direct path keeps it. Both survive sender restarts via the
+auto-reconnect + session resume.
