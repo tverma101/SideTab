@@ -54,6 +54,10 @@ private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 //   --ez enabled true --es mode sgsr [--ef sharpness 0.8] [--ef edge_threshold 0.03]
 //   --ez enabled true --es mode cfl [--ef cfl_strength 0.15]
 private const val VSR_CMD_ACTION = "com.sidescreen.app.VSR_CMD"
+private const val DEFAULT_USB_HOST = "127.0.0.1"
+private const val DEFAULT_USB_PORT = 54321
+private const val LEGACY_E3_HOST = "10.77.0.1"
+private const val LEGACY_E3_PORT = 54326
 
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
@@ -156,8 +160,23 @@ class MainActivity : AppCompatActivity() {
         val savedHost = savedSession.getString("host", null)
         val savedPort = savedSession.getInt("port", 0)
         if (savedHost != null && savedPort > 0 && prefs.connectionMode == ConnectionMode.USB) {
-            log("🔁 Resuming last session $savedHost:$savedPort")
-            connect(savedHost, savedPort)
+            // Older E3 experiments persisted 10.77.0.1:54326 as the USB
+            // video endpoint. The current Mac host exposes the normal USB
+            // stream through adb-reverse on 127.0.0.1:54321; only its control
+            // channel remains on 54322. Do not resurrect the obsolete video
+            // endpoint on every app launch.
+            if (savedHost == LEGACY_E3_HOST && savedPort == LEGACY_E3_PORT) {
+                log("🔁 Migrating stale E3 session $savedHost:$savedPort -> $DEFAULT_USB_HOST:$DEFAULT_USB_PORT")
+                savedSession
+                    .edit()
+                    .putString("host", DEFAULT_USB_HOST)
+                    .putInt("port", DEFAULT_USB_PORT)
+                    .apply()
+                connect(DEFAULT_USB_HOST, DEFAULT_USB_PORT)
+            } else {
+                log("🔁 Resuming last session $savedHost:$savedPort")
+                connect(savedHost, savedPort)
+            }
         }
     }
 
@@ -421,11 +440,11 @@ class MainActivity : AppCompatActivity() {
             var host =
                 binding.hostInput.text
                     .toString()
-                    .ifEmpty { "127.0.0.1" }
+                    .ifEmpty { DEFAULT_USB_HOST }
             val port =
                 binding.portInput.text
                     .toString()
-                    .toIntOrNull() ?: 54321
+                    .toIntOrNull() ?: DEFAULT_USB_PORT
 
             // Convert localhost to 127.0.0.1 for better Android compatibility
             if (host.equals("localhost", ignoreCase = true)) {
@@ -1467,7 +1486,7 @@ class MainActivity : AppCompatActivity() {
         // E3 carries bulk video through 10.77.0.1:54326. Keep tiny
         // latency/control packets on their dedicated adb-reverse port
         // so they cannot sit behind raw video frames in the E3 pipe.
-        val usesE3VideoPath = host == "10.77.0.1" && port == 54326
+        val usesE3VideoPath = host == LEGACY_E3_HOST && port == LEGACY_E3_PORT
         val client =
             StreamClient(
                 host,
@@ -1984,11 +2003,11 @@ class MainActivity : AppCompatActivity() {
             val port =
                 binding.portInput.text
                     .toString()
-                    .toIntOrNull() ?: 54326
+                    .toIntOrNull() ?: DEFAULT_USB_PORT
             val host =
                 binding.hostInput.text
                     .toString()
-                    .ifEmpty { "10.77.0.1" }
+                    .ifEmpty { DEFAULT_USB_HOST }
             // Probe the CONTROL listener with a PING/PONG exchange first:
             // it never touches the video port, so it cannot disturb a live
             // or starting video session (the old video-port probe is what
@@ -1996,7 +2015,7 @@ class MainActivity : AppCompatActivity() {
             // an IDR on it while idle. A null result (nothing answered on
             // the control port — pre-control-channel hosts, or adbd-only
             // listeners) falls back to the legacy video-port probe.
-            val usesE3VideoPath = host == "10.77.0.1" && port == 54326
+            val usesE3VideoPath = host == LEGACY_E3_HOST && port == LEGACY_E3_PORT
             val controlHost = if (usesE3VideoPath) "127.0.0.1" else host
             val controlPort = if (usesE3VideoPath) 54322 else port + 1
             val isServerRunning =

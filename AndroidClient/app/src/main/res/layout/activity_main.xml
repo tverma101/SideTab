@@ -444,7 +444,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:hint="Host"
-                        android:text="10.77.0.1"
+                        android:text="127.0.0.1"
                         android:textColor="#FFFFFF"
                         android:textColorHint="#888888"
                         android:inputType="text" />
@@ -461,7 +461,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:hint="Port"
-                        android:text="54326"
+                        android:text="54321"
                         android:textColor="#FFFFFF"
                         android:textColorHint="#888888"
                         android:inputType="number" />
