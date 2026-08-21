@@ -146,11 +146,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Returning from System Settings is the normal point at which a TCC
+        // decision changes. Re-run the passive check for the exact bundle that
+        // is now active instead of requiring a second launch or a manual Start
+        // attempt to discover the new state.
+        logRuntimeIdentity()
+        Task { await checkPermissions() }
+    }
+
     @MainActor
     private func refreshStatusIndicators() {
         // Keep the inline permission state current after the user returns from
         // System Settings, without generating another native prompt.
-        settings.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+        refreshScreenRecordingPermission()
         settings.adbInstalled = StatusDetector.adbInstalled()
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
@@ -368,11 +377,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 await self?.requestScreenRecordingPermission()
             }
         }
+        settings.onRefreshScreenRecordingPermission = { [weak self] in
+            self?.refreshPermissions()
+        }
+        settings.onCopyScreenRecordingIdentity = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.copyScreenRecordingIdentity()
+            }
+        }
     }
 
     @objc func showSettings() {
         settingsWindow?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @MainActor
+    private func refreshScreenRecordingPermission() {
+        let snapshot = ScreenRecordingPermissionSnapshot.current()
+        let changed = settings.updateScreenRecordingPermission(snapshot)
+        if changed {
+            debugLog(
+                "Screen Recording state: \(snapshot.statusText); " +
+                    "bundle=\(snapshot.bundleIdentifier) path=\(snapshot.bundlePath)"
+            )
+        }
+    }
+
+    @MainActor
+    private func copyScreenRecordingIdentity() {
+        let snapshot = settings.screenRecordingPermission
+        let text = "SideScreen Screen Recording identity\n" +
+            "status=\(snapshot.statusText)\n" +
+            snapshot.identityText + "\n" +
+            "canonical=\(snapshot.canonicalInstallPath)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        debugLog("Copied Screen Recording identity to the clipboard")
     }
 
     /// Refresh permission state without opening a system prompt. Screen capture
@@ -384,15 +425,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         debugLog("checkPermissions — macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)")
         logRuntimeIdentity()
 
-        // Check Screen Recording permission using CoreGraphics API
-        let hasScreenCapture = CGPreflightScreenCaptureAccess()
         await MainActor.run {
-            settings.hasScreenRecordingPermission = hasScreenCapture
+            refreshScreenRecordingPermission()
         }
+        let hasScreenCapture = await MainActor.run { settings.hasScreenRecordingPermission }
         if hasScreenCapture {
             debugLog("Screen recording permission granted (CGPreflight)")
         } else {
-            debugLog("Screen recording permission not granted yet")
+            debugLog("Screen recording permission not granted for the current bundle")
         }
 
         // Check Accessibility permission (required for touch/mouse injection)
@@ -406,21 +446,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func requestScreenRecordingPermission() async {
         let coreGraphicsGranted = CGRequestScreenCaptureAccess()
         debugLog("CoreGraphics Screen Recording request completed: \(coreGraphicsGranted ? "granted" : "not granted")")
-
-        if !coreGraphicsGranted {
-            do {
-                // macOS 26's privacy pane is "Screen & System Audio Recording".
-                // A single explicit ScreenCaptureKit discovery request creates
-                // that newer TCC entry without constructing the virtual display,
-                // server, or capture pipeline.
-                _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                debugLog("ScreenCaptureKit access request completed")
-            } catch {
-                debugLog("ScreenCaptureKit access request did not grant access: \(error.localizedDescription)")
-            }
-        }
-
-        settings.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+        // Do not start ScreenCaptureKit discovery here. On macOS 26 it can
+        // race the privacy decision and create a second failure path before
+        // the user has finished the System Settings action.
+        refreshScreenRecordingPermission()
         if !settings.hasScreenRecordingPermission {
             showSettings()
         }
@@ -564,10 +593,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         defer {
             Task { @MainActor [weak self] in self?.isStartingServer = false }
         }
-        let hasScreenCapture = CGPreflightScreenCaptureAccess()
         await MainActor.run {
-            settings.hasScreenRecordingPermission = hasScreenCapture
+            refreshScreenRecordingPermission()
         }
+        let hasScreenCapture = await MainActor.run { settings.hasScreenRecordingPermission }
         debugLog("🚀 startServer() invoked. Screen Recording permission: \(hasScreenCapture)")
         guard hasScreenCapture else {
             debugLog("❌ startServer aborted: Missing Screen Recording permission")
@@ -790,7 +819,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if permissionDenied {
                     // TCC denial belongs in the existing inline permission card.
                     // Do not stack a blocking app alert over macOS's own prompt.
-                    settings.hasScreenRecordingPermission = false
+                    refreshScreenRecordingPermission()
                     showSettings()
                 } else {
                     let alert = NSAlert()

@@ -1,5 +1,11 @@
 # SideScreen TCC permission repair (2026-08-15)
 
+> **Superseded by the 2026-08-21 identity recovery work.** Passive launch and
+> periodic checks remain. The current app permits `CGRequestScreenCaptureAccess`
+> only from the explicit Request Access action, removes the extra
+> ScreenCaptureKit request race, and shows the exact running bundle path when
+> the preflight result disagrees with the visible System Settings row.
+
 ## Symptom
 
 Launching the installed Mac host could leave the app unusable behind two

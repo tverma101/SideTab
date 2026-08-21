@@ -140,10 +140,13 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 > The installer uses `~/Applications/SideScreen.app` and preserves the
 > previous bundle with a `.previous.<timestamp>` suffix. Do not launch an
 > `exp_bin/SideScreenExp.app`, a build artifact in another checkout, or another
-> copy with the same display name. If macOS still shows Granted but SideScreen
-> reports Required, remove the stale Side Screen entry in System Settings →
-> Privacy & Security → Screen & System Audio Recording, then enable the exact
-> bundle installed by `install_mac.sh` once.
+> copy with the same display name. Local ad-hoc builds can receive a new
+> CDHash after the executable changes, so an enabled row is not proof that the
+> current build is authorized. SideScreen now shows the exact running path and
+> provides Recheck / Copy Identity / Open Settings actions. If it reports
+> Required, remove the stale Side Screen entry in System Settings → Privacy &
+> Security → Screen & System Audio Recording, then enable the exact bundle
+> installed by `install_mac.sh` once.
 
 > **⚠️ ADB Required**
 > The Mac app needs `adb` to communicate with your Android device. If the app doesn't show "Running" after launch, you likely need to install ADB:

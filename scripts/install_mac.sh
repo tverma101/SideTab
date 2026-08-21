@@ -27,6 +27,11 @@ fi
 
 mkdir -p "$INSTALL_ROOT"
 
+PREVIOUS_CDHASH=""
+if [ -d "$TARGET_APP" ]; then
+    PREVIOUS_CDHASH="$(codesign -dvvv --verbose=4 "$TARGET_APP" 2>&1 | awk -F= '/^CDHash=/{print $2}' || true)"
+fi
+
 # Stop only a process whose executable is inside the exact target bundle.
 for pid in $(pgrep -f "$TARGET_APP/Contents/MacOS/SideScreen" || true); do
     if [[ "$pid" =~ ^[0-9]+$ ]]; then
@@ -52,6 +57,12 @@ mv "$TEMP_ROOT/SideScreen.app" "$TARGET_APP"
 
 codesign --verify --deep --strict --verbose=2 "$TARGET_APP"
 echo "Installed current host: $TARGET_APP"
+CURRENT_CDHASH="$(codesign -dvvv --verbose=4 "$TARGET_APP" 2>&1 | awk -F= '/^CDHash=/{print $2}' || true)"
+echo "Current CDHash: ${CURRENT_CDHASH:-unknown}"
+if [ -n "$PREVIOUS_CDHASH" ] && [ -n "$CURRENT_CDHASH" ] && [ "$PREVIOUS_CDHASH" != "$CURRENT_CDHASH" ]; then
+    echo "WARNING: local ad-hoc code identity changed ($PREVIOUS_CDHASH -> $CURRENT_CDHASH)."
+    echo "If Screen Recording shows Granted but SideScreen says Required, rebind this exact bundle in System Settings."
+fi
 echo "Screen Recording must be granted to this exact bundle; do not launch a legacy copy."
 codesign -d -r- "$TARGET_APP" 2>&1 | tail -4
 

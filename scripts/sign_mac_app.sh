@@ -10,10 +10,11 @@ if [ ! -d "$APP_PATH" ]; then
     exit 1
 fi
 
-# Ad-hoc signatures normally use a changing CDHash as their designated
-# requirement. TCC then sees every local rebuild as a different application and
-# forgets Screen Recording approval. Embed an explicit, stable local-development
-# requirement so all SideScreen build paths retain the same TCC identity.
+# Keep an explicit local-development requirement so every build path reports
+# the same bundle identity. This does not make an ad-hoc CDHash stable: macOS
+# may still require a Screen Recording rebind after the executable changes. A
+# real persistent Apple signing identity is required for approval continuity
+# across arbitrary local rebuilds.
 LOCAL_REQUIREMENT='=designated => identifier "com.sidescreen.app" and info[CFBundleName] = "Side Screen"'
 
 codesign \

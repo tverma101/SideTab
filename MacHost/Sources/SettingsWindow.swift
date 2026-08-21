@@ -642,9 +642,9 @@ struct SettingsView: View {
                                           hint: "Whether the Android client app currently has an active stream session.")
                                 StatusRow(
                                     title: ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 ? "Screen & System Audio" : "Screen Recording",
-                                    status: settings.hasScreenRecordingPermission ? "Granted" : "Required",
+                                    status: settings.screenRecordingPermission.statusText,
                                     color: settings.hasScreenRecordingPermission ? .green : .red,
-                                    hint: "macOS privacy permission required to capture the virtual display. Grant in System Settings → Privacy & Security → Screen Recording."
+                                    hint: settings.screenRecordingPermission.diagnosticText
                                 )
                                 StatusRow(title: "Accessibility",
                                           status: settings.hasAccessibilityPermission ? "Granted" : "Optional",
@@ -705,6 +705,26 @@ struct SettingsView: View {
                                             : "Required to capture the virtual display.")
                                             .font(.system(size: 11))
                                             .foregroundColor(.secondary)
+                                        Text(settings.screenRecordingPermission.diagnosticText)
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.secondary)
+                                        Text("Running bundle")
+                                            .font(.system(size: 10, weight: .semibold))
+                                            .foregroundColor(.secondary)
+                                        Text(settings.screenRecordingPermission.bundlePath)
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .textSelection(.enabled)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        if !settings.screenRecordingPermission.isCanonicalInstall {
+                                            Text("Canonical install: \(settings.screenRecordingPermission.canonicalInstallPath)")
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundColor(.orange)
+                                                .textSelection(.enabled)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                        }
+                                        Text(settings.screenRecordingPermission.recoveryText)
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.secondary)
                                         HStack(spacing: 8) {
                                             Button(action: {
                                                 settings.requestScreenRecordingPermission()
@@ -722,6 +742,26 @@ struct SettingsView: View {
                                                 HStack {
                                                     Image(systemName: "gear")
                                                     Text("Open Settings")
+                                                }
+                                            }
+                                            .buttonStyle(.bordered)
+
+                                            Button(action: {
+                                                settings.refreshScreenRecordingPermission()
+                                            }) {
+                                                HStack {
+                                                    Image(systemName: "arrow.clockwise")
+                                                    Text("Recheck")
+                                                }
+                                            }
+                                            .buttonStyle(.bordered)
+
+                                            Button(action: {
+                                                settings.copyScreenRecordingIdentity()
+                                            }) {
+                                                HStack {
+                                                    Image(systemName: "doc.on.doc")
+                                                    Text("Copy Identity")
                                                 }
                                             }
                                             .buttonStyle(.bordered)
@@ -1092,7 +1132,8 @@ class DisplaySettings: ObservableObject {
     /// Device name of the wireless client currently streaming (nil when none).
     /// WirelessSection reads this to show a "Connected" badge on the matching row.
     @Published var currentWirelessDevice: String?
-    @Published var hasScreenRecordingPermission = false
+    @Published private(set) var screenRecordingPermission = ScreenRecordingPermissionSnapshot.initial()
+    var hasScreenRecordingPermission: Bool { screenRecordingPermission.isGranted }
     @Published var hasAccessibilityPermission = false
     @Published var adbInstalled = false
     @Published var adbReverseConfigured = false
@@ -1106,6 +1147,8 @@ class DisplaySettings: ObservableObject {
 
     var onToggleServer: (() -> Void)?
     var onRequestScreenRecordingPermission: (() -> Void)?
+    var onRefreshScreenRecordingPermission: (() -> Void)?
+    var onCopyScreenRecordingIdentity: (() -> Void)?
 
     static let fixedResolution = "1400x876"
 
@@ -1159,6 +1202,21 @@ class DisplaySettings: ObservableObject {
 
     func requestScreenRecordingPermission() {
         onRequestScreenRecordingPermission?()
+    }
+
+    @discardableResult
+    func updateScreenRecordingPermission(_ snapshot: ScreenRecordingPermissionSnapshot) -> Bool {
+        let changed = screenRecordingPermission != snapshot
+        screenRecordingPermission = snapshot
+        return changed
+    }
+
+    func refreshScreenRecordingPermission() {
+        onRefreshScreenRecordingPermission?()
+    }
+
+    func copyScreenRecordingIdentity() {
+        onCopyScreenRecordingIdentity?()
     }
 
     func resetToDefaults() {

@@ -32,16 +32,22 @@ the same symptom.
 ## Durable fix
 
 1. `scripts/install_mac.sh` is the canonical local installer. It copies the
-   current root build to `~/Applications/SideScreen.app`, signs it with the
-   repository's stable local requirement, preserves the previous bundle as a
-   timestamped `.previous.*` backup, and prints the installed identity.
-2. `AppDelegate` logs the bundle identifier and path at launch and while
-   checking permissions.
-3. The ineffective `SideScreen_forceStart` auto-start bypass was removed.
-   Auto-start now checks the current bundle's permission before starting the
-   capture server, so a stale copy cannot create a misleading retry loop.
-4. `README.md` contains the canonical build/install and stale-grant recovery
-   procedure.
+   current root build to `~/Applications/SideScreen.app`, preserves the
+   previous bundle as a timestamped `.previous.*` backup, reports the CDHash
+   change, and warns when a local ad-hoc rebuild may need a TCC rebind.
+2. `AppDelegate` logs the bundle identifier and path at launch, activation,
+   and permission checks. `ScreenRecordingPermissionSnapshot` keeps that
+   identity attached to the boolean preflight result.
+3. The permission card now shows the exact running path and provides Recheck,
+   Copy Identity, Request Access, and Open Settings actions. The app refreshes
+   the check after returning from System Settings.
+4. The ineffective `SideScreen_forceStart` auto-start bypass and the extra
+   ScreenCaptureKit request race were removed. Auto-start checks the current
+   bundle's permission before starting capture.
+5. The explicit local designated requirement is retained for diagnostics, but
+   it is not claimed to make an ad-hoc CDHash stable. A real persistent Apple
+   signing identity is needed for approval continuity across arbitrary local
+   rebuilds.
 
 ## Recovery procedure
 

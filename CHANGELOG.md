@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Video and the optional control channel bind to the selected WiFi route, including local-only WiFi networks; background reconnect and TCP keepalive remain disabled.
 
 ### macOS installation and permission identity
-- Added `scripts/install_mac.sh` as the canonical local install path (`~/Applications/SideScreen.app`). It preserves the previous bundle, signs the current build with the repository's stable local requirement, and logs the exact bundle path used for Screen Recording.
-- Removed the ineffective force-start permission bypass from auto-start. Auto-start now checks the current bundle's Screen Recording grant before attempting capture, avoiding repeated permission failures from stale duplicate installs.
+- Added `scripts/install_mac.sh` as the canonical local install path (`~/Applications/SideScreen.app`). It preserves the previous bundle, reports CDHash changes, and warns when a local ad-hoc rebuild may require a Screen Recording rebind.
+- Added an in-app permission snapshot/recovery card that shows the exact running bundle path, supports recheck/copy/open-settings actions, and refreshes when the app becomes active.
+- Removed the ineffective force-start permission bypass from auto-start and the extra ScreenCaptureKit permission race. Auto-start now checks the current bundle's Screen Recording grant before attempting capture.
 
 ---
 

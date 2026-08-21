@@ -96,8 +96,10 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-# Keep a stable designated requirement so TCC approval survives rebuilds.
-echo "Code signing (stable local identity)..."
+# Keep an explicit designated requirement for diagnostics. The local ad-hoc
+# CDHash still changes when the executable changes, so the app's in-product
+# recovery card must handle a possible TCC rebind after a rebuild.
+echo "Code signing (explicit local ad-hoc identity)..."
 "$SCRIPT_DIR/sign_mac_app.sh" "$APP_DIR"
 echo "  ✓ App signed"
 
