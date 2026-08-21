@@ -12,8 +12,10 @@ import Foundation
 /// run. Pattern math MUST stay in lockstep with harness fillY8/renderPatternSource
 /// in probes/offline_enc/main.swift (they produce the reference source PNGs).
 ///
-/// Format guard: only 420YpCbCr8BiPlanarFullRange (2 planes, interleaved
-/// CbCr) is supported — 10-bit biplanar buffers no-op with a log line.
+/// Supports 420YpCbCr8BiPlanarFullRange and the 10-bit video-range biplanar
+/// format used by the USB Main10 experiment. The 10-bit path currently
+/// supports the static color chart, which is enough to calibrate the receiver
+/// against the native Android screenshot baseline.
 enum PatternInjector {
     static func isActive() -> Bool {
         UserDefaults.standard.string(forKey: "SideScreen_exp_pattern") != nil
@@ -25,8 +27,16 @@ enum PatternInjector {
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
         guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return }
         let fmt = CVPixelBufferGetPixelFormatType(buffer)
+        if fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange {
+            if kind == "color" {
+                fill10BitColorPattern(buffer)
+            } else {
+                debugLog("PatternInjector: 10-bit path only supports the color chart")
+            }
+            return
+        }
         guard fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
-            debugLog("PatternInjector: format 0x\(String(fmt, radix: 16)) unsupported — skipping (10-bit path not supported on rig)")
+            debugLog("PatternInjector: format 0x\(String(fmt, radix: 16)) unsupported — skipping")
             return
         }
 
@@ -171,6 +181,44 @@ enum PatternInjector {
         debugLog("PatternInjector: injected '\(kind)' \(w)x\(h)")
     }
 
+    /// Fill the same chart into a 10-bit video-range buffer (P010-style,
+    /// high 10 bits in each UInt16 sample). The Y/Cb/Cr equations are BT.709
+    /// limited-range equivalents of ycbcr(_:_:_:), so the encoded chart has
+    /// the same intended sRGB patch values as the 8-bit harness.
+    static func fill10BitColorPattern(_ buffer: CVPixelBuffer) {
+        let w = CVPixelBufferGetWidth(buffer)
+        let h = CVPixelBufferGetHeight(buffer)
+        let yRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        let cRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+        let cH = CVPixelBufferGetHeightOfPlane(buffer, 1)
+        let cw = CVPixelBufferGetWidthOfPlane(buffer, 1)
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
+              let cbCr = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return }
+
+        let cols = 6, rows = 4
+        let pw = w / cols, ph = h / rows
+        let cpw = cw / cols, cph = cH / rows
+        for i in 0..<colorPatches.count {
+            let (y, cb, cr) = ycbcr10(colorPatches[i].0, colorPatches[i].1, colorPatches[i].2)
+            let cx = i % cols, cy = i / cols
+            for yy in (cy * ph)..<min((cy + 1) * ph, h) {
+                let row = yBase + yy * yRow
+                for xx in (cx * pw)..<min((cx + 1) * pw, w) {
+                    row.advanced(by: xx * 2).storeBytes(of: y, as: UInt16.self)
+                }
+            }
+            for yy in (cy * cph)..<min((cy + 1) * cph, cH) {
+                let row = cbCr + yy * cRow
+                for xx in 0..<cpw {
+                    let off = (cx * cpw + xx) * 4
+                    row.advanced(by: off).storeBytes(of: cb, as: UInt16.self)
+                    row.advanced(by: off + 2).storeBytes(of: cr, as: UInt16.self)
+                }
+            }
+        }
+        debugLog("PatternInjector: injected 10-bit 'color' \(w)x\(h)")
+    }
+
     static let colorPatches: [(UInt8, UInt8, UInt8)] = [
         (255,255,255),(0,0,0),(255,0,0),(0,255,0),(0,0,255),(255,255,0),
         (0,255,255),(255,0,255),(245,222,179),(255,140,105),(135,206,250),(255,215,0),
@@ -185,5 +233,17 @@ enum PatternInjector {
         let cb = -0.1146 * rf - 0.3854 * gf + 0.5 * bf + 128.0
         let cr = 0.5 * rf - 0.4542 * gf - 0.0458 * bf + 128.0
         return (UInt8(min(max(y, 0), 255)), UInt8(min(max(cb, 0), 255)), UInt8(min(max(cr, 0), 255)))
+    }
+
+    /// sRGB -> BT.709 limited-range 10-bit YCbCr, high-bit aligned for P010.
+    static func ycbcr10(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> (UInt16, UInt16, UInt16) {
+        let rf = Double(r) / 255.0, gf = Double(g) / 255.0, bf = Double(b) / 255.0
+        let y = 64.0 + (0.2126 * rf + 0.7152 * gf + 0.0722 * bf) * 876.0
+        let cb = 512.0 + (-0.1146 * rf - 0.3854 * gf + 0.5 * bf) * 896.0
+        let cr = 512.0 + (0.5 * rf - 0.4542 * gf - 0.0458 * bf) * 896.0
+        func pack(_ value: Double) -> UInt16 {
+            UInt16(min(max(Int(value.rounded()), 0), 1023) << 6)
+        }
+        return (pack(y), pack(cb), pack(cr))
     }
 }

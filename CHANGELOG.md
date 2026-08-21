@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added an in-app permission snapshot/recovery card that shows the exact running bundle path, supports recheck/copy/open-settings actions, and refreshes when the app becomes active.
 - Removed the ineffective force-start permission bypass, the extra ScreenCaptureKit permission race, and the legacy CGDisplayStream fallback. ScreenCaptureKit is now the only capture path. The Core Graphics Screen Recording preflight is advisory: manual Start and configured auto-start always attempt capture, while the actual ScreenCaptureKit setup determines whether the session can capture. The host stays launched/listening when capture is unavailable and reports the actual failure; the settings status reports **Capture working** only after the first ScreenCaptureKit frame.
 
+### USB SDR color path
+- Android's measured neutral sRGB tone profile now also covers the direct USB decoder path through a GPU bridge when VSR is disabled, without reconnecting or enabling sharpening. It is gated to decoder-reported 8-bit full-range content; normal 10-bit VideoRange content bypasses the curve because it already matches the native Android chart. The macOS SDR signaling remains unchanged because the tablet's vendor decoder applies the explicit VUI differently from the established USB baseline.
+- The sender's color-chart diagnostic now supports the 10-bit VideoRange USB path, allowing the Android profile to remain gated to 8-bit full-range content where it improves measured native-chart error.
+
 ---
 
 <a id="0.11.1"></a>

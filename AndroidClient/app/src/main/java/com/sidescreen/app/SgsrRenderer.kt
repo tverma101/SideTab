@@ -211,6 +211,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     @Volatile private var sharpness = 0.8f
     @Volatile private var edgeThreshold = 8.0f / 255.0f
     @Volatile private var colorProfileEnabled = AndroidColorProfile.DEFAULT_ENABLED
+    @Volatile private var fullRange = true
     @Volatile private var programDirty = false
     @Volatile private var pendingMode: Mode? = null
     @Volatile private var pendingSharpness: Float? = null
@@ -418,6 +419,16 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     }
 
     /**
+     * The calibrated Android sRGB tone curve is for the 8-bit full-range USB
+     * path. Main10 VideoRange already lands close to the native Android chart;
+     * keep the profile uniform off for that negotiated range.
+     */
+    fun setFullRange(full: Boolean) {
+        fullRange = full
+        requestRender()
+    }
+
+    /**
      * Called when the decoder reports its real output size (SPS-driven). The crop rect is
      * deliberately IGNORED: the QTI decoder on this tablet reports crop in rotated
      * coordinates (observed: 0,2799,0,1751 for a 2800x1760 landscape stream) and pre-crops
@@ -575,7 +586,9 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         GLES31.glUseProgram(postProgram)
         if (postSTex >= 0) GLES31.glUniform1i(postSTex, 0)
         if (postSharpness >= 0) GLES31.glUniform1f(postSharpness, sharpness)
-        if (postColorProfile >= 0) GLES31.glUniform1i(postColorProfile, if (colorProfileEnabled) 1 else 0)
+        if (postColorProfile >= 0) {
+            GLES31.glUniform1i(postColorProfile, if (colorProfileEnabled && fullRange) 1 else 0)
+        }
         GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
         GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, fboTextureId)
         drawQuad(postAPos, postATex)
@@ -701,7 +714,8 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
             "SGSR",
             "post program compiled: mode=$mode sharpness=$sharpness " +
                 "effectiveSharpness=$effectiveSharpness edgeThreshold=$edgeThreshold " +
-                "androidColorProfile=$colorProfileEnabled",
+                "androidColorProfile=${colorProfileEnabled && fullRange} " +
+                "sourceRange=${if (fullRange) "full" else "limited"}",
         )
     }
 

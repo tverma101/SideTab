@@ -672,8 +672,21 @@ class MainActivity : AppCompatActivity() {
             if (colorProfileSupported) AndroidColorProfile.NAME else "Requires OpenGL ES 3.1 GPU path"
         androidColorProfileSwitch.setOnCheckedChangeListener { _, isChecked ->
             prefs.androidColorProfileEnabled = isChecked
-            sgsrRenderer?.setAndroidColorProfileEnabled(isChecked)
-            cflRenderer?.setAndroidColorProfileEnabled(isChecked)
+            val needsUsbDirectPathRebuild =
+                isConnected &&
+                    prefs.connectionMode == ConnectionMode.USB &&
+                    !prefs.vsrEnabled &&
+                    supportsGles31() &&
+                    !shouldUseTextureView()
+            if (needsUsbDirectPathRebuild) {
+                // The direct MediaCodec -> Surface path has no shader stage.
+                // Rebuild only that local path so the profile can be added or
+                // removed without disconnecting USB or restarting the stream.
+                restartVideoPath()
+            } else {
+                sgsrRenderer?.setAndroidColorProfileEnabled(isChecked)
+                cflRenderer?.setAndroidColorProfileEnabled(isChecked)
+            }
         }
 
         vsrModeBridge.setOnClickListener {
@@ -1094,12 +1107,20 @@ class MainActivity : AppCompatActivity() {
                     val i = intent ?: return
                     if (i.action != VSR_CMD_ACTION) return
                     val mode = i.getStringExtra("mode")
+                    val directUsbProfilePath =
+                        isConnected &&
+                            prefs.connectionMode == ConnectionMode.USB &&
+                            !prefs.vsrEnabled &&
+                            supportsGles31() &&
+                            !shouldUseTextureView()
+                    val profileChangesVideoPath = i.hasExtra("color_profile") && directUsbProfilePath
                     val changesVideoPath =
                         mode != null ||
                             i.hasExtra("enabled") ||
                             i.hasExtra("sharpness") ||
                             i.hasExtra("cfl_strength") ||
-                            i.hasExtra("edge_threshold")
+                            i.hasExtra("edge_threshold") ||
+                            profileChangesVideoPath
                     val enabled =
                         if (i.hasExtra("enabled")) {
                             i.getBooleanExtra("enabled", false)
@@ -1114,8 +1135,10 @@ class MainActivity : AppCompatActivity() {
                     if (i.hasExtra("color_profile")) {
                         val profileEnabled = i.getBooleanExtra("color_profile", AndroidColorProfile.DEFAULT_ENABLED)
                         prefs.androidColorProfileEnabled = profileEnabled
-                        sgsrRenderer?.setAndroidColorProfileEnabled(profileEnabled)
-                        cflRenderer?.setAndroidColorProfileEnabled(profileEnabled)
+                        if (!profileChangesVideoPath) {
+                            sgsrRenderer?.setAndroidColorProfileEnabled(profileEnabled)
+                            cflRenderer?.setAndroidColorProfileEnabled(profileEnabled)
+                        }
                     }
                     mainDiag(
                         "VSR_CMD: enabled=${if (changesVideoPath) enabled else prefs.vsrEnabled} " +
@@ -1192,6 +1215,13 @@ class MainActivity : AppCompatActivity() {
             val cflOn = prefs.vsrEnabled && prefs.vsrMode.equals("cfl", true) &&
                 supportsGles31() && !useTextureView
             val vsrOn = prefs.vsrEnabled && supportsGles31() && !useTextureView && !cflOn
+            val usbColorBridgeOn =
+                prefs.connectionMode == ConnectionMode.USB &&
+                    prefs.androidColorProfileEnabled &&
+                    supportsGles31() &&
+                    !useTextureView &&
+                    !cflOn &&
+                    !vsrOn
             if (cflOn) {
                 // CfL chroma reconstruction via ByteBuffer-mode decode: the
                 // decoder is configured WITHOUT a surface and hands
@@ -1227,11 +1257,17 @@ class MainActivity : AppCompatActivity() {
                     cflRenderer = null
                     runOnUiThread { binding.vsrText.text = "fallback" }
                 }
-            } else if (vsrOn) {
+            } else if (vsrOn || usbColorBridgeOn) {
                 try {
                     val renderer = SgsrRenderer(applicationContext)
                     renderer.initialize(surface, displayWidth, displayHeight)
-                    renderer.setMode(SgsrRenderer.Mode.from(prefs.vsrMode))
+                    renderer.setMode(
+                        if (usbColorBridgeOn) {
+                            SgsrRenderer.Mode.BRIDGE_ONLY
+                        } else {
+                            SgsrRenderer.Mode.from(prefs.vsrMode)
+                        },
+                    )
                     renderer.setSharpness(prefs.vsrSharpness)
                     renderer.setEdgeThreshold(prefs.vsrEdgeThreshold)
                     renderer.setAndroidColorProfileEnabled(prefs.androidColorProfileEnabled)
@@ -1244,10 +1280,17 @@ class MainActivity : AppCompatActivity() {
                     }
                     sgsrRenderer = renderer
                     decoderSurface = renderer.decoderSurfaceRef ?: surface
-                    mainDiag(
-                        "VSR active: mode=${prefs.vsrMode} sharpness=${prefs.vsrSharpness} " +
-                            "colorProfile=${prefs.androidColorProfileEnabled}",
-                    )
+                    if (usbColorBridgeOn) {
+                        mainDiag(
+                            "USB color bridge active: sRGB / BT.709 profile=" +
+                                "${prefs.androidColorProfileEnabled}",
+                        )
+                    } else {
+                        mainDiag(
+                            "VSR active: mode=${prefs.vsrMode} sharpness=${prefs.vsrSharpness} " +
+                                "colorProfile=${prefs.androidColorProfileEnabled}",
+                        )
+                    }
                 } catch (e: Exception) {
                     mainDiag("VSR init failed (${e.message}) — falling back to direct surface")
                     sgsrRenderer?.release()
@@ -1274,10 +1317,14 @@ class MainActivity : AppCompatActivity() {
                 },
                 bufferOutput = useBufferOutput,
             )
+            videoDecoder?.onColorRange = { range ->
+                val fullRange = range != 2
+                sgsrRenderer?.setFullRange(fullRange)
+                cflRenderer?.setFullRange(fullRange)
+            }
             if (useBufferOutput) {
                 cflRenderer?.let { renderer ->
                     videoDecoder?.onDecodedImage = { img, done -> renderer.submitImage(img, done) }
-                    videoDecoder?.onColorRange = { range -> renderer.setFullRange(range != 2) }
                     videoDecoder?.onImageOutputUnavailable = {
                         runOnUiThread {
                             prefs.vsrEnabled = false

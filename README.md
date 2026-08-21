@@ -212,6 +212,8 @@ Wireless mode requires both devices to be on the same WiFi network. Local-only W
 
 USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wireless adds 10–50 ms depending on WiFi quality.
 
+For SDR USB sessions, the Android client uses a lightweight GPU color bridge when VSR is disabled. The measured Android sRGB tone profile is applied only after the decoder reports 8-bit full-range content; the normal 10-bit VideoRange path bypasses that curve because it already matches the native Android chart. The bridge adds no sharpening or reconnect, and it is a display correction—not a claim that streamed macOS pixels become native Android content.
+
 ### Headless mode (new in 0.11.0 — no Mac interaction)
 
 In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
