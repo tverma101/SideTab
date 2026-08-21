@@ -75,19 +75,7 @@ struct SettingsView: View {
     @State private var showPermissionAlert = false
     @State private var showResetConfirmation = false
     @State private var headerHovered = false
-    // Plain strings for the custom resolution fields: TextField(value:format:)
-    // only commits on Return/focus-loss, so clicking Apply read stale values,
-    // and .number formatting injected locale grouping separators ("1,200").
-    @State private var customWidthText = ""
-    @State private var customHeightText = ""
     @State private var daemonEnabled = false
-
-    private var customWidthValue: Int? { Int(customWidthText.trimmingCharacters(in: .whitespaces)) }
-    private var customHeightValue: Int? { Int(customHeightText.trimmingCharacters(in: .whitespaces)) }
-    private var customResolutionValid: Bool {
-        guard let w = customWidthValue, let h = customHeightValue else { return false }
-        return DisplaySettings.isValidCustomResolution(width: w, height: h)
-    }
 
     var body: some View {
         ZStack {
@@ -189,111 +177,29 @@ struct SettingsView: View {
                         // Display Configuration
                         FrostedGroupBox(title: "Display Configuration", icon: "display") {
                             VStack(alignment: .leading, spacing: 16) {
-                                // Resolution
-                                VStack(alignment: .leading, spacing: 8) {
+                                // Fixed tablet profile. Alternate and custom
+                                // resolutions are intentionally not exposed.
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Resolution")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
                                     HStack {
-                                        Text("Resolution")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.secondary)
+                                        Text("1400 × 876")
+                                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
                                         Spacer()
-                                        Toggle("Show all", isOn: $settings.showAllResolutions)
-                                            .toggleStyle(.switch)
-                                            .controlSize(.mini)
+                                        Text("HiDPI · 2800 × 1752 physical")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
                                     }
-
-                                    ScrollView {
-                                        VStack(alignment: .leading, spacing: 0) {
-                                            if settings.showAllResolutions {
-                                                // Custom (Apply) values aren't in any preset group —
-                                                // surface them so the selection is visible in the list.
-                                                if !DisplaySettings.allResolutions.contains(settings.resolution) {
-                                                    HStack(spacing: 6) {
-                                                        Text("Custom")
-                                                            .font(.system(size: 11, weight: .semibold))
-                                                        Text("User defined")
-                                                            .font(.system(size: 10))
-                                                            .foregroundColor(.secondary)
-                                                    }
-                                                    .padding(.horizontal, 12)
-                                                    .padding(.vertical, 6)
-                                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                                    .background(Color.primary.opacity(0.03))
-
-                                                    ResolutionRow(resolution: settings.resolution, isSelected: true) {}
-                                                }
-                                                ForEach(DisplaySettings.resolutionGroups) { group in
-                                                    HStack(spacing: 6) {
-                                                        Text(group.name)
-                                                            .font(.system(size: 11, weight: .semibold))
-                                                        Text(group.ratio)
-                                                            .font(.system(size: 10))
-                                                            .foregroundColor(.secondary)
-                                                    }
-                                                    .padding(.horizontal, 12)
-                                                    .padding(.vertical, 6)
-                                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                                    .background(Color.primary.opacity(0.03))
-
-                                                    ForEach(group.resolutions, id: \.self) { res in
-                                                        ResolutionRow(resolution: res, isSelected: settings.resolution == res) {
-                                                            settings.resolution = res
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                ForEach(DisplaySettings.commonResolutions, id: \.self) { res in
-                                                    ResolutionRow(resolution: res, isSelected: settings.resolution == res) {
-                                                        settings.resolution = res
-                                                    }
-                                                }
-                                                // Current selection from the full list or a custom
-                                                // Apply — keep it visible in the compact list too.
-                                                if !DisplaySettings.commonResolutions.contains(settings.resolution) {
-                                                    ResolutionRow(resolution: settings.resolution, isSelected: true) {}
-                                                }
-                                            }
-                                        }
-                                    }
-                                    .frame(height: settings.showAllResolutions ? 180 : 140)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 10)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                     .background(.ultraThinMaterial)
                                     .cornerRadius(8)
                                     .overlay(
                                         RoundedRectangle(cornerRadius: 8)
                                             .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
                                     )
-
-                                    if settings.showAllResolutions {
-                                        HStack(spacing: 8) {
-                                            TextField("W", text: $customWidthText)
-                                                .textFieldStyle(.roundedBorder)
-                                                .frame(width: 70)
-                                            Text("x")
-                                                .foregroundColor(.secondary)
-                                            TextField("H", text: $customHeightText)
-                                                .textFieldStyle(.roundedBorder)
-                                                .frame(width: 70)
-                                            Button("Apply") {
-                                                guard customResolutionValid,
-                                                      let w = customWidthValue,
-                                                      let h = customHeightValue else { return }
-                                                settings.customWidth = w
-                                                settings.customHeight = h
-                                                settings.applyCustomResolution()
-                                            }
-                                            .buttonStyle(.bordered)
-                                            .controlSize(.small)
-                                            .disabled(!customResolutionValid)
-                                        }
-                                        .onAppear {
-                                            customWidthText = String(settings.customWidth)
-                                            customHeightText = String(settings.customHeight)
-                                        }
-                                        if !customResolutionValid {
-                                            Text("Supported range: 640–7680 × 480–4320")
-                                                .font(.system(size: 10))
-                                                .foregroundColor(.orange)
-                                        }
-                                    }
                                 }
 
                                 // HiDPI (Retina)
@@ -302,15 +208,14 @@ struct SettingsView: View {
                                         Text("HiDPI (Retina)")
                                             .font(.system(size: 11))
                                             .foregroundColor(.secondary)
-                                        Text("Renders at 2× resolution for sharper text. Increases bandwidth.")
+                                        Text("Fixed at 2× resolution for sharper text.")
                                             .font(.system(size: 10))
                                             .foregroundColor(.secondary.opacity(0.7))
                                     }
                                     Spacer()
-                                    Toggle("", isOn: $settings.hiDPI)
-                                        .toggleStyle(.switch)
-                                        .controlSize(.mini)
-                                        .disabled(settings.isRunning)
+                                    Text("On")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundColor(.accentColor)
                                 }
 
                                 // Rotation
@@ -1044,34 +949,6 @@ struct StatusRow: View {
     }
 }
 
-struct ResolutionRow: View {
-    let resolution: String
-    let isSelected: Bool
-    let action: () -> Void
-    @State private var isHovered = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack {
-                Text(resolution.replacingOccurrences(of: "x", with: " x "))
-                    .font(.system(size: 12))
-                Spacer()
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.white)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(isSelected ? Color.accentColor : (isHovered ? Color.primary.opacity(0.05) : Color.clear))
-            .foregroundColor(isSelected ? .white : .primary)
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovered = $0 }
-    }
-}
-
 struct BitrateButton: View {
     let label: String
     let value: Int
@@ -1188,15 +1065,6 @@ class DisplaySettings: ObservableObject {
     @Published var flipVertical: Bool {
         didSet { save("flipVertical", flipVertical) }
     }
-    @Published var showAllResolutions: Bool {
-        didSet { save("showAllResolutions", showAllResolutions) }
-    }
-    @Published var customWidth: Int {
-        didSet { save("customWidth", customWidth) }
-    }
-    @Published var customHeight: Int {
-        didSet { save("customHeight", customHeight) }
-    }
     @Published var touchEnabled: Bool {
         didSet { save("touchEnabled", touchEnabled) }
     }
@@ -1231,10 +1099,15 @@ class DisplaySettings: ObservableObject {
     var onToggleServer: (() -> Void)?
     var onRequestScreenRecordingPermission: (() -> Void)?
 
+    static let fixedResolution = "1400x876"
+
     init() {
-        self.resolution = defaults.string(forKey: keyPrefix + "resolution") ?? "1920x1200"
+        // This client is paired with the 2800×1752 tablet. Keep the logical
+        // profile fixed at 1400×876 HiDPI so stale or accidental preferences
+        // cannot create a mismatched virtual display.
+        self.resolution = Self.fixedResolution
         self.refreshRate = defaults.object(forKey: keyPrefix + "refreshRate") as? Int ?? 60  // Default: 60 — balanced for most tablets. 120 may saturate high-res panel pipelines.
-        self.hiDPI = defaults.bool(forKey: keyPrefix + "hiDPI")
+        self.hiDPI = true
         self.bitrate = defaults.object(forKey: keyPrefix + "bitrate") as? Int ?? 1000  // Default: 1000 Mbps
         self.quality = defaults.string(forKey: keyPrefix + "quality") ?? "ultralow"  // Default: fastest encoding
         self.gamingBoost = defaults.bool(forKey: keyPrefix + "gamingBoost")
@@ -1244,9 +1117,6 @@ class DisplaySettings: ObservableObject {
         self.rotation = defaults.object(forKey: keyPrefix + "rotation") as? Int ?? 0
         self.flipHorizontal = defaults.bool(forKey: keyPrefix + "flipHorizontal")
         self.flipVertical = defaults.bool(forKey: keyPrefix + "flipVertical")
-        self.showAllResolutions = defaults.bool(forKey: keyPrefix + "showAllResolutions")
-        self.customWidth = defaults.object(forKey: keyPrefix + "customWidth") as? Int ?? 1920
-        self.customHeight = defaults.object(forKey: keyPrefix + "customHeight") as? Int ?? 1200
         self.touchEnabled = defaults.object(forKey: keyPrefix + "touchEnabled") as? Bool ?? true
         let modeRaw = defaults.string(forKey: keyPrefix + "connectionMode") ?? ConnectionMode.usb.rawValue
         self.connectionMode = ConnectionMode(rawValue: modeRaw) ?? .usb
@@ -1254,47 +1124,13 @@ class DisplaySettings: ObservableObject {
         let startupRaw = defaults.string(forKey: keyPrefix + "startupMode") ?? modeRaw
         self.startupMode = ConnectionMode(rawValue: startupRaw) ?? .usb
 
-        print("Loaded settings: \(resolution) @ \(refreshRate)Hz, bitrate=\(bitrate), quality=\(quality)")
+        defaults.set(Self.fixedResolution, forKey: keyPrefix + "resolution")
+        defaults.set(true, forKey: keyPrefix + "hiDPI")
+        print("Loaded fixed settings: \(resolution) @ \(refreshRate)Hz HiDPI, bitrate=\(bitrate), quality=\(quality)")
     }
 
     private func save(_ key: String, _ value: Any) {
         defaults.set(value, forKey: keyPrefix + key)
-    }
-
-    struct ResolutionGroup: Identifiable {
-        let id = UUID()
-        let name: String
-        let ratio: String
-        let resolutions: [String]
-    }
-
-    static let resolutionGroups: [ResolutionGroup] = [
-        ResolutionGroup(name: "16:10", ratio: "Widescreen", resolutions: [
-            "1280x800", "1400x876", "1440x900", "1680x1050", "1920x1200", "2560x1600"
-        ]),
-        ResolutionGroup(name: "16:9", ratio: "HD/4K", resolutions: [
-            "1280x720", "1366x768", "1600x900", "1920x1080", "2560x1440", "3840x2160"
-        ]),
-        ResolutionGroup(name: "4:3", ratio: "Classic", resolutions: [
-            "1024x768", "1280x960", "1600x1200"
-        ]),
-        ResolutionGroup(name: "3:2", ratio: "Surface/Pixel", resolutions: [
-            "1920x1280", "2160x1440", "2736x1824"
-        ]),
-        ResolutionGroup(name: "5:3", ratio: "Tablet Wide", resolutions: [
-            "2000x1200", "2560x1536", "2800x1680"
-        ]),
-        ResolutionGroup(name: "4:3", ratio: "iPad", resolutions: [
-            "2048x1536", "2224x1668", "2388x1668", "2732x2048"
-        ])
-    ]
-
-    static let commonResolutions = [
-        "1920x1080", "1920x1200", "2560x1440", "2560x1600"
-    ]
-
-    static var allResolutions: [String] {
-        resolutionGroups.flatMap { $0.resolutions }
     }
 
     var effectiveBitrate: Int {
@@ -1319,15 +1155,15 @@ class DisplaySettings: ObservableObject {
 
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
-                    "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical", "showAllResolutions",
-                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode"]
+                    "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical",
+                    "touchEnabled", "autoStartStreamingOnLaunch", "startupMode"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
 
-        resolution = "1920x1200"
+        resolution = Self.fixedResolution
         refreshRate = 120  // Default: highest FPS
-        hiDPI = false
+        hiDPI = true
         bitrate = 1000  // Default: 1000 Mbps
         quality = "ultralow"  // Default: fastest encoding
         gamingBoost = false
@@ -1335,9 +1171,6 @@ class DisplaySettings: ObservableObject {
         rotation = 0
         flipHorizontal = false
         flipVertical = false
-        showAllResolutions = false
-        customWidth = 1920
-        customHeight = 1200
         touchEnabled = true
         autoStartStreamingOnLaunch = false
         startupMode = .usb
@@ -1355,15 +1188,6 @@ class DisplaySettings: ObservableObject {
         return (baseWidth, baseHeight)
     }
 
-    static func isValidCustomResolution(width: Int, height: Int) -> Bool {
-        width >= 640 && width <= 7680 && height >= 480 && height <= 4320
-    }
-
-    func applyCustomResolution() {
-        if DisplaySettings.isValidCustomResolution(width: customWidth, height: customHeight) {
-            resolution = "\(customWidth)x\(customHeight)"
-        }
-    }
 }
 
 // MARK: - Window Controller

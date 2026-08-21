@@ -73,6 +73,18 @@ class CflRenderer {
         fullRange = full
     }
 
+    /** Reconstruction strength 0..1 — how much luma-derived chroma detail to
+     *  add back. 1.0 can overshoot (glossy/"shiny" edges: HEVC's own in-loop
+     *  chroma smoothing means the true edge is softer than luma predicts).
+     *  The conservative default is kept in PreferencesManager. */
+    @Volatile private var strength = 0.15f
+
+    fun setStrength(s: Float) {
+        val v = s.coerceIn(0f, 1f)
+        DiagLog.log(TAG, "strength=$v")
+        strength = v
+    }
+
     // --- GL objects ---
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
@@ -86,6 +98,7 @@ class CflRenderer {
     private var aTexLoc = -1
     private var srcSizeLoc = -1
     private var fullRangeLoc = -1
+    private var strengthLoc = -1
 
     // --- stream geometry (luma = full res; chroma = half) ---
     @Volatile private var codedWidth = 0
@@ -180,6 +193,7 @@ class CflRenderer {
         aTexLoc = GLES31.glGetAttribLocation(program, "aTexCoord")
         srcSizeLoc = GLES31.glGetUniformLocation(program, "uSrcSize")
         fullRangeLoc = GLES31.glGetUniformLocation(program, "uFullRange")
+        strengthLoc = GLES31.glGetUniformLocation(program, "uStrength")
 
         // VideoToolbox pads coded height to a 16-multiple (observed 1752 ->
         // 1760). Nothing to pre-allocate here — textures size themselves
@@ -386,6 +400,7 @@ class CflRenderer {
         GLES31.glUseProgram(program)
         GLES31.glUniform2f(srcSizeLoc, codedWidth.toFloat(), codedHeight.toFloat())
         GLES31.glUniform1i(fullRangeLoc, if (fullRange) 1 else 0)
+        GLES31.glUniform1f(strengthLoc, strength)
         GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
         GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, yTex)
         GLES31.glActiveTexture(GLES31.GL_TEXTURE1)
@@ -501,6 +516,7 @@ class CflRenderer {
         uniform sampler2D uV;    // R8 planar
         uniform int uSemiPlanar;
         uniform int uFullRange;
+        uniform float uStrength;
         uniform vec2 uSrcSize;
         out vec4 fragColor;
 
@@ -551,7 +567,7 @@ class CflRenderer {
             vec2 a = clamp(num / max(vec2(den), vec2(1e-5)), vec2(-1.0), vec2(1.0));
 
             float Y = fetchY(p);
-            vec2 C = clamp(cBil + a * (Y - yUp), vec2(0.0), vec2(1.0));
+            vec2 C = clamp(cBil + uStrength * a * (Y - yUp), vec2(0.0), vec2(1.0));
 
             vec3 rgb;
             if (uFullRange == 1) {

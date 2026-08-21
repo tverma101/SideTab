@@ -58,6 +58,12 @@ class PreferencesManager(
         get() = prefs.getFloat("vsr_sharpness", 0.8f)
         set(value) = prefs.edit().putFloat("vsr_sharpness", value).apply()
 
+    /** CfL chroma reconstruction strength. Kept separate from CAS/SGSR
+     * sharpness because strong luma-derived chroma detail can look glossy. */
+    var cflStrength: Float
+        get() = prefs.getFloat("cfl_strength", 0.15f).coerceIn(0f, 1f)
+        set(value) = prefs.edit().putFloat("cfl_strength", value.coerceIn(0f, 1f)).apply()
+
     var vsrEdgeThreshold: Float
         get() = prefs.getFloat("vsr_edge_threshold", 8.0f / 255.0f)
         set(value) = prefs.edit().putFloat("vsr_edge_threshold", value).apply()

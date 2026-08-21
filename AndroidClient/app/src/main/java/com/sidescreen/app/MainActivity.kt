@@ -52,6 +52,7 @@ private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
 // Debug A/B hook action: adb shell am broadcast -a com.sidescreen.app.VSR_CMD
 //   --ez enabled true --es mode sgsr [--ef sharpness 0.8] [--ef edge_threshold 0.03]
+//   --ez enabled true --es mode cfl [--ef cfl_strength 0.15]
 private const val VSR_CMD_ACTION = "com.sidescreen.app.VSR_CMD"
 
 class MainActivity : AppCompatActivity() {
@@ -63,7 +64,7 @@ class MainActivity : AppCompatActivity() {
     private var videoDecoder: VideoDecoder? = null
     private var sgsrRenderer: SgsrRenderer? = null
     private var cflRenderer: CflRenderer? = null
-    private var streamClient: StreamClient? = null
+    @Volatile private var streamClient: StreamClient? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
     private var decoderUsingTextureView = false
@@ -82,6 +83,10 @@ class MainActivity : AppCompatActivity() {
     // checklist probe hammered the Mac video port every 2s (2026-08-16).
     private var autoReconnectJob: Job? = null
     private var autoReconnectAttempt = 0
+    // All callbacks from an old StreamClient become inert as soon as a newer
+    // connect starts. Without this generation fence, a sender restart can
+    // leave several clients reconnecting at once and starve the decoder.
+    @Volatile private var activeConnectionGeneration = 0L
 
     @Volatile private var userRequestedDisconnect = false
 
@@ -1107,6 +1112,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     mode?.let { prefs.vsrMode = it }
                     i.getFloatExtra("sharpness", -1f).takeIf { it >= 0f }?.let { prefs.vsrSharpness = it }
+                    i.getFloatExtra("cfl_strength", -1f).takeIf { it >= 0f }?.let { prefs.cflStrength = it }
                     i.getFloatExtra("edge_threshold", -1f).takeIf { it >= 0f }?.let { prefs.vsrEdgeThreshold = it }
                     prefs.vsrEnabled = enabled
                     mainDiag("VSR_CMD: enabled=$enabled mode=${prefs.vsrMode}")
@@ -1203,6 +1209,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                     renderer.onPlanesUnavailable = unavailable
+                    renderer.setStrength(prefs.cflStrength)
                     cflRenderer = renderer
                     mainDiag("CfL active (luma-guided chroma reconstruction, buffer decode)")
                 } catch (e: Exception) {
@@ -1241,7 +1248,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             val useBufferOutput = cflRenderer != null
-            videoDecoder = VideoDecoder(surface, displayObj, displayWidth, displayHeight, mime, bufferOutput = useBufferOutput)
+            videoDecoder = VideoDecoder(decoderSurface, displayObj, displayWidth, displayHeight, mime, bufferOutput = useBufferOutput)
             if (useBufferOutput) {
                 cflRenderer?.let { renderer ->
                     videoDecoder?.onDecodedImage = { img, done -> renderer.submitImage(img, done) }
@@ -1446,52 +1453,82 @@ class MainActivity : AppCompatActivity() {
         // A fresh/explicit connect re-arms auto-reconnect (it is only
         // disarmed by an explicit user disconnect()).
         userRequestedDisconnect = false
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
+
+        // Invalidate and close the previous client before creating its
+        // replacement. Older callbacks are fenced by this generation.
+        val generation = activeConnectionGeneration + 1
+        activeConnectionGeneration = generation
+        streamClient?.disconnect()
+        streamClient = null
+        isConnected = false
+
+        // E3 carries bulk video through 10.77.0.1:54326. Keep tiny
+        // latency/control packets on their dedicated adb-reverse port
+        // so they cannot sit behind raw video frames in the E3 pipe.
+        val usesE3VideoPath = host == "10.77.0.1" && port == 54326
+        val client =
+            StreamClient(
+                host,
+                port,
+                applicationContext,
+                controlHost = if (usesE3VideoPath) "127.0.0.1" else host,
+                controlPort = if (usesE3VideoPath) 54322 else port + 1,
+            )
+        streamClient = client
+
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
 
-                // E3 carries bulk video through 10.77.0.1:54326. Keep tiny
-                // latency/control packets on their dedicated adb-reverse port
-                // so they cannot sit behind raw video packets in the E3 pipe.
-                val usesE3VideoPath = host == "10.77.0.1" && port == 54326
-                streamClient =
-                    StreamClient(
-                        host,
-                        port,
-                        applicationContext,
-                        controlHost = if (usesE3VideoPath) "127.0.0.1" else host,
-                        controlPort = if (usesE3VideoPath) 54322 else port + 1,
-                    )
-                streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-                    val dec = videoDecoder
-                    if (dec != null) {
-                        dec.decode(frameData, frameSize, timestamp, isKeyframe)
+                client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+                    if (isCurrentConnection(client, generation)) {
+                        val dec = videoDecoder
+                        if (dec != null) {
+                            dec.decode(frameData, frameSize, timestamp, isKeyframe)
+                        } else {
+                            client.releaseBuffer(frameData)
+                        }
                     } else {
-                        streamClient?.releaseBuffer(frameData)
+                        client.releaseBuffer(frameData)
                     }
                 }
 
                 // Wire up buffer release callback for buffer pooling
                 // When decode completes, buffer is returned to StreamClient's pool
-                videoDecoder?.onFrameDecoded = { buffer ->
-                    streamClient?.releaseBuffer(buffer)
-                }
+                videoDecoder?.onFrameDecoded = { buffer -> client.releaseBuffer(buffer) }
                 videoDecoder?.onKeyframeRequired = { force, reason ->
-                    streamClient?.requestKeyframe(force = force, reason = reason)
+                    if (isCurrentConnection(client, generation)) {
+                        client.requestKeyframe(force = force, reason = reason)
+                    }
                 }
 
                 // Latency measurement via ping/pong
-                streamClient?.onLatencyMeasured = { rttMs ->
-                    runOnUiThread {
-                        binding.latencyText.text = String.format("%.1f ms", rttMs)
+                client.onLatencyMeasured = { rttMs ->
+                    if (isCurrentConnection(client, generation)) {
+                        runOnUiThread {
+                            if (isCurrentConnection(client, generation)) {
+                                binding.latencyText.text = String.format("%.1f ms", rttMs)
+                            }
+                        }
                     }
                 }
 
                 // Real panel backlight from the host (BRIGHT over control channel).
-                streamClient?.onBrightness = { v -> applyBacklight(v) }
+                client.onBrightness = { v ->
+                    if (isCurrentConnection(client, generation)) applyBacklight(v)
+                }
 
-                streamClient?.onConnectionStatus = { connected ->
+                client.onConnectionStatus = { connected ->
                     runOnUiThread {
+                        if (!isCurrentConnection(client, generation)) {
+                            // A stale client must never flip the UI to
+                            // disconnected or schedule another reconnect.
+                            if (connected) client.disconnect()
+                            return@runOnUiThread
+                        }
+
                         // Update connection state flag
                         isConnected = connected
 
@@ -1561,35 +1598,46 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
-
-                streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
-                    mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-                    warnIfAvcOnlyWithoutNegotiation()
-                    displayWidth = width
-                    displayHeight = height
-                    displayRotation = rotation
-                    displayFlipHorizontal = flipHorizontal
-                    displayFlipVertical = flipVertical
-
-                    runOnUiThread {
-                        binding.resolutionText.text = "${width}x$height"
-                        applyRotation(rotation, flipHorizontal, flipVertical)
-                        applyDirectPixelMapping(width, height)
-                        initializeDecoderForCurrentSurface()
-                    }
-                    log("Display: ${width}x$height @ $rotation°")
+                client.onCodecSelected = { isHevc ->
+                    if (isCurrentConnection(client, generation)) onStreamCodecSelected(isHevc)
                 }
 
-                streamClient?.onStats = { fps, mbps ->
-                    runOnUiThread {
-                        binding.fpsText.text = String.format("%.1f", fps)
-                        binding.bitrateText.text = String.format("%.1f Mbps", mbps)
+                client.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
+                    if (isCurrentConnection(client, generation)) {
+                        mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
+                        warnIfAvcOnlyWithoutNegotiation()
+                        displayWidth = width
+                        displayHeight = height
+                        displayRotation = rotation
+                        displayFlipHorizontal = flipHorizontal
+                        displayFlipVertical = flipVertical
+
+                        runOnUiThread {
+                            if (isCurrentConnection(client, generation)) {
+                                binding.resolutionText.text = "${width}x$height"
+                                applyRotation(rotation, flipHorizontal, flipVertical)
+                                applyDirectPixelMapping(width, height)
+                                initializeDecoderForCurrentSurface()
+                            }
+                        }
+                        log("Display: ${width}x$height @ $rotation°")
                     }
                 }
 
-                streamClient?.connect()
+                client.onStats = { fps, mbps ->
+                    if (isCurrentConnection(client, generation)) {
+                        runOnUiThread {
+                            if (isCurrentConnection(client, generation)) {
+                                binding.fpsText.text = String.format("%.1f", fps)
+                                binding.bitrateText.text = String.format("%.1f Mbps", mbps)
+                            }
+                        }
+                    }
+                }
+
+                client.connect()
             } catch (e: Exception) {
+                if (!isCurrentConnection(client, generation)) return@launch
                 val errorMessage =
                     when {
                         e.message?.contains("ECONNREFUSED") == true -> {
@@ -1611,14 +1659,22 @@ class MainActivity : AppCompatActivity() {
                                 "• Check USB connection\n• Run: adb reverse tcp:$port tcp:$port"
                         }
                     }
-                updateStatus("Connection failed")
-                showError(errorMessage)
-                // Retryable failure (server restarting, transport down):
-                // schedule instead of leaving the app dead on its checklist.
-                scheduleAutoReconnect(host, port)
+                runOnUiThread {
+                    if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                    updateStatus("Connection failed")
+                    showError(errorMessage)
+                    // Retryable failure (server restarting, transport down):
+                    // schedule instead of leaving the app dead on its checklist.
+                    scheduleAutoReconnect(host, port)
+                }
             }
         }
     }
+
+    private fun isCurrentConnection(
+        client: StreamClient,
+        generation: Long,
+    ): Boolean = activeConnectionGeneration == generation && streamClient === client
 
     /**
      * Retry a dropped or failed session with capped exponential backoff
@@ -1631,7 +1687,10 @@ class MainActivity : AppCompatActivity() {
         port: Int,
     ) {
         if (userRequestedDisconnect || isFinishing) return
-        autoReconnectJob?.cancel()
+        // A single failed client can report through both its receive loop and
+        // its connect path. Keep one scheduled retry instead of continuously
+        // cancelling/restarting the backoff and creating overlapping clients.
+        if (autoReconnectJob?.isActive == true) return
         val delayMs = (1000L shl autoReconnectAttempt.coerceAtMost(3)).coerceAtMost(10_000L)
         autoReconnectAttempt += 1
         log("🔁 Auto-reconnect to $host:$port in ${delayMs / 1000.0}s (attempt $autoReconnectAttempt)")
@@ -1647,6 +1706,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun disconnect() {
         userRequestedDisconnect = true
+        activeConnectionGeneration += 1
         autoReconnectJob?.cancel()
         autoReconnectJob = null
         autoReconnectAttempt = 0
@@ -1658,6 +1718,7 @@ class MainActivity : AppCompatActivity() {
             .apply()
         stopPingTimer()
         streamClient?.disconnect()
+        streamClient = null
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
