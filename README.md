@@ -55,7 +55,7 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 ### USB-C or Wireless
 
-Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** lets you scan a QR code from the Mac once and the tablet auto-reconnects on every future launch over WiFi (5 GHz strongly recommended). The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
+Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** lets you scan a QR code from the Mac once, then tap **Reconnect** when you choose to start a session over WiFi (5 GHz strongly recommended). Wireless uses a bounded efficiency profile: capture and encode are fixed at 60 FPS with a 40 Mbps average / approximately 60 Mbps one-second peak. The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
 
 ### Virtual Display
 
@@ -130,6 +130,21 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 > ```
 > Then open the app again. This is needed because the app is not notarized with an Apple Developer certificate.
 
+> **⚠️ Screen Recording identity**
+> macOS grants Screen Recording to the app's signing identity, not just the
+> visible name. For a local build, install and launch the one canonical bundle:
+> ```bash
+> ./scripts/build_mac.sh
+> ./scripts/install_mac.sh --launch
+> ```
+> The installer uses `~/Applications/SideScreen.app` and preserves the
+> previous bundle with a `.previous.<timestamp>` suffix. Do not launch an
+> `exp_bin/SideScreenExp.app`, a build artifact in another checkout, or another
+> copy with the same display name. If macOS still shows Granted but SideScreen
+> reports Required, remove the stale Side Screen entry in System Settings →
+> Privacy & Security → Screen & System Audio Recording, then enable the exact
+> bundle installed by `install_mac.sh` once.
+
 > **⚠️ ADB Required**
 > The Mac app needs `adb` to communicate with your Android device. If the app doesn't show "Running" after launch, you likely need to install ADB:
 >
@@ -172,9 +187,9 @@ cd AndroidClient && ./gradlew assembleDebug
 
 1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
 2. Open **Side Screen** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
-3. The tablet remembers the Mac. Subsequent launches auto-reconnect — no rescan.
+3. The tablet remembers the Mac. On later launches, tap **Reconnect** when you want to start the session — no rescan and no background reconnect.
 
-Wireless mode requires both devices to be on the same WiFi network. **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
+Wireless mode requires both devices to be on the same WiFi network. Local-only WiFi/hotspot routes are supported when the Mac is reachable on that LAN, and **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
 
 USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wireless adds 10–50 ms depending on WiFi quality.
 

@@ -1,8 +1,6 @@
 package com.sidescreen.app
 
 import android.content.Context
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
@@ -186,21 +184,20 @@ class StreamClient(
         val s =
             try {
                 val sock = Socket()
-                sock.tcpNoDelay = true
-                val wifiNetwork =
-                    context?.let { ctx ->
-                        val cm = ctx.getSystemService(ConnectivityManager::class.java)
-                        cm.allNetworks.firstOrNull { net ->
-                            val caps = cm.getNetworkCapabilities(net)
-                            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                        }
-                    }
-                if (wifiNetwork != null) {
-                    Log.i(TAG, "connectWireless: binding socket to WiFi network $wifiNetwork")
-                    wifiNetwork.bindSocket(sock)
+                WirelessTransportProfile.tuneVideoSocket(sock)
+                val wifiRoute = context?.let { WirelessTransportProfile.findWifiRoute(it) }
+                if (wifiRoute != null && WirelessTransportProfile.bindSocket(sock, wifiRoute)) {
+                    controlChannel.bindTo(wifiRoute.network)
+                    Log.i(
+                        TAG,
+                        "connectWireless: bound video/control to WiFi " +
+                            "route=${wifiRoute.network} down=${wifiRoute.downstreamKbps}kbps " +
+                            "up=${wifiRoute.upstreamKbps}kbps validated=${wifiRoute.validated}",
+                    )
+                } else if (wifiRoute != null) {
+                    Log.w(TAG, "connectWireless: WiFi route binding failed, using default routing")
                 } else {
-                    Log.w(TAG, "connectWireless: no WiFi network found, using default routing")
+                    Log.w(TAG, "connectWireless: no WiFi route found, using default routing")
                 }
                 sock.connect(java.net.InetSocketAddress(host, port), 5000)
                 sock
@@ -266,7 +263,7 @@ class StreamClient(
         when (status) {
             AuthHandshake.ResponseStatus.OK -> {
                 socket = s
-                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
+                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES))
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
@@ -274,7 +271,12 @@ class StreamClient(
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
                 isConnected = true
-                diagLog("Wireless connected to $host:$port")
+                diagLog(
+                    "Wireless connected to $host:$port " +
+                        "profile=${WirelessTransportProfile.TARGET_FPS}fps " +
+                        "rcvBuf=${runCatching { s.receiveBufferSize }.getOrDefault(-1)} " +
+                        "streamBuf=${WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES / 1024}KiB",
+                )
                 onConnectionStatus?.invoke(true)
                 connectControlChannel()
                 receiveData()
@@ -388,7 +390,12 @@ class StreamClient(
                             input.readFully(buf)
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                             val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
-                            diagLog(String.format("PONG rtt=%.2fms", rtt))
+                            DiagLog.logSampled(
+                                "SC",
+                                "inband-pong",
+                                String.format("PONG rtt=%.2fms", rtt),
+                                DIAGNOSTIC_SAMPLE_INTERVAL_MS,
+                            )
                             onLatencyMeasured?.invoke(rtt)
                         }
 
@@ -517,7 +524,12 @@ class StreamClient(
                 socket?.getOutputStream()?.let { out ->
                     val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
                     val writeTime = System.nanoTime()
-                    diagLog(String.format("PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6))
+                    DiagLog.logSampled(
+                        "SC",
+                        "inband-ping",
+                        String.format("PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6),
+                        DIAGNOSTIC_SAMPLE_INTERVAL_MS,
+                    )
                     buffer.put(4.toByte()) // Type 4: ping
                     buffer.putLong(writeTime)
                     out.write(buffer.array())
@@ -663,6 +675,7 @@ class StreamClient(
         private const val MAX_FRAME_SIZE = 5 * 1024 * 1024 // 5MB
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
+        private const val DIAGNOSTIC_SAMPLE_INTERVAL_MS = 10_000L
         private const val MESSAGE_VIDEO_FRAME = 0
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
         private const val MESSAGE_KEYFRAME_REQUEST = 7

@@ -22,6 +22,8 @@ class VideoDecoder(
     // Exposed so MainActivity can detect a codec-negotiation/decoder mismatch
     // and recreate the decoder (see MainActivity.onStreamCodecSelected).
     val mime: String = MediaFormat.MIMETYPE_VIDEO_HEVC,
+    /** Wireless sends a bounded 60 FPS stream even on a 120 Hz panel. */
+    private val targetFrameRate: Int? = null,
     /** CfL path: configure with NO output surface and hand decoded Images
      *  to [onDecodedImage] via getOutputImage() — the only plane-accessible
      *  output on this SoC (ImageReader surfaces deliver opaque UBWC buffers
@@ -61,7 +63,8 @@ class VideoDecoder(
 
     private val frameTimes = ArrayDeque<Long>(120)
 
-    private val displayRefreshRate = display?.refreshRate ?: 60f
+    private val displayRefreshRate =
+        (targetFrameRate?.toFloat() ?: display?.refreshRate ?: 60f).coerceIn(30f, 240f)
 
     private var currentWidth = initialWidth
     private var currentHeight = initialHeight

@@ -121,9 +121,11 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
             "precision mediump float;\n" +
             "in vec2 v_texCoord;\n" +
             "uniform sampler2D ps0;\n" +
+            AndroidColorProfile.GLSL_FUNCTION + "\n" +
             "out vec4 fragColor;\n" +
             "void main() {\n" +
-            "  fragColor = texture(ps0, v_texCoord);\n" +
+            "  vec3 color = texture(ps0, v_texCoord).rgb;\n" +
+            "  fragColor = vec4(applyAndroidColorProfile(color), 1.0);\n" +
             "}\n"
 
     // AMD FidelityFX CAS, sharpen-only (noScaling) + better diagonals, per
@@ -135,6 +137,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
             "in vec2 v_texCoord;\n" +
             "uniform sampler2D ps0;\n" +
             "uniform float uSharpness;\n" +
+            AndroidColorProfile.GLSL_FUNCTION + "\n" +
             "out vec4 fragColor;\n" +
             "void main() {\n" +
             "  vec2 px = vec2(INV_SRC_W, INV_SRC_H);\n" +
@@ -159,7 +162,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
             "  float wG = amp.g * peak;\n" +
             "  float rcpWeight = 1.0 / (1.0 + 4.0 * wG);\n" +
             "  vec3 color = clamp((b + d + f + h) * wG + e, 0.0, 1.0) * rcpWeight;\n" +
-            "  fragColor = vec4(clamp(color, 0.0, 1.0), 1.0);\n" +
+            "  fragColor = vec4(applyAndroidColorProfile(clamp(color, 0.0, 1.0)), 1.0);\n" +
             "}\n"
 
     // EGL state
@@ -192,6 +195,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     private var postATex = -1
     private var postSTex = -1
     private var postSharpness = -1
+    private var postColorProfile = -1
 
     private val vertexBuffer: FloatBuffer
 
@@ -206,6 +210,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     @Volatile private var mode = Mode.SGSR1
     @Volatile private var sharpness = 0.8f
     @Volatile private var edgeThreshold = 8.0f / 255.0f
+    @Volatile private var colorProfileEnabled = AndroidColorProfile.DEFAULT_ENABLED
     @Volatile private var programDirty = false
     @Volatile private var pendingMode: Mode? = null
     @Volatile private var pendingSharpness: Float? = null
@@ -407,6 +412,11 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         requestRender()
     }
 
+    fun setAndroidColorProfileEnabled(enabled: Boolean) {
+        colorProfileEnabled = enabled
+        requestRender()
+    }
+
     /**
      * Called when the decoder reports its real output size (SPS-driven). The crop rect is
      * deliberately IGNORED: the QTI decoder on this tablet reports crop in rotated
@@ -565,6 +575,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         GLES31.glUseProgram(postProgram)
         if (postSTex >= 0) GLES31.glUniform1i(postSTex, 0)
         if (postSharpness >= 0) GLES31.glUniform1f(postSharpness, sharpness)
+        if (postColorProfile >= 0) GLES31.glUniform1i(postColorProfile, if (colorProfileEnabled) 1 else 0)
         GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
         GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, fboTextureId)
         drawQuad(postAPos, postATex)
@@ -663,7 +674,10 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
                         // algorithm's full 0..2 range instead of silently limiting SGSR1 to
                         // half strength.
                         val effectiveSharpness = sharpness * SGSR1_EDGE_SHARPNESS_MAX
-                        raw.replaceFirst(Regex("#version 310 es"), "#version 310 es$defines")
+                        raw.replaceFirst(
+                            Regex("#version 310 es"),
+                            "#version 310 es$defines${AndroidColorProfile.GLSL_FUNCTION}\n",
+                        )
                             .replaceFirst(Regex("#define EdgeThreshold .*"), "#define EdgeThreshold $edgeThreshold")
                             .replaceFirst(Regex("#define EdgeSharpness .*"), "#define EdgeSharpness $effectiveSharpness")
                     }
@@ -680,12 +694,14 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
         postSTex = GLES31.glGetUniformLocation(postProgram, "ps0")
         if (postSTex < 0) postSTex = GLES31.glGetUniformLocation(postProgram, "sTexture")
         postSharpness = GLES31.glGetUniformLocation(postProgram, "uSharpness")
+        postColorProfile = GLES31.glGetUniformLocation(postProgram, "uAndroidColorProfile")
         val effectiveSharpness =
             if (mode == Mode.SGSR1) sharpness * SGSR1_EDGE_SHARPNESS_MAX else sharpness
         DiagLog.log(
             "SGSR",
             "post program compiled: mode=$mode sharpness=$sharpness " +
-                "effectiveSharpness=$effectiveSharpness edgeThreshold=$edgeThreshold",
+                "effectiveSharpness=$effectiveSharpness edgeThreshold=$edgeThreshold " +
+                "androidColorProfile=$colorProfileEnabled",
         )
     }
 

@@ -1,5 +1,6 @@
 package com.sidescreen.app
 
+import android.net.Network
 import android.os.Process
 import java.io.BufferedInputStream
 import java.io.DataInputStream
@@ -52,46 +53,34 @@ class ControlChannel(
 
     private val sendLock = Any()
     private val connectLock = Any()
+    @Volatile private var boundNetwork: Network? = null
 
     val isConnected: Boolean
         get() = tcpActive
 
-    /** Best-effort: never throws — failures fall back to in-band ping/pong. */
+    /** Bind the optional control socket to the same Wi-Fi route as video. */
+    fun bindTo(network: Network?) {
+        boundNetwork = network
+    }
+
+    /**
+     * Best-effort: never throws — failures fall back to in-band ping/pong.
+     *
+     * This is intentionally a single attempt for each explicit video
+     * connection. The control path is optional; retrying it in the background
+     * can create a reconnect storm when the host is stopping or already has a
+     * client, and it does not improve the video connection.
+     */
     fun connect() {
         synchronized(connectLock) {
             if (running) return
             running = true
         }
-        Thread({ connectionLoop() }, "ControlConnection")
+        Thread({ tryTcp() }, "ControlConnect")
             .apply {
                 isDaemon = true
                 priority = Thread.MAX_PRIORITY
             }.start()
-    }
-
-    /** Keep the optional channel self-healing across relay/VPN/app restarts. */
-    private fun connectionLoop() {
-        while (running) {
-            if (!tcpActive) {
-                tryTcp()
-            } else {
-                val now = System.nanoTime()
-                val activeSocket = socket
-                if (activeSocket != null &&
-                    lastPingSentAtNs > lastPongAtNs &&
-                    now - lastPongAtNs > PONG_TIMEOUT_NS
-                ) {
-                    DiagLog.log("CC", "Control pong timeout — reconnecting")
-                    markTcpInactive(activeSocket)
-                }
-            }
-            try {
-                Thread.sleep(if (tcpActive) 250 else 500)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return
-            }
-        }
     }
 
     private fun tryTcp() {
@@ -100,6 +89,17 @@ class ControlChannel(
             val s = Socket()
             try {
                 // Bounded connect: never let the control path hang the caller.
+                boundNetwork?.let { network ->
+                    try {
+                        network.bindSocket(s)
+                        DiagLog.log("CC", "Control socket bound to the wireless video route")
+                    } catch (e: Exception) {
+                        // The control path is optional. If the route has gone
+                        // away, let the normal routing table try once rather
+                        // than turning a video session into a reconnect.
+                        DiagLog.log("CC", "Wireless control bind failed: ${e.message}; using default route")
+                    }
+                }
                 s.connect(InetSocketAddress(host, port), 2000)
                 s.tcpNoDelay = true
                 socket = s
@@ -149,14 +149,16 @@ class ControlChannel(
                         val processedAt = System.nanoTime()
                         lastPongAtNs = arrival
                         val appDelay = (processedAt - arrival) / 1_000_000.0
-                        DiagLog.log(
+                        DiagLog.logSampled(
                             "CC",
+                            "control-pong",
                             String.format(
                                 "PONG rtt=%.2fms appDelay=%.3fms transit=%.2fms mode=tcp",
                                 rtt,
                                 appDelay,
                                 rtt - appDelay,
                             ),
+                            DIAGNOSTIC_SAMPLE_INTERVAL_MS,
                         )
                         if (!tcpActive) {
                             tcpActive = true
@@ -204,6 +206,12 @@ class ControlChannel(
     fun sendPing(): Boolean {
         val activeSocket = socket ?: return false
         val out = output ?: return false
+        val now = System.nanoTime()
+        if (lastPingSentAtNs > lastPongAtNs && now - lastPongAtNs > PONG_TIMEOUT_NS) {
+            DiagLog.log("CC", "Control pong timeout — using in-band fallback")
+            markTcpInactive(activeSocket)
+            return false
+        }
         val ts = System.nanoTime()
         synchronized(sendLock) {
             return try {
@@ -288,7 +296,7 @@ class ControlChannel(
             } catch (_: Exception) {
             }
             if (running) {
-                DiagLog.log("CC", "Control channel inactive — reconnecting")
+                DiagLog.log("CC", "Control channel unavailable — using in-band fallback")
             }
         }
     }
@@ -311,5 +319,6 @@ class ControlChannel(
 
     private companion object {
         const val PONG_TIMEOUT_NS = 3_000_000_000L
+        const val DIAGNOSTIC_SAMPLE_INTERVAL_MS = 10_000L
     }
 }

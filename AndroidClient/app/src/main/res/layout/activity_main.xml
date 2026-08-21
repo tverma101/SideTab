@@ -373,14 +373,14 @@
                         android:id="@+id/checkMacServer"
                         android:layout_width="10dp"
                         android:layout_height="10dp"
-                        android:background="@drawable/status_indicator_red"
+                        android:background="@drawable/status_indicator_pending"
                         android:layout_marginEnd="10dp" />
                     <TextView
                         android:id="@+id/textMacServer"
                         android:layout_width="0dp"
                         android:layout_weight="1"
                         android:layout_height="wrap_content"
-                        android:text="Mac server running"
+                        android:text="Mac server · checked when you tap Connect"
                         android:textColor="@color/ss_text_secondary"
                         android:textSize="13sp" />
                 </LinearLayout>
@@ -411,7 +411,7 @@
                     android:id="@+id/statusIndicator"
                     android:layout_width="10dp"
                     android:layout_height="10dp"
-                    android:background="@drawable/status_indicator"
+                    android:background="@drawable/status_indicator_amber"
                     android:layout_marginEnd="10dp" />
 
                 <TextView
@@ -419,10 +419,20 @@
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:text="Ready to connect"
+                    android:text="Ready — tap Connect to start"
                     android:textColor="@color/ss_text_secondary"
                     android:textSize="14sp" />
             </LinearLayout>
+
+            <TextView
+                android:id="@+id/connectionHintText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Manual mode · automatic reconnect is off"
+                android:textColor="@color/ss_text_tertiary"
+                android:textSize="12sp"
+                android:gravity="center"
+                android:layout_marginBottom="20dp" />
 
             <!-- Advanced Settings (collapsed by default) -->
             <LinearLayout

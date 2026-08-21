@@ -64,6 +64,11 @@ class PreferencesManager(
         get() = prefs.getFloat("cfl_strength", 0.15f).coerceIn(0f, 1f)
         set(value) = prefs.edit().putFloat("cfl_strength", value.coerceIn(0f, 1f)).apply()
 
+    /** Neutral-anchored SDR Cb/Cr correction for the Android GPU display path. */
+    var androidColorProfileEnabled: Boolean
+        get() = prefs.getBoolean("android_color_profile", AndroidColorProfile.DEFAULT_ENABLED)
+        set(value) = prefs.edit().putBoolean("android_color_profile", value).apply()
+
     var vsrEdgeThreshold: Float
         get() = prefs.getFloat("vsr_edge_threshold", 8.0f / 255.0f)
         set(value) = prefs.edit().putFloat("vsr_edge_threshold", value).apply()

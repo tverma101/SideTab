@@ -321,12 +321,16 @@ struct SettingsView: View {
                         // Refresh Rate (own block)
                         FrostedGroupBox(title: "Refresh Rate", icon: "speedometer") {
                             VStack(alignment: .leading, spacing: 8) {
+                                let displayedRefreshRate = WirelessSessionProfile.frameRate(
+                                    for: settings.connectionMode,
+                                    requested: settings.effectiveRefreshRate
+                                )
                                 HStack {
                                     Text("Frame Rate")
                                         .font(.system(size: 11))
                                         .foregroundColor(.secondary)
                                     Spacer()
-                                    Text("\(settings.refreshRate) Hz")
+                                    Text("\(displayedRefreshRate) Hz")
                                         .font(.system(size: 11, weight: .medium))
                                 }
 
@@ -335,15 +339,19 @@ struct SettingsView: View {
                                         BitrateButton(
                                             label: "\(rate)",
                                             value: rate,
-                                            currentValue: settings.refreshRate,
-                                            disabled: false
+                                            currentValue: displayedRefreshRate,
+                                            disabled: settings.connectionMode == .wireless && rate > WirelessSessionProfile.frameRate
                                         ) {
                                             settings.refreshRate = rate
                                         }
                                     }
                                 }
 
-                                if settings.refreshRate >= 90 {
+                                if settings.connectionMode == .wireless {
+                                    Text("Wireless is fixed at 60 FPS for stable Wi-Fi and lower tablet power use.")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                } else if settings.refreshRate >= 90 {
                                     Text("High refresh rate for smooth experience")
                                         .font(.system(size: 10))
                                         .foregroundColor(.green)

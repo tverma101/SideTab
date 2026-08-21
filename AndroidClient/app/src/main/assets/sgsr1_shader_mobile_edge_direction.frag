@@ -133,5 +133,5 @@ void main()
 	}
 
 	color.w = 1.0;
-	out_Target0 = color;
+	out_Target0 = vec4(applyAndroidColorProfile(color.rgb), 1.0);
 }

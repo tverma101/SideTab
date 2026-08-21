@@ -31,6 +31,7 @@ class ScreenCapture {
     private var display: SCDisplay?
     private var virtualDisplayID: CGDirectDisplayID?
     private var refreshRate: Int = 60
+    private var frameRateCap: Int?
 
     // Thread-safe state for cross-thread access (frame output queue + main queue)
     private let stateLock = OSAllocatedUnfairLock(initialState: FrameMonitorState())
@@ -73,6 +74,7 @@ class ScreenCapture {
     private var currentQuality: String = "medium"
     private var currentGamingBoost: Bool = false
     private var currentFrameRate: Int = 60
+    private var currentBitrateCapMbps: Int?
 
     // Encoding pipeline state (captured by frame handler closure)
     private var encodeQueue: DispatchQueue?
@@ -210,9 +212,10 @@ class ScreenCapture {
     }
 
     /// Setup screen capture for a specific virtual display
-    func setupForVirtualDisplay(_ displayID: CGDirectDisplayID, refreshRate: Int = 60) async throws {
+    func setupForVirtualDisplay(_ displayID: CGDirectDisplayID, refreshRate: Int = 60, frameRateCap: Int? = nil) async throws {
         self.virtualDisplayID = displayID
         self.refreshRate = refreshRate
+        self.frameRateCap = frameRateCap
         try await setupDisplay()
         try await setupStream()
         await MainActor.run { registerWakeObservers() }
@@ -351,7 +354,8 @@ class ScreenCapture {
         // EXP-FORK: SideScreen_exp_fps caps the capture cadence (e.g. 90) —
         // a stable 90 beats a jittery 120 when the pipeline can't hold 120.
         let expFps = UserDefaults.standard.integer(forKey: "SideScreen_exp_fps")
-        let fps = expFps > 0 ? expFps : refreshRate
+        let requestedFrameRate = expFps > 0 ? expFps : refreshRate
+        let fps = min(requestedFrameRate, frameRateCap ?? Int.max)
 
         streamOutput = StreamOutput()
 
@@ -505,17 +509,22 @@ class ScreenCapture {
 
     // MARK: - Start streaming
 
-    func startStreaming(to server: StreamingServer?, bitrateMbps: Int = 20, quality: String = "medium", gamingBoost: Bool = false, frameRate: Int = 60) {
+    func startStreaming(to server: StreamingServer?, bitrateMbps: Int = 20, quality: String = "medium", gamingBoost: Bool = false, frameRate: Int = 60, bitrateCapMbps: Int? = nil, frameRateCap: Int? = nil) {
         // Save parameters for potential restart
         currentServer = server
         // EXP-FORK: SideScreen_exp_fps cap applies to the encoder too (rate
         // control must expect the same cadence the capture actually delivers).
         let expFps = UserDefaults.standard.integer(forKey: "SideScreen_exp_fps")
-        let effFrameRate = expFps > 0 ? expFps : frameRate
+        // A wireless session is hard-capped even if an old experiment knob
+        // still requests 90/120 FPS. USB retains the prior exp-fps behavior.
+        self.frameRateCap = frameRateCap
+        let requestedFrameRate = expFps > 0 ? expFps : frameRate
+        let effFrameRate = min(requestedFrameRate, frameRateCap ?? Int.max)
         currentBitrateMbps = bitrateMbps
         currentQuality = quality
         currentGamingBoost = gamingBoost
         currentFrameRate = effFrameRate
+        currentBitrateCapMbps = bitrateCapMbps
 
         isStreaming = true
 
@@ -532,7 +541,7 @@ class ScreenCapture {
             HDRConverter.ensureSetup(width: width, height: height)
         }
 
-        encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: effFrameRate)
+        encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: effFrameRate, maxBitrateMbps: bitrateCapMbps)
         encoder?.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }
@@ -916,7 +925,7 @@ class ScreenCapture {
     private func rebuildEncoder() {
         let (width, height) = encodeSize(for: codec)
         let server = currentServer
-        let newEncoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: currentBitrateMbps, quality: currentQuality, gamingBoost: currentGamingBoost, frameRate: currentFrameRate)
+        let newEncoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: currentBitrateMbps, quality: currentQuality, gamingBoost: currentGamingBoost, frameRate: currentFrameRate, maxBitrateMbps: currentBitrateCapMbps)
         newEncoder.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }

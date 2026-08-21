@@ -18,7 +18,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import android.provider.Settings
 import android.view.MotionEvent
 import android.view.Surface
@@ -43,16 +42,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
 // Debug A/B hook action: adb shell am broadcast -a com.sidescreen.app.VSR_CMD
 //   --ez enabled true --es mode sgsr [--ef sharpness 0.8] [--ef edge_threshold 0.03]
-//   --ez enabled true --es mode cfl [--ef cfl_strength 0.15]
+//   --ez enabled true --es mode cfl [--ef cfl_strength 0.15] [--ez color_profile false]
 private const val VSR_CMD_ACTION = "com.sidescreen.app.VSR_CMD"
 private const val DEFAULT_USB_HOST = "127.0.0.1"
 private const val DEFAULT_USB_PORT = 54321
@@ -77,22 +72,22 @@ class MainActivity : AppCompatActivity() {
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
     private var displayFlipHorizontal = false
     private var displayFlipVertical = false
-    private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
-    // Auto-reconnect: an interrupted session (host restart, transport blip,
-    // or failed connect) retries with capped backoff until the user
-    // explicitly disconnects. Before this, a sender restart left the app on
-    // its disconnected screen until someone tapped CONNECT — while the
-    // checklist probe hammered the Mac video port every 2s (2026-08-16).
-    private var autoReconnectJob: Job? = null
-    private var autoReconnectAttempt = 0
     // All callbacks from an old StreamClient become inert as soon as a newer
     // connect starts. Without this generation fence, a sender restart can
     // leave several clients reconnecting at once and starve the decoder.
     @Volatile private var activeConnectionGeneration = 0L
 
-    @Volatile private var userRequestedDisconnect = false
+    private var manualConnectionState = ManualConnectionState.READY
+
+    private enum class ManualConnectionState {
+        READY,
+        CONNECTING,
+        CONNECTED,
+        PAUSED,
+        FAILED,
+    }
 
     // For dragging stats overlay
     private var isDraggingOverlay = false
@@ -108,7 +103,7 @@ class MainActivity : AppCompatActivity() {
     private var isConnected = false // Track connection state to prevent checklist conflicts
 
     // Auto-disconnect: if the app stays backgrounded past the configured
-    // window (default 5 min; adb-tunable via
+    // window (default 60 s; adb-tunable via
     //   adb shell settings put system sidescreen_auto_disconnect_secs <N>)
     // the session tears itself down. A killed process needs no timer — its
     // sockets die and the host's idle-sleep takes over.
@@ -124,9 +119,6 @@ class MainActivity : AppCompatActivity() {
         // Allow rotation based on device sensor when not connected
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
 
-        // Keep screen on
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
         // Enable edge-to-edge display (draw behind system bars and cutout)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             window.attributes.layoutInDisplayCutoutMode =
@@ -139,9 +131,6 @@ class MainActivity : AppCompatActivity() {
         // Apply fullscreen mode immediately
         enableFullscreenMode()
 
-        // Enable performance mode for gaming (after binding is initialized)
-        enablePerformanceMode()
-
         setupSurface()
         setupUI()
         setupDraggableOverlay()
@@ -153,31 +142,9 @@ class MainActivity : AppCompatActivity() {
         setupWirelessController()
         setupVsrCommandReceiver()
 
-        // Boot-to-stream: resume the last live session automatically (an
-        // explicit disconnect() clears it). USB/E3 path only — wireless
-        // pairing has its own controller flow.
-        val savedSession = getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
-        val savedHost = savedSession.getString("host", null)
-        val savedPort = savedSession.getInt("port", 0)
-        if (savedHost != null && savedPort > 0 && prefs.connectionMode == ConnectionMode.USB) {
-            // Older E3 experiments persisted 10.77.0.1:54326 as the USB
-            // video endpoint. The current Mac host exposes the normal USB
-            // stream through adb-reverse on 127.0.0.1:54321; only its control
-            // channel remains on 54322. Do not resurrect the obsolete video
-            // endpoint on every app launch.
-            if (savedHost == LEGACY_E3_HOST && savedPort == LEGACY_E3_PORT) {
-                log("🔁 Migrating stale E3 session $savedHost:$savedPort -> $DEFAULT_USB_HOST:$DEFAULT_USB_PORT")
-                savedSession
-                    .edit()
-                    .putString("host", DEFAULT_USB_HOST)
-                    .putInt("port", DEFAULT_USB_PORT)
-                    .apply()
-                connect(DEFAULT_USB_HOST, DEFAULT_USB_PORT)
-            } else {
-                log("🔁 Resuming last session $savedHost:$savedPort")
-                connect(savedHost, savedPort)
-            }
-        }
+        // USB screen sharing is deliberately manual. ADB/USB becoming
+        // available must never open a video or control socket on its own.
+        log("Manual connection mode enabled — tap Connect to start")
     }
 
     private fun setupModeToggle() {
@@ -200,11 +167,9 @@ class MainActivity : AppCompatActivity() {
     private fun applyModeVisibility(mode: ConnectionMode) {
         binding.usbModeContent.visibility = if (mode == ConnectionMode.USB) View.VISIBLE else View.GONE
         binding.wirelessModeContent.visibility = if (mode == ConnectionMode.WIRELESS) View.VISIBLE else View.GONE
-        // USB checklist polls 127.0.0.1:port every 2s via adb-reverse to verify Mac
-        // server reachability. While in Wireless mode that probe creates loopback
-        // connections that fight the wireless session for the Mac's single client
-        // slot — kicking the wireless client off seconds after it auths. Pause
-        // checklist updates whenever Wireless is the active tab.
+        // Checklist updates are local-only while idle. They must not probe the
+        // Mac listener because the host accepts one screen-sharing client and
+        // a background probe can look like an unwanted reconnect.
         if (mode == ConnectionMode.WIRELESS) {
             stopChecklistUpdates()
         } else {
@@ -277,32 +242,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Enable performance mode for streaming
-     * NOTE: setSustainedPerformanceMode is DISABLED - it causes thermal throttling
-     * which makes the entire device laggy. Normal power management is more efficient.
-     */
-    private fun enablePerformanceMode() {
-        try {
-            // REMOVED: setSustainedPerformanceMode(true)
-            // Sustained performance mode forces max CPU/GPU clocks which causes
-            // thermal throttling on extended use, making the device laggy.
-            // Let the SoC manage power efficiently instead.
-
-            // Use PARTIAL_WAKE_LOCK with timeout to prevent battery drain
-            // Screen is already kept on via FLAG_KEEP_SCREEN_ON
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock =
-                powerManager.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "SideScreen::PerformanceMode",
-                )
-            // 30 minute timeout instead of infinite acquire
-            wakeLock?.acquire(30 * 60 * 1000L)
-
-            log("🎮 Performance mode ENABLED (balanced)")
-        } catch (e: Exception) {
-            log("⚠️ Performance mode failed: ${e.message}")
+    /** Keep the panel awake only while an active stream is visible. */
+    private fun updateScreenPowerState(streamingVisible: Boolean) {
+        if (streamingVisible) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 
@@ -457,7 +402,14 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
 
-            updateStatus("Connecting...")
+            if (manualConnectionState == ManualConnectionState.CONNECTING) {
+                return@setOnClickListener
+            }
+
+            manualConnectionState = ManualConnectionState.CONNECTING
+            binding.connectButton.isEnabled = false
+            setStatusIndicator(R.drawable.status_indicator_amber)
+            updateStatus("Connecting…")
             connect(host, port)
         }
 
@@ -474,7 +426,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Initial status
-        updateStatus("Ready to connect")
+        updateStatus("Ready — tap Connect to start")
+        setStatusIndicator(R.drawable.status_indicator_amber)
     }
 
     private fun showError(message: String) {
@@ -492,6 +445,10 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             binding.statusText.text = status
         }
+    }
+
+    private fun setStatusIndicator(drawableRes: Int) {
+        binding.statusIndicator.setBackgroundResource(drawableRes)
     }
 
     @SuppressLint("ClickableViewAccessibility", "InflateParams")
@@ -705,6 +662,20 @@ class MainActivity : AppCompatActivity() {
             prefs.vsrEnabled = isChecked
             restartVideoPath()
         }
+
+        val androidColorProfileSwitch = view.findViewById<SwitchMaterial>(R.id.androidColorProfileSwitch)
+        val androidColorProfileStatus = view.findViewById<TextView>(R.id.androidColorProfileStatus)
+        val colorProfileSupported = supportsGles31()
+        androidColorProfileSwitch.isChecked = prefs.androidColorProfileEnabled
+        androidColorProfileSwitch.isEnabled = colorProfileSupported
+        androidColorProfileStatus.text =
+            if (colorProfileSupported) AndroidColorProfile.NAME else "Requires OpenGL ES 3.1 GPU path"
+        androidColorProfileSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.androidColorProfileEnabled = isChecked
+            sgsrRenderer?.setAndroidColorProfileEnabled(isChecked)
+            cflRenderer?.setAndroidColorProfileEnabled(isChecked)
+        }
+
         vsrModeBridge.setOnClickListener {
             prefs.vsrMode = SgsrRenderer.Mode.BRIDGE_ONLY.name
             updateVsrModeSelection()
@@ -1123,6 +1094,12 @@ class MainActivity : AppCompatActivity() {
                     val i = intent ?: return
                     if (i.action != VSR_CMD_ACTION) return
                     val mode = i.getStringExtra("mode")
+                    val changesVideoPath =
+                        mode != null ||
+                            i.hasExtra("enabled") ||
+                            i.hasExtra("sharpness") ||
+                            i.hasExtra("cfl_strength") ||
+                            i.hasExtra("edge_threshold")
                     val enabled =
                         if (i.hasExtra("enabled")) {
                             i.getBooleanExtra("enabled", false)
@@ -1133,9 +1110,18 @@ class MainActivity : AppCompatActivity() {
                     i.getFloatExtra("sharpness", -1f).takeIf { it >= 0f }?.let { prefs.vsrSharpness = it }
                     i.getFloatExtra("cfl_strength", -1f).takeIf { it >= 0f }?.let { prefs.cflStrength = it }
                     i.getFloatExtra("edge_threshold", -1f).takeIf { it >= 0f }?.let { prefs.vsrEdgeThreshold = it }
-                    prefs.vsrEnabled = enabled
-                    mainDiag("VSR_CMD: enabled=$enabled mode=${prefs.vsrMode}")
-                    restartVideoPath()
+                    if (changesVideoPath) prefs.vsrEnabled = enabled
+                    if (i.hasExtra("color_profile")) {
+                        val profileEnabled = i.getBooleanExtra("color_profile", AndroidColorProfile.DEFAULT_ENABLED)
+                        prefs.androidColorProfileEnabled = profileEnabled
+                        sgsrRenderer?.setAndroidColorProfileEnabled(profileEnabled)
+                        cflRenderer?.setAndroidColorProfileEnabled(profileEnabled)
+                    }
+                    mainDiag(
+                        "VSR_CMD: enabled=${if (changesVideoPath) enabled else prefs.vsrEnabled} " +
+                            "mode=${prefs.vsrMode} colorProfile=${prefs.androidColorProfileEnabled}",
+                    )
+                    if (changesVideoPath) restartVideoPath()
                 }
             }
         val filter = IntentFilter(VSR_CMD_ACTION)
@@ -1229,8 +1215,12 @@ class MainActivity : AppCompatActivity() {
                     }
                     renderer.onPlanesUnavailable = unavailable
                     renderer.setStrength(prefs.cflStrength)
+                    renderer.setAndroidColorProfileEnabled(prefs.androidColorProfileEnabled)
                     cflRenderer = renderer
-                    mainDiag("CfL active (luma-guided chroma reconstruction, buffer decode)")
+                    mainDiag(
+                        "CfL active (luma-guided chroma reconstruction, buffer decode) " +
+                            "colorProfile=${prefs.androidColorProfileEnabled}",
+                    )
                 } catch (e: Exception) {
                     mainDiag("CfL init failed (${e.message}) — falling back to direct surface")
                     cflRenderer?.release()
@@ -1244,6 +1234,7 @@ class MainActivity : AppCompatActivity() {
                     renderer.setMode(SgsrRenderer.Mode.from(prefs.vsrMode))
                     renderer.setSharpness(prefs.vsrSharpness)
                     renderer.setEdgeThreshold(prefs.vsrEdgeThreshold)
+                    renderer.setAndroidColorProfileEnabled(prefs.androidColorProfileEnabled)
                     renderer.onStats = { s ->
                         mainDiag(
                             "VSR stats: ${s.summary()} " +
@@ -1253,7 +1244,10 @@ class MainActivity : AppCompatActivity() {
                     }
                     sgsrRenderer = renderer
                     decoderSurface = renderer.decoderSurfaceRef ?: surface
-                    mainDiag("VSR active: mode=${prefs.vsrMode} sharpness=${prefs.vsrSharpness}")
+                    mainDiag(
+                        "VSR active: mode=${prefs.vsrMode} sharpness=${prefs.vsrSharpness} " +
+                            "colorProfile=${prefs.androidColorProfileEnabled}",
+                    )
                 } catch (e: Exception) {
                     mainDiag("VSR init failed (${e.message}) — falling back to direct surface")
                     sgsrRenderer?.release()
@@ -1267,7 +1261,19 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             val useBufferOutput = cflRenderer != null
-            videoDecoder = VideoDecoder(decoderSurface, displayObj, displayWidth, displayHeight, mime, bufferOutput = useBufferOutput)
+            videoDecoder = VideoDecoder(
+                decoderSurface,
+                displayObj,
+                displayWidth,
+                displayHeight,
+                mime,
+                targetFrameRate = if (prefs.connectionMode == ConnectionMode.WIRELESS) {
+                    WirelessTransportProfile.TARGET_FPS
+                } else {
+                    null
+                },
+                bufferOutput = useBufferOutput,
+            )
             if (useBufferOutput) {
                 cflRenderer?.let { renderer ->
                     videoDecoder?.onDecodedImage = { img, done -> renderer.submitImage(img, done) }
@@ -1314,7 +1320,12 @@ class MainActivity : AppCompatActivity() {
             }
             streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
             mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, texture=$useTextureView")
-            log("✅ Decoder initialized ${displayWidth}x$displayHeight $mime (${displayObj?.refreshRate ?: 60f}Hz)")
+            val effectiveDecoderRate = if (prefs.connectionMode == ConnectionMode.WIRELESS) {
+                WirelessTransportProfile.TARGET_FPS.toFloat()
+            } else {
+                displayObj?.refreshRate ?: 60f
+            }
+            log("✅ Decoder initialized ${displayWidth}x$displayHeight $mime (${effectiveDecoderRate}Hz target)")
         } catch (e: Exception) {
             decoderUsingTextureView = false
             mainDiag("Decoder init FAILED: ${e.message}")
@@ -1354,17 +1365,20 @@ class MainActivity : AppCompatActivity() {
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
                 isConnected = connected
+                manualConnectionState =
+                    if (connected) ManualConnectionState.CONNECTED else ManualConnectionState.PAUSED
                 if (connected) {
-                    updateStatus("Connected - Streaming active")
+                    updateStatus("Connected · streaming active")
                 } else {
-                    updateStatus("Disconnected")
+                    updateStatus("Connection paused · tap Connect to resume")
                 }
                 binding.connectButton.isEnabled = !connected
                 binding.disconnectButton.isEnabled = connected
-                binding.statusIndicator.setBackgroundResource(
-                    if (connected) android.R.color.holo_green_light else android.R.color.holo_red_light,
+                setStatusIndicator(
+                    if (connected) R.drawable.status_indicator_green else R.drawable.status_indicator_amber,
                 )
                 if (connected) {
+                    updateScreenPowerState(true)
                     startPingTimer()
                     stopChecklistUpdates()
                     enableFullscreenMode()
@@ -1384,6 +1398,8 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
                 } else {
+                    updateScreenPowerState(false)
+                    releaseVideoPipeline()
                     stopPingTimer()
                     disableFullscreenMode()
                     resetOrientationToSensor()
@@ -1401,7 +1417,7 @@ class MainActivity : AppCompatActivity() {
                         // Tell wireless controller to show the idle/reconnect UI.
                         wirelessController.onStreamDisconnected()
                     } else {
-                        log("📋 Restarting checklist updates")
+                        log("Manual reconnect required — automatic reconnect is disabled")
                         startChecklistUpdates()
                     }
                 }
@@ -1469,12 +1485,6 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
-        // A fresh/explicit connect re-arms auto-reconnect (it is only
-        // disarmed by an explicit user disconnect()).
-        userRequestedDisconnect = false
-        autoReconnectJob?.cancel()
-        autoReconnectJob = null
-
         // Invalidate and close the previous client before creating its
         // replacement. Older callbacks are fenced by this generation.
         val generation = activeConnectionGeneration + 1
@@ -1550,39 +1560,33 @@ class MainActivity : AppCompatActivity() {
 
                         // Update connection state flag
                         isConnected = connected
+                        manualConnectionState =
+                            if (connected) ManualConnectionState.CONNECTED else ManualConnectionState.PAUSED
 
                         if (connected) {
-                            updateStatus("Connected - Streaming active")
+                            updateStatus("Connected · streaming active")
                         } else {
-                            updateStatus("Disconnected")
+                            updateStatus("Connection paused · tap Connect to resume")
                         }
 
                         binding.connectButton.isEnabled = !connected
                         binding.disconnectButton.isEnabled = connected
 
                         // Update status indicator color
-                        binding.statusIndicator.setBackgroundResource(
+                        setStatusIndicator(
                             if (connected) {
-                                android.R.color.holo_green_light
+                                R.drawable.status_indicator_green
                             } else {
-                                android.R.color.holo_red_light
+                                R.drawable.status_indicator_amber
                             },
                         )
 
                         if (connected) {
+                            updateScreenPowerState(true)
                             // Start periodic ping for latency measurement
                             startPingTimer()
-                            autoReconnectAttempt = 0
 
-                            // Remember the live session for boot-to-stream
-                            // resume after an app/device restart.
-                            getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
-                                .edit()
-                                .putString("host", host)
-                                .putInt("port", port)
-                                .apply()
-
-                            // Stop checklist updates when connected (prevents socket conflicts)
+                            // Stop local-only checklist updates while the stream is active.
                             stopChecklistUpdates()
 
                             // Enter fullscreen mode when connected
@@ -1593,6 +1597,8 @@ class MainActivity : AppCompatActivity() {
                             restoreSettingsButtonPosition()
                             updateOverlayVisibility(prefs.showStatsOverlay)
                         } else {
+                            updateScreenPowerState(false)
+                            releaseVideoPipeline()
                             // Stop ping timer
                             stopPingTimer()
 
@@ -1606,13 +1612,10 @@ class MainActivity : AppCompatActivity() {
                             binding.settingsButton.visibility = View.GONE
                             binding.statusBar.visibility = View.GONE
 
-                            // Restart checklist updates immediately
-                            log("📋 Restarting checklist updates")
+                            // Resume local-only checklist updates. Reconnecting is
+                            // intentionally left to the user.
+                            log("Manual reconnect required — automatic reconnect is disabled")
                             startChecklistUpdates()
-
-                            // Session dropped without the user asking — bring
-                            // it back (host restart, transport blip).
-                            scheduleAutoReconnect(host, port)
                         }
                     }
                 }
@@ -1680,11 +1683,12 @@ class MainActivity : AppCompatActivity() {
                     }
                 runOnUiThread {
                     if (!isCurrentConnection(client, generation)) return@runOnUiThread
-                    updateStatus("Connection failed")
+                    manualConnectionState = ManualConnectionState.FAILED
+                    binding.connectButton.isEnabled = true
+                    binding.disconnectButton.isEnabled = false
+                    setStatusIndicator(R.drawable.status_indicator_red)
+                    updateStatus("Connection failed · tap Connect to retry")
                     showError(errorMessage)
-                    // Retryable failure (server restarting, transport down):
-                    // schedule instead of leaving the app dead on its checklist.
-                    scheduleAutoReconnect(host, port)
                 }
             }
         }
@@ -1695,60 +1699,47 @@ class MainActivity : AppCompatActivity() {
         generation: Long,
     ): Boolean = activeConnectionGeneration == generation && streamClient === client
 
-    /**
-     * Retry a dropped or failed session with capped exponential backoff
-     * (1s, 2s, 4s, 8s, then every 10s). Cancelled by an explicit disconnect()
-     * or a newer schedule. The reconnect attempt itself re-enters connect(),
-     * so each failure reschedules naturally until it succeeds.
-     */
-    private fun scheduleAutoReconnect(
-        host: String,
-        port: Int,
-    ) {
-        if (userRequestedDisconnect || isFinishing) return
-        // A single failed client can report through both its receive loop and
-        // its connect path. Keep one scheduled retry instead of continuously
-        // cancelling/restarting the backoff and creating overlapping clients.
-        if (autoReconnectJob?.isActive == true) return
-        val delayMs = (1000L shl autoReconnectAttempt.coerceAtMost(3)).coerceAtMost(10_000L)
-        autoReconnectAttempt += 1
-        log("🔁 Auto-reconnect to $host:$port in ${delayMs / 1000.0}s (attempt $autoReconnectAttempt)")
-        autoReconnectJob =
-            lifecycleScope.launch(Dispatchers.Main) {
-                kotlinx.coroutines.delay(delayMs)
-                if (!userRequestedDisconnect && !isConnected && !isFinishing) {
-                    updateStatus("Reconnecting...")
-                    connect(host, port)
-                }
-            }
-    }
-
-    private fun disconnect() {
-        userRequestedDisconnect = true
+    private fun disconnect(restartChecklist: Boolean = true) {
         activeConnectionGeneration += 1
-        autoReconnectJob?.cancel()
-        autoReconnectJob = null
-        autoReconnectAttempt = 0
-        // Explicit disconnect ends the session for good — do not resume it
-        // on next launch.
-        getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
-            .edit()
-            .clear()
-            .apply()
+        manualConnectionState = ManualConnectionState.READY
+        isConnected = false
         stopPingTimer()
         streamClient?.disconnect()
         streamClient = null
+        releaseVideoPipeline()
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
         runOnUiThread {
+            updateScreenPowerState(false)
+            disableFullscreenMode()
+            resetOrientationToSensor()
             applyDirectPixelMapping(0, 0)
             binding.textureView.visibility = View.GONE
             applyTextureTransform()
+            binding.settingsPanel.visibility = View.VISIBLE
+            binding.settingsButton.visibility = View.GONE
+            binding.statusBar.visibility = View.GONE
+            binding.connectButton.isEnabled = true
+            binding.disconnectButton.isEnabled = false
+            setStatusIndicator(R.drawable.status_indicator_amber)
+            updateStatus("Ready — tap Connect to start")
+            if (restartChecklist && prefs.connectionMode == ConnectionMode.USB) {
+                startChecklistUpdates()
+            }
         }
-        log("Disconnected")
+        log("Disconnected — automatic reconnect is disabled")
+    }
+
+    private fun releaseVideoPipeline() {
+        videoDecoder?.release()
+        videoDecoder = null
+        sgsrRenderer?.release()
+        sgsrRenderer = null
+        cflRenderer?.release()
+        cflRenderer = null
     }
 
     private fun startPingTimer() {
@@ -1756,7 +1747,7 @@ class MainActivity : AppCompatActivity() {
         pingJob =
             lifecycleScope.launch(Dispatchers.IO) {
                 while (true) {
-                    kotlinx.coroutines.delay(1000) // Ping every 1 second
+                    kotlinx.coroutines.delay(LATENCY_PING_INTERVAL_MS)
                     streamClient?.sendPing()
                 }
             }
@@ -1769,26 +1760,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun cleanup() {
         try {
-            disconnect()
-            videoDecoder?.release()
-            videoDecoder = null
-            sgsrRenderer?.release()
-            sgsrRenderer = null
-            cflRenderer?.release()
-            cflRenderer = null
+            disconnect(restartChecklist = false)
             currentTextureSurface?.release()
             currentTextureSurface = null
-
-            // Release wake lock safely
-            try {
-                if (wakeLock?.isHeld == true) {
-                    wakeLock?.release()
-                }
-            } catch (e: Exception) {
-                // Ignore wake lock release errors
-            }
-            wakeLock = null
-            log("🎮 Performance mode DISABLED")
         } catch (e: Exception) {
             log("⚠️ Cleanup error: ${e.message}")
         }
@@ -1913,15 +1887,24 @@ class MainActivity : AppCompatActivity() {
         backgroundedAtMs = 0L
         autoDisconnectJob?.cancel()
         autoDisconnectJob = null
+        updateScreenPowerState(isConnected)
+        if (isConnected) {
+            startPingTimer()
+        }
+        if (!isConnected && prefs.connectionMode == ConnectionMode.USB) {
+            startChecklistUpdates()
+        }
     }
 
     override fun onStop() {
         super.onStop()
+        updateScreenPowerState(false)
+        stopPingTimer()
         // Backgrounded while streaming: arm the auto-disconnect timer.
         if (!isConnected) return
         backgroundedAtMs = System.currentTimeMillis()
         val secs =
-            Settings.System.getInt(contentResolver, "sidescreen_auto_disconnect_secs", 300)
+            Settings.System.getInt(contentResolver, "sidescreen_auto_disconnect_secs", DEFAULT_BACKGROUND_DISCONNECT_SECS)
                 .coerceAtLeast(10)
         autoDisconnectJob =
             lifecycleScope.launch {
@@ -1932,7 +1915,7 @@ class MainActivity : AppCompatActivity() {
                     System.currentTimeMillis() - backgroundedAtMs >= secs * 1000L
                 ) {
                     DiagLog.log("MA", "auto-disconnect: backgrounded > ${secs}s — tearing down session")
-                    disconnect()
+                    disconnect(restartChecklist = false)
                 }
             }
     }
@@ -1955,7 +1938,7 @@ class MainActivity : AppCompatActivity() {
             object : Runnable {
                 override fun run() {
                     updateChecklist()
-                    checklistHandler.postDelayed(this, 2000) // Update every 2 seconds
+                    checklistHandler.postDelayed(this, CHECKLIST_INTERVAL_MS) // Local checks only; no host polling
                 }
             }
         checklistHandler.post(checklistRunnable!!)
@@ -1995,54 +1978,52 @@ class MainActivity : AppCompatActivity() {
         val isUsbConnected = usbManager.deviceList.isNotEmpty() || isCharging()
         updateChecklistItem(binding.checkUsbConnected, isUsbConnected)
 
-        // Check Mac Server (try to connect to port)
-        lifecycleScope.launch(Dispatchers.IO) {
-            // Double-check connection state before socket test
-            if (isConnected) return@launch
+        // The Mac server is intentionally not probed while idle. A TCP probe
+        // is still a screen-sharing connection from the host's perspective,
+        // and can contend with the real client. The first explicit Connect
+        // is the only server check.
+        binding.textMacServer.text = "Mac server · checked when you tap Connect"
+        updateChecklistPending(binding.checkMacServer)
 
-            val port =
-                binding.portInput.text
-                    .toString()
-                    .toIntOrNull() ?: DEFAULT_USB_PORT
-            val host =
-                binding.hostInput.text
-                    .toString()
-                    .ifEmpty { DEFAULT_USB_HOST }
-            // Probe the CONTROL listener with a PING/PONG exchange first:
-            // it never touches the video port, so it cannot disturb a live
-            // or starting video session (the old video-port probe is what
-            // fed the 2026-08-16 reset storm), and the server does not burn
-            // an IDR on it while idle. A null result (nothing answered on
-            // the control port — pre-control-channel hosts, or adbd-only
-            // listeners) falls back to the legacy video-port probe.
-            val usesE3VideoPath = host == LEGACY_E3_HOST && port == LEGACY_E3_PORT
-            val controlHost = if (usesE3VideoPath) "127.0.0.1" else host
-            val controlPort = if (usesE3VideoPath) 54322 else port + 1
-            val isServerRunning =
-                checkServerRunningControl(controlHost, controlPort)
-                    ?: checkServerRunning(host, port)
-            runOnUiThread {
-                // Final check before updating UI
-                if (isConnected) return@runOnUiThread
-
-                updateChecklistItem(binding.checkMacServer, isServerRunning)
-
-                // Update main status indicator based on all checklist items
-                val allReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected && isServerRunning
-                updateMainStatus(allReady)
-            }
-        }
+        val localSetupReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected
+        updateMainStatus(localSetupReady)
     }
 
-    private fun updateMainStatus(allReady: Boolean) {
-        binding.statusIndicator.setBackgroundResource(
-            if (allReady) {
-                R.drawable.status_indicator_green
-            } else {
-                R.drawable.status_indicator_red
-            },
-        )
-        binding.statusText.text = if (allReady) "Ready to connect" else "Not ready to connect"
+    private fun updateMainStatus(localSetupReady: Boolean) {
+        when (manualConnectionState) {
+            ManualConnectionState.READY -> {
+                setStatusIndicator(
+                    if (localSetupReady) {
+                        R.drawable.status_indicator_amber
+                    } else {
+                        R.drawable.status_indicator_red
+                    },
+                )
+                binding.statusText.text =
+                    if (localSetupReady) {
+                        "Ready — tap Connect to start"
+                    } else {
+                        "USB setup needs attention"
+                    }
+            }
+
+            ManualConnectionState.CONNECTING -> {
+                setStatusIndicator(R.drawable.status_indicator_amber)
+                binding.statusText.text = "Connecting…"
+            }
+
+            ManualConnectionState.PAUSED -> {
+                setStatusIndicator(R.drawable.status_indicator_amber)
+                binding.statusText.text = "Connection paused · tap Connect to resume"
+            }
+
+            ManualConnectionState.FAILED -> {
+                setStatusIndicator(R.drawable.status_indicator_red)
+                binding.statusText.text = "Connection failed · tap Connect to retry"
+            }
+
+            ManualConnectionState.CONNECTED -> Unit
+        }
     }
 
     private fun updateChecklistItem(
@@ -2058,6 +2039,10 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun updateChecklistPending(indicator: View) {
+        indicator.setBackgroundResource(R.drawable.status_indicator_pending)
+    }
+
     private fun isCharging(): Boolean {
         val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         val batteryStatus = registerReceiver(null, intentFilter)
@@ -2066,101 +2051,11 @@ class MainActivity : AppCompatActivity() {
             status == android.os.BatteryManager.BATTERY_STATUS_FULL
     }
 
-    /**
-     * Check if Mac server is actually running (not just ADB reverse)
-     *
-     * Problem: When `adb reverse tcp:8888 tcp:8888` is active, ADB daemon listens on port 8888.
-     * A simple socket connect will succeed to ADB daemon, not the actual Mac server.
-     *
-     * Solution: After connecting, try to read data with a short timeout.
-     * Mac server sends display config (type=1) immediately upon connection.
-     * ADB daemon doesn't send anything, so read will timeout → false.
-     */
-    /**
-     * Server-alive probe on the dedicated CONTROL port: send PING
-     * ([4][clientTs 8] little-endian), expect PONG ([5][clientTs 8][serverTs 8]).
-     * Only a real SideScreen host answers with type 5, so this cannot be
-     * fooled by adbd listeners the way a bare TCP connect can.
-     *
-     * @return true  — control port answered with a PONG (server running)
-     *         null  — nothing usable on the control port (old host without a
-     *                 control listener, or connect refused); caller falls
-     *                 back to the legacy video-port probe
-     *         false — control port present but the exchange failed
-     */
-    private fun checkServerRunningControl(
-        host: String,
-        port: Int,
-    ): Boolean? {
-        var socket: Socket? = null
-        return try {
-            socket = Socket()
-            socket.connect(InetSocketAddress(host, port), 300)
-            socket.tcpNoDelay = true
-            socket.soTimeout = 300
-            val ping =
-                ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN).apply {
-                    put(4.toByte())
-                    putLong(System.nanoTime())
-                }
-            socket.getOutputStream().apply {
-                write(ping.array())
-                flush()
-            }
-            val input = socket.getInputStream()
-            val type = input.read()
-            if (type != 5) return null
-            // Drain the 16 payload bytes so the close is a clean FIN, not an RST.
-            val rest = ByteArray(16)
-            var read = 0
-            while (read < 16) {
-                val r = input.read(rest, read, 16 - read)
-                if (r <= 0) break
-                read += r
-            }
-            true
-        } catch (e: Exception) {
-            null
-        } finally {
-            try {
-                socket?.close()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    private fun checkServerRunning(
-        host: String,
-        port: Int,
-    ): Boolean {
-        var socket: Socket? = null
-        return try {
-            socket = Socket()
-            socket.connect(InetSocketAddress(host, port), 300) // 300ms connect timeout
-            socket.soTimeout = 200 // 200ms read timeout
-
-            // Try to read - Mac server sends display config immediately
-            // ADB daemon doesn't send anything, so read will timeout
-            val input = socket.getInputStream()
-            val firstByte = input.read() // Blocks up to soTimeout
-
-            // If we got data (>= 0), it's the real Mac server
-            // -1 means EOF (connection closed), anything else is data
-            firstByte >= 0
-        } catch (e: Exception) {
-            // Timeout, connection refused, or other error = server not running
-            false
-        } finally {
-            try {
-                socket?.close()
-            } catch (e: Exception) {
-                // ignore
-            }
-        }
-    }
-
     private companion object {
         const val DIRECT_PIXEL_MIN_SCALE = 0.97f
+        const val DEFAULT_BACKGROUND_DISCONNECT_SECS = 60
+        const val LATENCY_PING_INTERVAL_MS = 2_000L
+        const val CHECKLIST_INTERVAL_MS = 10_000L
     }
 
     /**

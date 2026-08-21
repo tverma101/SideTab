@@ -78,11 +78,17 @@ class CflRenderer {
      *  chroma smoothing means the true edge is softer than luma predicts).
      *  The conservative default is kept in PreferencesManager. */
     @Volatile private var strength = 0.15f
+    @Volatile private var androidColorProfileEnabled = AndroidColorProfile.DEFAULT_ENABLED
 
     fun setStrength(s: Float) {
         val v = s.coerceIn(0f, 1f)
         DiagLog.log(TAG, "strength=$v")
         strength = v
+    }
+
+    fun setAndroidColorProfileEnabled(enabled: Boolean) {
+        DiagLog.log(TAG, "androidColorProfile=$enabled")
+        androidColorProfileEnabled = enabled
     }
 
     // --- GL objects ---
@@ -99,6 +105,7 @@ class CflRenderer {
     private var srcSizeLoc = -1
     private var fullRangeLoc = -1
     private var strengthLoc = -1
+    private var androidColorProfileLoc = -1
 
     // --- stream geometry (luma = full res; chroma = half) ---
     @Volatile private var codedWidth = 0
@@ -194,6 +201,7 @@ class CflRenderer {
         srcSizeLoc = GLES31.glGetUniformLocation(program, "uSrcSize")
         fullRangeLoc = GLES31.glGetUniformLocation(program, "uFullRange")
         strengthLoc = GLES31.glGetUniformLocation(program, "uStrength")
+        androidColorProfileLoc = GLES31.glGetUniformLocation(program, "uAndroidColorProfile")
 
         // VideoToolbox pads coded height to a 16-multiple (observed 1752 ->
         // 1760). Nothing to pre-allocate here — textures size themselves
@@ -401,6 +409,7 @@ class CflRenderer {
         GLES31.glUniform2f(srcSizeLoc, codedWidth.toFloat(), codedHeight.toFloat())
         GLES31.glUniform1i(fullRangeLoc, if (fullRange) 1 else 0)
         GLES31.glUniform1f(strengthLoc, strength)
+        GLES31.glUniform1i(androidColorProfileLoc, if (androidColorProfileEnabled) 1 else 0)
         GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
         GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, yTex)
         GLES31.glActiveTexture(GLES31.GL_TEXTURE1)
@@ -520,6 +529,8 @@ class CflRenderer {
         uniform vec2 uSrcSize;
         out vec4 fragColor;
 
+        ${AndroidColorProfile.GLSL_FUNCTION}
+
         float fetchY(ivec2 p) {
             p = clamp(p, ivec2(0), ivec2(uSrcSize) - 1);
             return texelFetch(uY, p, 0).r;
@@ -588,7 +599,7 @@ class CflRenderer {
                            1.16438 * y - 0.39176 * cb - 0.81297 * cr,
                            1.16438 * y + 2.01723 * cb);
             }
-            fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+            fragColor = vec4(applyAndroidColorProfile(clamp(rgb, 0.0, 1.0)), 1.0);
         }
         """.trimIndent()
 

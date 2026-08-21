@@ -67,8 +67,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isStartingServer = false
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
 
+    /// Keep the bundle path visible in the diagnostic log. Screen Recording
+    /// approval is identity-scoped on macOS; launching a second copy with the
+    /// same display name can otherwise look like a permission regression.
+    private func logRuntimeIdentity() {
+        let bundle = Bundle.main
+        debugLog(
+            "Runtime identity: bundle=\(bundle.bundleIdentifier ?? "unknown") " +
+                "path=\(bundle.bundlePath)"
+        )
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
+        logRuntimeIdentity()
 
         // Create menu bar item
         setupMenuBar()
@@ -113,19 +125,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.autoStartStreamingOnLaunch {
             settings.connectionMode = settings.startupMode
             Task {
-                // CAMPAIGN FORK: forceStart bypass (proven pattern) — skips the
-                // permission/SCShareableContent dance so cold starts bind fast
-                // (the experiment runner depends on deterministic startup).
-                if UserDefaults.standard.bool(forKey: "SideScreen_forceStart") {
-                    debugLog("FORCE-START active — bypassing permission checks entirely")
+                // Permission must be checked before auto-start. The old
+                // forceStart experiment path still called startServer(), which
+                // rejected the request anyway and made every stale/duplicate
+                // install look like a repeated permission failure.
+                await self.checkPermissions()
+                if self.settings.hasScreenRecordingPermission {
                     await self.startServer()
                 } else {
-                    await self.checkPermissions()
-                    if self.settings.hasScreenRecordingPermission {
-                        await self.startServer()
-                    } else {
-                        debugLog("Auto-start skipped: Screen Recording permission not granted")
-                    }
+                    debugLog("Auto-start skipped: Screen Recording permission not granted")
                 }
             }
         }
@@ -374,6 +382,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func checkPermissions() async {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         debugLog("checkPermissions — macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)")
+        logRuntimeIdentity()
 
         // Check Screen Recording permission using CoreGraphics API
         let hasScreenCapture = CGPreflightScreenCaptureAccess()
@@ -569,13 +578,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
+            let isWirelessSession = settings.connectionMode == .wireless
+            let sessionFrameRate = WirelessSessionProfile.frameRate(
+                for: settings.connectionMode,
+                requested: settings.effectiveRefreshRate
+            )
+            let sessionBitrateCap = WirelessSessionProfile.bitrateCap(for: settings.connectionMode)
+            debugLog(
+                "Session profile: mode=\(settings.connectionMode.rawValue) " +
+                    "fps=\(sessionFrameRate)" +
+                    (sessionBitrateCap.map { ", avgBitrateCap=\($0)Mbps, peak=\(WirelessSessionProfile.peakBitrateMbps)Mbps" } ?? "")
+            )
+
             // Create virtual display and run ADB setup in parallel
             virtualDisplayManager = VirtualDisplayManager()
             let size = settings.resolutionSize
             try virtualDisplayManager?.createDisplay(
                 width: size.width,
                 height: size.height,
-                refreshRate: settings.refreshRate,
+                // A wireless panel may refresh at 120 Hz, but producing 120
+                // capture frames over Wi-Fi wastes power and creates bursts.
+                // Keep the actual virtual display mode at the session cap.
+                refreshRate: isWirelessSession ? WirelessSessionProfile.frameRate : settings.refreshRate,
                 hiDPI: settings.hiDPI,
                 name: "SideScreen"
             )
@@ -622,7 +646,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.settings.captureMethod = method
                 }
             }
-            try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            try await screenCapture?.setupForVirtualDisplay(
+                displayID,
+                refreshRate: sessionFrameRate,
+                frameRateCap: isWirelessSession ? WirelessSessionProfile.frameRate : nil
+            )
 
             // Setup server. Control channel (out-of-band ping/pong + keyframe
             // requests) runs on its own port: settings.port + 1, overridable
@@ -738,7 +766,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 bitrateMbps: settings.effectiveBitrate,
                 quality: settings.effectiveQuality,
                 gamingBoost: settings.gamingBoost,
-                frameRate: settings.effectiveRefreshRate
+                frameRate: sessionFrameRate,
+                bitrateCapMbps: sessionBitrateCap,
+                frameRateCap: isWirelessSession ? WirelessSessionProfile.frameRate : nil
             )
 
             await MainActor.run {

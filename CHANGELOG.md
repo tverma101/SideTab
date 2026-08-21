@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-touch gestures
 - Stylus/pen support
 
+### Wireless efficiency profile
+- Wireless sessions now cap capture, encoding, and Android decoder operating rate at 60 FPS, even when the tablet panel supports 90/120 Hz.
+- Wireless encoding uses a bounded 40 Mbps average target with the existing one-second 1.5x ceiling (approximately 60 Mbps peak) to reduce WiFi bursts, decoder pressure, and tablet power use.
+- Video and the optional control channel bind to the selected WiFi route, including local-only WiFi networks; background reconnect and TCP keepalive remain disabled.
+
+### macOS installation and permission identity
+- Added `scripts/install_mac.sh` as the canonical local install path (`~/Applications/SideScreen.app`). It preserves the previous bundle, signs the current build with the repository's stable local requirement, and logs the exact bundle path used for Screen Recording.
+- Removed the ineffective force-start permission bypass from auto-start. Auto-start now checks the current bundle's Screen Recording grant before attempting capture, avoiding repeated permission failures from stale duplicate installs.
+
 ---
 
 <a id="0.11.1"></a>

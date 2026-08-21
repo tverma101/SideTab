@@ -3,6 +3,7 @@ package com.sidescreen.app
 import android.content.Context
 import android.util.Log
 import java.io.File
+import java.util.HashMap
 import java.util.concurrent.Executors
 
 /**
@@ -16,6 +17,9 @@ object DiagLog {
 
     @Volatile
     private var logFile: File? = null
+
+    private val sampledLogLock = Any()
+    private val lastSampledLogAtNs = HashMap<String, Long>()
 
     private val logExecutor =
         Executors.newSingleThreadExecutor { runnable ->
@@ -34,6 +38,46 @@ object DiagLog {
         msg: String,
     ) {
         Log.d(tag, msg)
+        enqueueFileWrite(tag, msg)
+    }
+
+    /**
+     * Keep every sample in logcat, but persist at most one sample per key in
+     * the requested interval. High-frequency diagnostics should not turn a
+     * latency probe into a stream of app-private file opens and writes.
+     */
+    fun logSampled(
+        tag: String,
+        key: String,
+        msg: String,
+        intervalMs: Long,
+    ) {
+        Log.d(tag, msg)
+        if (intervalMs <= 0L) {
+            enqueueFileWrite(tag, msg)
+            return
+        }
+
+        val now = System.nanoTime()
+        val intervalNs = intervalMs * 1_000_000L
+        val shouldPersist = synchronized(sampledLogLock) {
+            val previous = lastSampledLogAtNs[key]
+            if (previous != null && now - previous < intervalNs) {
+                false
+            } else {
+                lastSampledLogAtNs[key] = now
+                true
+            }
+        }
+        if (shouldPersist) {
+            enqueueFileWrite(tag, msg)
+        }
+    }
+
+    private fun enqueueFileWrite(
+        tag: String,
+        msg: String,
+    ) {
         val f = logFile ?: return
         logExecutor.execute {
             try {

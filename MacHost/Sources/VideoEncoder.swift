@@ -17,11 +17,13 @@ class VideoEncoder {
     private var quality: String = "medium"
     private var gamingBoost: Bool = false
     private var frameRate: Int = 60
+    private let maxBitrateMbps: Int?
     private let stateLock = OSAllocatedUnfairLock(initialState: EncoderState())
-    init(width: Int, height: Int, codec: StreamCodec = .hevc, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60) {
+    init(width: Int, height: Int, codec: StreamCodec = .hevc, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60, maxBitrateMbps: Int? = nil) {
         self.width = width
         self.height = height
         self.codec = codec
+        self.maxBitrateMbps = maxBitrateMbps
         // gamingBoost = the "ultralow" bitrate preset (6/9 Mbps bounded): the
         // bounded-frame-size profile that keeps encode time flat under motion
         // (the old gamingBoost overrides were no-ops once Quality took over
@@ -121,7 +123,8 @@ class VideoEncoder {
         // gamingBoost pins the bounded ultralow profile — its 1000Mbps
         // effectiveBitrate is ignored (it predates bounded rate control).
         let uiFloor = (bitrateMbps >= 100 && bitrateMbps <= 2000) ? bitrateMbps : 0
-        let targetMbps = expBitrate ?? (gamingBoost ? presetMbps : max(presetMbps, uiFloor))
+        let requestedTargetMbps = expBitrate ?? (gamingBoost ? presetMbps : max(presetMbps, uiFloor))
+        let targetMbps = max(1, min(requestedTargetMbps, maxBitrateMbps ?? Int.max))
         let avgBps = targetMbps * 1_000_000
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: avgBps as CFNumber)
         // Hard cap: bytes over a 1s window at 1.5x target — the guarantee
@@ -132,7 +135,9 @@ class VideoEncoder {
         let capBytes = Int(Double(targetMbps) * 1.5 * 1_000_000.0 / 8.0)
         let dataRateLimits = [capBytes, 1] as CFArray
         let limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits)
-        debugLog("Rate control: avg=\(targetMbps)Mbps cap=\(Int(Double(targetMbps) * 1.5))Mbps/1s (DataRateLimits status=\(limitStatus))")
+        debugLog("Rate control: avg=\(targetMbps)Mbps cap=\(Int(Double(targetMbps) * 1.5))Mbps/1s" +
+                 (maxBitrateMbps.map { " profileCap=\($0)Mbps" } ?? "") +
+                 " (DataRateLimits status=\(limitStatus))")
 
         // Frame rate settings
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
