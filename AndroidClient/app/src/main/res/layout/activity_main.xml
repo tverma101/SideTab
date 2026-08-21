@@ -4,7 +4,7 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000">
+    android:background="@color/ss_background">
 
     <!-- Video Surface -->
     <SurfaceView
@@ -35,7 +35,7 @@
         android:elevation="8dp"
         android:visibility="gone"
         app:cardCornerRadius="20dp"
-        app:cardBackgroundColor="#CC000000"
+        app:cardBackgroundColor="@color/ss_scrim"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
@@ -56,14 +56,14 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="FPS"
-                    android:textColor="#88FFFFFF"
+                    android:textColor="@color/ss_text_tertiary"
                     android:textSize="10sp" />
                 <TextView
                     android:id="@+id/fpsText"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="--"
-                    android:textColor="#4CAF50"
+                    android:textColor="@color/ss_accent"
                     android:textSize="16sp"
                     android:textStyle="bold" />
             </LinearLayout>
@@ -78,14 +78,14 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="BITRATE"
-                    android:textColor="#88FFFFFF"
+                    android:textColor="@color/ss_text_tertiary"
                     android:textSize="10sp" />
                 <TextView
                     android:id="@+id/bitrateText"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="--"
-                    android:textColor="#2196F3"
+                    android:textColor="@color/ss_info"
                     android:textSize="16sp"
                     android:textStyle="bold" />
             </LinearLayout>
@@ -100,14 +100,14 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="RESOLUTION"
-                    android:textColor="#88FFFFFF"
+                    android:textColor="@color/ss_text_tertiary"
                     android:textSize="10sp" />
                 <TextView
                     android:id="@+id/resolutionText"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="--"
-                    android:textColor="#FF9800"
+                    android:textColor="@color/ss_warning"
                     android:textSize="16sp"
                     android:textStyle="bold" />
             </LinearLayout>
@@ -122,14 +122,14 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="RTT"
-                    android:textColor="#88FFFFFF"
+                    android:textColor="@color/ss_text_tertiary"
                     android:textSize="10sp" />
                 <TextView
                     android:id="@+id/latencyText"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="--"
-                    android:textColor="#E91E63"
+                    android:textColor="@color/ss_info"
                     android:textSize="16sp"
                     android:textStyle="bold" />
             </LinearLayout>
@@ -143,14 +143,14 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="PROC"
-                    android:textColor="#88FFFFFF"
+                    android:textColor="@color/ss_text_tertiary"
                     android:textSize="10sp" />
                 <TextView
                     android:id="@+id/vsrText"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="off"
-                    android:textColor="#9C27B0"
+                    android:textColor="@color/ss_accent"
                     android:textSize="16sp"
                     android:textStyle="bold" />
             </LinearLayout>
@@ -167,7 +167,7 @@
         android:elevation="8dp"
         android:visibility="gone"
         app:cardCornerRadius="28dp"
-        app:cardBackgroundColor="#CC000000"
+        app:cardBackgroundColor="@color/ss_scrim"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
@@ -176,7 +176,7 @@
             android:layout_height="24dp"
             android:layout_gravity="center"
             android:src="@drawable/ic_settings"
-            android:tint="#FFFFFF" />
+            android:tint="@color/ss_text_primary" />
     </androidx.cardview.widget.CardView>
 
     <!-- Modern Connection Panel -->
@@ -190,7 +190,7 @@
         android:layout_marginBottom="24dp"
         android:elevation="24dp"
         app:cardCornerRadius="32dp"
-        app:cardBackgroundColor="#E6000000"
+        app:cardBackgroundColor="@color/ss_scrim_strong"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
@@ -220,7 +220,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Side Screen"
-                android:textColor="#FFFFFF"
+                android:textColor="@color/ss_text_primary"
                 android:textSize="28sp"
                 android:textStyle="bold"
                 android:letterSpacing="-0.01"
@@ -231,7 +231,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Turn your tablet into a second display"
-                android:textColor="#999999"
+                android:textColor="@color/ss_text_secondary"
                 android:textSize="14sp"
                 android:gravity="center"
                 android:layout_marginBottom="20dp" />
@@ -253,7 +253,7 @@
                     android:text="USB"
                     android:textColor="@color/mode_toggle_text"
                     app:backgroundTint="@color/mode_toggle_bg"
-                    app:strokeColor="#444444"
+                    app:strokeColor="@color/ss_outline"
                     app:strokeWidth="1dp" />
 
                 <com.google.android.material.button.MaterialButton
@@ -264,7 +264,7 @@
                     android:text="Wireless"
                     android:textColor="@color/mode_toggle_text"
                     app:backgroundTint="@color/mode_toggle_bg"
-                    app:strokeColor="#444444"
+                    app:strokeColor="@color/ss_outline"
                     app:strokeWidth="1dp" />
             </com.google.android.material.button.MaterialButtonToggleGroup>
 
@@ -289,7 +289,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:text="Connection Checklist"
-                    android:textColor="#FFFFFF"
+                    android:textColor="@color/ss_text_primary"
                     android:textSize="14sp"
                     android:textStyle="bold"
                     android:layout_marginBottom="12dp" />
@@ -313,7 +313,7 @@
                         android:layout_weight="1"
                         android:layout_height="wrap_content"
                         android:text="Developer Mode enabled"
-                        android:textColor="#BBBBBB"
+                        android:textColor="@color/ss_text_secondary"
                         android:textSize="13sp" />
                 </LinearLayout>
 
@@ -336,7 +336,7 @@
                         android:layout_weight="1"
                         android:layout_height="wrap_content"
                         android:text="USB Debugging enabled"
-                        android:textColor="#BBBBBB"
+                        android:textColor="@color/ss_text_secondary"
                         android:textSize="13sp" />
                 </LinearLayout>
 
@@ -359,7 +359,7 @@
                         android:layout_weight="1"
                         android:layout_height="wrap_content"
                         android:text="USB cable connected"
-                        android:textColor="#BBBBBB"
+                        android:textColor="@color/ss_text_secondary"
                         android:textSize="13sp" />
                 </LinearLayout>
 
@@ -381,7 +381,7 @@
                         android:layout_weight="1"
                         android:layout_height="wrap_content"
                         android:text="Mac server running"
-                        android:textColor="#BBBBBB"
+                        android:textColor="@color/ss_text_secondary"
                         android:textSize="13sp" />
                 </LinearLayout>
 
@@ -396,7 +396,7 @@
                 android:textSize="18sp"
                 android:textStyle="bold"
                 app:cornerRadius="20dp"
-                app:backgroundTint="#007AFF"
+                app:backgroundTint="@color/ss_accent"
                 android:layout_marginBottom="20dp" />
 
             <!-- Status Section -->
@@ -420,7 +420,7 @@
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
                     android:text="Ready to connect"
-                    android:textColor="#AAAAAA"
+                    android:textColor="@color/ss_text_secondary"
                     android:textSize="14sp" />
             </LinearLayout>
 
@@ -436,8 +436,8 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
-                    app:boxStrokeColor="#FFFFFF"
-                    app:hintTextColor="#AAAAAA"
+                    app:boxStrokeColor="@color/ss_outline_strong"
+                    app:hintTextColor="@color/ss_text_secondary"
                     android:layout_marginBottom="12dp">
                     <com.google.android.material.textfield.TextInputEditText
                         android:id="@+id/hostInput"
@@ -445,8 +445,8 @@
                         android:layout_height="wrap_content"
                         android:hint="Host"
                         android:text="127.0.0.1"
-                        android:textColor="#FFFFFF"
-                        android:textColorHint="#888888"
+                        android:textColor="@color/ss_text_primary"
+                        android:textColorHint="@color/ss_text_tertiary"
                         android:inputType="text" />
                 </com.google.android.material.textfield.TextInputLayout>
 
@@ -454,16 +454,16 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
-                    app:boxStrokeColor="#FFFFFF"
-                    app:hintTextColor="#AAAAAA">
+                    app:boxStrokeColor="@color/ss_outline_strong"
+                    app:hintTextColor="@color/ss_text_secondary">
                     <com.google.android.material.textfield.TextInputEditText
                         android:id="@+id/portInput"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:hint="Port"
                         android:text="54321"
-                        android:textColor="#FFFFFF"
-                        android:textColorHint="#888888"
+                        android:textColor="@color/ss_text_primary"
+                        android:textColorHint="@color/ss_text_tertiary"
                         android:inputType="number" />
                 </com.google.android.material.textfield.TextInputLayout>
 
@@ -475,7 +475,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Advanced Settings"
-                android:textColor="#007AFF"
+                android:textColor="@color/ss_accent"
                 android:textSize="13sp"
                 android:gravity="center"
                 android:padding="8dp" />
@@ -506,7 +506,7 @@
                     <ProgressBar
                         android:layout_width="48dp"
                         android:layout_height="48dp"
-                        android:indeterminateTint="#4CAF50"
+                        android:indeterminateTint="@color/ss_accent"
                         android:layout_marginBottom="16dp" />
 
                     <TextView
@@ -514,7 +514,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Connecting…"
-                        android:textColor="#FFFFFF"
+                        android:textColor="@color/ss_text_primary"
                         android:textSize="15sp"
                         android:textStyle="bold"
                         android:gravity="center"
@@ -525,7 +525,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text=""
-                        android:textColor="#999999"
+                        android:textColor="@color/ss_text_secondary"
                         android:textSize="12sp"
                         android:gravity="center" />
                 </LinearLayout>
@@ -544,7 +544,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Pair with your Mac"
-                        android:textColor="#FFFFFF"
+                        android:textColor="@color/ss_text_primary"
                         android:textSize="16sp"
                         android:textStyle="bold"
                         android:gravity="center"
@@ -554,7 +554,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Open Side Screen on your Mac → switch to the Wireless tab → scan the QR shown"
-                        android:textColor="#BBBBBB"
+                        android:textColor="@color/ss_text_secondary"
                         android:textSize="13sp"
                         android:gravity="center"
                         android:layout_marginBottom="16dp" />
@@ -566,8 +566,8 @@
                         android:text="Scan QR Code"
                         android:textSize="16sp"
                         app:cornerRadius="16dp"
-                        app:backgroundTint="#4ade80"
-                        android:textColor="#000000" />
+                        app:backgroundTint="@color/ss_success"
+                        android:textColor="@color/ss_on_accent" />
                 </LinearLayout>
 
                 <!-- State 3: Connected -->
@@ -585,7 +585,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="● Connected"
-                        android:textColor="#4ade80"
+                        android:textColor="@color/ss_success"
                         android:textSize="14sp"
                         android:textStyle="bold"
                         android:gravity="center"
@@ -596,7 +596,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Mac"
-                        android:textColor="#FFFFFF"
+                        android:textColor="@color/ss_text_primary"
                         android:textSize="16sp"
                         android:textStyle="bold"
                         android:gravity="center" />
@@ -606,7 +606,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="—"
-                        android:textColor="#888888"
+                        android:textColor="@color/ss_text_tertiary"
                         android:textSize="12sp"
                         android:gravity="center"
                         android:layout_marginBottom="16dp" />
@@ -625,8 +625,8 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Forget this Mac"
-                        android:textColor="#fca5a5"
-                        app:strokeColor="#7f1d1d" />
+                        android:textColor="@color/ss_error_soft"
+                        app:strokeColor="@color/ss_error_container" />
                 </LinearLayout>
 
                 <!-- State: Paired idle (after explicit Disconnect) -->
@@ -644,7 +644,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="○ Disconnected"
-                        android:textColor="#888888"
+                        android:textColor="@color/ss_text_tertiary"
                         android:textSize="14sp"
                         android:textStyle="bold"
                         android:gravity="center"
@@ -655,7 +655,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Mac"
-                        android:textColor="#FFFFFF"
+                        android:textColor="@color/ss_text_primary"
                         android:textSize="16sp"
                         android:textStyle="bold"
                         android:gravity="center" />
@@ -665,7 +665,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="—"
-                        android:textColor="#888888"
+                        android:textColor="@color/ss_text_tertiary"
                         android:textSize="12sp"
                         android:gravity="center"
                         android:layout_marginBottom="16dp" />
@@ -677,8 +677,8 @@
                         android:text="Reconnect"
                         android:textSize="16sp"
                         app:cornerRadius="16dp"
-                        app:backgroundTint="#4CAF50"
-                        android:textColor="#FFFFFF"
+                        app:backgroundTint="@color/ss_accent"
+                        android:textColor="@color/ss_text_primary"
                         android:layout_marginBottom="8dp" />
 
                     <com.google.android.material.button.MaterialButton
@@ -687,8 +687,8 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Forget this Mac"
-                        android:textColor="#fca5a5"
-                        app:strokeColor="#7f1d1d" />
+                        android:textColor="@color/ss_error_soft"
+                        app:strokeColor="@color/ss_error_container" />
                 </LinearLayout>
 
                 <!-- State 4: Token mismatch / re-pair -->
@@ -707,7 +707,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="⚠ Couldn't connect"
-                        android:textColor="#fca5a5"
+                        android:textColor="@color/ss_error_soft"
                         android:textSize="16sp"
                         android:textStyle="bold"
                         android:gravity="center"
@@ -718,7 +718,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Scan a fresh QR from your Mac to re-pair."
-                        android:textColor="#BBBBBB"
+                        android:textColor="@color/ss_text_secondary"
                         android:textSize="13sp"
                         android:gravity="center"
                         android:layout_marginBottom="16dp" />
@@ -729,8 +729,8 @@
                         android:layout_height="56dp"
                         android:text="Scan QR Code"
                         app:cornerRadius="16dp"
-                        app:backgroundTint="#4ade80"
-                        android:textColor="#000000" />
+                        app:backgroundTint="@color/ss_success"
+                        android:textColor="@color/ss_on_accent" />
                 </LinearLayout>
 
                 <!-- State 5: Permission denied permanently -->
@@ -748,7 +748,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="Camera permission required to scan QR"
-                        android:textColor="#FFFFFF"
+                        android:textColor="@color/ss_text_primary"
                         android:textSize="15sp"
                         android:textStyle="bold"
                         android:gravity="center"
@@ -758,7 +758,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:text="You blocked the permission. Open Settings → Apps → Side Screen → Permissions to allow."
-                        android:textColor="#BBBBBB"
+                        android:textColor="@color/ss_text_secondary"
                         android:textSize="13sp"
                         android:gravity="center"
                         android:layout_marginBottom="16dp" />
@@ -769,7 +769,7 @@
                         android:layout_height="56dp"
                         android:text="Open Settings"
                         app:cornerRadius="16dp"
-                        app:backgroundTint="#007AFF" />
+                        app:backgroundTint="@color/ss_accent" />
                 </LinearLayout>
 
             </LinearLayout>
