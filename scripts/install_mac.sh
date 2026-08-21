@@ -27,9 +27,11 @@ fi
 
 mkdir -p "$INSTALL_ROOT"
 
-PREVIOUS_CDHASH=""
+PREVIOUS_IDENTITY=""
+PREVIOUS_DR=""
 if [ -d "$TARGET_APP" ]; then
-    PREVIOUS_CDHASH="$(codesign -dvvv --verbose=4 "$TARGET_APP" 2>&1 | awk -F= '/^CDHash=/{print $2}' || true)"
+    PREVIOUS_IDENTITY="$(codesign -dvvv --verbose=4 "$TARGET_APP" 2>&1 | awk -F= '/^Authority=/{print $2; exit}' || true)"
+    PREVIOUS_DR="$(codesign -d -r- "$TARGET_APP" 2>&1 | tail -1 || true)"
 fi
 
 # Stop only a process whose executable is inside the exact target bundle.
@@ -58,13 +60,23 @@ mv "$TEMP_ROOT/SideScreen.app" "$TARGET_APP"
 codesign --verify --deep --strict --verbose=2 "$TARGET_APP"
 echo "Installed current host: $TARGET_APP"
 CURRENT_CDHASH="$(codesign -dvvv --verbose=4 "$TARGET_APP" 2>&1 | awk -F= '/^CDHash=/{print $2}' || true)"
+CURRENT_IDENTITY="$(codesign -dvvv --verbose=4 "$TARGET_APP" 2>&1 | awk -F= '/^Authority=/{print $2; exit}' || true)"
+CURRENT_TEAM="$(codesign -dvvv --verbose=4 "$TARGET_APP" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}' || true)"
+CURRENT_DR="$(codesign -d -r- "$TARGET_APP" 2>&1 | tail -1 || true)"
 echo "Current CDHash: ${CURRENT_CDHASH:-unknown}"
-if [ -n "$PREVIOUS_CDHASH" ] && [ -n "$CURRENT_CDHASH" ] && [ "$PREVIOUS_CDHASH" != "$CURRENT_CDHASH" ]; then
-    echo "WARNING: local ad-hoc code identity changed ($PREVIOUS_CDHASH -> $CURRENT_CDHASH)."
-    echo "If Screen Recording shows Granted but SideScreen says Required, rebind this exact bundle in System Settings."
+echo "Current signing identity: ${CURRENT_IDENTITY:-unknown}"
+echo "Current TeamIdentifier: ${CURRENT_TEAM:-unknown}"
+if [ -n "$PREVIOUS_IDENTITY" ] && [ -n "$CURRENT_IDENTITY" ] && [ "$PREVIOUS_IDENTITY" != "$CURRENT_IDENTITY" ]; then
+    echo "Signing identity changed: $PREVIOUS_IDENTITY -> $CURRENT_IDENTITY"
+    echo "A one-time Screen Recording rebind may be required for the new stable identity."
 fi
-echo "Screen Recording must be granted to this exact bundle; do not launch a legacy copy."
-codesign -d -r- "$TARGET_APP" 2>&1 | tail -4
+if [ -n "$PREVIOUS_DR" ] && [ -n "$CURRENT_DR" ] && [ "$PREVIOUS_DR" != "$CURRENT_DR" ]; then
+    echo "Designated requirement changed; re-enable this exact bundle once in Screen & System Audio Recording."
+fi
+echo "Stable Apple Development signing is required for Screen Recording continuity."
+echo "Screen Recording preflight is advisory; this host will attempt capture and report the actual result."
+echo "Use this exact bundle for the grant; do not launch a legacy copy."
+printf 'Current designated requirement: %s\n' "${CURRENT_DR:-unknown}"
 
 if $LAUNCH; then
     open -n "$TARGET_APP"

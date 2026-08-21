@@ -125,16 +125,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.autoStartStreamingOnLaunch {
             settings.connectionMode = settings.startupMode
             Task {
-                // Permission must be checked before auto-start. The old
-                // forceStart experiment path still called startServer(), which
-                // rejected the request anyway and made every stale/duplicate
-                // install look like a repeated permission failure.
+                // Preflight is diagnostic only. The actual capture setup below
+                // is the authoritative test, so a stale TCC boolean cannot
+                // prevent an explicitly configured auto-start from trying.
                 await self.checkPermissions()
-                if self.settings.hasScreenRecordingPermission {
-                    await self.startServer()
-                } else {
-                    debugLog("Auto-start skipped: Screen Recording permission not granted")
-                }
+                await self.startServer()
             }
         }
     }
@@ -361,13 +356,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { [weak self] in
                     guard let self else { return }
                     await self.checkPermissions()
-                    if self.settings.hasScreenRecordingPermission {
-                        await self.startServer()
-                    } else {
-                        await MainActor.run {
-                            self.showSettings()
-                        }
-                    }
+                    await self.startServer()
                 }
             }
         }
@@ -595,15 +584,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         await MainActor.run {
             refreshScreenRecordingPermission()
+            settings.screenCaptureOperational = false
+            settings.screenCaptureFailure = nil
+            settings.captureMethod = "Starting..."
         }
         let hasScreenCapture = await MainActor.run { settings.hasScreenRecordingPermission }
-        debugLog("🚀 startServer() invoked. Screen Recording permission: \(hasScreenCapture)")
-        guard hasScreenCapture else {
-            debugLog("❌ startServer aborted: Missing Screen Recording permission")
-            await MainActor.run {
-                showSettings()
-            }
-            return
+        debugLog("🚀 startServer() invoked. Screen Recording preflight: \(hasScreenCapture) (advisory)")
+        if !hasScreenCapture {
+            debugLog("⚠️ Screen Recording preflight is negative; attempting actual capture setup anyway")
         }
 
         do {
@@ -665,21 +653,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            // Setup capture
-            guard let displayID = virtualDisplayManager?.displayID else { return }
-            screenCapture = try await ScreenCapture()
-            screenCapture?.onCaptureMethodChanged = { [weak self] method in
-                guard let self = self else { return }
-                debugLog("Capture method: \(method)")
-                Task { @MainActor in
-                    self.settings.captureMethod = method
+            // Setup ScreenCaptureKit independently from the host listener.
+            // TCC/preflight and SCShareableContent can be stale or unavailable;
+            // neither should prevent the user from launching the host and
+            // repairing the exact installed bundle's permission.
+            var captureReady = false
+            if let displayID = virtualDisplayManager?.displayID {
+                do {
+                    screenCapture = try await ScreenCapture()
+                    screenCapture?.onCaptureMethodChanged = { [weak self] method in
+                        guard let self = self else { return }
+                        debugLog("Capture method: \(method)")
+                        Task { @MainActor in
+                            self.settings.captureMethod = method
+                            let operational = !method.hasPrefix("Unavailable")
+                            self.settings.screenCaptureOperational = operational
+                            self.settings.screenCaptureFailure = operational ? nil : method
+                        }
+                    }
+                    try await screenCapture?.setupForVirtualDisplay(
+                        displayID,
+                        refreshRate: sessionFrameRate,
+                        frameRateCap: isWirelessSession ? WirelessSessionProfile.frameRate : nil
+                    )
+                    captureReady = true
+                } catch {
+                    let description = String(describing: error)
+                    debugLog("ScreenCaptureKit setup unavailable; keeping host/listener available: \(description)")
+                    await MainActor.run {
+                        settings.captureMethod = "Unavailable — ScreenCaptureKit setup failed"
+                        settings.screenCaptureOperational = false
+                        settings.screenCaptureFailure = "ScreenCaptureKit setup failed: \(description)"
+                    }
+                }
+            } else {
+                let description = "Virtual display ID was not available"
+                debugLog("ScreenCaptureKit setup unavailable; keeping host/listener available: \(description)")
+                await MainActor.run {
+                    settings.captureMethod = "Unavailable — \(description)"
+                    settings.screenCaptureOperational = false
+                    settings.screenCaptureFailure = description
                 }
             }
-            try await screenCapture?.setupForVirtualDisplay(
-                displayID,
-                refreshRate: sessionFrameRate,
-                frameRateCap: isWirelessSession ? WirelessSessionProfile.frameRate : nil
-            )
 
             // Setup server. Control channel (out-of-band ping/pong + keyframe
             // requests) runs on its own port: settings.port + 1, overridable
@@ -790,17 +805,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             streamingServer?.start()
-            screenCapture?.startStreaming(
-                to: streamingServer,
-                bitrateMbps: settings.effectiveBitrate,
-                quality: settings.effectiveQuality,
-                gamingBoost: settings.gamingBoost,
-                frameRate: sessionFrameRate,
-                bitrateCapMbps: sessionBitrateCap,
-                frameRateCap: isWirelessSession ? WirelessSessionProfile.frameRate : nil
-            )
+            if captureReady {
+                screenCapture?.startStreaming(
+                    to: streamingServer,
+                    bitrateMbps: settings.effectiveBitrate,
+                    quality: settings.effectiveQuality,
+                    gamingBoost: settings.gamingBoost,
+                    frameRate: sessionFrameRate,
+                    bitrateCapMbps: sessionBitrateCap,
+                    frameRateCap: isWirelessSession ? WirelessSessionProfile.frameRate : nil
+                )
+            } else {
+                debugLog("Server started without ScreenCaptureKit capture")
+            }
 
             await MainActor.run {
+                // The host is running even when capture is unavailable. The
+                // capture status becomes operational only after SCStream
+                // delivers its first frame.
                 settings.isRunning = true
             }
 
@@ -808,13 +830,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             print("❌ Failed to start: \(error)")
             let errorDescription = error.localizedDescription
-            let permissionDenied = !CGPreflightScreenCaptureAccess()
-                || errorDescription.localizedCaseInsensitiveContains("TCC")
+            let permissionDenied = errorDescription.localizedCaseInsensitiveContains("TCC")
                 || errorDescription.localizedCaseInsensitiveContains("declined")
                 || errorDescription.localizedCaseInsensitiveContains("not authorized")
             await MainActor.run {
-                settings.isRunning = false
-                settings.displayCreated = false
+                stopServer()
 
                 if permissionDenied {
                     // TCC denial belongs in the existing inline permission card.
@@ -843,8 +863,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.isRunning = false
         settings.displayCreated = false
         settings.clientConnected = false
+        settings.screenCaptureOperational = false
+        settings.screenCaptureFailure = nil
         settings.currentFPS = 0
         settings.currentBitrate = 0
+        settings.captureMethod = "Initializing..."
 
         print("⏹️ Server stopped")
     }
@@ -1307,8 +1330,9 @@ extension AppDelegate: NSMenuDelegate {
         )
         toggle.target = self
         // Mirror the settings-window Start button: starting needs the Screen
-        // Recording permission, stopping is always allowed.
-        toggle.isEnabled = settings.isRunning || settings.hasScreenRecordingPermission
+        // Screen Recording preflight is advisory; let the real capture path
+        // decide whether this build can stream and surface its actual error.
+        toggle.isEnabled = true
         menu.addItem(toggle)
 
         // Connection mode (switching while running restarts the server, same

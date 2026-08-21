@@ -21,9 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Video and the optional control channel bind to the selected WiFi route, including local-only WiFi networks; background reconnect and TCP keepalive remain disabled.
 
 ### macOS installation and permission identity
-- Added `scripts/install_mac.sh` as the canonical local install path (`~/Applications/SideScreen.app`). It preserves the previous bundle, reports CDHash changes, and warns when a local ad-hoc rebuild may require a Screen Recording rebind.
+- Added stable Apple Development signing to the canonical local build/install path (`~/Applications/SideScreen.app`). The signing helper discovers the valid Personal Team identity and fails closed instead of creating an ad-hoc build whose TCC identity changes on every rebuild. The installer reports the certificate-backed identity, Team ID, CDHash, and designated requirement; the first transition from an old ad-hoc grant may require one manual rebind.
 - Added an in-app permission snapshot/recovery card that shows the exact running bundle path, supports recheck/copy/open-settings actions, and refreshes when the app becomes active.
-- Removed the ineffective force-start permission bypass from auto-start and the extra ScreenCaptureKit permission race. Auto-start now checks the current bundle's Screen Recording grant before attempting capture.
+- Removed the ineffective force-start permission bypass, the extra ScreenCaptureKit permission race, and the legacy CGDisplayStream fallback. ScreenCaptureKit is now the only capture path. The Core Graphics Screen Recording preflight is advisory: manual Start and configured auto-start always attempt capture, while the actual ScreenCaptureKit setup determines whether the session can capture. The host stays launched/listening when capture is unavailable and reports the actual failure; the settings status reports **Capture working** only after the first ScreenCaptureKit frame.
 
 ---
 

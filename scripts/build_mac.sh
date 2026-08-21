@@ -96,10 +96,10 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-# Keep an explicit designated requirement for diagnostics. The local ad-hoc
-# CDHash still changes when the executable changes, so the app's in-product
-# recovery card must handle a possible TCC rebind after a rebuild.
-echo "Code signing (explicit local ad-hoc identity)..."
+# Sign every installed development build with the same Apple Development
+# identity. The signing helper fails closed instead of silently creating an
+# ad-hoc build that macOS will treat as a new TCC identity.
+echo "Code signing (stable Apple Development identity)..."
 "$SCRIPT_DIR/sign_mac_app.sh" "$APP_DIR"
 echo "  ✓ App signed"
 

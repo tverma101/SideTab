@@ -642,9 +642,13 @@ struct SettingsView: View {
                                           hint: "Whether the Android client app currently has an active stream session.")
                                 StatusRow(
                                     title: ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 ? "Screen & System Audio" : "Screen Recording",
-                                    status: settings.screenRecordingPermission.statusText,
-                                    color: settings.hasScreenRecordingPermission ? .green : .red,
-                                    hint: settings.screenRecordingPermission.diagnosticText
+                                    status: settings.screenCaptureOperational
+                                        ? "Capture working"
+                                        : (settings.screenCaptureFailure == nil ? settings.screenRecordingPermission.statusText : "Capture unavailable"),
+                                    color: settings.screenCaptureOperational || (settings.screenCaptureFailure == nil && settings.hasScreenRecordingPermission) ? .green : .red,
+                                    hint: settings.screenCaptureOperational
+                                        ? "The actual capture setup succeeded for this running bundle. The Core Graphics preflight result is advisory."
+                                        : (settings.screenCaptureFailure ?? settings.screenRecordingPermission.diagnosticText)
                                 )
                                 StatusRow(title: "Accessibility",
                                           status: settings.hasAccessibilityPermission ? "Granted" : "Optional",
@@ -653,8 +657,8 @@ struct SettingsView: View {
                                 if settings.isRunning {
                                     StatusRow(title: "Capture Method",
                                               status: settings.captureMethod,
-                                              color: settings.captureMethod.contains("fallback") ? .orange : .green,
-                                              hint: "Which macOS API is currently capturing the virtual display. SCStream is the modern path; CGDisplayStream fallback activates if SCStream fails (e.g. on certain virtual display configs).")
+                                              color: settings.screenCaptureOperational ? .green : (settings.captureMethod.hasPrefix("Unavailable") ? .red : .orange),
+                                              hint: "ScreenCaptureKit is the only capture path. This reports Starting until the first frame arrives, or Unavailable with the actual failure.")
                                 }
 
                                 // Mode-aware contextual rows
@@ -692,7 +696,7 @@ struct SettingsView: View {
                                               hint: "The LAN address the tablet must reach. The QR code embeds this exact host:port — if it changes (e.g. you switch WiFi), re-scan the new QR on the tablet.")
                                 }
 
-                                if !settings.hasScreenRecordingPermission {
+                                if !settings.hasScreenRecordingPermission && !settings.screenCaptureOperational {
                                     VStack(alignment: .leading, spacing: 8) {
                                         HStack(spacing: 6) {
                                             Image(systemName: "exclamationmark.triangle.fill")
@@ -708,6 +712,11 @@ struct SettingsView: View {
                                         Text(settings.screenRecordingPermission.diagnosticText)
                                             .font(.system(size: 11))
                                             .foregroundColor(.secondary)
+                                        if let failure = settings.screenCaptureFailure {
+                                            Text("Capture attempt: \(failure). The host remains available because the preflight result is advisory.")
+                                                .font(.system(size: 11))
+                                                .foregroundColor(.orange)
+                                        }
                                         Text("Running bundle")
                                             .font(.system(size: 10, weight: .semibold))
                                             .foregroundColor(.secondary)
@@ -854,7 +863,6 @@ struct SettingsView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(settings.isRunning ? .red : .accentColor)
                         .controlSize(.large)
-                        .disabled(!settings.hasScreenRecordingPermission)
 
                         if settings.isRunning {
                             HStack(spacing: 6) {
@@ -1134,6 +1142,8 @@ class DisplaySettings: ObservableObject {
     @Published var currentWirelessDevice: String?
     @Published private(set) var screenRecordingPermission = ScreenRecordingPermissionSnapshot.initial()
     var hasScreenRecordingPermission: Bool { screenRecordingPermission.isGranted }
+    @Published var screenCaptureOperational = false
+    @Published var screenCaptureFailure: String? = nil
     @Published var hasAccessibilityPermission = false
     @Published var adbInstalled = false
     @Published var adbReverseConfigured = false

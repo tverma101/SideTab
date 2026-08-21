@@ -5,7 +5,6 @@ import VideoToolbox
 import CoreMedia
 import CoreGraphics
 import CoreVideo
-import IOSurface
 import IOKit.pwr_mgt
 import os
 
@@ -39,7 +38,6 @@ class ScreenCapture {
     private struct FrameMonitorState {
         var lastFrameTime: DispatchTime?
         var hasReceivedFirstFrame = false
-        var fallbackActive = false
     }
 
     private struct KeyframeRequestState {
@@ -65,9 +63,6 @@ class ScreenCapture {
     private var hasDisplaySleepAssertion = false
     private var wakeRestartPending = false
 
-    // CGDisplayStream fallback
-    private var cgDisplayStream: CGDisplayStream?
-
     // Streaming parameters (saved for restart)
     private weak var currentServer: StreamingServer?
     private var currentBitrateMbps: Int = 20
@@ -81,7 +76,7 @@ class ScreenCapture {
     private var pendingEncodes: Int32 = 0
     private var lastPixelBuffer: CVPixelBuffer?
 
-    /// Callback when capture method changes (e.g. SCStream → CGDisplayStream fallback)
+    /// Callback when the ScreenCaptureKit capture state changes.
     var onCaptureMethodChanged: ((String) -> Void)?
 
     /// Force the encoder to emit an IDR keyframe on the next frame.
@@ -150,7 +145,7 @@ class ScreenCapture {
     /// downscales a HiDPI 2x backing raster — the encoder must never chew 4x
     /// pixels; GATE-422-EXP 2026-08-14), clamped to the client's reported
     /// decoder limit when known, else to the conservative AVC floor when
-    /// streaming H.264. SCStream/CGDisplayStream scale the capture into this
+    /// streaming H.264. SCStream scales the capture into this
     /// size, so no virtual-display change is needed. At 1x, logical == physical.
     func encodeSize(for codec: StreamCodec) -> (width: Int, height: Int) {
         // CAMPAIGN PATCH (2026-08-14): encode the PHYSICAL pixel size, not the
@@ -223,10 +218,9 @@ class ScreenCapture {
 
     // MARK: - Display wake handling
 
-    /// Display sleep tears down SCStream (SCStreamErrorDomain -3815, "no
-    /// displays or windows to capture"), which silently drops capture onto
-    /// the CGDisplayStream fallback for the rest of the session. Restart
-    /// the capture whenever the screens wake so it returns to SCStream.
+    /// Restart ScreenCaptureKit after a display wake. Display sleep can tear
+    /// down SCStream (SCStreamErrorDomain -3815, "no displays or windows to
+    /// capture"); a bounded restart is the only recovery path we expose.
     private func registerWakeObservers() {
         guard wakeObservers.isEmpty else { return }
         let center = NSWorkspace.shared.notificationCenter
@@ -253,7 +247,7 @@ class ScreenCapture {
 
     private func handleWake() {
         // Only act while a capture is actually running.
-        guard stream != nil || cgDisplayStream != nil else { return }
+        guard stream != nil else { return }
         // A full system wake fires both screensDidWake and didWake —
         // coalesce them into a single restart.
         guard !wakeRestartPending else { return }
@@ -263,19 +257,7 @@ class ScreenCapture {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
             self.wakeRestartPending = false
-            guard self.stream != nil || self.cgDisplayStream != nil else { return }
-            // Display sleep usually kills SCStream with error -3815 ("no
-            // displays or windows to capture"), which pushes capture onto the
-            // CGDisplayStream fallback. After wake, always try to get back
-            // onto SCStream — restartStream() re-enters the fallback by
-            // itself if SCStream still cannot start.
-            let fallbackActive = self.stateLock.withLock { $0.fallbackActive }
-            if fallbackActive {
-                debugLog("Wake restart: leaving CGDisplayStream fallback, retrying SCStream")
-                self.cgDisplayStream?.stop()
-                self.cgDisplayStream = nil
-                self.stateLock.withLock { $0.fallbackActive = false }
-            }
+            guard self.stream != nil else { return }
             self.restartStream()
             // A wake-triggered restart must not consume the one-shot budget
             // the frame monitor uses for stall recovery.
@@ -362,11 +344,8 @@ class ScreenCapture {
         let delegate = StreamDelegate()
         delegate.onStreamError = { [weak self] _ in
             guard let self = self else { return }
-            debugLog("StreamDelegate error callback — attempting fallback")
-            let alreadyActive = self.stateLock.withLock { $0.fallbackActive }
-            if !alreadyActive {
-                self.attemptFallbackCapture()
-            }
+            debugLog("StreamDelegate error callback — scheduling ScreenCaptureKit restart")
+            self.restartStream()
         }
         streamDelegate = delegate
 
@@ -571,8 +550,7 @@ class ScreenCapture {
                 startFrameMonitor()
             } catch {
                 debugLog("Failed to start SCStream capture: \(error)")
-                debugLog("Attempting CGDisplayStream fallback due to start failure")
-                attemptFallbackCapture()
+                onCaptureMethodChanged?("Unavailable — ScreenCaptureKit start failed: \(error.localizedDescription)")
             }
         }
     }
@@ -587,23 +565,17 @@ class ScreenCapture {
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
 
-            let isFallback = self.stateLock.withLock { $0.fallbackActive }
-            guard !isFallback else {
-                self.stopFrameMonitor()
-                return
-            }
-
             let stalled: Bool
             let lastTime = self.stateLock.withLock { $0.lastFrameTime }
             if let last = lastTime {
                 let elapsed = Double(DispatchTime.now().uptimeNanoseconds - last.uptimeNanoseconds) / 1_000_000_000
                 stalled = elapsed > 5.0
                 if stalled {
-                    debugLog("Frame flow stalled — no frames for \(String(format: "%.1f", elapsed))s, triggering fallback")
+                    debugLog("Frame flow stalled — no frames for \(String(format: "%.1f", elapsed))s")
                 }
             } else {
                 stalled = true
-                debugLog("Frame flow stalled — no frames ever received after 5s, triggering fallback")
+                debugLog("Frame flow stalled — no frames received during the monitor window")
             }
 
             if stalled {
@@ -627,8 +599,8 @@ class ScreenCapture {
                         debugLog("Attempting SCStream restart...")
                         self.restartStream()
                     } else {
-                        debugLog("Restart already attempted — falling back to CGDisplayStream")
-                        self.attemptFallbackCapture()
+                        debugLog("Restart already attempted — ScreenCaptureKit capture unavailable")
+                        self.onCaptureMethodChanged?("Unavailable — ScreenCaptureKit frame flow stalled")
                     }
                 }
             }
@@ -652,11 +624,9 @@ class ScreenCapture {
     /// cannot strand capture in the wrong state (worst case: a brief extra
     /// stop/start; end state is always "capturing when a client is present").
     /// The frame monitor is stopped so its stall detector does not treat the
-    /// pause as a dead stream and trigger the CGDisplayStream fallback.
+    /// intentional pause as a dead stream.
     func pauseForIdle() {
         guard !idlePaused, isStreaming, stream != nil else { return }
-        let isFallback = stateLock.withLock { $0.fallbackActive }
-        guard !isFallback else { return }
         idlePaused = true
         idleGeneration &+= 1
         let gen = idleGeneration
@@ -750,11 +720,11 @@ class ScreenCapture {
                 debugLog("SCStream restarted — starting frame flow monitor")
                 startFrameMonitor()
             } catch {
-                debugLog("SCStream restart failed: \(error) — falling back to CGDisplayStream")
+                debugLog("SCStream restart failed: \(error)")
                 if isStreaming, gen == streamGeneration {
-                    attemptFallbackCapture()
+                    onCaptureMethodChanged?("Unavailable — ScreenCaptureKit restart failed: \(error.localizedDescription)")
                 } else {
-                    debugLog("restartStream(gen \(gen)) superseded before fallback — aborted")
+                    debugLog("restartStream(gen \(gen)) superseded before failure report — aborted")
                 }
             }
         }
@@ -797,93 +767,6 @@ class ScreenCapture {
         debugLog("Display-sleep assertion released")
     }
 
-    // MARK: - CGDisplayStream fallback
-
-    private func attemptFallbackCapture() {
-        guard let displayID = virtualDisplayID else {
-            debugLog("Fallback skipped — no displayID")
-            return
-        }
-
-        // Thread-safe check-and-set for fallbackActive
-        let alreadyActive = stateLock.withLock { state -> Bool in
-            if state.fallbackActive { return true }
-            state.fallbackActive = true
-            return false
-        }
-        guard !alreadyActive else {
-            debugLog("Fallback skipped — already active")
-            return
-        }
-
-        // Stop SCStream synchronously (nil out output first to prevent new frames)
-        streamOutput?.onFrameReceived = nil
-        Task {
-            try? await stream?.stopCapture()
-            stream = nil
-            streamOutput = nil
-            streamDelegate = nil
-        }
-
-        // CGDisplayStream scales natively via outputWidth/Height, so the
-        // AVC clamp applies here exactly as in the SCStream path.
-        let (width, height) = encodeSize(for: codec)
-
-        debugLog("CGDisplayStream fallback — display \(displayID) (\(width)x\(height))")
-
-        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-        let queue = DispatchQueue(label: "com.sidescreen.cgdisplaystream", qos: .userInteractive)
-
-        // Without kCGDisplayStreamShowCursor the fallback stream never
-        // composites the cursor at all (the key defaults to false), so any
-        // session that degrades to CGDisplayStream loses the pointer on the
-        // tablet even when WindowServer is healthy.
-        let streamProps = [CGDisplayStream.showCursor as String: true] as CFDictionary
-
-        guard let displayStream = CGDisplayStream(
-            dispatchQueueDisplay: displayID,
-            outputWidth: width,
-            outputHeight: height,
-            pixelFormat: pixelFormat,
-            properties: streamProps,
-            queue: queue,
-            handler: { [weak self] _, _, frameSurface, _ in
-                guard let self = self, let surface = frameSurface else { return }
-
-                var unmanagedPB: Unmanaged<CVPixelBuffer>?
-                let attrs: [String: Any] = [
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-                ]
-                let cvReturn = CVPixelBufferCreateWithIOSurface(
-                    kCFAllocatorDefault,
-                    surface,
-                    attrs as CFDictionary,
-                    &unmanagedPB
-                )
-
-                guard cvReturn == kCVReturnSuccess, let pb = unmanagedPB?.takeRetainedValue() else { return }
-
-                // Use CMClock for accurate timestamps instead of raw Mach time
-                let pts = CMClockGetTime(CMClockGetHostTimeClock())
-                self.encoder?.encode(pixelBuffer: pb, presentationTimeStamp: pts)
-            }
-        ) else {
-            debugLog("Failed to create CGDisplayStream — fallback unavailable")
-            stateLock.withLock { $0.fallbackActive = false }
-            return
-        }
-
-        let startResult = displayStream.start()
-        if startResult == .success {
-            cgDisplayStream = displayStream
-            debugLog("CGDisplayStream fallback started successfully")
-            onCaptureMethodChanged?("CGDisplayStream (fallback)")
-        } else {
-            debugLog("CGDisplayStream.start() failed: \(startResult)")
-            stateLock.withLock { $0.fallbackActive = false }
-        }
-    }
-
     // MARK: - Settings update
 
     func updateEncoderSettings(bitrateMbps: Int, quality: String, gamingBoost: Bool) {
@@ -895,9 +778,6 @@ class ScreenCapture {
     /// SCStream delivers buffers at the (possibly clamped) dimensions. The
     /// client's keyframe-request loop (force, 200 ms interval) bridges the
     /// restart gap — the decoder drops frames until the first new keyframe.
-    /// Note: if the CGDisplayStream fallback is active, restartStream() only
-    /// rebuilds the SCStream path; the rare fallback+codec-switch combination
-    /// recovers on the next fallback restart rather than immediately.
     /// Apply the per-connection negotiation result: stream codec plus the
     /// client's reported decoder ceiling. Rebuilds the encoder mid-session
     /// when either changes the encode setup (a codec switch, or a ceiling
@@ -958,19 +838,10 @@ class ScreenCapture {
             }
         }
 
-        // Stop CGDisplayStream fallback
-        let wasFallback = stateLock.withLock { $0.fallbackActive }
-        if wasFallback {
-            cgDisplayStream?.stop()
-            cgDisplayStream = nil
-            debugLog("CGDisplayStream fallback stopped")
-        }
-
         // Reset state
         stateLock.withLock { state in
             state.lastFrameTime = nil
             state.hasReceivedFirstFrame = false
-            state.fallbackActive = false
         }
         restartAttempted = false
         unregisterWakeObservers()

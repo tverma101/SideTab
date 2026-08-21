@@ -131,8 +131,18 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 > Then open the app again. This is needed because the app is not notarized with an Apple Developer certificate.
 
 > **⚠️ Screen Recording identity**
-> macOS grants Screen Recording to the app's signing identity, not just the
-> visible name. For a local build, install and launch the one canonical bundle:
+> macOS grants Screen Recording to the app's designated signing requirement, not
+> just the visible name. Local development builds must use the same Apple
+> Development identity, Team ID, and bundle ID on every rebuild. Check that
+> Xcode has a Personal Team certificate before building:
+> ```bash
+> security find-identity -v -p codesigning
+> ```
+> If no `Apple Development: ...` identity appears, open Xcode → Settings →
+> Apple Accounts and create/select the Personal Team certificate. The build
+> scripts intentionally fail instead of silently producing an ad-hoc build.
+>
+> For a local build, install and launch the one canonical bundle:
 > ```bash
 > ./scripts/build_mac.sh
 > ./scripts/install_mac.sh --launch
@@ -140,13 +150,17 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 > The installer uses `~/Applications/SideScreen.app` and preserves the
 > previous bundle with a `.previous.<timestamp>` suffix. Do not launch an
 > `exp_bin/SideScreenExp.app`, a build artifact in another checkout, or another
-> copy with the same display name. Local ad-hoc builds can receive a new
-> CDHash after the executable changes, so an enabled row is not proof that the
-> current build is authorized. SideScreen now shows the exact running path and
-> provides Recheck / Copy Identity / Open Settings actions. If it reports
-> Required, remove the stale Side Screen entry in System Settings → Privacy &
-> Security → Screen & System Audio Recording, then enable the exact bundle
-> installed by `install_mac.sh` once.
+> copy with the same display name. The CDHash may still change on each build;
+> the stable certificate-backed designated requirement is what preserves TCC
+> continuity. SideScreen shows the exact running path and provides Recheck /
+> Copy Identity / Open Settings actions. After the first transition from an
+> old ad-hoc build, remove or disable the stale Side Screen row in System
+> Settings → Privacy & Security → Screen & System Audio Recording, then enable
+> the exact bundle installed by `install_mac.sh` once. Future rebuilds should
+> retain the grant. The preflight value is advisory: Start and configured
+> auto-start still attempt capture, and the status changes to **Capture working**
+> only after ScreenCaptureKit delivers the first frame. If capture setup fails,
+> the host may remain listening and the status card names the actual failure.
 
 > **⚠️ ADB Required**
 > The Mac app needs `adb` to communicate with your Android device. If the app doesn't show "Running" after launch, you likely need to install ADB:
@@ -167,8 +181,10 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 git clone https://github.com/tranvuongquocdat/SideScreen.git
 cd SideScreen
 
-# macOS
-cd MacHost && swift build -c release
+# macOS (requires a valid Apple Development identity; ad-hoc signing is refused)
+security find-identity -v -p codesigning
+./scripts/build_mac.sh
+./scripts/install_mac.sh --launch
 
 # Android
 cd AndroidClient && ./gradlew assembleDebug
@@ -263,7 +279,11 @@ The Mac's auth token resets when you click **Reset Token (forget all)** or reins
 <details>
 <summary><strong>Virtual display not appearing</strong></summary>
 
-Grant Screen Recording permission: **System Preferences → Privacy & Security → Screen Recording → Enable Side Screen**
+Screen Recording is still required for the virtual display: **System Preferences
+→ Privacy & Security → Screen & System Audio Recording → Enable Side Screen**.
+SideScreen does not use the Core Graphics preflight result as a start gate; if the
+actual capture setup fails, use the inline recovery card to rebind the exact
+installed bundle.
 </details>
 
 ---
