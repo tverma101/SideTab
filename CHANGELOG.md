@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### USB SDR color path
 - Android's measured neutral sRGB tone profile now also covers the direct USB decoder path through a GPU bridge when VSR is disabled, without reconnecting or enabling sharpening. It is gated to decoder-reported 8-bit full-range content; normal 10-bit VideoRange content bypasses the curve because it already matches the native Android chart. The macOS SDR signaling remains unchanged because the tablet's vendor decoder applies the explicit VUI differently from the established USB baseline.
 - The sender's color-chart diagnostic now supports the 10-bit VideoRange USB path, allowing the Android profile to remain gated to 8-bit full-range content where it improves measured native-chart error.
+- The experimental USB color bridge now caps Android presentation at 60 FPS and passes the same rate as the decoder operating-rate hint. It drains to the newest frame instead of queueing stale frames; normal USB 10-bit/CAS and wireless policies are unchanged. The cap is Android-side and does not silently alter macOS capture/encoding.
 
 ---
 

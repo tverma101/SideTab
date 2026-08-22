@@ -32,11 +32,16 @@ import java.util.Locale
  *   - No CPU pixel readback, no Bitmap, no per-pixel JVM loops, no extra codec.
  *   - Frames stay on the GPU; textures/FBOs preallocated; shaders compiled once.
  *   - Dedicated render thread + own EGL context; swap interval 0 (no added vsync wait).
+ *     An optional render-side cadence cap is used only by the experimental USB
+ *     color bridge, so it can stay at a stable 60 FPS without queueing frames.
  *   - Drain-to-latest: if the decoder outpaces the GPU, intermediate frames are consumed
  *     and dropped; only the freshest complete frame is rendered.
  *   - CPU + GPU (EXT_disjoint_timer_query, when available) postprocess timing.
  */
-class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailableListener {
+class SgsrRenderer(
+    private val context: Context,
+    frameRateCap: Int? = null,
+) : SurfaceTexture.OnFrameAvailableListener {
 
     enum class Mode {
         BRIDGE_ONLY, // OES->2D bridge only (isolates bridge cost from shader cost)
@@ -205,6 +210,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     @Volatile private var frameAvailable = false
     @Volatile private var forceRender = false
     private var renderThread: Thread? = null
+    private val framePacer = FramePacer(frameRateCap)
 
     // Post program params (applied on the render thread via dirty flags)
     @Volatile private var mode = Mode.SGSR1
@@ -329,7 +335,8 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
             gpuQuery = q[0]
         }
         DiagLog.log("SGSR", "init stream=${streamWidth}x$streamHeight display=${displayWidth}x$displayHeight " +
-            "gpuTimer=$gpuTimerSupported gl=${GLES30.glGetString(GLES30.GL_VERSION)}")
+            "gpuTimer=$gpuTimerSupported frameCap=${framePacer.targetFps ?: "off"} " +
+            "gl=${GLES30.glGetString(GLES30.GL_VERSION)}")
 
         // Pass 1 program
         blitProgram = createProgram(BLIT_VERTEX_SHADER, BLIT_FRAGMENT_SHADER)
@@ -512,6 +519,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
                 st.updateTexImage()
                 backlog++
             }
+            if (!waitForPresentationSlot()) break
             if (backlog > 0) {
                 renderFrame(backlog - 1)
             } else {
@@ -521,6 +529,23 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
             }
         }
         teardownGl()
+    }
+
+    private fun waitForPresentationSlot(): Boolean {
+        while (running) {
+            val waitNs = framePacer.delayNanos(System.nanoTime())
+            if (waitNs <= 0L) {
+                framePacer.markSlotStarted(System.nanoTime())
+                return true
+            }
+            try {
+                Thread.sleep(waitNs / 1_000_000L, (waitNs % 1_000_000L).toInt())
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return false
     }
 
     private fun renderFrame(backlog: Long) {

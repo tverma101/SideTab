@@ -18,6 +18,13 @@ object AndroidColorProfile {
     const val DEFAULT_ENABLED = true
 
     /**
+     * The experimental USB bridge is a quality/power diagnostic path, not a
+     * high-refresh gaming path. Keep its Android presentation at a stable
+     * 60 FPS while leaving the normal USB and wireless policies independent.
+     */
+    const val USB_BRIDGE_FPS_CAP = 60
+
+    /**
      * GLSL helper shared by the SurfaceTexture and decoder-fed YUV paths.
      * The uniform keeps A/B switching live without rebuilding the decoder.
      */

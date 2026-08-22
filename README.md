@@ -57,6 +57,8 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** lets you scan a QR code from the Mac once, then tap **Reconnect** when you choose to start a session over WiFi (5 GHz strongly recommended). Wireless uses a bounded efficiency profile: capture and encode are fixed at 60 FPS with a 40 Mbps average / approximately 60 Mbps one-second peak. The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
 
+The experimental Android sRGB/BT.709 color bridge is presentation-capped at 60 FPS and asks the tablet decoder for a 60 FPS operating rate. It drains to the newest decoded frame rather than queueing stale frames, so the cap protects smoothness and power without changing the normal USB 10-bit path. This is an Android-side cap; macOS capture/encoding remains governed by the selected virtual-display refresh rate.
+
 ### Virtual Display
 
 Create a true virtual display on your Mac. Drag windows to your tablet like a real monitor — not mirroring, but extending.

@@ -1259,7 +1259,14 @@ class MainActivity : AppCompatActivity() {
                 }
             } else if (vsrOn || usbColorBridgeOn) {
                 try {
-                    val renderer = SgsrRenderer(applicationContext)
+                    val renderer = SgsrRenderer(
+                        applicationContext,
+                        frameRateCap = if (usbColorBridgeOn) {
+                            AndroidColorProfile.USB_BRIDGE_FPS_CAP
+                        } else {
+                            null
+                        },
+                    )
                     renderer.initialize(surface, displayWidth, displayHeight)
                     renderer.setMode(
                         if (usbColorBridgeOn) {
@@ -1283,7 +1290,8 @@ class MainActivity : AppCompatActivity() {
                     if (usbColorBridgeOn) {
                         mainDiag(
                             "USB color bridge active: sRGB / BT.709 profile=" +
-                                "${prefs.androidColorProfileEnabled}",
+                                "${prefs.androidColorProfileEnabled} " +
+                                "fpsCap=${AndroidColorProfile.USB_BRIDGE_FPS_CAP}",
                         )
                     } else {
                         mainDiag(
@@ -1310,10 +1318,11 @@ class MainActivity : AppCompatActivity() {
                 displayWidth,
                 displayHeight,
                 mime,
-                targetFrameRate = if (prefs.connectionMode == ConnectionMode.WIRELESS) {
-                    WirelessTransportProfile.TARGET_FPS
-                } else {
-                    null
+                targetFrameRate = when {
+                    prefs.connectionMode == ConnectionMode.WIRELESS ->
+                        WirelessTransportProfile.TARGET_FPS
+                    usbColorBridgeOn -> AndroidColorProfile.USB_BRIDGE_FPS_CAP
+                    else -> null
                 },
                 bufferOutput = useBufferOutput,
             )
@@ -1367,10 +1376,11 @@ class MainActivity : AppCompatActivity() {
             }
             streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
             mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, texture=$useTextureView")
-            val effectiveDecoderRate = if (prefs.connectionMode == ConnectionMode.WIRELESS) {
-                WirelessTransportProfile.TARGET_FPS.toFloat()
-            } else {
-                displayObj?.refreshRate ?: 60f
+            val effectiveDecoderRate = when {
+                prefs.connectionMode == ConnectionMode.WIRELESS ->
+                    WirelessTransportProfile.TARGET_FPS.toFloat()
+                usbColorBridgeOn -> AndroidColorProfile.USB_BRIDGE_FPS_CAP.toFloat()
+                else -> displayObj?.refreshRate ?: 60f
             }
             log("✅ Decoder initialized ${displayWidth}x$displayHeight $mime (${effectiveDecoderRate}Hz target)")
         } catch (e: Exception) {
