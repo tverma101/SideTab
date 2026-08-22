@@ -216,6 +216,15 @@ USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wir
 
 For SDR USB sessions, the Android client uses a lightweight GPU color bridge when VSR is disabled. The measured Android sRGB tone profile is applied only after the decoder reports 8-bit full-range content; the normal 10-bit VideoRange path bypasses that curve because it already matches the native Android chart. The bridge adds no sharpening or reconnect, and it is a display correction—not a claim that streamed macOS pixels become native Android content.
 
+For the closest native-like USB presentation, keep VSR sharpening off. The
+unsharpened Bridge preserves the decoded pixel grid and applies only the
+measured 8-bit Android tone correction. On the Tab S8+, the bridge also uses a
+single external-texture pass for the native-sized `2800x1752` stream (the
+Qualcomm decoder reports an 8-pixel block-aligned height, which is handled as
+the panel crop) and nearest sampling for the general GPU path. CAS and SGSR1
+are optional enhancement modes; they can make edges look more artificial than
+the native Android launcher and are not the native-fidelity profile.
+
 ### Experimental same-aspect Android final upscale (opt-in)
 
 The private USB quality experiment can send a same-aspect `2560x1602` physical
@@ -259,6 +268,13 @@ contrast (about `255` to `210–214`). The upscaled bridge still held roughly
 `10.5 ms` versus `~2 ms` for exact-size output. It is therefore a useful
 quality experiment for video and larger UI, not the default for tiny desktop
 text or battery-sensitive sessions.
+
+The same-source native-launcher comparison also measured the Android bridge
+renderer itself. With the new single-pass native-size path, RGB error fell from
+`7.08` to `6.94` mean absolute error against the original `2800x1752` PNG, and
+GPU postprocess time fell from roughly `3.3 ms` to `1.9–2.0 ms`. This measures
+transport/presentation fidelity only; HEVC 4:2:0 compression and the Mac's
+own rasterization still remain upstream limits.
 
 ### Headless mode (new in 0.11.0 — no Mac interaction)
 

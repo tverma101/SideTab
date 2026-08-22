@@ -18,6 +18,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.Locale
+import kotlin.math.abs
 
 /**
  * GPU post-processing bridge between MediaCodec and the display surface.
@@ -105,6 +106,25 @@ class SgsrRenderer(
             "out vec4 fragColor;\n" +
             "void main() {\n" +
             "  fragColor = texture(sTexture, vTexCoord);\n" +
+            "}\n"
+
+    /**
+     * Exact-size bridge path. Sampling the decoder's external texture directly
+     * avoids the intermediate RGBA texture and second texture lookup used by
+     * the general scaler path. The transform is still applied by the shared
+     * blit vertex shader so SurfaceTexture orientation/crop behavior is kept.
+     */
+    private val DIRECT_BRIDGE_POST_FRAGMENT_SHADER =
+        "#version 310 es\n" +
+            "#extension GL_OES_EGL_image_external_essl3 : require\n" +
+            "precision mediump float;\n" +
+            "in vec2 vTexCoord;\n" +
+            "uniform samplerExternalOES sTexture;\n" +
+            AndroidColorProfile.GLSL_FUNCTION + "\n" +
+            "out vec4 fragColor;\n" +
+            "void main() {\n" +
+            "  vec3 color = texture(sTexture, vTexCoord).rgb;\n" +
+            "  fragColor = vec4(applyAndroidColorProfile(color), 1.0);\n" +
             "}\n"
 
     private val POST_VERTEX_SHADER_PREFIX =
@@ -241,8 +261,10 @@ class SgsrRenderer(
     private var postAPos = -1
     private var postATex = -1
     private var postSTex = -1
+    private var postUstMatrix = -1
     private var postSharpness = -1
     private var postColorProfile = -1
+    private var postUsesExternalTexture = false
 
     private val vertexBuffer: FloatBuffer
 
@@ -408,8 +430,13 @@ class SgsrRenderer(
             GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA, streamWidth, streamHeight, 0,
             GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, null,
         )
-        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_LINEAR)
-        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_LINEAR)
+        // The post shaders perform their own sampling. Linear filtering here
+        // would blur the intermediate texture once before CAS/SGSR or the
+        // explicit bicubic scaler samples it again. Nearest preserves the
+        // decoded pixel grid for exact-size USB output and keeps the bicubic
+        // bridge a true 16-tap reconstruction instead of a double filter.
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
         GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_CLAMP_TO_EDGE)
         GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_CLAMP_TO_EDGE)
 
@@ -631,34 +658,52 @@ class SgsrRenderer(
             }
         }
 
-        // ===== PASS 1: OES -> 2D (FBO) =====
         if (gpuTimerSupported) {
             GLES30.glBeginQuery(GL_TIME_ELAPSED_EXT, gpuQuery)
         }
 
-        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fboId)
-        GLES31.glViewport(0, 0, streamWidth, streamHeight)
-        GLES31.glUseProgram(blitProgram)
-        if (blitUstMatrix >= 0) {
-            GLES31.glUniformMatrix4fv(blitUstMatrix, 1, false, transformMatrix, 0)
-        }
-        if (blitSTex >= 0) GLES31.glUniform1i(blitSTex, 0)
-        GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
-        GLES31.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
-        drawQuad(blitAPos, blitATex)
+        if (postUsesExternalTexture) {
+            // Exact-size bridge: keep the decoder's external texture in the
+            // single output pass so no intermediate resampling/quantization is
+            // introduced before the Android tone profile.
+            GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+            GLES31.glViewport(0, 0, displayWidth, displayHeight)
+            GLES31.glUseProgram(postProgram)
+            if (postUstMatrix >= 0) {
+                GLES31.glUniformMatrix4fv(postUstMatrix, 1, false, transformMatrix, 0)
+            }
+            if (postSTex >= 0) GLES31.glUniform1i(postSTex, 0)
+            if (postColorProfile >= 0) {
+                GLES31.glUniform1i(postColorProfile, if (colorProfileEnabled && fullRange) 1 else 0)
+            }
+            GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
+            GLES31.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+            drawQuad(postAPos, postATex)
+        } else {
+            // General path: OES -> 2D (FBO) -> post/scaler -> display.
+            GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fboId)
+            GLES31.glViewport(0, 0, streamWidth, streamHeight)
+            GLES31.glUseProgram(blitProgram)
+            if (blitUstMatrix >= 0) {
+                GLES31.glUniformMatrix4fv(blitUstMatrix, 1, false, transformMatrix, 0)
+            }
+            if (blitSTex >= 0) GLES31.glUniform1i(blitSTex, 0)
+            GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
+            GLES31.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+            drawQuad(blitAPos, blitATex)
 
-        // ===== PASS 2: post shader -> display =====
-        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
-        GLES31.glViewport(0, 0, displayWidth, displayHeight)
-        GLES31.glUseProgram(postProgram)
-        if (postSTex >= 0) GLES31.glUniform1i(postSTex, 0)
-        if (postSharpness >= 0) GLES31.glUniform1f(postSharpness, sharpness)
-        if (postColorProfile >= 0) {
-            GLES31.glUniform1i(postColorProfile, if (colorProfileEnabled && fullRange) 1 else 0)
+            GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+            GLES31.glViewport(0, 0, displayWidth, displayHeight)
+            GLES31.glUseProgram(postProgram)
+            if (postSTex >= 0) GLES31.glUniform1i(postSTex, 0)
+            if (postSharpness >= 0) GLES31.glUniform1f(postSharpness, sharpness)
+            if (postColorProfile >= 0) {
+                GLES31.glUniform1i(postColorProfile, if (colorProfileEnabled && fullRange) 1 else 0)
+            }
+            GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
+            GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, fboTextureId)
+            drawQuad(postAPos, postATex)
         }
-        GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
-        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, fboTextureId)
-        drawQuad(postAPos, postATex)
 
         if (gpuTimerSupported) {
             GLES30.glEndQuery(GL_TIME_ELAPSED_EXT)
@@ -736,9 +781,20 @@ class SgsrRenderer(
         }
 
         val defines = compileTimeDefines()
-        val vertexSource = POST_VERTEX_SHADER_PREFIX + defines + POST_VERTEX_SHADER_BODY
-
-        val fragmentSource =
+        val normalVertexSource = POST_VERTEX_SHADER_PREFIX + defines + POST_VERTEX_SHADER_BODY
+        // QTI reports the 2800x1752 panel stream as a block-aligned 2800x1760
+        // texture, while SurfaceTexture carries the effective crop. Treat that
+        // bounded 8-pixel height padding as exact-size so the decoded image
+        // still avoids an intermediate FBO copy.
+        val exactBridge =
+            mode == Mode.BRIDGE_ONLY &&
+                displayWidth == streamWidth &&
+                abs(displayHeight - streamHeight) <= NEAR_NATIVE_DIMENSION_TOLERANCE
+        postUsesExternalTexture = exactBridge
+        val vertexSource = if (exactBridge) BLIT_VERTEX_SHADER else normalVertexSource
+        val fragmentSource = if (exactBridge) {
+            DIRECT_BRIDGE_POST_FRAGMENT_SHADER
+        } else {
             when (mode) {
                 Mode.BRIDGE_ONLY -> {
                     val needsUpscale = displayWidth > streamWidth || displayHeight > streamHeight
@@ -773,14 +829,17 @@ class SgsrRenderer(
                     }
                 }
             }
+        }
 
         postProgram = createProgram(vertexSource, fragmentSource)
         if (postProgram == 0) {
             DiagLog.log("SGSR", "post program failed — falling back to bridge shader")
-            postProgram = createProgram(vertexSource, BRIDGE_POST_FRAGMENT_SHADER)
+            postUsesExternalTexture = false
+            postProgram = createProgram(normalVertexSource, BRIDGE_POST_FRAGMENT_SHADER)
         }
         postAPos = GLES31.glGetAttribLocation(postProgram, "aPosition")
         postATex = GLES31.glGetAttribLocation(postProgram, "aTexCoord")
+        postUstMatrix = GLES31.glGetUniformLocation(postProgram, "uSTMatrix")
         postSTex = GLES31.glGetUniformLocation(postProgram, "ps0")
         if (postSTex < 0) postSTex = GLES31.glGetUniformLocation(postProgram, "sTexture")
         postSharpness = GLES31.glGetUniformLocation(postProgram, "uSharpness")
@@ -794,6 +853,7 @@ class SgsrRenderer(
                 "androidColorProfile=${colorProfileEnabled && fullRange} " +
                 "sourceRange=${if (fullRange) "full" else "limited"} " +
                 "upscale=${mode == Mode.BRIDGE_ONLY && (displayWidth > streamWidth || displayHeight > streamHeight)} " +
+                "externalTexture=$postUsesExternalTexture " +
                 "output=${displayWidth}x$displayHeight",
         )
     }
@@ -909,6 +969,7 @@ class SgsrRenderer(
         private const val STAT_WINDOW = 60
         private const val MAX_DRAIN = 8
         private const val SGSR1_EDGE_SHARPNESS_MAX = 2.0f
+        private const val NEAR_NATIVE_DIMENSION_TOLERANCE = 8
 
         // EXT_disjoint_timer_query constants (reuse core ES3 query entry points)
         private const val GL_TIME_ELAPSED_EXT = 0x88BF

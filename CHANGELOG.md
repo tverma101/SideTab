@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stylus/pen support
 
 ### Experimental USB quality bridge
+- The Android GPU bridge now keeps exact-size USB frames on a single external-texture pass and uses nearest sampling for the intermediate texture used by scaled/sharpened modes. This removes an unintended extra filter from the native-size path and avoids double-filtering the explicit bicubic scaler.
+- On the SM-X800's `2800x1760` block-aligned decoder output (cropped to the `2800x1752` panel), the native-size Bridge path reduced measured RGB error against a same-source Android launcher image from `7.08` to `6.94` MAE and reduced GPU postprocess time from about `3.3 ms` to `1.9–2.0 ms`. CAS/SGSR1 remain optional sharpening modes rather than the native-fidelity default.
 - Added an opt-in same-aspect source-size override: `SideScreen_exp_sourceResolution=1280x801` creates a `2560x1602` physical HiDPI source while Android presents it on the native `2800x1752` panel.
 - Android keeps the SurfaceView at panel size and uses a bicubic GPU bridge only when the decoded source is smaller; exact-size `2800x1752` output bypasses the scaler. The experiment remains behind defaults and does not change production resolution or wireless behavior.
 - Live SM-X800 testing on 2026-08-21 confirmed the corrected shader compiled on the Adreno driver, ran at `56–58 FPS` with zero steady-state drops, and held decoder latency near `10 ms`. Uniform color patches were unchanged (`2.17` mean RGB chart error), while 1–2 pixel text bars were softer (`255` exact-size contrast versus `210–214` upscaled), and GPU time rose to about `10.5 ms` from roughly `2 ms`.
