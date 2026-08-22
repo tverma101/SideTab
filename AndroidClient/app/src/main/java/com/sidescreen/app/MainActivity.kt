@@ -1043,6 +1043,13 @@ class MainActivity : AppCompatActivity() {
         return am.deviceConfigurationInfo.reqGlEsVersion >= 0x30001
     }
 
+    private fun isUsbColorBridgePathActive(): Boolean =
+        prefs.connectionMode == ConnectionMode.USB &&
+            prefs.androidColorProfileEnabled &&
+            supportsGles31() &&
+            !shouldUseTextureView() &&
+            !prefs.vsrEnabled
+
     /** Recreate the video path (decoder + optional VSR renderer) with current prefs. */
     private fun restartVideoPath() {
         if (!isConnected) return
@@ -1071,7 +1078,9 @@ class MainActivity : AppCompatActivity() {
         binding.surfaceView.post {
             val panelWidth = binding.root.width
             val panelHeight = binding.root.height
+            val usbColorBridgeOn = isUsbColorBridgePathActive()
             val nearNative =
+                !usbColorBridgeOn &&
                 !prefs.vsrEnabled &&
                     !shouldUseTextureView() &&
                     streamWidth in 1..panelWidth &&
@@ -1087,7 +1096,7 @@ class MainActivity : AppCompatActivity() {
                 binding.surfaceView.layoutParams = params
             }
             mainDiag(
-                "Surface mapping: ${if (nearNative) "1:1" else "fill"} " +
+                "Surface mapping: ${if (usbColorBridgeOn) "GPU upscale/fill" else if (nearNative) "1:1" else "fill"} " +
                     "stream=${streamWidth}x$streamHeight panel=${panelWidth}x$panelHeight",
             )
         }
@@ -1215,13 +1224,7 @@ class MainActivity : AppCompatActivity() {
             val cflOn = prefs.vsrEnabled && prefs.vsrMode.equals("cfl", true) &&
                 supportsGles31() && !useTextureView
             val vsrOn = prefs.vsrEnabled && supportsGles31() && !useTextureView && !cflOn
-            val usbColorBridgeOn =
-                prefs.connectionMode == ConnectionMode.USB &&
-                    prefs.androidColorProfileEnabled &&
-                    supportsGles31() &&
-                    !useTextureView &&
-                    !cflOn &&
-                    !vsrOn
+            val usbColorBridgeOn = isUsbColorBridgePathActive() && !cflOn && !vsrOn
             if (cflOn) {
                 // CfL chroma reconstruction via ByteBuffer-mode decode: the
                 // decoder is configured WITHOUT a surface and hands

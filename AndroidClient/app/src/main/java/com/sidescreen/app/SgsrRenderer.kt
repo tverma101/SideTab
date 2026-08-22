@@ -133,6 +133,48 @@ class SgsrRenderer(
             "  fragColor = vec4(applyAndroidColorProfile(color), 1.0);\n" +
             "}\n"
 
+    /**
+     * Catmull-Rom bicubic final scaler for the experimental bridge. It is
+     * selected only when the EGL window is larger than the decoded texture;
+     * exact-size 2800x1752 output keeps the one-sample bridge path.
+     */
+    private val BICUBIC_BRIDGE_POST_FRAGMENT_SHADER =
+        "#version 310 es\n" +
+            "precision highp float;\n" +
+            "in vec2 v_texCoord;\n" +
+            "uniform sampler2D ps0;\n" +
+            AndroidColorProfile.GLSL_FUNCTION + "\n" +
+            "precision highp float;\n" +
+            "out vec4 fragColor;\n" +
+            "float cubicWeight(float x) {\n" +
+            "  float a = abs(x);\n" +
+            "  if (a <= 1.0) return 1.5 * a * a * a - 2.5 * a * a + 1.0;\n" +
+            "  if (a < 2.0) return -0.5 * a * a * a + 2.5 * a * a - 4.0 * a + 2.0;\n" +
+            "  return 0.0;\n" +
+            "}\n" +
+            "vec3 sampleBicubic(vec2 uv) {\n" +
+            "  highp vec2 source = uv * vec2(SRC_W, SRC_H) - vec2(0.5);\n" +
+            "  highp vec2 base = floor(source);\n" +
+            "  highp vec2 fraction = source - base;\n" +
+            "  vec3 color = vec3(0.0);\n" +
+            "  float total = 0.0;\n" +
+            "  for (int y = -1; y <= 2; y++) {\n" +
+            "    float wy = cubicWeight(float(y) - fraction.y);\n" +
+            "    for (int x = -1; x <= 2; x++) {\n" +
+            "      float weight = wy * cubicWeight(float(x) - fraction.x);\n" +
+            "      highp vec2 sampleCoord = (base + vec2(float(x), float(y)) + vec2(0.5)) * " +
+            "vec2(INV_SRC_W, INV_SRC_H);\n" +
+            "      color += texture(ps0, clamp(sampleCoord, vec2(0.0), vec2(1.0))).rgb * weight;\n" +
+            "      total += weight;\n" +
+            "    }\n" +
+            "  }\n" +
+            "  return color / max(total, 0.0001);\n" +
+            "}\n" +
+            "void main() {\n" +
+            "  vec3 color = clamp(sampleBicubic(v_texCoord), 0.0, 1.0);\n" +
+            "  fragColor = vec4(applyAndroidColorProfile(color), 1.0);\n" +
+            "}\n"
+
     // AMD FidelityFX CAS, sharpen-only (noScaling) + better diagonals, per
     // https://github.com/GPUOpen-Effects/FidelityFX-CAS (MIT). Green-channel
     // coefficient fast path, as in the reference CasFilter().
@@ -698,7 +740,17 @@ class SgsrRenderer(
 
         val fragmentSource =
             when (mode) {
-                Mode.BRIDGE_ONLY -> BRIDGE_POST_FRAGMENT_SHADER
+                Mode.BRIDGE_ONLY -> {
+                    val needsUpscale = displayWidth > streamWidth || displayHeight > streamHeight
+                    if (needsUpscale) {
+                        BICUBIC_BRIDGE_POST_FRAGMENT_SHADER.replaceFirst(
+                            Regex("#version 310 es"),
+                            "#version 310 es$defines",
+                        )
+                    } else {
+                        BRIDGE_POST_FRAGMENT_SHADER
+                    }
+                }
                 Mode.CAS -> CAS_POST_FRAGMENT_SHADER.replaceFirst(Regex("#version 310 es"), "#version 310 es$defines")
                 Mode.SGSR1 -> {
                     val raw = loadAsset("sgsr1_shader_mobile_edge_direction.frag")
@@ -740,7 +792,9 @@ class SgsrRenderer(
             "post program compiled: mode=$mode sharpness=$sharpness " +
                 "effectiveSharpness=$effectiveSharpness edgeThreshold=$edgeThreshold " +
                 "androidColorProfile=${colorProfileEnabled && fullRange} " +
-                "sourceRange=${if (fullRange) "full" else "limited"}",
+                "sourceRange=${if (fullRange) "full" else "limited"} " +
+                "upscale=${mode == Mode.BRIDGE_ONLY && (displayWidth > streamWidth || displayHeight > streamHeight)} " +
+                "output=${displayWidth}x$displayHeight",
         )
     }
 

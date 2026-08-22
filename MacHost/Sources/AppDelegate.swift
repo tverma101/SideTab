@@ -609,7 +609,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Create virtual display and run ADB setup in parallel
             virtualDisplayManager = VirtualDisplayManager()
-            let size = settings.resolutionSize
+            let configuredSize = settings.resolutionSize
+            let size = ExperimentalDisplayProfile.logicalSize(
+                fallback: .init(width: configuredSize.width, height: configuredSize.height)
+            )
+            if size.width != configuredSize.width || size.height != configuredSize.height {
+                debugLog(
+                    "Experimental source resolution: logical \(size.width)x\(size.height) " +
+                        "(HiDPI physical \(size.width * 2)x\(size.height * 2))"
+                )
+            }
             try virtualDisplayManager?.createDisplay(
                 width: size.width,
                 height: size.height,

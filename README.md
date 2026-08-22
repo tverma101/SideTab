@@ -216,6 +216,50 @@ USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wir
 
 For SDR USB sessions, the Android client uses a lightweight GPU color bridge when VSR is disabled. The measured Android sRGB tone profile is applied only after the decoder reports 8-bit full-range content; the normal 10-bit VideoRange path bypasses that curve because it already matches the native Android chart. The bridge adds no sharpening or reconnect, and it is a display correction—not a claim that streamed macOS pixels become native Android content.
 
+### Experimental same-aspect Android final upscale (opt-in)
+
+The private USB quality experiment can send a same-aspect `2560x1602` physical
+source (`1280x801` logical HiDPI) and let the Android GPU upscale it into the
+full `2800x1752` panel. The Android SurfaceView stays panel-sized, so the
+experiment tests a real GPU scaler rather than a smaller letterboxed surface.
+The bicubic bridge is selected only when the output surface is larger than the
+decoded stream; an exact `2800x1752` stream bypasses it. The normal production
+profile is unchanged when the override is absent.
+
+For a controlled USB experiment, use the same 8-bit full-range sRGB profile on
+both sides and cap the bridge at 60 FPS:
+
+```bash
+defaults write com.sidescreen.app SideScreen_exp_sourceResolution -string 1280x801
+defaults write com.sidescreen.app SideScreen_exp_pixelFormat -string 8bit
+defaults write com.sidescreen.app SideScreen_exp_profile -string main
+defaults write com.sidescreen.app SideScreen_exp_colorSpace -string srgb
+defaults write com.sidescreen.app SideScreen_exp_fps -int 60
+```
+
+Restart the canonical Mac host after changing the source-size key, disable VSR
+on the tablet, and tap **Connect** manually. To restore the normal source and
+10-bit profile, restore the regular defaults and remove the experiment keys:
+
+```bash
+defaults write com.sidescreen.app SideScreen_exp_pixelFormat -string 10bit
+defaults write com.sidescreen.app SideScreen_exp_profile -string main10
+defaults delete com.sidescreen.app SideScreen_exp_colorSpace
+defaults delete com.sidescreen.app SideScreen_exp_sourceResolution
+defaults delete com.sidescreen.app SideScreen_exp_fps
+```
+
+Restart the host after restoring these values. The experiment does not enable
+automatic reconnect; tap **Connect** manually on the tablet.
+
+The 2026-08-21 SM-X800 A/B run kept uniform color-chart error at `2.17` mean
+RGB for both exact-size and upscaled output, but the 1–2 pixel text bars lost
+contrast (about `255` to `210–214`). The upscaled bridge still held roughly
+`56–58 FPS` with zero steady-state drops, but its measured GPU time was about
+`10.5 ms` versus `~2 ms` for exact-size output. It is therefore a useful
+quality experiment for video and larger UI, not the default for tiny desktop
+text or battery-sensitive sessions.
+
 ### Headless mode (new in 0.11.0 — no Mac interaction)
 
 In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
