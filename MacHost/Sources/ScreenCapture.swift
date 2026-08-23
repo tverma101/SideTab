@@ -76,6 +76,10 @@ class ScreenCapture {
     private var pendingEncodes: Int32 = 0
     private var lastPixelBuffer: CVPixelBuffer?
 
+    // Default-on adaptive cadence controller. It consumes ScreenCaptureKit
+    // metadata only — no full-frame pixel hashing in the normal path.
+    private var adaptiveRefreshController: AdaptiveRefreshController?
+
     /// Callback when the ScreenCaptureKit capture state changes.
     var onCaptureMethodChanged: ((String) -> Void)?
 
@@ -351,37 +355,30 @@ class ScreenCapture {
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
 
-        let config = SCStreamConfiguration()
-        config.width = width
-        config.height = height
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        // EXP-FORK knobs (absent = current production behavior):
-        //   SideScreen_exp_pixelFormat "10bit" -> 420YpCbCr10BiPlanarVideoRange (Main10 source)
-        //   SideScreen_exp_colorSpace   "displayP3" | "bt2020" -> explicit color space
-        let expPixelFormat = UserDefaults.standard.string(forKey: "SideScreen_exp_pixelFormat")
-        config.pixelFormat = expPixelFormat == "10bit"
-            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        switch UserDefaults.standard.string(forKey: "SideScreen_exp_colorSpace") {
-        case "displayP3":
-            config.colorSpaceName = "kCGColorSpaceDisplayP3" as CFString
-        case "bt2020":
-            config.colorSpaceName = "kCGColorSpaceITUR_2020" as CFString
-        case "srgb":
-            config.colorSpaceName = "kCGColorSpaceSRGB" as CFString
-        default:
-            break // leave SCKit's default (current production behavior)
-        }
-        config.showsCursor = true
-        config.queueDepth = 4
-        config.capturesAudio = false
-        config.backgroundColor = .clear
-        config.scalesToFit = false
+        // The initial configuration and every live adaptive update use the
+        // same builder so changing FPS cannot reset color/pixel-format knobs.
+        let config = AdaptiveRefreshController.makeStreamConfiguration(
+            width: width,
+            height: height,
+            fps: fps
+        )
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: delegate)
         try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
 
         stream = scStream
+        if AdaptiveRefreshController.isEnabled {
+            adaptiveRefreshController = AdaptiveRefreshController(
+                width: width,
+                height: height,
+                maxFPS: fps,
+                gamingBoost: currentGamingBoost
+            )
+            debugLog("Adaptive refresh enabled — session ceiling \(fps)fps")
+        } else {
+            adaptiveRefreshController = nil
+            debugLog("Adaptive refresh disabled — fixed \(fps)fps")
+        }
         debugLog("Stream configured: \(width)x\(height) @ \(fps)fps (with delegate)")
     }
 
@@ -427,6 +424,16 @@ class ScreenCapture {
                 self.onCaptureMethodChanged?("SCStream")
             }
 
+            // ScreenCaptureKit already reports idle frames + changed regions.
+            // Use that metadata before touching the pixel buffer; an idle frame
+            // exits here without dither/HDR/hash/encode/network work.
+            if self.adaptiveRefreshController?.observe(
+                sampleBuffer: sampleBuffer,
+                stream: self.stream
+            ) == true {
+                return
+            }
+
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
             // Backpressure: skip if encode queue already has 2+ frames pending
@@ -447,11 +454,10 @@ class ScreenCapture {
                 if DitherPass.enabled {
                     DitherPass.apply(imageBuffer)
                 }
-                // FrameSkipper (efficiency Lever 1, Entry U) — skip
-                // pixel-identical frames (SideScreen_exp_skipFrames=1).
-                // lastFrameTime was already updated at handler top, so the
-                // early return cannot false-trigger the stall monitor.
-                if FrameSkipper.enabled {
+                // The old FrameSkipper remains available only for fixed-FPS
+                // A/B experiments. Adaptive mode must not SHA-256 entire pixel
+                // planes merely to learn information SCK already supplies.
+                if FrameSkipper.enabled && self.adaptiveRefreshController == nil {
                     let decision = FrameSkipper.decide(imageBuffer)
                     if decision.skip {
                         return  // identical content — skip encode+send
@@ -504,6 +510,7 @@ class ScreenCapture {
         currentGamingBoost = gamingBoost
         currentFrameRate = effFrameRate
         currentBitrateCapMbps = bitrateCapMbps
+        adaptiveRefreshController?.update(maxFPS: effFrameRate, gamingBoost: gamingBoost)
 
         isStreaming = true
 
@@ -692,6 +699,7 @@ class ScreenCapture {
                 streamOutput = nil
                 streamDelegate = nil
                 display = nil
+                adaptiveRefreshController = nil
 
                 // Re-setup
                 try await setupDisplay()
@@ -700,6 +708,7 @@ class ScreenCapture {
                     debugLog("restartStream(gen \(gen)) superseded during setup — aborting")
                     try? await stream?.stopCapture()
                     stream = nil
+                    adaptiveRefreshController = nil
                     return
                 }
 
@@ -714,6 +723,7 @@ class ScreenCapture {
                 guard isStreaming, gen == streamGeneration else {
                     debugLog("restartStream(gen \(gen)) superseded after startCapture — aborting")
                     try? await stream?.stopCapture()
+                    adaptiveRefreshController = nil
                     return
                 }
 
@@ -770,6 +780,10 @@ class ScreenCapture {
     // MARK: - Settings update
 
     func updateEncoderSettings(bitrateMbps: Int, quality: String, gamingBoost: Bool) {
+        currentBitrateMbps = bitrateMbps
+        currentQuality = quality
+        currentGamingBoost = gamingBoost
+        adaptiveRefreshController?.update(maxFPS: currentFrameRate, gamingBoost: gamingBoost)
         encoder?.updateSettings(bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost)
     }
 
@@ -823,8 +837,9 @@ class ScreenCapture {
         isStreaming = false
         streamGeneration &+= 1
 
-        // Cancel frame flow monitor
+        // Cancel frame flow monitor and adaptive cadence watchdog.
         stopFrameMonitor()
+        adaptiveRefreshController = nil
 
         // Let the display idle-sleep normally again once we stop streaming.
         releaseDisplaySleepAssertion()
