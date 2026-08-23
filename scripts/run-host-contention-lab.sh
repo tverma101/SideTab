@@ -74,6 +74,11 @@ if [[ -z "$WINDOWSERVER_PID" ]]; then
   echo "Could not identify WindowServer." >&2
   exit 6
 fi
+SIDESCREEN_LOG="/tmp/sidescreen.log"
+log_start_bytes=0
+if [[ -f "$SIDESCREEN_LOG" ]]; then
+  log_start_bytes="$(wc -c < "$SIDESCREEN_LOG" | tr -d ' ')"
+fi
 
 mkdir -p "$OUTPUT_DIR"
 cd "$ROOT_DIR"
@@ -95,6 +100,7 @@ cat > "$OUTPUT_DIR/samples.csv" <<EOF
 # macos=$macos_version
 # hardware=$hardware
 # duration_s=$DURATION
+# log_start_bytes=$log_start_bytes
 timestamp,elapsed_s,scenario,sidescreen_cpu_pct,windowserver_cpu_pct,total_cpu_pct,memory_free_pct,swap_used_mb,thermal_warning
 EOF
 
@@ -133,13 +139,20 @@ for ((sample = 0; sample < DURATION; sample++)); do
   sleep 1
 done
 
-if [[ -f /tmp/sidescreen.log ]]; then
-  cp /tmp/sidescreen.log "$OUTPUT_DIR/sidescreen.log"
+if [[ -f "$SIDESCREEN_LOG" ]]; then
+  log_end_bytes="$(wc -c < "$SIDESCREEN_LOG" | tr -d ' ')"
+  if (( log_end_bytes >= log_start_bytes )); then
+    tail -c "+$((log_start_bytes + 1))" "$SIDESCREEN_LOG" > "$OUTPUT_DIR/sidescreen.log"
+  else
+    # The log was truncated or rotated while sampling; keep the available
+    # post-rotation content rather than mixing it with an older run.
+    cp "$SIDESCREEN_LOG" "$OUTPUT_DIR/sidescreen.log"
+  fi
   {
-    echo "SCStream frame geometry lines: $(rg -c 'SCStream frame geometry' /tmp/sidescreen.log || true)"
-    echo "Frame flow lines: $(rg -c 'Frame flow' /tmp/sidescreen.log || true)"
-    echo "Capture latency lines: $(rg -c 'Capture latency|capture->' /tmp/sidescreen.log || true)"
-    echo "Encoder configuration lines: $(rg -c 'VideoToolbox encoder configured' /tmp/sidescreen.log || true)"
+    echo "SCStream frame geometry lines: $(rg -c 'SCStream frame geometry' "$OUTPUT_DIR/sidescreen.log" || true)"
+    echo "Frame flow lines: $(rg -c 'Frame flow' "$OUTPUT_DIR/sidescreen.log" || true)"
+    echo "Capture latency lines: $(rg -c 'Capture latency|capture->' "$OUTPUT_DIR/sidescreen.log" || true)"
+    echo "Encoder configuration lines: $(rg -c 'VideoToolbox encoder configured' "$OUTPUT_DIR/sidescreen.log" || true)"
   } > "$OUTPUT_DIR/sidescreen-log-summary.txt"
 fi
 
@@ -157,6 +170,7 @@ scenario=$SCENARIO
 duration_s=$DURATION
 macos=$macos_version
 hardware=$hardware
+log_start_bytes=$log_start_bytes
 EOF
 
 echo "Host contention lab run: $OUTPUT_DIR"
