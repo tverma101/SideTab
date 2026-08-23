@@ -111,11 +111,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.autoStartStreamingOnLaunch {
             settings.connectionMode = settings.startupMode
             Task {
-                await self.checkPermissions()
-                if self.settings.hasScreenRecordingPermission {
+                // CAMPAIGN FORK: forceStart bypass (proven pattern) — skips the
+                // permission/SCShareableContent dance so cold starts bind fast
+                // (the experiment runner depends on deterministic startup).
+                if UserDefaults.standard.bool(forKey: "SideScreen_forceStart") {
+                    debugLog("FORCE-START active — bypassing permission checks entirely")
                     await self.startServer()
                 } else {
-                    debugLog("Auto-start skipped: Screen Recording permission not granted")
+                    await self.checkPermissions()
+                    if self.settings.hasScreenRecordingPermission {
+                        await self.startServer()
+                    } else {
+                        debugLog("Auto-start skipped: Screen Recording permission not granted")
+                    }
                 }
             }
         }

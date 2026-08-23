@@ -86,6 +86,10 @@ class ScreenCapture {
     /// If the encoder hasn't been created yet (request arrived before
     /// startStreaming), the request is stored and applied at encoder init.
     func requestKeyframe() {
+        // SANDBOX: FrameSkipper — every keyframe request also forces the next
+        // captured frame through the skip gate (client connect on a static
+        // screen must still receive a fresh IDR).
+        FrameSkipper.forceNextFrame()
         if let encoder {
             encoder.requestKeyframe()
             return
@@ -344,7 +348,10 @@ class ScreenCapture {
 
         // Physical pixels for full Retina sharpness, clamped when H.264 (SCStream scales)
         let (width, height) = encodeSize(for: codec)
-        let fps = refreshRate
+        // EXP-FORK: SideScreen_exp_fps caps the capture cadence (e.g. 90) —
+        // a stable 90 beats a jittery 120 when the pipeline can't hold 120.
+        let expFps = UserDefaults.standard.integer(forKey: "SideScreen_exp_fps")
+        let fps = expFps > 0 ? expFps : refreshRate
 
         streamOutput = StreamOutput()
 
@@ -446,10 +453,44 @@ class ScreenCapture {
             }
 
             if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-                self.lastPixelBuffer = imageBuffer
+                // EXP-FORK: inject synthetic test patterns (SideScreen_exp_pattern)
+                // so experiments measure known pixels, not the user's desktop.
+                if PatternInjector.isActive() {
+                    PatternInjector.fill(imageBuffer)
+                }
+                // EXP-FORK: dither (SideScreen_exp_dither) — slope-adaptive
+                // blue noise on the 8-bit Y plane, AFTER pattern injection
+                // so injected patterns are measured dithered too.
+                if DitherPass.enabled {
+                    DitherPass.apply(imageBuffer)
+                }
+                // SANDBOX: FrameSkipper (efficiency Lever 1) — skip
+                // pixel-identical frames (SideScreen_exp_skipFrames=1).
+                // lastFrameTime was already updated at handler top, so the
+                // early return cannot false-trigger the stall monitor.
+                if FrameSkipper.enabled {
+                    let decision = FrameSkipper.decide(imageBuffer)
+                    if decision.skip {
+                        return  // identical content — skip encode+send
+                    }
+                    FrameSkipper.noteSent(hash: decision.hash)
+                }
+                // EXP-FORK: HDR mode (SideScreen_exp_hdr) — convert the 8-bit
+                // capture to 10-bit PQ/BT.2020 before encoding so the tablet's
+                // HDR path engages (AMOLED gradient fix). The converted buffer
+                // is pooled (4 deep) and safe to hand to the async encode.
+                var toEncode = imageBuffer
+                if HDRConverter.enabled {
+                    if let hdr = HDRConverter.convert(imageBuffer) {
+                        toEncode = hdr
+                    } else {
+                        debugLog("HDRConverter: convert failed — falling back to 8-bit")
+                    }
+                }
+                self.lastPixelBuffer = toEncode
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
-                    self.encoder?.encode(pixelBuffer: imageBuffer, presentationTimeStamp: pts)
+                    self.encoder?.encode(pixelBuffer: toEncode, presentationTimeStamp: pts)
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
             } else if let cached = self.lastPixelBuffer {
@@ -467,10 +508,14 @@ class ScreenCapture {
     func startStreaming(to server: StreamingServer?, bitrateMbps: Int = 20, quality: String = "medium", gamingBoost: Bool = false, frameRate: Int = 60) {
         // Save parameters for potential restart
         currentServer = server
+        // EXP-FORK: SideScreen_exp_fps cap applies to the encoder too (rate
+        // control must expect the same cadence the capture actually delivers).
+        let expFps = UserDefaults.standard.integer(forKey: "SideScreen_exp_fps")
+        let effFrameRate = expFps > 0 ? expFps : frameRate
         currentBitrateMbps = bitrateMbps
         currentQuality = quality
         currentGamingBoost = gamingBoost
-        currentFrameRate = frameRate
+        currentFrameRate = effFrameRate
 
         isStreaming = true
 
@@ -481,7 +526,13 @@ class ScreenCapture {
 
         let (width, height) = encodeSize(for: codec)
 
-        encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: frameRate)
+        // EXP-FORK: HDR mode — prepare the 10-bit converter pool + LUTs for the
+        // capture size up front (first frame would race the encode otherwise).
+        if HDRConverter.enabled {
+            HDRConverter.ensureSetup(width: width, height: height)
+        }
+
+        encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: effFrameRate)
         encoder?.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }

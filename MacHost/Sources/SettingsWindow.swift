@@ -695,6 +695,10 @@ struct SettingsView: View {
                                         Text("Low").tag("low")
                                         Text("Medium").tag("medium")
                                         Text("High").tag("high")
+                                        // EXP-FORK: Ultra ladder (quality campaign)
+                                        Text("Extra High").tag("extrahigh")
+                                        Text("Max").tag("max")
+                                        Text("Ultra").tag("ultra")
                                     }
                                     .pickerStyle(.segmented)
                                     .disabled(settings.gamingBoost)
