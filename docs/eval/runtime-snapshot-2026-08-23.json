@@ -1,13 +1,13 @@
 {
-  "snapshot_commit_sha": "284843a3565721cf062bdf575f5034210f346064",
-  "receipt_commit_sha": "c98f250eaa51ae16699880be5f96265c94d703fc",
+  "snapshot_commit_sha": "5e3df909818909222195f42d8f247734b07a72bd",
+  "receipt_commit_sha": "5e3df909818909222195f42d8f247734b07a72bd",
   "source_branch": "eval/runtime-snapshot-2026-08-23",
   "remote": "git@github.com:tverma101/SideScreen.git",
   "mac": {
     "installed_path": "/Users/redacted/Applications/SideScreen.app",
     "bundle_id": "com.sidescreen.app",
     "version": "0.11.1",
-    "cdhash": "dff5e86793d5fcecd06d32ce8aa8d2e805f60ea5",
+    "cdhash": "9166dedc4e3e4d76b0c01ce8539b6e84bff387c3",
     "team_identifier": "REDACTED",
     "signing_identity": "REDACTED",
     "architecture": "universal arm64+x86_64"
@@ -23,9 +23,9 @@
     "installed_apk_sha256_verified": true
   },
   "tests": {
-    "mac_swift": "final swift test: 60 passed, 0 failures",
-    "mac_build": "./scripts/build_mac.sh and ./scripts/install_mac.sh: passed; final production universal bundle installed",
-    "mac_cdhash": "final installed CDHash dff5e86793d5fcecd06d32ce8aa8d2e805f60ea5",
+    "mac_swift": "final swift test: 61 passed, 0 failures",
+    "mac_build": "./scripts/build_mac.sh and ./scripts/install_mac.sh: passed; final production universal bundle installed with CDHash 9166dedc4e3e4d76b0c01ce8539b6e84bff387c3",
+    "mac_cdhash": "final installed CDHash 9166dedc4e3e4d76b0c01ce8539b6e84bff387c3",
     "android_unit": "final ./gradlew testDebugUnitTest --no-daemon: BUILD SUCCESSFUL, 26 actionable tasks",
     "android_build": "final ./scripts/build_android.sh and ./scripts/install_android.sh: BUILD SUCCESSFUL; built APK SHA256 equals pulled installed APK SHA256",
     "quality_lab_build": "swift build -c release --package-path MacHost/QualityLab: passed",
@@ -38,12 +38,13 @@
     "capture_latency": "after mach-absolute display-time conversion, representative host WindowServer->callback p50/p95/max was 6.2/14.0/21.3 ms and capture->send p50/p95/max was 21.2/31.5/38.3 ms; Android trace was capture->receive 52.79 ms and capture->surface-render max 68.3 ms",
     "disconnect_restore": "UI disconnect restored Android brightness from 247 to 77 and released brightness/presentation ownership",
     "android_final_install": "SM-X800 R52X30G5TNB has package com.sidescreen.app version 0.11.1/versionCode 1101 installed; APK pull matched 4e7aafa4129f035a0e002bc533d2afd987864c266000e16810f4ab7dfa70daad; app was force-stopped at handoff",
-    "mac_headless": "final installed executable --headless kept Google Chrome frontmost before and after launch, presented zero SideScreen Settings windows, and logged Launch mode: headless plus Settings window suppressed/app activation skipped; direct headless Screen Recording preflight is not granted in this environment, so headless video capture is not claimed",
-    "mac_normal_launch": "final DMG launch from /Volumes/Side Screen/SideScreen.app used Launch mode: normal and presented one Settings window; after switching to Google Chrome, Chrome stayed frontmost while the Settings window remained visible, proving repeated callbacks did not steal focus",
+    "mac_headless": "current installed CDHash 9166dedc4e3e4d76b0c01ce8539b6e84bff387c3 launched with --headless, kept ChatGPT frontmost, presented zero SideScreen Settings windows, and logged Launch mode: headless plus Settings window suppressed/app activation skipped; Screen Recording preflight was granted but auto-start was disabled, so no headless stream was started",
+    "mac_normal_launch": "current DMG launch from /Volumes/Side Screen/SideScreen.app used Launch mode: normal and presented one Settings window; after switching to Google Chrome, Chrome stayed frontmost while the Settings window remained visible, proving repeated callbacks did not steal focus",
     "mac_dmg_launch": "final SideScreen-0.11.1-mac-universal.dmg was mounted, opened through the normal user path, logged Screen Recording permission granted for the mounted build, then the exact process was stopped and the volume detached",
     "native_pixelcopy_static_ui": "observed run source 03a0fdd: valid native 2800x1752 PixelCopy; RGB MAE 1.2866, RMSE 1.8195, PSNR 42.9318 dB, abs error p50/p95/p99/max 1/3/4/4, luma MAE 0.2311",
-    "streamed_pixelcopy_static_ui": "observed run source 03a0fdd with a real foreground USB stream and stable 2800x1752 SurfaceView: RGB MAE 9.3080, RMSE 15.4359, PSNR 24.3602 dB, abs error p50/p95/p99/max 9/11/11/255, luma MAE 9.8150; sampled pixels show a real range/tone shift, so static quality is not declared at the ceiling",
-    "native_to_streamed_static_ui": "observed run source 03a0fdd direct native-to-streamed comparison: RGB MAE 8.9660, RMSE 15.2092, PSNR 24.4887 dB, abs error p50/p95/p99/max 8/12/12/255, exact RGB rate 14.14%",
+    "streamed_pixelcopy_static_ui": "current source 5e3df90 with the unset/default 8-bit video-range profile, a real foreground USB stream, and stable 2800x1752 SurfaceView: RGB MAE 1.7220, RMSE 12.2287, PSNR 26.3832 dB, abs error p50/p95/p99/max 0/2/3/252, luma MAE 1.2152, chroma-proxy MAE 1.9607; Android reported color-range=2 (limited) and the renderer switched to sourceRange=limited",
+    "color_range_ab": "same-build SM-X800 PixelCopy comparison: full-range 420f control produced RGB MAE 9.3064, luma MAE 9.8147, PSNR 24.3596 dB, and p95/p99 absolute error 11/11; video-range 420v default produced RGB MAE 1.7220, luma MAE 1.2152, PSNR 26.3832 dB, and p95/p99 2/3. The default removes the systematic contrast expansion; rare thin-pixel/capture-boundary outliers remain",
+    "native_to_streamed_static_ui": "historical run source 03a0fdd direct native-to-streamed comparison used the full-range control: RGB MAE 8.9660, RMSE 15.2092, PSNR 24.4887 dB, abs error p50/p95/p99/max 8/12/12/255, exact RGB rate 14.14%; superseded for range diagnosis by color_range_ab and the current default result",
     "static_smoothness": "observed run source 03a0fdd: adaptive static stream rendered 2.2235 FPS with no duplicate/skipped/reordered frames; this is expected static throttling, not a motion cadence result",
     "motion_smoothness_usb": "observed run source 03a0fdd with deterministic 2800x1752 motion source over USB: 887 rendered rows, 58.8126 FPS, inter-frame p50/p95/p99/max 16.946/18.819/21.586/54.004 ms, 35 cadence-band violations, duplicate/skipped/reordered 0/0/0, freshness p50/p95/p99/max 17.830/19.394/40.402/53.779 ms, queue input-to-release p50/p95/p99/max 10.307/12.061/13.497/15.303 ms",
     "perfetto": "a 5 s Perfetto-requested run produced no trace artifact on the retail device; this run is unavailable, not silently treated as collected. The final runner records perfetto_status=collected or unavailable and preserves perfetto.stderr",
@@ -59,5 +60,5 @@
     "handoff_defaults": "auto-start false, startup mode wireless, no experiment pattern/pixel/profile/motion keys"
   },
   "created_at": "2026-08-23T20:53:38Z",
-  "notes": "The final source tree was rebuilt and installed after the focus guard. Build outputs remain outside Git; the final installed APK hash was verified by pulling the package from the connected device. Recovery bundles created by the installer remain retained outside the repository. No GitHub push, PR mutation, or GitHub Actions operation was performed."
+  "notes": "The 5e3df90 source tree was rebuilt and installed after the range fix. Build outputs remain outside Git; the installed Android APK was rebuilt, installed, pulled, and matched 4e7aafa4129f035a0e002bc533d2afd987864c266000e16810f4ab7dfa70daad. Production defaults were restored to auto-start false, startup mode wireless, and no experiment pattern/pixel/profile/motion keys. The installer recovery bundle remains retained outside the repository. No GitHub Actions, PR mutation, merge, or force-push operation was performed."
 }
