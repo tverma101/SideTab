@@ -1,0 +1,29 @@
+name: Adaptive Refresh CI
+
+on:
+  push:
+    branches:
+      - fix/adaptive-refresh-governor
+  pull_request:
+    paths:
+      - 'MacHost/**'
+      - '.github/workflows/adaptive-refresh-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  macos-swift-tests:
+    name: macOS Swift tests
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build and test MacHost
+        working-directory: MacHost
+        run: swift test
