@@ -1,6 +1,6 @@
 {
   "snapshot_commit_sha": "284843a3565721cf062bdf575f5034210f346064",
-  "receipt_commit_sha": null,
+  "receipt_commit_sha": "2d4e3d9a09e940fa51018c8d5782326d58e31861",
   "source_branch": "eval/runtime-snapshot-2026-08-23",
   "remote": "git@github.com:tverma101/SideScreen.git",
   "mac": {
