@@ -117,6 +117,7 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
 
     func testGamingBoostKeepsAtLeastSixtyAndAllowsMaximumOnBroadMotion() {
         var policy = AdaptiveRefreshPolicy(maxFPS: 120, gamingBoost: true, initialFPS: 120)
+        _ = policy.observe(nowNs: 0, isIdle: true, dirtyRatio: 0)
 
         let quiet = policy.observe(nowNs: 7_000 * ms, isIdle: true, dirtyRatio: 0)
         XCTAssertEqual(quiet.targetFPS, 60)
