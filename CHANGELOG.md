@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a standalone macOS quality-lab package that generates deterministic native-resolution UI, gradient, chroma-edge, and frame-marker patterns and computes RGB MAE/RMSE/PSNR, absolute-error percentiles, exact-pixel rate, luma error, and a chroma proxy from aligned PNG pairs.
 - Added an internal Android lab SurfaceView and PixelCopy capture path for native reference frames and the active streamed SurfaceView. Captures stay app-private and are pulled with `run-as`; normal launches and user controls are unchanged.
 - Added opt-in per-frame Android trace CSV export and cadence analysis. Inter-frame p50/p95/p99/max, standard deviation/MAD, freshness, queue time, and duplicate/skipped/reordered frame IDs are kept separate from average FPS.
-- Added host-load and smoothness runners that preserve source SHA, installed Mac CDHash, Android package identity, workload label, memory/swap/thermal samples, raw logs, optional Perfetto output, and machine-readable summaries.
+- Added host-load and smoothness runners that preserve source SHA, installed Mac CDHash, Android package identity, workload label, memory/swap/thermal samples, raw logs, optional Perfetto output with collected/unavailable status, and machine-readable summaries.
 - Added an opt-in deterministic moving-bar/grid/frame-marker source for downstream presentation cadence. It is explicitly not a substitute for real ScreenCaptureKit/WindowServer contention evidence or the external 240-FPS motion-to-photon test.
 
 ### Native tablet brightness controls

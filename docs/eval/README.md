@@ -30,7 +30,10 @@ phases. They do not change production defaults or choose a codec profile:
 - `scripts/run-smoothness-lab.sh` enables the Android private raw trace writer
   for an already-active USB or wireless session. It emits frame timestamps,
   cadence percentiles, duplicate/skipped/reordered frame counts, freshness,
-  decoder queue time, and an optional Perfetto trace.
+  decoder queue time, and an optional Perfetto trace. When `--perfetto` is
+  requested, `run-metadata.txt` records `perfetto_status=collected` or
+  `perfetto_status=unavailable`; the latter keeps `perfetto.stderr` so a
+  retail-device permission or tooling limitation is explicit.
 - `scripts/run-host-contention-lab.sh` samples the exact installed SideScreen
   PID, WindowServer, total CPU, memory free percentage, swap, and thermal state
   for a user-labelled W0-W5 workload. It never launches or closes the user's
