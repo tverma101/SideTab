@@ -17,6 +17,7 @@ SideScreen must treat the configured display refresh rate as a **ceiling**, not 
 - ScreenCaptureKit `.idle` frames are discarded before dither, HDR conversion, hashing, encode, and network send.
 - The default adaptive path must use ScreenCaptureKit frame metadata (`SCFrameStatus`, `dirtyRects`), not whole-frame hashes.
 - Rate increases are immediate; rate decreases use hysteresis so the stream does not visibly flap between tiers.
+- A warm decay observation cannot re-promote a stream that has just been demoted; promotion requires new UI/broad motion or direct interaction.
 
 ## Implementation map
 

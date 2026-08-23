@@ -7,13 +7,21 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "🔨 Building Android Client..."
 cd "$ROOT_DIR/AndroidClient"
 
-# Set JAVA_HOME for Android Studio's bundled JDK
-export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+# Prefer an explicitly supplied JDK, then Android Studio's bundled JDK, then
+# the macOS-managed Java 21 installation used by this project.
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+    ANDROID_STUDIO_JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    if [ -x "$ANDROID_STUDIO_JAVA_HOME/bin/java" ]; then
+        export JAVA_HOME="$ANDROID_STUDIO_JAVA_HOME"
+    elif [ -x "/usr/libexec/java_home" ]; then
+        JAVA_HOME="$(/usr/libexec/java_home -v 21 2>/dev/null || true)"
+        export JAVA_HOME
+    fi
+fi
 
-# Check if Java is available
-if [ ! -d "$JAVA_HOME" ]; then
-    echo "❌ Java not found at: $JAVA_HOME"
-    echo "   Please install Android Studio or set JAVA_HOME manually"
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+    echo "❌ Java 21 not found"
+    echo "   Install Android Studio, install a Java 21 JDK, or set JAVA_HOME manually"
     exit 1
 fi
 

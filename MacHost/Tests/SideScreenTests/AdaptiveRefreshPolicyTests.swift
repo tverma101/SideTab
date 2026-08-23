@@ -62,6 +62,20 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
         XCTAssertEqual(decision.reason, .lowMotion)
     }
 
+    func testWarmDecayDoesNotRepromoteAfterLowMotionDemotion() {
+        var policy = AdaptiveRefreshPolicy(maxFPS: 120, initialFPS: 60)
+
+        _ = policy.observe(nowNs: 0, isIdle: false, dirtyRatio: 0.008)
+        let demoted = policy.observe(nowNs: 500 * ms, isIdle: false, dirtyRatio: 0.008)
+        XCTAssertEqual(demoted.targetFPS, 30)
+
+        // No new meaningful change: the warm window must not bounce the
+        // already-demoted stream back to 60 FPS.
+        let held = policy.observe(nowNs: 600 * ms, isIdle: true, dirtyRatio: 0)
+        XCTAssertEqual(held.targetFPS, 30)
+        XCTAssertEqual(held.reason, .warm)
+    }
+
     func testBroadMotionPromotesImmediatelyToSixty() {
         var policy = AdaptiveRefreshPolicy(maxFPS: 120, initialFPS: 8)
         _ = policy.observe(nowNs: 0, isIdle: true, dirtyRatio: 0)

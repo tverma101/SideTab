@@ -41,6 +41,7 @@ struct AdaptiveRefreshPolicy {
 
     private var startedAtNs: UInt64?
     private var lastMeaningfulChangeNs: UInt64?
+    private var lastPromotionEligibleChangeNs: UInt64?
     private var lastBroadChangeNs: UInt64?
     private var broadMotionSinceNs: UInt64?
     private var fastBroadStreak = 0
@@ -133,6 +134,7 @@ struct AdaptiveRefreshPolicy {
                 broadMotionSinceNs = nowNs
             }
             lastMeaningfulChangeNs = nowNs
+            lastPromotionEligibleChangeNs = nowNs
 
             if fastBroadStreak >= 2, maxFPS > 60 {
                 highCadenceValidatedUntilNs = nowNs + Self.highCadenceTailNs
@@ -143,6 +145,9 @@ struct AdaptiveRefreshPolicy {
                nowNs - lastBroad > 120_000_000 {
                 broadMotionSinceNs = nil
                 fastBroadStreak = 0
+            }
+            if uiMotion {
+                lastPromotionEligibleChangeNs = nowNs
             }
             if uiMotion || lowMotion {
                 lastMeaningfulChangeNs = nowNs
@@ -224,6 +229,17 @@ struct AdaptiveRefreshPolicy {
 
         // Promotions happen immediately. Demotions wait briefly so short gaps
         // in animation/video do not make the capture rate sawtooth visibly.
+        // A warm decay tier is not new motion. Once a lower tier has already
+        // been applied, do not immediately promote back to 60 just because
+        // the last meaningful frame is still inside the warm window; require
+        // a new meaningful observation (or explicit interaction/gaming).
+        let warmPromotionWithoutNewChange = desired > currentFPS
+            && reason == .warm
+            && (lastPromotionEligibleChangeNs ?? 0) <= lastRateChangeNs
+        if warmPromotionWithoutNewChange {
+            return Decision(targetFPS: currentFPS, reason: reason)
+        }
+
         if desired < currentFPS,
            nowNs >= lastRateChangeNs,
            nowNs - lastRateChangeNs < Self.downwardHoldNs {
