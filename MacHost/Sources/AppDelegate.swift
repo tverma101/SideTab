@@ -448,7 +448,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Repeated lifecycle/error callbacks may ask for the same window. Do
         // not repeatedly steal focus when it is already visible and active.
-        let shouldActivate = !(settingsWindow?.window?.isVisible ?? false) || !NSApp.isActive
+        // Only the first presentation should activate the app. If the window
+        // is already visible, a background permission/status/error callback
+        // must not pull focus back from the user's current application.
+        let shouldActivate = !(settingsWindow?.window?.isVisible ?? false)
         settingsWindow?.showWindow(nil)
         if shouldActivate {
             NSApp.activate(ignoringOtherApps: true)
