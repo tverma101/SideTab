@@ -64,13 +64,18 @@ adb -s "$SERIAL" shell am broadcast \
   --es output_name "$TRACE_NAME" >/dev/null
 
 perfetto_device="/data/local/tmp/sidescreen-${RANDOM}.perfetto-trace"
+perfetto_error="$OUTPUT_DIR/perfetto.stderr"
+perfetto_status="not_requested"
+perfetto_exit="not_run"
 if (( PERFETTO )); then
   # `perfetto` may be unavailable or permission-limited on a retail build;
   # keep that failure visible in the run metadata rather than treating it as
   # proof that no SurfaceFlinger trace exists.
+  : > "$perfetto_error"
   adb -s "$SERIAL" shell perfetto -o "$perfetto_device" -t "${DURATION}s" \
-    sched freq idle am wm gfx view binder_driver hal >/dev/null 2>&1 &
+    sched freq idle am wm gfx view binder_driver hal >/dev/null 2>"$perfetto_error" &
   perfetto_pid=$!
+  perfetto_status="pending"
 else
   perfetto_pid=""
 fi
@@ -104,9 +109,19 @@ adb -s "$SERIAL" logcat -d -v threadtime -s VD:V MA:V LAB:V DiagLog:V '*:S' > "$
 
 if (( PERFETTO )); then
   if [[ -n "$perfetto_pid" ]]; then
-    wait "$perfetto_pid" || true
+    if wait "$perfetto_pid"; then
+      perfetto_exit=0
+    else
+      perfetto_exit=$?
+    fi
   fi
-  adb -s "$SERIAL" pull "$perfetto_device" "$OUTPUT_DIR/" >/dev/null 2>&1 || true
+  perfetto_trace="$OUTPUT_DIR/$(basename "$perfetto_device")"
+  if adb -s "$SERIAL" pull "$perfetto_device" "$OUTPUT_DIR/" >/dev/null 2>>"$perfetto_error"; then
+    perfetto_status="collected"
+  else
+    perfetto_status="unavailable"
+    rm -f "$perfetto_trace"
+  fi
   adb -s "$SERIAL" shell rm -f "$perfetto_device" >/dev/null 2>&1 || true
 fi
 
@@ -134,6 +149,9 @@ android_release=$device_release
 target_fps=$TARGET_FPS
 duration_s=$DURATION
 perfetto_requested=$PERFETTO
+perfetto_status=$perfetto_status
+perfetto_exit=$perfetto_exit
+perfetto_error=$([[ "$PERFETTO" == 1 ]] && printf '%s' "$perfetto_error" || printf '%s' '')
 mac_installed_path=$mac_app
 mac_cdhash=$mac_cdhash
 EOF
