@@ -46,6 +46,13 @@ point, so it is useful for encoder/transport/Android presentation cadence but
 does not replace real-desktop #19/#28 capture and contention runs. Remove the
 key after a run. None of these tools claims the external 240-FPS camera gate.
 
+For the #16 color/range boundary, the unset/default 8-bit path now selects
+ScreenCaptureKit's video-range `420v` input. `SideScreen_exp_pixelFormat=8bit`
+selects the full-range `420f` control for paired A/B measurements; `10bit`
+continues to select the existing Main10 video-range path. The production choice
+is based on the same-build SM-X800 PixelCopy comparison recorded in the runtime
+receipt and removes the measured full-range/limited-range contrast expansion.
+
 Example native digital-path run:
 
 ```bash

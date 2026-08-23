@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### SDR capture-range alignment
+- Changed the normal 8-bit ScreenCaptureKit input from full-range `420f` to video-range `420v`, matching the Android hardware decoder's default limited-range output instead of forcing a contrast expansion through the receiver.
+- Kept full-range `420f` as an explicit `SideScreen_exp_pixelFormat=8bit` A/B control and retained the existing 10-bit video-range option.
+- Updated deterministic static and motion pattern injection to encode luma/chroma endpoints for either 8-bit range, with focused coverage for black/white video-range mapping.
+- Same-build SM-X800 PixelCopy evidence improved from `9.306` to `1.722` RGB MAE and from `24.360` to `26.383 dB` PSNR; p95/p99 absolute error fell from `11/11` to `2/3`. Thin-pixel/capture-boundary outliers remain and are not treated as proof that visual quality has reached the ceiling.
+
 ### Authoritative Android session lifecycle and render timing
 - Replaced the parallel Android connection flags with one generation-fenced session state machine. USB/wireless transport, negotiation, decoder readiness, first decoded frame, first rendered frame, and degraded control-channel health now drive one UI truth; stale callbacks cannot regain ownership after reconnect.
 - Kept the idle Android app ordinary: system bars, user brightness, orientation policy, screen-awake state, touch forwarding, and decoder resources are untouched until a real stream reaches the render path. Disconnect/failure tears down fullscreen, decoder, touch, keep-awake, and brightness ownership.

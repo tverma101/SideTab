@@ -12,10 +12,10 @@ import Foundation
 /// run. Pattern math MUST stay in lockstep with harness fillY8/renderPatternSource
 /// in probes/offline_enc/main.swift (they produce the reference source PNGs).
 ///
-/// Supports 420YpCbCr8BiPlanarFullRange and the 10-bit video-range biplanar
-/// format used by the USB Main10 experiment. The 10-bit path currently
-/// supports the static color chart, which is enough to calibrate the receiver
-/// against the native Android screenshot baseline.
+/// Supports 8-bit full/video-range biplanar input and the 10-bit video-range
+/// biplanar format used by the USB Main10 experiment. The 10-bit path
+/// currently supports the static color chart, which is enough to calibrate
+/// the receiver against the native Android screenshot baseline.
 enum PatternInjector {
     private static let motionFPSKey = "SideScreen_lab_motion_fps"
 
@@ -38,11 +38,15 @@ enum PatternInjector {
         let attributes: [CFString: Any] = [
             kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
         ]
+        let configuredFormat = AdaptiveRefreshController.configuredPixelFormat()
+        let motionFormat = configuredFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            : configuredFormat
         let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
             width,
             height,
-            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            motionFormat,
             attributes as CFDictionary,
             &buffer
         )
@@ -63,7 +67,13 @@ enum PatternInjector {
             }
             return
         }
-        guard fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
+        let fullRange: Bool
+        switch fmt {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            fullRange = true
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+            fullRange = false
+        default:
             debugLog("PatternInjector: format 0x\(String(fmt, radix: 16)) unsupported — skipping")
             return
         }
@@ -76,21 +86,27 @@ enum PatternInjector {
                 debugLog("PatternInjector: file mode but no loadable PNG at '\(path)'")
                 return
             }
-            fillFromRGB(rgb, into: buffer)
+            fillFromRGB(rgb, into: buffer, fullRange: fullRange)
             debugLog("PatternInjector: injected file \(path) (\(rgb.width)x\(rgb.height))")
             return
         }
-        fillPattern(kind, buffer: buffer, base: base)
+        fillPattern(kind, buffer: buffer, base: base, fullRange: fullRange)
     }
 
-    /// Fill one deterministic motion frame into the 8-bit full-range 4:2:0
+    /// Fill one deterministic motion frame into the configured 8-bit 4:2:0
     /// buffer used by the direct lab profile. The visible frame counter is a
     /// source marker; the transport trace's encoder frame ID remains the
     /// authoritative admission/drop sequence.
     static func fillMotionLab(_ buffer: CVPixelBuffer, frameID: UInt64) {
         let format = CVPixelBufferGetPixelFormatType(buffer)
-        guard format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
-            debugLog("PatternInjector: motion lab requires 8-bit full-range 420")
+        let fullRange: Bool
+        switch format {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            fullRange = true
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+            fullRange = false
+        default:
+            debugLog("PatternInjector: motion lab requires 8-bit 420, got 0x\(String(format, radix: 16))")
             return
         }
         let width = CVPixelBufferGetWidth(buffer)
@@ -112,7 +128,11 @@ enum PatternInjector {
                 let inRed = x >= redX && x < redX + 24
                 let inBlue = x >= blueX && x < blueX + 18
                 let grid = x % 64 == 0 || y % 64 == 0
-                row.advanced(by: x).storeBytes(of: inRed || inBlue ? 235 : (grid ? 104 : 24), as: UInt8.self)
+                let value: UInt8 = inRed || inBlue ? 235 : (grid ? 104 : 24)
+                row.advanced(by: x).storeBytes(
+                    of: encodeLuma(value, fullRange: fullRange),
+                    as: UInt8.self
+                )
             }
         }
 
@@ -125,11 +145,26 @@ enum PatternInjector {
                 let inRed = lumaX >= redX && lumaX < redX + 24
                 let inBlue = lumaX >= blueX && lumaX < blueX + 18
                 let offset = x * 2
-                row.advanced(by: offset).storeBytes(of: inRed ? 90 : (inBlue ? 240 : 128), as: UInt8.self)
-                row.advanced(by: offset + 1).storeBytes(of: inRed ? 240 : (inBlue ? 110 : 128), as: UInt8.self)
+                let cb: UInt8 = inRed ? 90 : (inBlue ? 240 : 128)
+                let cr: UInt8 = inRed ? 240 : (inBlue ? 110 : 128)
+                row.advanced(by: offset).storeBytes(
+                    of: encodeChroma(Double(cb), fullRange: fullRange),
+                    as: UInt8.self
+                )
+                row.advanced(by: offset + 1).storeBytes(
+                    of: encodeChroma(Double(cr), fullRange: fullRange),
+                    as: UInt8.self
+                )
             }
         }
-        drawFrameMarker(yBase: yBase, rowBytes: yRow, width: width, height: height, frameID: frameID)
+        drawFrameMarker(
+            yBase: yBase,
+            rowBytes: yRow,
+            width: width,
+            height: height,
+            frameID: frameID,
+            fullRange: fullRange
+        )
     }
 
     private static func drawFrameMarker(
@@ -137,12 +172,13 @@ enum PatternInjector {
         rowBytes: Int,
         width: Int,
         height: Int,
-        frameID: UInt64
+        frameID: UInt64,
+        fullRange: Bool = true
     ) {
         let boxWidth = min(width, 420)
         let boxHeight = min(height, 56)
         for y in 0..<boxHeight {
-            memset(yBase + y * rowBytes, 235, boxWidth)
+            memset(yBase + y * rowBytes, Int32(encodeLuma(UInt8(235), fullRange: fullRange)), boxWidth)
         }
         let digits = String(frameID % 1_000_000).compactMap { $0.wholeNumberValue }
         let scale = 3
@@ -158,7 +194,10 @@ enum PatternInjector {
                             guard px < width, py < height else { continue }
                             yBase
                                 .advanced(by: py * rowBytes + px)
-                                .storeBytes(of: UInt8(16), as: UInt8.self)
+                                .storeBytes(
+                                    of: encodeLuma(UInt8(16), fullRange: fullRange),
+                                    as: UInt8.self
+                                )
                         }
                     }
                 }
@@ -197,9 +236,14 @@ enum PatternInjector {
         return RGBImage(width: w, height: h, pixels: pixels)
     }
 
-    /// Blit an RGBA image into the 420f buffer (Y + interleaved CbCr), 1:1 at
-    /// the buffer's top-left; un-covered area stays as-is.
-    static func fillFromRGB(_ rgb: RGBImage, into buffer: CVPixelBuffer) {
+    /// Blit an RGBA image into an 8-bit 420 buffer (Y + interleaved CbCr), 1:1
+    /// at the buffer's top-left; un-covered area stays as-is. Encode either
+    /// full-range or video-range samples to match the destination buffer.
+    static func fillFromRGB(
+        _ rgb: RGBImage,
+        into buffer: CVPixelBuffer,
+        fullRange: Bool = true
+    ) {
         let bw = CVPixelBufferGetWidth(buffer)
         let bh = CVPixelBufferGetHeight(buffer)
         let yRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
@@ -214,7 +258,7 @@ enum PatternInjector {
             for x in 0..<w {
                 let o = (y * rgb.width + x) * 4
                 let r = rgb.pixels[o], g = rgb.pixels[o + 1], b = rgb.pixels[o + 2]
-                let (yv, cb, cr) = ycbcr(r, g, b)
+                let (yv, cb, cr) = ycbcr(r, g, b, fullRange: fullRange)
                 yp.advanced(by: x).storeBytes(of: yv, as: UInt8.self)
                 let cx = x / 2
                 cp.advanced(by: cx * 2).storeBytes(of: cb, as: UInt8.self)
@@ -223,7 +267,12 @@ enum PatternInjector {
         }
     }
 
-    static func fillPattern(_ kind: String, buffer: CVPixelBuffer, base: UnsafeMutableRawPointer) {
+    static func fillPattern(
+        _ kind: String,
+        buffer: CVPixelBuffer,
+        base: UnsafeMutableRawPointer,
+        fullRange: Bool = true
+    ) {
         let w = CVPixelBufferGetWidth(buffer)
         let h = CVPixelBufferGetHeight(buffer)
         let yRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
@@ -237,17 +286,17 @@ enum PatternInjector {
         case "gradient":
             for y in 0..<h {
                 let v = UInt8(min(255, y * 255 / max(h - 1, 1)))
-                memset(base + y * yRow, Int32(v), w)
+                memset(base + y * yRow, Int32(encodeLuma(v, fullRange: fullRange)), w)
             }
         case "lowramp":
             for y in 0..<h {
                 let v = UInt8(min(64, y * 64 / max(h - 1, 1)))
-                memset(base + y * yRow, Int32(v), w)
+                memset(base + y * yRow, Int32(encodeLuma(v, fullRange: fullRange)), w)
             }
         case "stepped":
             let patches = 17, ph = h / patches
             for i in 0..<patches {
-                let v = UInt8(i * 8)
+                let v = encodeLuma(UInt8(i * 8), fullRange: fullRange)
                 for y in (i * ph)..<min((i + 1) * ph, h) {
                     memset(base + y * yRow, Int32(v), w)
                 }
@@ -266,14 +315,22 @@ enum PatternInjector {
                     default: if xb < 8 { v = 0 }
                     }
                     if x % 7 == 0 && y % 7 == 0 { v = 0 }
-                    row.advanced(by: x).storeBytes(of: v, as: UInt8.self)
+                    row.advanced(by: x).storeBytes(
+                        of: encodeLuma(v, fullRange: fullRange),
+                        as: UInt8.self
+                    )
                 }
             }
         case "color":
             let cols = 6, rows = 4
             let pw = w / cols, ph = h / rows
             for i in 0..<colorPatches.count {
-                let (y, _, _) = ycbcr(colorPatches[i].0, colorPatches[i].1, colorPatches[i].2)
+                let (y, _, _) = ycbcr(
+                    colorPatches[i].0,
+                    colorPatches[i].1,
+                    colorPatches[i].2,
+                    fullRange: fullRange
+                )
                 let cx = i % cols, cy = i / cols
                 for yy in (cy * ph)..<min((cy + 1) * ph, h) {
                     memset(base + yy * yRow + cx * pw, Int32(y), pw)
@@ -290,7 +347,12 @@ enum PatternInjector {
             let ph = h / rows
             let cpw = cw / cols, cph = cH / rows
             for i in 0..<colorPatches.count {
-                let (_, cb, cr) = ycbcr(colorPatches[i].0, colorPatches[i].1, colorPatches[i].2)
+                let (_, cb, cr) = ycbcr(
+                    colorPatches[i].0,
+                    colorPatches[i].1,
+                    colorPatches[i].2,
+                    fullRange: fullRange
+                )
                 let cx = i % cols, cy = i / cols
                 for yy in (cy * cph)..<min((cy + 1) * cph, cH) {
                     let row = cbCr + yy * cRow
@@ -352,13 +414,44 @@ enum PatternInjector {
         (255,182,193),(255,228,196),(176,224,230),(238,130,238),(255,160,122),(128,0,128),
     ]
 
-    /// sRGB -> BT.709 YCbCr (full-range 0-255, matching harness).
-    static func ycbcr(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> (UInt8, UInt8, UInt8) {
+    /// sRGB -> BT.709 YCbCr. Full-range values match the harness; video-range
+    /// values map luma to 16..235 and chroma to 16..240.
+    static func ycbcr(
+        _ r: UInt8,
+        _ g: UInt8,
+        _ b: UInt8,
+        fullRange: Bool = true
+    ) -> (UInt8, UInt8, UInt8) {
         let rf = Double(r), gf = Double(g), bf = Double(b)
         let y = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf
         let cb = -0.1146 * rf - 0.3854 * gf + 0.5 * bf + 128.0
         let cr = 0.5 * rf - 0.4542 * gf - 0.0458 * bf + 128.0
-        return (UInt8(min(max(y, 0), 255)), UInt8(min(max(cb, 0), 255)), UInt8(min(max(cr, 0), 255)))
+        if fullRange {
+            return (
+                UInt8(min(max(y, 0), 255)),
+                UInt8(min(max(cb, 0), 255)),
+                UInt8(min(max(cr, 0), 255))
+            )
+        }
+        return (
+            encodeLuma(y, fullRange: false),
+            encodeChroma(cb, fullRange: false),
+            encodeChroma(cr, fullRange: false)
+        )
+    }
+
+    private static func encodeLuma(_ value: UInt8, fullRange: Bool) -> UInt8 {
+        encodeLuma(Double(value), fullRange: fullRange)
+    }
+
+    private static func encodeLuma(_ value: Double, fullRange: Bool) -> UInt8 {
+        let encoded = fullRange ? value : 16.0 + value * 219.0 / 255.0
+        return UInt8(min(max(encoded.rounded(), 0), 255))
+    }
+
+    private static func encodeChroma(_ value: Double, fullRange: Bool) -> UInt8 {
+        let encoded = fullRange ? value : 16.0 + value * 224.0 / 255.0
+        return UInt8(min(max(encoded.rounded(), 0), 255))
     }
 
     /// sRGB -> BT.709 limited-range 10-bit YCbCr, high-bit aligned for P010.

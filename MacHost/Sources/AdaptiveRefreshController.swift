@@ -255,18 +255,20 @@ final class AdaptiveRefreshController {
     /// Single source of truth for the initial SCStream configuration and every
     /// adaptive FPS update. Keeping all non-FPS properties identical prevents
     /// `updateConfiguration` from accidentally resetting image quality knobs.
-    static func makeStreamConfiguration(width: Int, height: Int, fps: Int) -> SCStreamConfiguration {
+    static func makeStreamConfiguration(
+        width: Int,
+        height: Int,
+        fps: Int,
+        defaults: UserDefaults = .standard
+    ) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
 
-        let expPixelFormat = UserDefaults.standard.string(forKey: "SideScreen_exp_pixelFormat")
-        config.pixelFormat = expPixelFormat == "10bit"
-            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        config.pixelFormat = configuredPixelFormat(defaults: defaults)
 
-        switch UserDefaults.standard.string(forKey: "SideScreen_exp_colorSpace") {
+        switch defaults.string(forKey: "SideScreen_exp_colorSpace") {
         case "displayP3":
             config.colorSpaceName = "kCGColorSpaceDisplayP3" as CFString
         case "bt2020":
@@ -283,6 +285,21 @@ final class AdaptiveRefreshController {
         config.backgroundColor = .clear
         config.scalesToFit = false
         return config
+    }
+
+    /// Resolve the capture range explicitly. The normal 8-bit path uses
+    /// Apple's video-range 420v format so the HEVC bitstream and Android's
+    /// default video-range decoder conversion agree. `8bit` remains an
+    /// explicit full-range 420f control for A/B measurements.
+    static func configuredPixelFormat(defaults: UserDefaults = .standard) -> OSType {
+        switch defaults.string(forKey: "SideScreen_exp_pixelFormat") {
+        case "10bit":
+            return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        case "8bitVideo", nil:
+            return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        default:
+            return kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        }
     }
 
     private static func observation(from sampleBuffer: CMSampleBuffer) -> Observation {
