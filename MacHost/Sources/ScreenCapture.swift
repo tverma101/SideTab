@@ -119,6 +119,13 @@ class ScreenCapture {
             return nil
         }
 
+        // Apple's current Swift API exposes this attachment as UInt64: the
+        // mach-absolute WindowServer presentation timestamp. It is not a
+        // CMTime, so this must be checked before the compatibility bridges.
+        if let displayTime = rawDisplayTime as? UInt64, displayTime > 0 {
+            return displayTime
+        }
+
         if let displayTime = rawDisplayTime as? CMTime,
            displayTime.isValid,
            displayTime.isNumeric {
