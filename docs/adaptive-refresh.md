@@ -24,6 +24,7 @@ SideScreen must treat the configured display refresh rate as a **ceiling**, not 
 - `AdaptiveRefreshController.swift`: reads ScreenCaptureKit metadata, observes input, serializes live `SCStream.updateConfiguration` calls, and advances idle decay when ScreenCaptureKit goes silent.
 - `ScreenCapture.swift`: owns the controller and exits early on ScreenCaptureKit idle frames.
 - `AdaptiveRefreshPolicyTests.swift`: deterministic acceptance tests.
+- `scripts/benchmark-adaptive-refresh.sh`: repeatable SideScreen + WindowServer CPU sampler for A/B runs.
 
 ## Debug escape hatch
 
@@ -51,7 +52,21 @@ Run the same resolution, codec, bitrate/quality, transport, and tablet build for
 | 60-FPS YouTube | 60 after probe | | | | |
 | High-cadence animation | up to session ceiling | | | | |
 
+For each row, sample the same duration on both branches. Example:
+
+```bash
+./scripts/benchmark-adaptive-refresh.sh static-terminal 30 results/static-terminal.csv
+```
+
+The CSV records branch/commit/macOS/hardware plus one-second SideScreen and WindowServer CPU samples. Also retain SideScreen logs containing `Adaptive refresh:` so the measured CPU can be tied to the actual tier selected by the governor.
+
 A CPU/power win does **not** justify visible latency, dropped interaction, decoder instability, or degraded image quality. A smoothness win does **not** justify pinning an unchanged desktop at 120 FPS.
+
+## Virtual-display refresh is a separate measurement
+
+The USB `CGVirtualDisplay` may still advertise/run a 120 Hz display mode so macOS can generate true high-cadence content. Do not couple its mode directly to the capture governor. Core Graphics display-mode switching is synchronous and can change display parameters; rapid mode switching could create more instability than it saves.
+
+Issue #3 owns the isolated 60-vs-120 WindowServer experiment. Only consider coarse virtual-display mode adaptation if that measurement proves the display mode itself remains a significant static cost after capture adaptation.
 
 ## Regression rules for future changes
 
