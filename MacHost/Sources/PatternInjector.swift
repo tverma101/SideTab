@@ -17,8 +17,36 @@ import Foundation
 /// supports the static color chart, which is enough to calibrate the receiver
 /// against the native Android screenshot baseline.
 enum PatternInjector {
+    private static let motionFPSKey = "SideScreen_lab_motion_fps"
+
     static func isActive() -> Bool {
         UserDefaults.standard.string(forKey: "SideScreen_exp_pattern") != nil
+    }
+
+    /// Opt-in source motion for the #27 cadence lab. The timer that requests
+    /// these frames lives in ScreenCapture; keeping the pixel generator here
+    /// makes the source deterministic and shared with the static corpus math.
+    static var motionLabFPS: Int {
+        let requested = UserDefaults.standard.integer(forKey: motionFPSKey)
+        return min(max(requested, 0), 120)
+    }
+
+    static var isMotionLabActive: Bool { motionLabFPS > 0 }
+
+    static func makeMotionBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        ]
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            attributes as CFDictionary,
+            &buffer
+        )
+        return status == kCVReturnSuccess ? buffer : nil
     }
 
     static func fill(_ buffer: CVPixelBuffer) {
@@ -54,6 +82,104 @@ enum PatternInjector {
         }
         fillPattern(kind, buffer: buffer, base: base)
     }
+
+    /// Fill one deterministic motion frame into the 8-bit full-range 4:2:0
+    /// buffer used by the direct lab profile. The visible frame counter is a
+    /// source marker; the transport trace's encoder frame ID remains the
+    /// authoritative admission/drop sequence.
+    static func fillMotionLab(_ buffer: CVPixelBuffer, frameID: UInt64) {
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        guard format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
+            debugLog("PatternInjector: motion lab requires 8-bit full-range 420")
+            return
+        }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let yRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        let cRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+        let cHeight = CVPixelBufferGetHeightOfPlane(buffer, 1)
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
+              let cBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return }
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+        let redX = Int((frameID &* 4) % UInt64(max(width, 1)))
+        let blueX = Int((frameID &* 7 &+ UInt64(width / 2)) % UInt64(max(width, 1)))
+        for y in 0..<height {
+            let row = yBase + y * yRow
+            for x in 0..<width {
+                let inRed = x >= redX && x < redX + 24
+                let inBlue = x >= blueX && x < blueX + 18
+                let grid = x % 64 == 0 || y % 64 == 0
+                row.advanced(by: x).storeBytes(of: inRed || inBlue ? 235 : (grid ? 104 : 24), as: UInt8.self)
+            }
+        }
+
+        // Neutral chroma except for the two moving bars. Chroma is sampled at
+        // 2x2, so the marker deliberately crosses several chroma cells.
+        for y in 0..<cHeight {
+            let row = cBase + y * cRow
+            for x in 0..<(width / 2) {
+                let lumaX = x * 2
+                let inRed = lumaX >= redX && lumaX < redX + 24
+                let inBlue = lumaX >= blueX && lumaX < blueX + 18
+                let offset = x * 2
+                row.advanced(by: offset).storeBytes(of: inRed ? 90 : (inBlue ? 240 : 128), as: UInt8.self)
+                row.advanced(by: offset + 1).storeBytes(of: inRed ? 240 : (inBlue ? 110 : 128), as: UInt8.self)
+            }
+        }
+        drawFrameMarker(yBase: yBase, rowBytes: yRow, width: width, height: height, frameID: frameID)
+    }
+
+    private static func drawFrameMarker(
+        yBase: UnsafeMutableRawPointer,
+        rowBytes: Int,
+        width: Int,
+        height: Int,
+        frameID: UInt64
+    ) {
+        let boxWidth = min(width, 420)
+        let boxHeight = min(height, 56)
+        for y in 0..<boxHeight {
+            memset(yBase + y * rowBytes, 235, boxWidth)
+        }
+        let digits = String(frameID % 1_000_000).compactMap { $0.wholeNumberValue }
+        let scale = 3
+        var cursorX = 16
+        for digit in digits {
+            let pattern = digitPatterns[digit]
+            for row in 0..<7 {
+                for col in 0..<5 where ((pattern[row] >> (4 - col)) & 1) == 1 {
+                    for dy in 0..<scale {
+                        for dx in 0..<scale {
+                            let px = cursorX + col * scale + dx
+                            let py = 8 + row * scale + dy
+                            guard px < width, py < height else { continue }
+                            yBase
+                                .advanced(by: py * rowBytes + px)
+                                .storeBytes(of: UInt8(16), as: UInt8.self)
+                        }
+                    }
+                }
+            }
+            cursorX += 6 * scale
+            if cursorX >= boxWidth - 20 { break }
+        }
+    }
+
+    private static let digitPatterns: [[UInt8]] = [
+        [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+        [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
+        [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        [0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110],
+        [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+        [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
+    ]
 
     struct RGBImage { let width: Int; let height: Int; let pixels: [UInt8] } // RGBA
 

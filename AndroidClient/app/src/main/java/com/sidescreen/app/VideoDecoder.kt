@@ -690,8 +690,9 @@ class VideoDecoder(
                     (trace.surfaceRenderedNs - trace.outputReleaseRequestedNs) / 1_000_000.0
                 } else {
                     0.0
-                }
+            }
             val summary = traceStats.summary()
+            val pacing = traceStats.pacingSummary()
             if (summary != null) {
                 diagLog(
                     "Trace frame=${trace.frameId} stages=" +
@@ -706,6 +707,21 @@ class VideoDecoder(
                         "${"%.1f".format(summary.p99Ms)}/" +
                         "${"%.1f".format(summary.maxMs)}ms n=${summary.count}",
                 )
+                if (pacing != null) {
+                    diagLog(
+                        "Frame pacing fps=${"%.2f".format(pacing.renderedFps)} " +
+                            "inter-frame p50/p95/p99/max=" +
+                            "${"%.2f".format(pacing.p50Ms)}/" +
+                            "${"%.2f".format(pacing.p95Ms)}/" +
+                            "${"%.2f".format(pacing.p99Ms)}/" +
+                            "${"%.2f".format(pacing.maxMs)}ms " +
+                            "std=${"%.2f".format(pacing.standardDeviationMs)}ms " +
+                            "MAD=${"%.2f".format(pacing.medianAbsoluteDeviationMs)}ms " +
+                            "duplicates=${pacing.duplicateFrames} " +
+                            "skipped=${pacing.skippedFrames} " +
+                            "reordered=${pacing.reorderedFrames}",
+                    )
+                }
             }
         }
     }

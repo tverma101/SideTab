@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Converted ScreenCaptureKit's mach-absolute `displayTime` ticks to nanoseconds before calibrating them to the process uptime clock per capture session; WindowServer-to-callback latency no longer drifts into tens of seconds or a multi-hour clock-domain error after an idle pause/resume.
 - Added an explicit macOS `--headless` diagnostic launch (also available as `SIDESCREEN_HEADLESS=1`) that suppresses Settings presentation, avoids app activation, and uses accessory activation policy; ordinary Finder/DMG launches retain the normal visible Settings path and repeated callbacks no longer re-activate an already visible window.
 
+### Objective evaluation labs (#16, #19, #27, #28)
+- Added a standalone macOS quality-lab package that generates deterministic native-resolution UI, gradient, chroma-edge, and frame-marker patterns and computes RGB MAE/RMSE/PSNR, absolute-error percentiles, exact-pixel rate, luma error, and a chroma proxy from aligned PNG pairs.
+- Added an internal Android lab SurfaceView and PixelCopy capture path for native reference frames and the active streamed SurfaceView. Captures stay app-private and are pulled with `run-as`; normal launches and user controls are unchanged.
+- Added opt-in per-frame Android trace CSV export and cadence analysis. Inter-frame p50/p95/p99/max, standard deviation/MAD, freshness, queue time, and duplicate/skipped/reordered frame IDs are kept separate from average FPS.
+- Added host-load and smoothness runners that preserve source SHA, installed Mac CDHash, Android package identity, workload label, memory/swap/thermal samples, raw logs, optional Perfetto output, and machine-readable summaries.
+- Added an opt-in deterministic moving-bar/grid/frame-marker source for downstream presentation cadence. It is explicitly not a substitute for real ScreenCaptureKit/WindowServer contention evidence or the external 240-FPS motion-to-photon test.
+
 ### Native tablet brightness controls
 - Added a native macOS brightness slider to SideScreen Settings and the menu-bar menu. Both controls use the existing `BRIGHT` transport, persist the tablet backlight level while disconnected, and reapply it automatically on reconnect. F1/F2 (including ordinary function-key events) and the optional BetterDisplay bridge now keep the Settings value synchronized; brightness falls back to the live video socket if the optional control socket drops.
 

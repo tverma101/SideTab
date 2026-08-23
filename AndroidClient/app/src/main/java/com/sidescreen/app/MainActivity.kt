@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
@@ -19,6 +20,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.view.MotionEvent
+import android.view.PixelCopy
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.TextureView
@@ -39,6 +41,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
@@ -46,6 +49,7 @@ private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 //   --ez enabled true --es mode sgsr [--ef sharpness 0.8] [--ef edge_threshold 0.03]
 //   --ez enabled true --es mode cfl [--ef cfl_strength 0.15] [--ez color_profile false]
 private const val VSR_CMD_ACTION = "com.sidescreen.app.VSR_CMD"
+private const val LAB_CMD_ACTION = "com.sidescreen.app.LAB_CMD"
 private const val DEFAULT_USB_HOST = "127.0.0.1"
 private const val DEFAULT_USB_PORT = 54321
 private const val LEGACY_E3_HOST = "10.77.0.1"
@@ -136,6 +140,7 @@ class MainActivity : AppCompatActivity() {
         setupModeToggle()
         setupWirelessController()
         setupVsrCommandReceiver()
+        setupLabCommandReceiver()
         renderSessionState(sessionController.state)
 
         // USB screen sharing is deliberately manual. ADB/USB becoming
@@ -1063,6 +1068,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var vsrCmdReceiver: BroadcastReceiver? = null
+    private var labCmdReceiver: BroadcastReceiver? = null
+    private val labCaptureHandler = Handler(Looper.getMainLooper())
 
     /** Debug A/B hook: adb broadcast to switch VSR modes headlessly (no UI taps, no reconnect). */
     private fun setupVsrCommandReceiver() {
@@ -1119,6 +1126,169 @@ class MainActivity : AppCompatActivity() {
         val filter = IntentFilter(VSR_CMD_ACTION)
         ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
         vsrCmdReceiver = receiver
+    }
+
+    /**
+     * Opt-in Android-side evaluation controls. The shell runner uses these
+     * commands to capture the actual SurfaceView with PixelCopy, render the
+     * native control image, and export raw per-frame timing. Ordinary launches
+     * never send these commands and keep the normal connection path unchanged.
+     */
+    private fun setupLabCommandReceiver() {
+        if (labCmdReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val command = intent ?: return
+                if (command.action != LAB_CMD_ACTION) return
+                when (command.getStringExtra("op")) {
+                    "native_capture" -> {
+                        val labIntent = Intent(this@MainActivity, LabActivity::class.java)
+                            .putExtra(
+                                LabActivity.EXTRA_SOURCE_PATH,
+                                command.getStringExtra("source_path"),
+                            )
+                            .putExtra(
+                                LabActivity.EXTRA_OUTPUT_NAME,
+                                command.getStringExtra("output_name") ?: "native.png",
+                            )
+                        startActivity(labIntent)
+                    }
+                    "surface_capture" -> {
+                        val outputName = command.getStringExtra("output_name") ?: "streamed.png"
+                        val expectedWidth = command.getIntExtra("expected_width", 0)
+                        val expectedHeight = command.getIntExtra("expected_height", 0)
+                        // Wait for the first real frame to transition the
+                        // activity into stream-only presentation. Before
+                        // that transition the control shell still owns the
+                        // system bars, so a PixelCopy would be the wrong
+                        // surface size for an exact corpus comparison.
+                        labCaptureHandler.postDelayed({
+                            captureLabSurface(outputName, expectedWidth, expectedHeight)
+                        }, LAB_SURFACE_CAPTURE_DELAY_MS)
+                    }
+                    "trace_start" -> {
+                        val name = command.getStringExtra("output_name") ?: "frame-trace.csv"
+                        val file = FrameTraceRecorder.start(applicationContext, name)
+                        mainDiag("LAB trace started path=${file.absolutePath}")
+                    }
+                    "trace_stop" -> {
+                        FrameTraceRecorder.stop()
+                        mainDiag("LAB trace stopped")
+                    }
+                    else -> mainDiag("LAB ignored unknown command")
+                }
+            }
+        }
+        ContextCompat.registerReceiver(
+            this,
+            receiver,
+            IntentFilter(LAB_CMD_ACTION),
+            ContextCompat.RECEIVER_EXPORTED,
+        )
+        labCmdReceiver = receiver
+    }
+
+    private fun captureLabSurface(
+        requestedName: String,
+        expectedWidth: Int = 0,
+        expectedHeight: Int = 0,
+        attempt: Int = 0,
+    ) {
+        val holder = currentSurfaceHolder
+        if (holder == null || !holder.surface.isValid) {
+            retryLabSurfaceCapture(
+                requestedName,
+                expectedWidth,
+                expectedHeight,
+                attempt,
+                "SurfaceView surface unavailable",
+            )
+            return
+        }
+        val frame = holder.surfaceFrame
+        val width = frame.width()
+        val height = frame.height()
+        if (width <= 0 || height <= 0) {
+            retryLabSurfaceCapture(
+                requestedName,
+                expectedWidth,
+                expectedHeight,
+                attempt,
+                "invalid surface size ${width}x$height",
+            )
+            return
+        }
+        if (expectedWidth > 0 && expectedHeight > 0 &&
+            (width != expectedWidth || height != expectedHeight)
+        ) {
+            retryLabSurfaceCapture(
+                requestedName,
+                expectedWidth,
+                expectedHeight,
+                attempt,
+                "surface size ${width}x$height; expected ${expectedWidth}x$expectedHeight",
+            )
+            return
+        }
+        val safeName = requestedName
+            .replace(Regex("[^A-Za-z0-9_.-]"), "_")
+            .ifBlank { "streamed.png" }
+        val output = File(File(filesDir, "lab"), safeName)
+        output.parentFile?.mkdirs()
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        PixelCopy.request(
+            holder.surface,
+            bitmap,
+            { result ->
+                if (result == PixelCopy.SUCCESS) {
+                    runCatching {
+                        output.outputStream().use { stream ->
+                            bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                        }
+                        mainDiag(
+                            "LAB streamed PixelCopy PASS path=${output.absolutePath} " +
+                                "surface=${width}x$height",
+                        )
+                    }.onFailure { error ->
+                        mainDiag("LAB streamed PixelCopy write failed: ${error.message}")
+                    }
+                } else {
+                    retryLabSurfaceCapture(
+                        requestedName,
+                        expectedWidth,
+                        expectedHeight,
+                        attempt,
+                        "PixelCopy result=$result surface=${width}x$height",
+                    )
+                }
+                bitmap.recycle()
+            },
+            Handler(Looper.getMainLooper()),
+        )
+    }
+
+    private fun retryLabSurfaceCapture(
+        requestedName: String,
+        expectedWidth: Int,
+        expectedHeight: Int,
+        attempt: Int,
+        reason: String,
+    ) {
+        if (attempt >= LAB_SURFACE_CAPTURE_RETRY_LIMIT) {
+            mainDiag("LAB streamed PixelCopy gave up after ${attempt + 1} attempts: $reason")
+            return
+        }
+        mainDiag(
+            "LAB streamed PixelCopy retry ${attempt + 1}/$LAB_SURFACE_CAPTURE_RETRY_LIMIT: $reason",
+        )
+        labCaptureHandler.postDelayed({
+            captureLabSurface(
+                requestedName,
+                expectedWidth,
+                expectedHeight,
+                attempt + 1,
+            )
+        }, LAB_SURFACE_CAPTURE_RETRY_DELAY_MS)
     }
 
     private fun activeVideoSurface(): Pair<Surface, Boolean>? {
@@ -1323,6 +1493,9 @@ class MainActivity : AppCompatActivity() {
             }
             videoDecoder?.onDecodeLatency = { avgMs, maxMs ->
                 mainDiag("decode latency avg=" + "%.1f".format(avgMs) + "ms max=" + "%.1f".format(maxMs) + "ms")
+            }
+            videoDecoder?.onFrameTrace = { trace ->
+                FrameTraceRecorder.record(trace)
             }
             videoDecoder?.onDecodedFormat = { w, h, cl, cr, ct, cb ->
                 mainDiag("decoder output format ${w}x$h crop=$cl,$cr,$ct,$cb")
@@ -1801,6 +1974,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun cleanup() {
         try {
+            labCaptureHandler.removeCallbacksAndMessages(null)
+            labCmdReceiver?.let {
+                unregisterReceiver(it)
+                labCmdReceiver = null
+            }
+            vsrCmdReceiver?.let {
+                unregisterReceiver(it)
+                vsrCmdReceiver = null
+            }
+            FrameTraceRecorder.stop()
             disconnect(restartChecklist = false)
             currentTextureSurface?.release()
             currentTextureSurface = null
@@ -2048,6 +2231,9 @@ class MainActivity : AppCompatActivity() {
         const val DEFAULT_BACKGROUND_DISCONNECT_SECS = 60
         const val LATENCY_PING_INTERVAL_MS = 2_000L
         const val CHECKLIST_INTERVAL_MS = 10_000L
+        const val LAB_SURFACE_CAPTURE_DELAY_MS = 250L
+        const val LAB_SURFACE_CAPTURE_RETRY_DELAY_MS = 150L
+        const val LAB_SURFACE_CAPTURE_RETRY_LIMIT = 12
     }
 
     /** Apply a host-issued brightness only for the current Streaming owner. */

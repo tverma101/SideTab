@@ -60,5 +60,8 @@ temp/
 *.tmp
 .superpowers/
 
+# Local evaluation output (receipts remain under docs/eval)
+runs/
+
 # Local ktlint binary (CI downloads its own)
 AndroidClient/ktlint

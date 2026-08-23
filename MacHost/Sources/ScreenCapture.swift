@@ -50,6 +50,8 @@ class ScreenCapture {
 
     // Main-thread-only state
     private var frameMonitorTimer: DispatchSourceTimer?
+    private var labMotionTimer: DispatchSourceTimer?
+    private var labMotionFrameID: UInt64 = 0
     private var restartAttempted = false
     private var wakeObservers: [NSObjectProtocol] = []
     /// True between startStreaming and stopStreaming. Guards wake-triggered
@@ -601,6 +603,14 @@ class ScreenCapture {
                 return
             }
 
+            // The motion lab owns its own deterministic frame clock. The
+            // ordinary SCK callback remains useful for capture diagnostics,
+            // but must not inject an extra static/duplicate frame into the
+            // downstream cadence measurement.
+            if PatternInjector.isMotionLabActive {
+                return
+            }
+
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             let callbackTimestampNs = DispatchTime.now().uptimeNanoseconds
             let windowServerDisplayNs = self.normalizedWindowServerDisplayTimestampNs(
@@ -746,6 +756,7 @@ class ScreenCapture {
                 try await stream?.startCapture()
                 debugLog("SCStream capture started — starting frame flow monitor (3s interval, 5s timeout)")
                 startFrameMonitor()
+                startLabMotionGenerator()
             } catch {
                 debugLog("Failed to start SCStream capture: \(error)")
                 onCaptureMethodChanged?("Unavailable — ScreenCaptureKit start failed: \(error.localizedDescription)")
@@ -825,6 +836,63 @@ class ScreenCapture {
         frameMonitorTimer = timer
     }
 
+    /// Opt-in deterministic downstream motion source for #27. It deliberately
+    /// starts after SCStream so the normal session/encoder/server lifecycle is
+    /// exercised, while making the pixel trajectory independent of whatever
+    /// the user happens to have on the virtual display. Because the pixels are
+    /// generated after the SCK admission point, this probe does not claim to
+    /// measure WindowServer capture jitter; #19/#28 still use real desktop
+    /// content for that boundary.
+    private func startLabMotionGenerator() {
+        stopLabMotionGenerator()
+        guard PatternInjector.isMotionLabActive,
+              isStreaming,
+              let queue = encodeQueue else { return }
+        let fps = PatternInjector.motionLabFPS
+        let (width, height) = encodeSize(for: codec)
+        labMotionFrameID = 0
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let intervalMs = max(1, Int((1000.0 / Double(fps)).rounded()))
+        timer.schedule(
+            deadline: .now() + .milliseconds(500),
+            repeating: .milliseconds(intervalMs),
+            leeway: .milliseconds(1)
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.isStreaming,
+                  !self.idlePaused,
+                  let encoder = self.encoder,
+                  let server = self.currentServer,
+                  server.shouldEncodeNextFrame(),
+                  let buffer = PatternInjector.makeMotionBuffer(width: width, height: height) else {
+                return
+            }
+            self.labMotionFrameID &+= 1
+            let frameID = self.labMotionFrameID
+            PatternInjector.fillMotionLab(buffer, frameID: frameID)
+            let now = DispatchTime.now().uptimeNanoseconds
+            let pts = CMTime(
+                value: CMTimeValue(now / 1000),
+                timescale: 1_000_000
+            )
+            encoder.encode(
+                pixelBuffer: buffer,
+                presentationTimeStamp: pts,
+                captureTimestampNs: now,
+                screenCaptureCallbackTimestampNs: now
+            )
+        }
+        timer.resume()
+        labMotionTimer = timer
+        debugLog("Motion lab source enabled: \(width)x\(height) @ \(fps)fps")
+    }
+
+    private func stopLabMotionGenerator() {
+        labMotionTimer?.cancel()
+        labMotionTimer = nil
+    }
+
     private func stopFrameMonitor() {
         frameMonitorTimer?.cancel()
         frameMonitorTimer = nil
@@ -876,6 +944,7 @@ class ScreenCapture {
         Task {
             try? await stream?.startCapture()
             startFrameMonitor()
+            startLabMotionGenerator()
             debugLog("IDLE: capture resumed")
         }
     }
@@ -938,6 +1007,7 @@ class ScreenCapture {
 
                 debugLog("SCStream restarted — starting frame flow monitor")
                 startFrameMonitor()
+                startLabMotionGenerator()
             } catch {
                 debugLog("SCStream restart failed: \(error)")
                 if isStreaming, gen == streamGeneration {
@@ -1049,6 +1119,7 @@ class ScreenCapture {
 
         // Cancel frame flow monitor and adaptive cadence watchdog.
         stopFrameMonitor()
+        stopLabMotionGenerator()
         adaptiveRefreshController = nil
 
         // Let the display idle-sleep normally again once we stop streaming.

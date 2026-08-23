@@ -31,6 +31,12 @@
             android:name=".QRScannerActivity"
             android:exported="false"
             android:screenOrientation="portrait" />
+
+        <!-- Internal PixelCopy/native reference surface for the opt-in lab. -->
+        <activity
+            android:name=".LabActivity"
+            android:exported="false"
+            android:screenOrientation="landscape" />
     </application>
 
 </manifest>

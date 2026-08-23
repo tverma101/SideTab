@@ -309,6 +309,15 @@ installed executable with `--headless`:
 normal double-click/Finder/DMG launch does not use this mode: it keeps the
 regular macOS app policy and opens the normal Settings window when appropriate.
 
+### Objective visual, smoothness, and contention labs
+
+The repository includes opt-in, measurement-first runners for the native
+2800x1752 visual comparison, Android PixelCopy captures, raw frame pacing, and
+W0-W5 Mac contention sampling. They preserve source/runtime provenance and do
+not change the normal user path. See
+[docs/eval/README.md](docs/eval/README.md) for the commands and the explicit
+240-FPS camera and real-workload boundaries.
+
 ---
 
 ## Configuration
