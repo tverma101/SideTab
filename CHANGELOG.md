@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Made tablet brightness transactional. The client snapshots global mode/value and the per-window override, applies only for the active streaming generation, preserves independent user changes, and restores on teardown. A control-channel drop keeps video streaming and reports controls as degraded.
 - Decoder setup now logs hardware/vendor/software capability evidence, supported size/rate, profiles, and the low-latency feature before requesting decoder-safe keys. The encoder-only `KEY_MAX_B_FRAMES` path was removed. Android frame traces now separate output availability, release request, and `OnFrameRenderedListener` time.
 - macOS capture traces now use ScreenCaptureKit `displayTime` when present and report WindowServer-to-callback delay separately from encode and send-completion stages.
-- Calibrated ScreenCaptureKit `displayTime` to the process uptime clock per capture session so WindowServer-to-callback latency cannot be reported as a multi-hour clock-domain error.
+- Converted ScreenCaptureKit's mach-absolute `displayTime` ticks to nanoseconds before calibrating them to the process uptime clock per capture session; WindowServer-to-callback latency no longer drifts into tens of seconds or a multi-hour clock-domain error after an idle pause/resume.
 - Added an explicit macOS `--headless` diagnostic launch (also available as `SIDESCREEN_HEADLESS=1`) that suppresses Settings presentation, avoids app activation, and uses accessory activation policy; ordinary Finder/DMG launches retain the normal visible Settings path and repeated callbacks no longer re-activate an already visible window.
 
 ### Native tablet brightness controls

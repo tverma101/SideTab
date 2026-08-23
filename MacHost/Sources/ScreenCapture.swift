@@ -7,6 +7,7 @@ import CoreGraphics
 import CoreVideo
 import IOKit.pwr_mgt
 import os
+import Darwin
 
 // MARK: - SCStreamDelegate
 
@@ -94,6 +95,22 @@ class ScreenCapture {
     // subtracting the raw values and reporting a multi-hour fake latency.
     private let displayTimeCalibrationLock = NSLock()
     private var displayTimeToUptimeOffsetNs: Int64?
+    private let displayTimeDiagnosticLock = OSAllocatedUnfairLock(initialState: false)
+
+    // SCStreamFrameInfo.displayTime is a mach-absolute timestamp (ticks),
+    // while DispatchTime.uptimeNanoseconds is already scaled to nanoseconds.
+    // Convert the attachment before calibrating the two clock epochs; treating
+    // ticks as nanoseconds makes the timestamp drift roughly by the timebase
+    // ratio and eventually reports tens of seconds of fake pipeline latency.
+    private static let machTimebase: (numerator: UInt64, denominator: UInt64)? = {
+        var info = mach_timebase_info_data_t()
+        guard mach_timebase_info(&info) == KERN_SUCCESS,
+              info.numer != 0,
+              info.denom != 0 else {
+            return nil
+        }
+        return (UInt64(info.numer), UInt64(info.denom))
+    }()
 
     private func cachedPixelBufferSnapshot() -> CVPixelBuffer? {
         cachedPixelBufferLock.lock()
@@ -123,7 +140,7 @@ class ScreenCapture {
         // mach-absolute WindowServer presentation timestamp. It is not a
         // CMTime, so this must be checked before the compatibility bridges.
         if let displayTime = rawDisplayTime as? UInt64, displayTime > 0 {
-            return displayTime
+            return machAbsoluteTicksToNanoseconds(displayTime)
         }
 
         if let displayTime = rawDisplayTime as? CMTime,
@@ -140,15 +157,35 @@ class ScreenCapture {
         // Keep a defensive numeric fallback for SDK/runtime bridges that box
         // the attachment rather than exposing CMTime directly.
         if let number = rawDisplayTime as? NSNumber, number.uint64Value > 0 {
-            return number.uint64Value
+            return machAbsoluteTicksToNanoseconds(number.uint64Value)
         }
         return nil
+    }
+
+    private func machAbsoluteTicksToNanoseconds(_ ticks: UInt64) -> UInt64? {
+        guard let machTimebase = Self.machTimebase else { return nil }
+        let (scaled, overflow) = ticks.multipliedReportingOverflow(by: machTimebase.numerator)
+        guard !overflow else { return nil }
+        let nanoseconds = scaled / machTimebase.denominator
+        return nanoseconds > 0 ? nanoseconds : nil
     }
 
     private func resetDisplayTimeCalibration() {
         displayTimeCalibrationLock.lock()
         displayTimeToUptimeOffsetNs = nil
         displayTimeCalibrationLock.unlock()
+        displayTimeDiagnosticLock.withLock { $0 = false }
+    }
+
+    private func logDisplayTimeDiagnosticOnce(_ message: String) {
+        let shouldLog = displayTimeDiagnosticLock.withLock { didLog -> Bool in
+            guard !didLog else { return false }
+            didLog = true
+            return true
+        }
+        if shouldLog {
+            debugLog(message)
+        }
     }
 
     private func normalizedWindowServerDisplayTimestampNs(
@@ -156,8 +193,10 @@ class ScreenCapture {
         callbackTimestampNs: UInt64
     ) -> UInt64? {
         guard let rawDisplayTimestampNs = rawWindowServerDisplayTimestampNs(from: sampleBuffer) else {
+            logDisplayTimeDiagnosticOnce("ScreenCaptureKit displayTime attachment unavailable; using callback timestamp")
             return nil
         }
+        logDisplayTimeDiagnosticOnce("ScreenCaptureKit displayTime attachment received raw=\(rawDisplayTimestampNs)")
 
         displayTimeCalibrationLock.lock()
         defer { displayTimeCalibrationLock.unlock() }
