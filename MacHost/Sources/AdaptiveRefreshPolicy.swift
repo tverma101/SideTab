@@ -122,6 +122,16 @@ struct AdaptiveRefreshPolicy {
             }
         }
 
+        // Expire a failed high-cadence probe before considering a new one.
+        // Doing this first is important: otherwise sustained 60-FPS broad
+        // motion can renew a 120-Hz probe on the exact frame that should end it.
+        if probeUntilNs > 0, nowNs >= probeUntilNs {
+            if highCadenceValidatedUntilNs <= nowNs {
+                probeCooldownUntilNs = nowNs + Self.probeCooldownNs
+            }
+            probeUntilNs = 0
+        }
+
         // A probe is the only automatic path from 60 -> >60 without Gaming
         // Boost. At 120 capture, real 120-Hz content produces broad dirty frames
         // ~8.3 ms apart and validates. A 60-FPS video produces them ~16.7 ms
@@ -129,20 +139,13 @@ struct AdaptiveRefreshPolicy {
         if maxFPS > 60,
            !gamingBoost,
            highCadenceValidatedUntilNs <= nowNs,
-           probeUntilNs <= nowNs,
+           probeUntilNs == 0,
            probeCooldownUntilNs <= nowNs,
            let broadSince = broadMotionSinceNs,
            broad,
            nowNs >= broadSince,
            nowNs - broadSince >= Self.broadProbeDelayNs {
             probeUntilNs = nowNs + Self.probeDurationNs
-        }
-
-        if probeUntilNs > 0, nowNs >= probeUntilNs {
-            if highCadenceValidatedUntilNs <= nowNs {
-                probeCooldownUntilNs = nowNs + Self.probeCooldownNs
-            }
-            probeUntilNs = 0
         }
 
         let desired: Int
