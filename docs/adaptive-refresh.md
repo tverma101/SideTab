@@ -28,19 +28,33 @@ SideScreen must treat the configured display refresh rate as a **ceiling**, not 
 
 ## Debug escape hatch
 
-Adaptive refresh is default-on. To compare with the old fixed-FPS path:
+Adaptive refresh is default-on. SideScreen variants currently share the `com.sidescreen.app` defaults domain, so use a known full app/binary path and verify its PID when doing A/B work; do not identify a running experiment by bundle ID alone.
+
+Disable adaptive refresh for the fixed-FPS comparison:
 
 ```bash
-defaults write com.sidescreen.host SideScreen_adaptiveRefresh -bool false
+defaults write com.sidescreen.app SideScreen_adaptiveRefresh -bool false
 ```
 
-Use the actual app bundle identifier if it differs. Re-enable by setting the key to `true` or deleting the override.
+Re-enable it with `true` or delete the override. Remember that the shared defaults domain means the setting affects other SideScreen variants that use the same bundle identifier.
 
 The legacy SHA-based `FrameSkipper` is intentionally kept out of the default adaptive path. It may be used only for controlled fixed-FPS experiments.
 
+## Validation order before merge
+
+Hosted GitHub Actions are intentionally not the acceptance gate for SideScreen. Validate the installed/runtime boundary:
+
+1. Run macOS tests locally from `MacHost` (`swift test`).
+2. Run Android unit tests and a real Android build.
+3. Run relevant shell/diff checks, including the benchmark sampler below.
+4. Launch the exact intended SideScreen binary by full path and verify its PID/runtime identity.
+5. Run live Mac <-> Android quality, cadence, latency, and CPU checks.
+
+A source-only build/test pass is not enough for this display pipeline.
+
 ## Hardware performance gate before merge
 
-Run the same resolution, codec, bitrate/quality, transport, and tablet build for both the canonical branch and the adaptive branch. Warm each case before sampling.
+Run the same resolution, codec, bitrate/quality, transport, tablet build, and installed host binary for both the canonical branch and the adaptive branch. Warm each case before sampling.
 
 | Scenario | Expected adaptive tier | SideScreen CPU | WindowServer CPU | Encode/send FPS | Visual notes |
 |---|---:|---:|---:|---:|---|
@@ -50,17 +64,17 @@ Run the same resolution, codec, bitrate/quality, transport, and tablet build for
 | Web scrolling / drag | 60-120 | | | | |
 | 30-FPS video | <=60 | | | | |
 | 60-FPS YouTube | 60 after probe | | | | |
-| High-cadence animation | up to session ceiling | | | | |
+| High-cadence animation / cursor-circle test | up to session ceiling | | | | |
 
-For each row, sample the same duration on both branches. Example:
+For each row, sample the same duration on both branches. Prefer an explicit PID so multiple SideScreen variants cannot contaminate the measurement:
 
 ```bash
-./scripts/benchmark-adaptive-refresh.sh static-terminal 30 results/static-terminal.csv
+SIDESCREEN_PID=<pid> ./scripts/benchmark-adaptive-refresh.sh static-terminal 30 results/static-terminal.csv
 ```
 
 The CSV records branch/commit/macOS/hardware plus one-second SideScreen and WindowServer CPU samples. Also retain SideScreen logs containing `Adaptive refresh:` so the measured CPU can be tied to the actual tier selected by the governor.
 
-A CPU/power win does **not** justify visible latency, dropped interaction, decoder instability, or degraded image quality. A smoothness win does **not** justify pinning an unchanged desktop at 120 FPS.
+A CPU/power win does **not** justify visible latency, dropped interaction, decoder instability, degraded image quality, or a regression below stable 60 FPS where motion actually needs it. A smoothness win does **not** justify pinning an unchanged desktop at 120 FPS.
 
 ## Virtual-display refresh is a separate measurement
 
@@ -70,10 +84,11 @@ Issue #3 owns the isolated 60-vs-120 WindowServer experiment. Only consider coar
 
 ## Regression rules for future changes
 
-Any change to cadence thresholds, ScreenCaptureKit configuration, frame skipping, encoder scheduling, or input handling must:
+Any change to cadence thresholds, ScreenCaptureKit configuration, frame skipping, encoder scheduling, display modes, or input handling must:
 
-1. Preserve the session/wireless caps.
+1. Preserve the session/wireless caps and Android decoder limits.
 2. Add or update deterministic policy tests.
 3. Re-run the hardware matrix above when the change can affect capture cadence or latency.
 4. Keep an A/B path until the hardware result is recorded.
 5. Never claim a performance improvement from frame skipping alone if ScreenCaptureKit is still capturing at the old high cadence.
+6. Never claim "120 FPS" from a configured ceiling alone; record actual encoded/received cadence during the live test.
