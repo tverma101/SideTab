@@ -36,6 +36,7 @@
     "disconnect_restore": "UI disconnect restored Android brightness from 247 to 77 and released brightness/presentation ownership",
     "mac_headless": "installed executable --headless preserved the frontmost Safari app, presented zero Settings windows, and logged activation skipped",
     "mac_normal_launch": "normal open -n of the installed bundle presented one Side Screen Settings window and used Launch mode: normal",
+    "mac_dmg_launch": "mounted SideScreen-0.11.1-mac-universal.dmg, opened /Volumes/Side Screen/SideScreen.app normally, observed one Settings window and Launch mode: normal, then detached the volume",
     "external_240fps_camera": "not run; physical panel latency remains a separate hardware/user-visible acceptance boundary"
   },
   "experiment_overrides": {
