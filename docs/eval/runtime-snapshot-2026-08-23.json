@@ -1,0 +1,48 @@
+{
+  "snapshot_commit_sha": "f02208706cfa5e16621d36e78463806cfc006c25",
+  "receipt_commit_sha": null,
+  "source_branch": "eval/runtime-snapshot-2026-08-23",
+  "remote": "git@github.com:tverma101/SideScreen.git",
+  "mac": {
+    "installed_path": "/Users/redacted/Applications/SideScreen.app",
+    "bundle_id": "com.sidescreen.app",
+    "version": "0.11.1",
+    "cdhash": "82f8b4f654f727f2820b345e5956d8f347555e31",
+    "team_identifier": "REDACTED",
+    "signing_identity": "REDACTED",
+    "architecture": "universal arm64+x86_64"
+  },
+  "android": {
+    "device_serial": "R52X30G5TNB",
+    "model": "SM_X800",
+    "package": "com.sidescreen.app",
+    "version_code": 1101,
+    "version_name": "0.11.1",
+    "apk_path": "/Users/redacted/vd_campaign/120hz_attack/tools/SideScreen-src/AndroidClient/app/build/outputs/apk/debug/app-debug.apk",
+    "apk_sha256": "4f9fcbf2235b1808f35ba261afe8a5309cc5e558f15c04195f470fd497e289fe",
+    "installed_apk_sha256_verified": true
+  },
+  "tests": {
+    "mac_swift": "swift test: 60 passed, 0 failures",
+    "mac_build": "./scripts/build_mac.sh: passed; production universal bundle installed",
+    "android_unit": "./gradlew testDebugUnitTest --no-daemon: BUILD SUCCESSFUL, 26 actionable tasks",
+    "android_build": "./scripts/build_android.sh: BUILD SUCCESSFUL",
+    "diff_check": "git diff --check: passed"
+  },
+  "live": {
+    "android_idle": "installed APK showed normal status/navigation bars, CONNECT shell, brightness mode 0/value 77, and decoder initialization skipped while no session existed",
+    "usb_stream": "installed Mac opened the USB listeners; Android connected through adb reverse; hardware/vendor low-latency HEVC decoder selected; first output and render listener observed",
+    "capture_latency": "after mach-absolute display-time conversion, representative host WindowServer->callback p50/p95/max was 6.2/14.0/21.3 ms and capture->send p50/p95/max was 21.2/31.5/38.3 ms; Android trace was capture->receive 52.79 ms and capture->surface-render max 68.3 ms",
+    "disconnect_restore": "UI disconnect restored Android brightness from 247 to 77 and released brightness/presentation ownership",
+    "mac_headless": "installed executable --headless preserved the frontmost Safari app, presented zero Settings windows, and logged activation skipped",
+    "mac_normal_launch": "normal open -n of the installed bundle presented one Side Screen Settings window and used Launch mode: normal",
+    "external_240fps_camera": "not run; physical panel latency remains a separate hardware/user-visible acceptance boundary"
+  },
+  "experiment_overrides": {
+    "SideScreen_autoStartStreamingOnLaunch": "temporarily true for live USB test, restored false",
+    "SideScreen_startupMode": "temporarily usb for live USB test, restored wireless",
+    "SideScreen_connectionMode": "left unchanged as usb"
+  },
+  "created_at": "2026-08-23T19:19:56Z",
+  "notes": "The source commit identifies the exact tree used to produce the recorded Mac bundle and Android APK. Build outputs remain outside Git; the installed APK hash was verified by pulling the package from the connected device. Recovery bundles created by the installer remain retained outside the repository."
+}
