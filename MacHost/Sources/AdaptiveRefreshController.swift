@@ -27,6 +27,7 @@ final class AdaptiveRefreshController {
     private var lastObservationNs: UInt64 = 0
     private weak var currentStream: SCStream?
     private var idleTimer: DispatchSourceTimer?
+    private var inputMonitor: Any?
 
     /// Default-on. Set `SideScreen_adaptiveRefresh = false` to get the old
     /// fixed-FPS behavior for A/B debugging.
@@ -49,10 +50,14 @@ final class AdaptiveRefreshController {
         )
         self.appliedFPS = safeMax
         self.desiredFPS = safeMax
+        installInputMonitor()
     }
 
     deinit {
         idleTimer?.cancel()
+        if let inputMonitor {
+            NSEvent.removeMonitor(inputMonitor)
+        }
     }
 
     func update(maxFPS: Int, gamingBoost: Bool) {
@@ -85,6 +90,51 @@ final class AdaptiveRefreshController {
         ensureIdleTimer()
         request(decision, stream: stream)
         return observation.isIdle
+    }
+
+    /// Pre-wake from user input before an 8/15-FPS ScreenCaptureKit cadence has
+    /// a chance to add visible latency. Scroll/drag is continuous motion and
+    /// gets the session ceiling; keys/clicks get up to 60 FPS. Plain mouse
+    /// movement is intentionally excluded so moving a cursor on another Mac
+    /// display cannot keep SideScreen at 120 FPS indefinitely.
+    private func installInputMonitor() {
+        let mask: NSEvent.EventTypeMask = [
+            .keyDown,
+            .leftMouseDown,
+            .rightMouseDown,
+            .otherMouseDown,
+            .leftMouseDragged,
+            .rightMouseDragged,
+            .otherMouseDragged,
+            .scrollWheel
+        ]
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let token = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+                self?.handleInput(event)
+            }
+            self.lock.lock()
+            self.inputMonitor = token
+            self.lock.unlock()
+        }
+    }
+
+    private func handleInput(_ event: NSEvent) {
+        let highRate: Bool
+        switch event.type {
+        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel:
+            highRate = true
+        default:
+            highRate = false
+        }
+
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        let stream = currentStream
+        let decision = policy.noteInteraction(nowNs: now, highRate: highRate)
+        lock.unlock()
+        request(decision, stream: stream)
     }
 
     /// ScreenCaptureKit can stop producing buffers entirely on an unchanged
@@ -165,13 +215,11 @@ final class AdaptiveRefreshController {
                 return
             }
 
-            var nextTarget: Int?
             self.lock.lock()
             let old = self.appliedFPS
             self.appliedFPS = target
-            if self.desiredFPS != target {
-                nextTarget = self.desiredFPS
-            } else {
+            let needsAnotherUpdate = self.desiredFPS != target
+            if !needsAnotherUpdate {
                 self.updateInFlight = false
             }
             self.lock.unlock()
@@ -180,7 +228,7 @@ final class AdaptiveRefreshController {
                 debugLog("Adaptive refresh: \(old) -> \(target) fps (\(reason.rawValue))")
             }
 
-            if nextTarget != nil, let stream {
+            if needsAnotherUpdate, let stream {
                 self.applyNext(on: stream)
             }
         }
@@ -234,14 +282,14 @@ final class AdaptiveRefreshController {
             if let value = attachments[.status] as? NSNumber { return value.intValue }
             return nil
         }()
-        let status = statusRaw.flatMap(SCFrameStatus.init(rawValue:))
+        let status = statusRaw.flatMap { SCFrameStatus(rawValue: $0) }
         let isIdle = status == .idle
 
         var rects: [CGRect] = []
         if let values = attachments[.dirtyRects] as? [CGRect] {
             rects = values
         } else if let values = attachments[.dirtyRects] as? [NSValue] {
-            rects = values.map(\.rectValue)
+            rects = values.map { $0.rectValue }
         }
 
         let frameArea: Double = {
