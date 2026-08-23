@@ -48,6 +48,9 @@ class StreamClient(
     /** Server→client brightness command (0..255) over the control channel. */
     var onBrightness: ((Int) -> Unit)? = null
 
+    /** Optional control health; video transport remains authoritative. */
+    var onControlChannelState: ((Boolean) -> Unit)? = null
+
     /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
     @Volatile var streamCodecIsHevc = true
         private set
@@ -332,6 +335,9 @@ class StreamClient(
         controlChannel.onBrightnessCommand = { v ->
             onBrightness?.invoke(v)
         }
+        controlChannel.onAvailabilityChanged = { healthy ->
+            onControlChannelState?.invoke(healthy)
+        }
         Thread({
             try {
                 controlChannel.connect()
@@ -461,6 +467,17 @@ class StreamClient(
                         12 -> {
                             videoClockSyncReady = true
                             diagLog("Video clock synchronization acknowledged by host")
+                        }
+
+                        MESSAGE_BRIGHT -> {
+                            // The preferred BRIGHT path is the dedicated
+                            // control socket. New hosts may fall back to the
+                            // live video socket if that optional socket is
+                            // unavailable; the client capability declaration
+                            // makes this safe for older hosts/clients.
+                            val value = input.readByte().toInt() and 0xFF
+                            diagLog("BRIGHT command value=$value (video fallback)")
+                            onBrightness?.invoke(value)
                         }
 
                         MESSAGE_CODEC_SELECTED -> {
@@ -788,6 +805,7 @@ class StreamClient(
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 12
+        private const val MESSAGE_BRIGHT = 11
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

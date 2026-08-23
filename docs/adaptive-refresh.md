@@ -4,7 +4,9 @@ SideScreen must treat the configured display refresh rate as a **ceiling**, not 
 
 ## Non-negotiable behavior
 
-- Static/read-only content must decay from 60 -> 30 -> 15 -> 8 FPS.
+- Static/read-only content must decay from 60 -> 30 -> 15 -> 8 FPS, and a
+  silent ScreenCaptureKit stream must not be kept alive by re-encoding the
+  cached full frame.
 - A blinking caret/cursor-sized dirty region must not keep the stream hot.
 - Direct input must pre-wake the capture path before a low idle cadence can add visible latency:
   - scroll/drag: session ceiling (up to 120 FPS)
@@ -14,18 +16,27 @@ SideScreen must treat the configured display refresh rate as a **ceiling**, not 
 - 60-FPS video must settle at 60 FPS. A short >60-FPS probe is allowed, but it must fail closed and cool down when broad dirty frames do not arrive faster than ~74 Hz.
 - True high-cadence broad motion may remain at the session ceiling after validation.
 - The existing wireless 60-FPS ceiling is authoritative.
+- The effective capture ceiling is also the virtual-display mode: USB Main10
+  is negotiated at 60 FPS, while an 8-bit/Main USB session may retain its
+  requested 120-FPS ceiling. A display mode that is faster than capture is
+  treated as avoidable WindowServer work.
 - ScreenCaptureKit `.idle` frames are discarded before dither, HDR conversion, hashing, encode, and network send.
 - The default adaptive path must use ScreenCaptureKit frame metadata (`SCFrameStatus`, `dirtyRects`), not whole-frame hashes.
 - Rate increases are immediate; rate decreases use hysteresis so the stream does not visibly flap between tiers.
 - A warm decay observation cannot re-promote a stream that has just been demoted; promotion requires new UI/broad motion or direct interaction.
+- The silent-stream policy watchdog runs at 1 Hz. It advances the policy clock
+  only; it does not inspect pixels or encode a keepalive frame.
 
 ## Implementation map
 
 - `AdaptiveRefreshPolicy.swift`: deterministic state machine. No ScreenCaptureKit dependency.
 - `AdaptiveRefreshController.swift`: reads ScreenCaptureKit metadata, observes input, serializes live `SCStream.updateConfiguration` calls, and advances idle decay when ScreenCaptureKit goes silent.
 - `ScreenCapture.swift`: owns the controller and exits early on ScreenCaptureKit idle frames.
+- `ScreenCapture.swift`: suppresses cached full-frame keepalives by default;
+  set `SideScreen_exp_idleKeepalive=true` only for a diagnostic comparison.
 - `AdaptiveRefreshPolicyTests.swift`: deterministic acceptance tests.
 - `scripts/benchmark-adaptive-refresh.sh`: repeatable SideScreen + WindowServer CPU sampler for A/B runs.
+- `scripts/run-capture-source-benchmark.sh`: installed-bundle, same-display callback check for ScreenCaptureKit versus Core Graphics. It records callback cadence and non-empty buffers; it does not measure transport latency or re-enable the production CG fallback.
 
 ## Debug escape hatch
 
@@ -40,6 +51,11 @@ defaults write com.sidescreen.app SideScreen_adaptiveRefresh -bool false
 Re-enable it with `true` or delete the override. Remember that the shared defaults domain means the setting affects other SideScreen variants that use the same bundle identifier.
 
 The legacy SHA-based `FrameSkipper` is intentionally kept out of the default adaptive path. It may be used only for controlled fixed-FPS experiments.
+
+Cached-frame keepalives are also disabled by default. The dedicated control
+channel owns liveness, and the reconnect/keyframe path explicitly replays the
+cached frame when a client needs it. This keeps a static desktop at zero
+keepalive encodes and video bytes after the last useful frame.
 
 ## Validation order before merge
 
@@ -75,13 +91,28 @@ SIDESCREEN_PID=<pid> ./scripts/benchmark-adaptive-refresh.sh static-terminal 30 
 
 The CSV records branch/commit/macOS/hardware plus one-second SideScreen and WindowServer CPU samples. Also retain SideScreen logs containing `Adaptive refresh:` so the measured CPU can be tied to the actual tier selected by the governor.
 
+For a capture-source comparison on the live virtual display, use the exact
+installed bundle and the display ID printed by the host:
+
+```bash
+./scripts/run-capture-source-benchmark.sh <display-id> 10
+```
+
+The results are appended to `/tmp/sidescreen.log` as
+`capture-source-benchmark:` entries. This diagnostic was structured around
+the same capture-cadence question documented by the MIT-licensed
+[Telemachus](https://github.com/aaditagrawal/telemachus) reference project;
+SideScreen does not copy its implementation or add a legacy CG fallback.
+
 A CPU/power win does **not** justify visible latency, dropped interaction, decoder instability, degraded image quality, or a regression below stable 60 FPS where motion actually needs it. A smoothness win does **not** justify pinning an unchanged desktop at 120 FPS.
 
-## Virtual-display refresh is a separate measurement
+## Virtual-display refresh follows the validated capture ceiling
 
-The USB `CGVirtualDisplay` may still advertise/run a 120 Hz display mode so macOS can generate true high-cadence content. Do not couple its mode directly to the capture governor. Core Graphics display-mode switching is synchronous and can change display parameters; rapid mode switching could create more instability than it saves.
-
-Issue #3 owns the isolated 60-vs-120 WindowServer experiment. Only consider coarse virtual-display mode adaptation if that measurement proves the display mode itself remains a significant static cost after capture adaptation.
+The virtual display is configured once at session start with the same effective
+ceiling used by ScreenCaptureKit and VideoToolbox. This avoids asking
+WindowServer for a 120 Hz source while the selected Main10 path is capped at
+60 FPS. Adaptive content changes still update ScreenCaptureKit's capture
+cadence; they do not repeatedly switch Core Graphics display modes.
 
 ## Regression rules for future changes
 

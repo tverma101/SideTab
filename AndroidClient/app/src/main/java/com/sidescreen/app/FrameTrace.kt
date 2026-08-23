@@ -8,7 +8,10 @@ data class FrameTrace(
     val receivedNs: Long,
     val inputQueuedNs: Long = 0L,
     val outputAvailableNs: Long = 0L,
-    val renderedNs: Long = 0L,
+    /** The request handed to MediaCodec to release the output to Surface. */
+    val outputReleaseRequestedNs: Long = 0L,
+    /** Supplied by MediaCodec.OnFrameRenderedListener when available. */
+    val surfaceRenderedNs: Long = 0L,
 )
 
 data class FrameTraceSummary(
@@ -21,19 +24,19 @@ data class FrameTraceSummary(
 
 /** Bounded visible-latency window used by the runtime diagnostic log. */
 class FrameTraceStats(private val maxSamples: Int = 240) {
-    private val captureToRenderNs = ArrayDeque<Long>(maxSamples)
+    private val captureToSurfaceRenderNs = ArrayDeque<Long>(maxSamples)
 
     @Synchronized
     fun add(trace: FrameTrace) {
-        if (trace.captureNs <= 0L || trace.renderedNs < trace.captureNs) return
-        if (captureToRenderNs.size == maxSamples) captureToRenderNs.removeFirst()
-        captureToRenderNs.addLast(trace.renderedNs - trace.captureNs)
+        if (trace.captureNs <= 0L || trace.surfaceRenderedNs < trace.captureNs) return
+        if (captureToSurfaceRenderNs.size == maxSamples) captureToSurfaceRenderNs.removeFirst()
+        captureToSurfaceRenderNs.addLast(trace.surfaceRenderedNs - trace.captureNs)
     }
 
     @Synchronized
     fun summary(): FrameTraceSummary? {
-        if (captureToRenderNs.isEmpty()) return null
-        val sorted = captureToRenderNs.sorted()
+        if (captureToSurfaceRenderNs.isEmpty()) return null
+        val sorted = captureToSurfaceRenderNs.sorted()
         fun percentile(fraction: Double): Double {
             val index = (kotlin.math.ceil(fraction * sorted.size).toInt() - 1)
                 .coerceIn(0, sorted.lastIndex)

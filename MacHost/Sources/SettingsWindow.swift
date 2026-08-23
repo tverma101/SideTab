@@ -318,6 +318,46 @@ struct SettingsView: View {
                             }
                         }
 
+                        // Tablet backlight. This is deliberately app-owned:
+                        // the virtual display has no physical IODisplay
+                        // backlight endpoint for macOS Displays to control.
+                        FrostedGroupBox(title: "Tablet Brightness", icon: "sun.max") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack {
+                                    Text("Brightness")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                    Spacer()
+                                    Text("\(settings.brightnessPercent)%")
+                                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                        .foregroundColor(.accentColor)
+                                }
+
+                                HStack(spacing: 8) {
+                                    Image(systemName: "sun.min")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                        .accessibilityHidden(true)
+                                    Slider(
+                                        value: $settings.brightness,
+                                        in: NativeBrightnessController.normalizedValue(
+                                            for: UInt8(NativeBrightnessController.minimumLevel)
+                                        )...1.0
+                                    )
+                                    .accessibilityLabel("SideScreen tablet brightness")
+                                    .accessibilityValue("\(settings.brightnessPercent) percent")
+                                    Image(systemName: "sun.max")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                        .accessibilityHidden(true)
+                                }
+
+                                Text("Controls the tablet panel directly and is remembered for the next connection. F1/F2 also adjust it.")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
                         // Refresh Rate (own block)
                         FrostedGroupBox(title: "Refresh Rate", icon: "speedometer") {
                             VStack(alignment: .leading, spacing: 8) {
@@ -1121,6 +1161,12 @@ class DisplaySettings: ObservableObject {
     @Published var flipVertical: Bool {
         didSet { save("flipVertical", flipVertical) }
     }
+    @Published var brightness: Double {
+        didSet {
+            let level = NativeBrightnessController.level(forNormalizedValue: brightness)
+            defaults.set(level, forKey: NativeBrightnessController.defaultsKey)
+        }
+    }
     @Published var touchEnabled: Bool {
         didSet { save("touchEnabled", touchEnabled) }
     }
@@ -1178,6 +1224,9 @@ class DisplaySettings: ObservableObject {
         self.rotation = defaults.object(forKey: keyPrefix + "rotation") as? Int ?? 0
         self.flipHorizontal = defaults.bool(forKey: keyPrefix + "flipHorizontal")
         self.flipVertical = defaults.bool(forKey: keyPrefix + "flipVertical")
+        self.brightness = NativeBrightnessController.normalizedValue(
+            for: UInt8(NativeBrightnessController.persistedLevel)
+        )
         self.touchEnabled = defaults.object(forKey: keyPrefix + "touchEnabled") as? Bool ?? true
         let modeRaw = defaults.string(forKey: keyPrefix + "connectionMode") ?? ConnectionMode.usb.rawValue
         self.connectionMode = ConnectionMode(rawValue: modeRaw) ?? .usb
@@ -1204,6 +1253,20 @@ class DisplaySettings: ObservableObject {
 
     var effectiveRefreshRate: Int {
         return gamingBoost ? 120 : refreshRate
+    }
+
+    var brightnessPercent: Int {
+        Int((brightness * 100.0).rounded())
+    }
+
+    var brightnessLevel: UInt8 {
+        NativeBrightnessController.level(forNormalizedValue: brightness)
+    }
+
+    func updateBrightnessFromController(_ level: UInt8) {
+        let normalized = NativeBrightnessController.normalizedValue(for: level)
+        guard abs(brightness - normalized) > 0.0001 else { return }
+        brightness = normalized
     }
 
     func toggleServer() {

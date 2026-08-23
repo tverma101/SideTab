@@ -97,6 +97,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentWirelessDevice: String?
     private var cancellables = Set<AnyCancellable>()
     private var statusRefreshTimer: Timer?
+    /// Runtime performance values are diagnostic UI only. Publishing them on
+    /// every one-second transport interval needlessly invalidates the whole
+    /// SwiftUI settings tree while the stream is otherwise idle.
+    private var lastPublishedStatsNs: UInt64 = 0
     /// Reentrancy latch for startServer() — a second Start (double-clicked menu
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
@@ -133,7 +137,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Periodic status refresh for the per-mode checklist (ADB / WiFi / Listening IP).
-        statusRefreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        statusRefreshTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshStatusIndicators()
             }
@@ -261,6 +265,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupSettingsObservers() {
+        // Brightness is a persisted preference while disconnected and is
+        // applied immediately through the controller when a session exists.
+        settings.$brightness
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] value in
+                guard let self, let controller = self.nativeBrightness else { return }
+                controller.setNormalizedValue(value)
+            }
+            .store(in: &cancellables)
+
         // Observer cho gaming boost changes
         settings.$gamingBoost
             .dropFirst() // Skip initial value
@@ -635,14 +650,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             let isWirelessSession = settings.connectionMode == .wireless
-            let sessionFrameRate = WirelessSessionProfile.frameRate(
+            let requestedSessionFrameRate = WirelessSessionProfile.frameRate(
                 for: settings.connectionMode,
                 requested: settings.effectiveRefreshRate
+            )
+            let sessionFrameRate = CaptureFrameRatePolicy.effectiveFrameRate(
+                requested: requestedSessionFrameRate
             )
             let sessionBitrateCap = WirelessSessionProfile.bitrateCap(for: settings.connectionMode)
             debugLog(
                 "Session profile: mode=\(settings.connectionMode.rawValue) " +
-                    "fps=\(sessionFrameRate)" +
+                    "requestedFPS=\(requestedSessionFrameRate) effectiveFPS=\(sessionFrameRate)" +
                     (sessionBitrateCap.map { ", avgBitrateCap=\($0)Mbps, peak=\(WirelessSessionProfile.peakBitrateMbps)Mbps" } ?? "")
             )
 
@@ -661,10 +679,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try virtualDisplayManager?.createDisplay(
                 width: size.width,
                 height: size.height,
-                // A wireless panel may refresh at 120 Hz, but producing 120
-                // capture frames over Wi-Fi wastes power and creates bursts.
-                // Keep the actual virtual display mode at the session cap.
-                refreshRate: isWirelessSession ? WirelessSessionProfile.frameRate : settings.refreshRate,
+                // Keep the actual display mode at the effective capture cap.
+                // This matters for USB Main10 too: the encoder is stable at
+                // 60 FPS, so advertising 120 Hz only makes WindowServer wake
+                // for work the pipeline cannot use.
+                refreshRate: sessionFrameRate,
                 hiDPI: settings.hiDPI,
                 name: "SideScreen"
             )
@@ -824,8 +843,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.onStats = { [weak self] fps, mbps in
                 let captured = self
                 Task { @MainActor in
-                    captured?.settings.currentFPS = fps
-                    captured?.settings.currentBitrate = mbps
+                    guard let captured,
+                          captured.settingsWindow?.window?.isVisible == true else {
+                        return
+                    }
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    guard captured.lastPublishedStatsNs == 0 ||
+                            now - captured.lastPublishedStatsNs >= 2_000_000_000 else {
+                        return
+                    }
+                    captured.lastPublishedStatsNs = now
+                    captured.settings.currentFPS = fps
+                    captured.settings.currentBitrate = mbps
                 }
             }
 
@@ -835,10 +864,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // SideScreen_brightnessKeys -bool false` to disable.
             let nb = NativeBrightnessController()
             nb.onBrightness = { [weak self] level in
+                self?.settings.updateBrightnessFromController(level)
                 self?.streamingServer?.sendBrightness(level)
             }
             nb.start()
             nativeBrightness = nb
+            settings.updateBrightnessFromController(nb.level)
 
             // BetterDisplay bridge (experiment-gated): translate BetterDisplay's
             // software-brightness intent for this virtual display into BRIGHT
@@ -848,8 +879,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if UserDefaults.standard.bool(forKey: "SideScreen_exp_brightness") {
                 let monitor = BrightnessMonitor()
                 monitor.onBrightness = { [weak self] level in
-                    self?.nativeBrightness?.syncExternalLevel(level)
-                    self?.streamingServer?.sendBrightness(level)
+                    guard let self else { return }
+                    let effectiveLevel = self.nativeBrightness?.syncExternalLevel(level) ?? level
+                    self.settings.updateBrightnessFromController(effectiveLevel)
+                    self.streamingServer?.sendBrightness(effectiveLevel)
                 }
                 monitor.start()
                 brightnessMonitor = monitor
@@ -933,6 +966,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Save display position before destroying
         virtualDisplayManager?.saveDisplayPosition()
 
+        idleSleepMonitor?.stop()
+        idleSleepMonitor = nil
         nativeBrightness?.stop()
         nativeBrightness = nil
         brightnessMonitor?.stop()
@@ -949,6 +984,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.screenCaptureFailure = nil
         settings.currentFPS = 0
         settings.currentBitrate = 0
+        lastPublishedStatsNs = 0
         settings.captureMethod = "Initializing..."
         setTouchDisplayBounds(nil)
 
@@ -1524,6 +1560,23 @@ extension AppDelegate: NSMenuDelegate {
         let modeItem = NSMenuItem(title: "Connection Mode", action: nil, keyEquivalent: "")
         modeItem.submenu = modeMenu
         menu.addItem(modeItem)
+
+        let brightnessItem = NSMenuItem()
+        let brightnessView = BrightnessMenuItemView(
+            level: nativeBrightness?.level ?? settings.brightnessLevel
+        )
+        brightnessView.onChange = { [weak self] level in
+            guard let self else { return }
+            if let controller = self.nativeBrightness {
+                controller.setLevel(level)
+            } else {
+                // Keep the control useful before the server starts; the
+                // controller reads this persisted value on the next session.
+                self.settings.updateBrightnessFromController(level)
+            }
+        }
+        brightnessItem.view = brightnessView
+        menu.addItem(brightnessItem)
 
         menu.addItem(.separator())
 

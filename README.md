@@ -57,7 +57,7 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** lets you scan a QR code from the Mac once, then tap **Reconnect** when you choose to start a session over WiFi (5 GHz strongly recommended). Wireless uses a bounded efficiency profile: capture and encode are fixed at 60 FPS with a 40 Mbps average / approximately 60 Mbps one-second peak. The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
 
-The experimental Android sRGB/BT.709 color bridge is presentation-capped at 60 FPS and asks the tablet decoder for a 60 FPS operating rate. It drains to the newest decoded frame rather than queueing stale frames, so the cap protects smoothness and power without changing the normal USB 10-bit path. This is an Android-side cap; macOS capture/encoding remains governed by the selected virtual-display refresh rate.
+The experimental Android sRGB/BT.709 color bridge is presentation-capped at 60 FPS and asks the tablet decoder for a 60 FPS operating rate. It drains to the newest decoded frame rather than queueing stale frames, so the cap protects smoothness and power without changing the normal USB 10-bit path. The macOS virtual-display mode, ScreenCaptureKit capture ceiling, and encoder now share the same effective rate: Main10 is held at 60 FPS, while 8-bit/Main remains eligible for 120 FPS.
 
 ### Virtual Display
 
@@ -66,6 +66,18 @@ Create a true virtual display on your Mac. Drag windows to your tablet like a re
 <div align="center">
   <img src="resources/screenshots/feature_virtual_display.png" alt="Virtual Display in macOS Display Preferences" width="600"/>
 </div>
+
+### Tablet Brightness
+
+Use the native **Tablet Brightness** slider in SideScreen Settings or the menu-bar menu to control the tablet's actual panel backlight. The value is remembered while disconnected and reapplied automatically when the tablet reconnects; F1/F2 brightness keys remain available as a keyboard shortcut, including keyboards configured to send ordinary F1/F2 events. SideScreen prefers its low-latency control channel and falls back to the live video connection if that optional channel drops. This control belongs to SideScreen because the macOS Displays pane cannot drive the Android tablet's backlight through the virtual display.
+
+### Android session lifecycle
+
+The Android client keeps a normal app shell while idle: system bars, the user's brightness mode, screen-power policy, touch forwarding, and decoder resources remain untouched. Fullscreen presentation, screen-awake ownership, transactional brightness, and touch forwarding begin only after the current connection has negotiated a display, started its decoder, and produced a frame through the render path. Disconnect and failure release those resources and return to the normal shell. If the optional control channel drops while video continues, the session stays connected and reports controls as degraded instead of hiding a healthy picture.
+
+The USB checklist is intentionally advisory. `UsbManager.deviceList` describes Android acting as a USB host, while SideScreen's ADB-reverse route has the Mac as host and the tablet as the USB device. Tap **Connect** to verify the actual route; the checklist does not probe the Mac listener in the background.
+
+Decoder selection and frame timing are recorded in the Android diagnostic log: codec hardware/vendor/software classification, supported size/rate, low-latency feature, profiles, configure fallback, codec metrics, output release, and `OnFrameRenderedListener` timing. The Mac log separately reports WindowServer display-time → ScreenCaptureKit callback delay and the later encode/send stages. See [docs/android-session-lifecycle.md](docs/android-session-lifecycle.md) for the state contract and evidence checklist.
 
 ### Ultra-Low Latency
 

@@ -37,6 +37,10 @@ class ControlChannel(
     /** Server→client brightness command: 0..255, apply to the REAL panel. */
     var onBrightnessCommand: ((Int) -> Unit)? = null
 
+    /** True when the optional control socket is usable; false is degraded,
+     * not a video-session failure. */
+    var onAvailabilityChanged: ((Boolean) -> Unit)? = null
+
     // TCP path
     private var socket: Socket? = null
     private var output: DataOutputStream? = null
@@ -118,6 +122,7 @@ class ControlChannel(
                 // pong before declaring active deadlocks the first ping.
                 tcpActive = true
                 DiagLog.log("CC", "Control channel ACTIVE mode=tcp")
+                onAvailabilityChanged?.invoke(true)
                 declareBrightnessSupport()
                 declareClockSyncSupport()
                 Thread({ tcpReadLoop(s) }, "ControlTcpThread")
@@ -128,6 +133,7 @@ class ControlChannel(
                 socket = null
                 output = null
                 tcpActive = false
+                onAvailabilityChanged?.invoke(false)
                 try {
                     s.close()
                 } catch (_: Exception) {
@@ -346,12 +352,14 @@ class ControlChannel(
             if (running) {
                 DiagLog.log("CC", "Control channel unavailable — using in-band fallback")
             }
+            onAvailabilityChanged?.invoke(false)
         }
     }
 
     fun disconnect() {
         synchronized(connectLock) {
             running = false
+            val wasActive = tcpActive
             tcpActive = false
             output = null
             lastPongAtNs = 0L
@@ -363,6 +371,7 @@ class ControlChannel(
                 activeSocket?.close()
             } catch (_: Exception) {
             }
+            if (wasActive) onAvailabilityChanged?.invoke(false)
         }
     }
 

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Authoritative Android session lifecycle and render timing
+- Replaced the parallel Android connection flags with one generation-fenced session state machine. USB/wireless transport, negotiation, decoder readiness, first decoded frame, first rendered frame, and degraded control-channel health now drive one UI truth; stale callbacks cannot regain ownership after reconnect.
+- Kept the idle Android app ordinary: system bars, user brightness, orientation policy, screen-awake state, touch forwarding, and decoder resources are untouched until a real stream reaches the render path. Disconnect/failure tears down fullscreen, decoder, touch, keep-awake, and brightness ownership.
+- Made the USB checklist honest for the Mac-host/Android-device ADB topology. `UsbManager.deviceList` is advisory rather than a false-negative readiness gate, and the Mac listener is verified only by the explicit Connect action.
+- Made tablet brightness transactional. The client snapshots global mode/value and the per-window override, applies only for the active streaming generation, preserves independent user changes, and restores on teardown. A control-channel drop keeps video streaming and reports controls as degraded.
+- Decoder setup now logs hardware/vendor/software capability evidence, supported size/rate, profiles, and the low-latency feature before requesting decoder-safe keys. The encoder-only `KEY_MAX_B_FRAMES` path was removed. Android frame traces now separate output availability, release request, and `OnFrameRenderedListener` time.
+- macOS capture traces now use ScreenCaptureKit `displayTime` when present and report WindowServer-to-callback delay separately from encode and send-completion stages.
+
+### Native tablet brightness controls
+- Added a native macOS brightness slider to SideScreen Settings and the menu-bar menu. Both controls use the existing `BRIGHT` transport, persist the tablet backlight level while disconnected, and reapply it automatically on reconnect. F1/F2 (including ordinary function-key events) and the optional BetterDisplay bridge now keep the Settings value synchronized; brightness falls back to the live video socket if the optional control socket drops.
+
+### Idle capture efficiency
+- The virtual display now uses the same effective frame-rate ceiling as ScreenCaptureKit and VideoToolbox. USB 10-bit/Main10 sessions therefore negotiate 60 Hz instead of advertising 120 Hz while capture is capped, reducing avoidable WindowServer work without changing the validated 8-bit/Main 120-FPS path.
+- A silent ScreenCaptureKit stream no longer re-encodes the cached 2800×1752 frame as a video keepalive by default. The dedicated control channel owns liveness, and reconnect/keyframe handling still replays the cached frame when needed. Set `SideScreen_exp_idleKeepalive=true` only for a diagnostic comparison.
+- Reduced idle wakeups: the adaptive silence watchdog is 1 Hz, BetterDisplay polling is 1 Hz, status checks are 10 s, and settings performance stats are throttled to visible-window updates at most every 2 s.
+- Added deterministic coverage for the shared capture/display/encoder frame-rate policy.
+
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming

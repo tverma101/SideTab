@@ -213,7 +213,8 @@ class VideoEncoder {
     func encode(
         pixelBuffer: CVPixelBuffer,
         presentationTimeStamp: CMTime,
-        captureTimestampNs: UInt64? = nil
+        captureTimestampNs: UInt64? = nil,
+        screenCaptureCallbackTimestampNs: UInt64? = nil
     ) {
         guard let session = compressionSession else { return }
 
@@ -225,6 +226,7 @@ class VideoEncoder {
         // VideoToolbox work.
         let encodeStartNs = DispatchTime.now().uptimeNanoseconds
         let captureNs = captureTimestampNs ?? encodeStartNs
+        let callbackNs = screenCaptureCallbackTimestampNs ?? captureNs
         let frameID = stateLock.withLock { state -> UInt64 in
             state.nextFrameID &+= 1
             return state.nextFrameID
@@ -232,6 +234,7 @@ class VideoEncoder {
         let context = FrameEncodeContext(
             frameID: frameID,
             captureTimestampNs: captureNs,
+            screenCaptureCallbackTimestampNs: callbackNs,
             encodeStartTimestampNs: encodeStartNs
         )
         let refconValue = UnsafeMutablePointer<FrameEncodeContext>.allocate(capacity: 1)
@@ -271,6 +274,7 @@ private let nalStartCode: [UInt8] = [0, 0, 0, 1]
 private struct FrameEncodeContext {
     let frameID: UInt64
     let captureTimestampNs: UInt64
+    let screenCaptureCallbackTimestampNs: UInt64
     let encodeStartTimestampNs: UInt64
 }
 
@@ -294,6 +298,7 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         context = FrameEncodeContext(
             frameID: 0,
             captureTimestampNs: now,
+            screenCaptureCallbackTimestampNs: now,
             encodeStartTimestampNs: now
         )
     }
@@ -380,6 +385,7 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         EncodedVideoFrame(
             frameID: context.frameID,
             captureTimestampNs: context.captureTimestampNs,
+            screenCaptureCallbackTimestampNs: context.screenCaptureCallbackTimestampNs,
             encodeStartTimestampNs: context.encodeStartTimestampNs,
             encodeCompleteTimestampNs: DispatchTime.now().uptimeNanoseconds,
             data: frameData,

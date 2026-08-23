@@ -1,5 +1,10 @@
 import Foundation
 import AppKit
+import Darwin
+
+if CaptureSourceBenchmark.runIfRequested(arguments: CommandLine.arguments) {
+    exit(0)
+}
 
 print("🚀 Side Screen starting...")
 

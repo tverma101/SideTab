@@ -3,6 +3,18 @@ package com.sidescreen.app
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
+
+data class DecoderCapability(
+    val name: String,
+    val mime: String,
+    val isHardware: Boolean,
+    val isVendor: Boolean,
+    val supportsSize: Boolean,
+    val supportsRate: Boolean,
+    val supportsLowLatency: Boolean,
+    val profileLevels: String,
+)
 
 /**
  * One-shot decoder capability probe. AVC-only devices drive the H.264
@@ -43,11 +55,66 @@ object CodecCapabilities {
         if (info.isEncoder) return false
         if (info.supportedTypes.none { it.equals(mime, ignoreCase = true) }) return false
         val name = info.name.lowercase()
-        val isSoftware = name.startsWith("c2.android.") || name.startsWith("omx.google.")
+        val isSoftware = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            info.isSoftwareOnly
+        } else {
+            name.startsWith("c2.android.") || name.startsWith("omx.google.")
+        }
         val isBrokenHevc =
             mime.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, ignoreCase = true) &&
                 BROKEN_HEVC_HW_PREFIXES.any { name.startsWith(it) }
         return !isSoftware && !isBrokenHevc
+    }
+
+    /**
+     * Full capability evidence used by decoder selection and diagnostics.
+     * The list is intentionally public so the selected path can be persisted
+     * in the runtime trace instead of disappearing behind MediaCodec fallback.
+     */
+    fun decoderCandidates(
+        mime: String,
+        width: Int,
+        height: Int,
+        targetRate: Double,
+    ): List<DecoderCapability> = try {
+        MediaCodecList(MediaCodecList.ALL_CODECS)
+            .codecInfos
+            .asSequence()
+            .filter { !it.isEncoder && it.supportedTypes.any { type -> type.equals(mime, ignoreCase = true) } }
+            .mapNotNull { info ->
+                val caps = runCatching { info.getCapabilitiesForType(mime) }.getOrNull() ?: return@mapNotNull null
+                val videoCaps = caps.videoCapabilities ?: return@mapNotNull null
+                val supportsSize = runCatching { videoCaps.isSizeSupported(width, height) }.getOrDefault(false)
+                val supportsRate = supportsSize && runCatching {
+                    videoCaps.areSizeAndRateSupported(width, height, targetRate)
+                }.getOrDefault(false)
+                val isHardware = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    info.isHardwareAccelerated && !info.isSoftwareOnly
+                } else {
+                    !info.name.startsWith("c2.android.") && !info.name.startsWith("OMX.google.")
+                }
+                val isVendor = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && info.isVendor
+                val lowLatency = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                    runCatching {
+                        caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+                    }.getOrDefault(false)
+                val profiles = caps.profileLevels.joinToString(",") { level ->
+                    "${level.profile}/${level.level}"
+                }
+                DecoderCapability(
+                    name = info.name,
+                    mime = mime,
+                    isHardware = isHardware,
+                    isVendor = isVendor,
+                    supportsSize = supportsSize,
+                    supportsRate = supportsRate,
+                    supportsLowLatency = lowLatency,
+                    profileLevels = profiles,
+                )
+            }
+            .toList()
+    } catch (_: Exception) {
+        emptyList()
     }
 
     val hasHevcDecoder: Boolean by lazy {

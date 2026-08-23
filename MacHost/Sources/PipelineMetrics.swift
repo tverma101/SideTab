@@ -5,7 +5,12 @@ import Foundation
 /// nanoseconds from DispatchTime.
 struct EncodedVideoFrame {
     let frameID: UInt64
+    /// WindowServer display time when ScreenCaptureKit provided it; otherwise
+    /// the callback monotonic time is used as an explicitly marked fallback.
     let captureTimestampNs: UInt64
+    /// ScreenCaptureKit callback receipt time, kept separate from the source
+    /// display timestamp so delivery delay is visible in diagnostics.
+    let screenCaptureCallbackTimestampNs: UInt64
     let encodeStartTimestampNs: UInt64
     let encodeCompleteTimestampNs: UInt64
     let data: Data

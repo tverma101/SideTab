@@ -72,14 +72,11 @@ class ScreenCapture {
     private var currentBitrateCapMbps: Int?
 
     /// The current Apple Silicon capture/HEVC Main10 path does not produce a
-    /// usable stream at the virtual display's 120-FPS request. Keep the
-    /// quality experiment live at a stable 60 FPS until a validated 10-bit
-    /// 120-FPS encoder path exists; 8-bit/Main remains eligible for 120 FPS.
+    /// usable stream at a 120-FPS request. Keep the quality experiment live at
+    /// a stable 60 FPS until a validated 10-bit 120-FPS encoder path exists;
+    /// 8-bit/Main remains eligible for 120 FPS.
     private func qualitySafeFrameRate(_ requested: Int) -> Int {
-        let expPixelFormat = UserDefaults.standard.string(forKey: "SideScreen_exp_pixelFormat")
-        let expProfile = UserDefaults.standard.string(forKey: "SideScreen_exp_profile")
-        guard expPixelFormat == "10bit" || expProfile == "main10" else { return requested }
-        let capped = min(requested, 60)
+        let capped = CaptureFrameRatePolicy.effectiveFrameRate(requested: requested)
         if capped < requested {
             debugLog("10-bit/Main10 cadence capped: " + String(requested) + " -> " + String(capped) + " fps for stable hardware output")
         }
@@ -102,6 +99,37 @@ class ScreenCapture {
         cachedPixelBufferLock.lock()
         lastPixelBuffer = pixelBuffer
         cachedPixelBufferLock.unlock()
+    }
+
+    /// ScreenCaptureKit's displayTime is the WindowServer presentation time,
+    /// not callback arrival. Keep callback time as a separate stage and use it
+    /// only when the attachment is unavailable on an older/legacy path.
+    private func windowServerDisplayTimestampNs(from sampleBuffer: CMSampleBuffer) -> UInt64? {
+        guard let frameInfo = (CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer,
+            createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]])?.first,
+        let rawDisplayTime = frameInfo[.displayTime] else {
+            return nil
+        }
+
+        if let displayTime = rawDisplayTime as? CMTime,
+           displayTime.isValid,
+           displayTime.isNumeric {
+            let nanoseconds = CMTimeConvertScale(
+                displayTime,
+                timescale: 1_000_000_000,
+                method: .roundHalfAwayFromZero
+            ).value
+            return nanoseconds > 0 ? UInt64(nanoseconds) : nil
+        }
+
+        // Keep a defensive numeric fallback for SDK/runtime bridges that box
+        // the attachment rather than exposing CMTime directly.
+        if let number = rawDisplayTime as? NSNumber, number.uint64Value > 0 {
+            return number.uint64Value
+        }
+        return nil
     }
 
     // Default-on adaptive cadence controller. It consumes ScreenCaptureKit
@@ -153,12 +181,13 @@ class ScreenCapture {
         )
 
         guard currentServer?.shouldEncodeNextFrame() ?? true else { return }
-        let captureTimestampNs = DispatchTime.now().uptimeNanoseconds
+        let callbackTimestampNs = DispatchTime.now().uptimeNanoseconds
         encodeQueue?.async {
             encoder.encode(
                 pixelBuffer: cached,
                 presentationTimeStamp: pts,
-                captureTimestampNs: captureTimestampNs
+                captureTimestampNs: callbackTimestampNs,
+                screenCaptureCallbackTimestampNs: callbackTimestampNs
             )
         }
     }
@@ -371,10 +400,10 @@ class ScreenCapture {
 
         // Physical pixels for full Retina sharpness, clamped when H.264 (SCStream scales)
         let (width, height) = encodeSize(for: codec)
-        // EXP-FORK: SideScreen_exp_fps caps the capture cadence (e.g. 90) —
-        // a stable 90 beats a jittery 120 when the pipeline can't hold 120.
-        let expFps = UserDefaults.standard.integer(forKey: "SideScreen_exp_fps")
-        let requestedFrameRate = qualitySafeFrameRate(expFps > 0 ? expFps : refreshRate)
+        // The same effective ceiling is used by the virtual display and the
+        // encoder so WindowServer does not keep producing a faster mode than
+        // the selected capture path can consume.
+        let requestedFrameRate = qualitySafeFrameRate(refreshRate)
         let fps = min(requestedFrameRate, frameRateCap ?? Int.max)
 
         streamOutput = StreamOutput()
@@ -477,7 +506,9 @@ class ScreenCapture {
             }
 
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            let captureTimestampNs = DispatchTime.now().uptimeNanoseconds
+            let callbackTimestampNs = DispatchTime.now().uptimeNanoseconds
+            let windowServerDisplayNs = self.windowServerDisplayTimestampNs(from: sampleBuffer)
+            let captureTimestampNs = windowServerDisplayNs ?? callbackTimestampNs
 
             // Backpressure: skip if encode queue already has 2+ frames pending
             let pending = OSAtomicAdd32(0, &self.pendingEncodes)
@@ -532,7 +563,8 @@ class ScreenCapture {
                     self.encoder?.encode(
                         pixelBuffer: toEncode,
                         presentationTimeStamp: pts,
-                        captureTimestampNs: captureTimestampNs
+                        captureTimestampNs: captureTimestampNs,
+                        screenCaptureCallbackTimestampNs: callbackTimestampNs
                     )
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
@@ -540,13 +572,14 @@ class ScreenCapture {
                 if let server = self.currentServer, !server.shouldEncodeNextFrame() {
                     return
                 }
-                let cachedCaptureTimestampNs = DispatchTime.now().uptimeNanoseconds
+                let cachedCallbackTimestampNs = DispatchTime.now().uptimeNanoseconds
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
                     self.encoder?.encode(
                         pixelBuffer: cached,
                         presentationTimeStamp: pts,
-                        captureTimestampNs: cachedCaptureTimestampNs
+                        captureTimestampNs: cachedCallbackTimestampNs,
+                        screenCaptureCallbackTimestampNs: cachedCallbackTimestampNs
                     )
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
@@ -559,13 +592,9 @@ class ScreenCapture {
     func startStreaming(to server: StreamingServer?, bitrateMbps: Int = 20, quality: String = "medium", gamingBoost: Bool = false, frameRate: Int = 60, bitrateCapMbps: Int? = nil, frameRateCap: Int? = nil) {
         // Save parameters for potential restart
         currentServer = server
-        // EXP-FORK: SideScreen_exp_fps cap applies to the encoder too (rate
-        // control must expect the same cadence the capture actually delivers).
-        let expFps = UserDefaults.standard.integer(forKey: "SideScreen_exp_fps")
-        // A wireless session is hard-capped even if an old experiment knob
-        // still requests 90/120 FPS. USB retains the prior exp-fps behavior.
+        // The encoder must use the same effective ceiling as ScreenCaptureKit.
         self.frameRateCap = frameRateCap
-        let requestedFrameRate = qualitySafeFrameRate(expFps > 0 ? expFps : frameRate)
+        let requestedFrameRate = qualitySafeFrameRate(frameRate)
         let effFrameRate = min(requestedFrameRate, frameRateCap ?? Int.max)
         currentBitrateMbps = bitrateMbps
         currentQuality = quality
@@ -650,22 +679,33 @@ class ScreenCapture {
             if stalled {
                 let hasHadFrames = self.stateLock.withLock { $0.hasReceivedFirstFrame }
 
-                if hasHadFrames, let lastBuffer = self.cachedPixelBufferSnapshot() {
-                    // Screen is idle — SCStream is healthy but not delivering frames (macOS optimization).
-                    // Re-send the last captured frame as a keepalive so the tablet stays connected.
-                    let pts = CMTime(
-                        value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
-                        timescale: 1_000_000
-                    )
-                    if self.currentServer?.shouldEncodeNextFrame() ?? true {
-                        let captureTimestampNs = DispatchTime.now().uptimeNanoseconds
-                        self.encodeQueue?.async {
-                            self.encoder?.encode(
-                                pixelBuffer: lastBuffer,
-                                presentationTimeStamp: pts,
-                                captureTimestampNs: captureTimestampNs
-                            )
+                if hasHadFrames {
+                    // SCStream can legitimately go silent on an unchanged
+                    // display. The control channel owns liveness and the
+                    // reconnect path explicitly replays the cached frame, so
+                    // encoding a full 2800x1752 keepalive here only burns CPU
+                    // and sends bytes that cannot change the framebuffer.
+                    // Keep the old behavior available for diagnosis only.
+                    if UserDefaults.standard.bool(forKey: "SideScreen_exp_idleKeepalive"),
+                       let lastBuffer = self.cachedPixelBufferSnapshot() {
+                        let pts = CMTime(
+                            value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
+                            timescale: 1_000_000
+                        )
+                        if self.currentServer?.shouldEncodeNextFrame() ?? true {
+                            let captureTimestampNs = DispatchTime.now().uptimeNanoseconds
+                            self.encodeQueue?.async {
+                                self.encoder?.encode(
+                                    pixelBuffer: lastBuffer,
+                                    presentationTimeStamp: pts,
+                                    captureTimestampNs: captureTimestampNs,
+                                    screenCaptureCallbackTimestampNs: captureTimestampNs
+                                )
+                            }
                         }
+                        debugLog("Frame flow stalled — diagnostic cached-frame keepalive sent")
+                    } else {
+                        debugLog("Frame flow idle — cached-frame keepalive suppressed")
                     }
                     self.stateLock.withLock { $0.lastFrameTime = DispatchTime.now() }
                     // Keep monitoring — real errors are handled by the SCStream error delegate

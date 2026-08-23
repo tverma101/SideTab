@@ -66,7 +66,10 @@ class StreamingServer {
     private var listener: NWListener?
     private var connection: NWConnection?
 
-    // Dedicated out-of-band control channel (ping/pong + keyframe requests).
+    // Dedicated out-of-band control channel (ping/pong + keyframe requests
+    // + brightness). Brightness also has a capability-gated in-band fallback
+    // because the control socket is optional and may disappear independently
+    // of an otherwise healthy video stream.
     // Pongs are answered on this connection so they never queue behind video
     // frames on the main NWConnection — measured RTT reflects the transport,
     // not the video send/read scheduling.
@@ -78,6 +81,7 @@ class StreamingServer {
     private var lastControlTouchNs: UInt64 = 0
     private var maxControlTouchGapMs = 0.0
     private var clientSupportsBrightness = false
+    private var lastBrightness: UInt8?
     private var clientSupportsClockSync = false
     private var clientSupportsVideoClockSync = false
     private let controlQueue = DispatchQueue(label: "controlQueue", qos: .userInteractive)
@@ -127,6 +131,7 @@ class StreamingServer {
     // at most the explicitly bounded sender window even when VideoToolbox
     // produces frames faster than NWConnection drains them.
     private let backpressure = FrameBackpressureController()
+    private var windowServerToCallbackLatency = LatencyPercentiles()
     private var captureToEncodeLatency = LatencyPercentiles()
     private var captureToEnqueueLatency = LatencyPercentiles()
     private var captureToSendCompleteLatency = LatencyPercentiles()
@@ -354,6 +359,9 @@ class StreamingServer {
                 controlInputBuffer = Data(controlInputBuffer.dropFirst())
                 clientSupportsBrightness = true
                 debugLog("Client supports brightness (BRIGHT armed)")
+                if let value = lastBrightness {
+                    sendBrightnessMessage(value, on: connection, path: "control")
+                }
 
             case WireMessage.clientSupportsClockSync:
                 // [type 13] payload-free capability. Old hosts consume this
@@ -373,17 +381,36 @@ class StreamingServer {
         }
     }
 
-    /// Send a brightness command (0..255) to the client on the control channel.
-    /// Only sent when the client declared support (type 3) — old clients
-    /// disconnect on unknown message types, so never send unsolicited.
-    /// No-op when the control connection is not ready. Call from any queue.
+    /// Send a brightness command (0..255) to the client.
+    ///
+    /// Only sent after the client declared support (type 3), so old clients
+    /// never see the newer message. Prefer the dedicated control socket; if
+    /// that optional socket has already closed, use the live video socket as
+    /// a capability-gated fallback. The Android client accepts type 11 on
+    /// either path.
     func sendBrightness(_ value: UInt8) {
-        guard clientSupportsBrightness, let connection = controlConnection else { return }
+        lastBrightness = value
+        guard clientSupportsBrightness else {
+            debugLog("BRIGHT queued: \(value) (client capability not armed)")
+            return
+        }
+        if let connection = controlConnection {
+            sendBrightnessMessage(value, on: connection, path: "control")
+            return
+        }
+        guard connectionReady, let connection else {
+            debugLog("BRIGHT queued: \(value) (no live transport)")
+            return
+        }
+        sendBrightnessMessage(value, on: connection, path: "video fallback")
+    }
+
+    private func sendBrightnessMessage(_ value: UInt8, on connection: NWConnection, path: String) {
         var msg = Data(capacity: 2)
         msg.append(WireMessage.bright)
         msg.append(value)
         connection.send(content: msg, completion: .contentProcessed { _ in })
-        debugLog("BRIGHT sent: \(value)")
+        debugLog("BRIGHT sent (\(path)): \(value)")
     }
 
     // Contender: a new connection that arrived while a live client is
@@ -425,6 +452,8 @@ class StreamingServer {
         clientSupportsFrameTrace = false
         clientSupportsVideoClockSync = false
         clientIsAvcOnly = false
+        clientSupportsBrightness = false
+        lastBrightness = nil
         clientDecodeLimits = nil
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
@@ -522,6 +551,8 @@ class StreamingServer {
         connectionReady = false
         isReceiving = false
         connection = nil
+        clientSupportsBrightness = false
+        lastBrightness = nil
         inputBuffer.removeAll(keepingCapacity: true)
         backpressure.resetForNewSession()
         onClientDisconnected?()
@@ -926,6 +957,11 @@ class StreamingServer {
 
             let packet = self.makeFramePacket(frame)
             let enqueuedAtNs = DispatchTime.now().uptimeNanoseconds
+            if frame.screenCaptureCallbackTimestampNs >= frame.captureTimestampNs {
+                self.windowServerToCallbackLatency.add(
+                    nanoseconds: frame.screenCaptureCallbackTimestampNs - frame.captureTimestampNs
+                )
+            }
             self.captureToEncodeLatency.add(
                 nanoseconds: frame.encodeCompleteTimestampNs >= frame.captureTimestampNs
                     ? frame.encodeCompleteTimestampNs - frame.captureTimestampNs
@@ -1016,6 +1052,7 @@ class StreamingServer {
 
             let backpressure = self.backpressure.snapshot()
             let trace = self.captureToSendCompleteLatency.summary()
+            let windowServerToCallback = self.windowServerToCallbackLatency.summary()
             let queue = self.enqueueToSendCompleteLatency.summary()
             let admission = self.captureToEnqueueLatency.summary()
             let encode = self.captureToEncodeLatency.summary()
@@ -1025,6 +1062,12 @@ class StreamingServer {
                     $0.p50Ms, $0.p95Ms, $0.p99Ms, $0.maxMs, $0.count
                 )
             } ?? "capture->send n=0"
+            let windowServerText = windowServerToCallback.map {
+                String(
+                    format: "WindowServer->callback p50/p95/p99/max=%.1f/%.1f/%.1f/%.1fms",
+                    $0.p50Ms, $0.p95Ms, $0.p99Ms, $0.maxMs
+                )
+            } ?? "WindowServer->callback n=0"
             let queueText = queue.map {
                 String(
                     format: "send-completion p50/p95/p99/max=%.1f/%.1f/%.1f/%.1fms",
@@ -1047,11 +1090,12 @@ class StreamingServer {
                     "syncDrop=\(backpressure.syncDrops), " +
                     "completed=\(backpressure.completedFrames), " +
                     "awaitingSync=\(backpressure.awaitingSyncFrame); " +
-                    "\(traceText); \(queueText); \(admissionText); \(encodeText)"
+                    "\(windowServerText); \(traceText); \(queueText); \(admissionText); \(encodeText)"
             )
 
             bytesSent = 0
             frameCount = 0
+            windowServerToCallbackLatency.removeAll()
             captureToEncodeLatency.removeAll()
             captureToEnqueueLatency.removeAll()
             captureToSendCompleteLatency.removeAll()

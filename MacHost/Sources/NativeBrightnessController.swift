@@ -19,15 +19,16 @@ import CoreGraphics
 ///
 /// Requires Input Monitoring (CGEventTap on the HID tap when the app is
 /// not key) or Accessibility otherwise — the existing permission prompt
-/// covers it. Falls back to NSEvent global monitor when the tap cannot be
-/// created, so F1/F2 still work while SideScreen is key.
+/// covers it. Falls back to NSEvent monitors when the tap cannot be created,
+/// so standard F1/F2 key events still work while SideScreen is key and, when
+/// macOS permits global monitoring, while another app is focused.
 final class NativeBrightnessController {
-    private static let defaultsKey = "SideScreen_virtualBrightness"
+    static let defaultsKey = "SideScreen_virtualBrightness"
     private static let disableKey = "SideScreen_brightnessKeys"
-    private static let full: Int = 255
+    static let maximumLevel: Int = 255
+    static let minimumLevel: Int = 8      // never black out the panel
     private static let coarseStep: Int = 16   // ~6% = macOS 16-stop scale
     private static let fineStep: Int = 4      // Option+Shift = 1/4 step
-    private static let minValue: Int = 8      // never black out the panel
 
     var onBrightness: ((UInt8) -> Void)?
 
@@ -37,12 +38,19 @@ final class NativeBrightnessController {
         set {
             _currentLevel = newValue
             UserDefaults.standard.set(newValue, forKey: Self.defaultsKey)
-            hud.show(level: newValue, max: Self.full)
+            hud.show(level: newValue, max: Self.maximumLevel)
         }
     }
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var globalMonitor: Any?
+    private var localKeyboardMonitor: Any?
+    private var globalKeyboardMonitor: Any?
+
+    // Key codes used when the keyboard is configured to send ordinary F1/F2
+    // events instead of the consumer-key brightness events.
+    private static let standardBrightnessDownKeyCode: UInt16 = 122 // F1
+    private static let standardBrightnessUpKeyCode: UInt16 = 120   // F2
 
     /// Set if we consumed the HID so AppKit must not also deliver it. The
     /// CGEventTap callback runs before the NSEvent monitor; without this the
@@ -53,15 +61,40 @@ final class NativeBrightnessController {
 
     private let hud = BrightnessHUD()
 
+    var level: UInt8 { UInt8(currentLevel) }
+
+    var normalizedValue: Double {
+        Self.normalizedValue(for: level)
+    }
+
     init() {
-        let saved = UserDefaults.standard.integer(forKey: Self.defaultsKey)
-        // integer(forKey:) returns 0 when absent — treat that as "first run".
-        if UserDefaults.standard.object(forKey: Self.defaultsKey) == nil {
-            currentLevel = Self.full
-        } else {
-            currentLevel = max(Self.minValue, min(Self.full, saved == 0 ? Self.full : saved))
+        currentLevel = Self.persistedLevel
+        debugLog("NativeBrightness: level \(currentLevel)/\(Self.maximumLevel)")
+    }
+
+    static var persistedLevel: Int {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: Self.defaultsKey) != nil else {
+            return Self.maximumLevel
         }
-        debugLog("NativeBrightness: level \(currentLevel)/\(Self.full)")
+
+        // integer(forKey:) returns 0 when absent. A real zero is not persisted
+        // by this controller because the minimum keeps the panel recoverable.
+        let saved = defaults.integer(forKey: Self.defaultsKey)
+        return clampedLevel(saved == 0 ? Self.maximumLevel : saved)
+    }
+
+    static func clampedLevel(_ rawLevel: Int) -> Int {
+        max(Self.minimumLevel, min(Self.maximumLevel, rawLevel))
+    }
+
+    static func normalizedValue(for level: UInt8) -> Double {
+        Double(Int(level)) / Double(Self.maximumLevel)
+    }
+
+    static func level(forNormalizedValue value: Double) -> UInt8 {
+        let raw = Int((value * Double(Self.maximumLevel)).rounded())
+        return UInt8(clampedLevel(raw))
     }
 
     func start() {
@@ -87,17 +120,46 @@ final class NativeBrightnessController {
             NSEvent.removeMonitor(m)
             globalMonitor = nil
         }
+        if let m = localKeyboardMonitor {
+            NSEvent.removeMonitor(m)
+            localKeyboardMonitor = nil
+        }
+        if let m = globalKeyboardMonitor {
+            NSEvent.removeMonitor(m)
+            globalKeyboardMonitor = nil
+        }
         hud.hide()
         debugLog("NativeBrightness: stopped")
     }
 
+    /// Apply a native macOS Settings/menu control value and send it through
+    /// the same callback used by F1/F2. The persisted value is updated even
+    /// while no tablet is connected; the next connection receives it through
+    /// `pushCurrent()`.
+    @discardableResult
+    func setLevel(_ level: UInt8) -> UInt8 {
+        let value = Self.clampedLevel(Int(level))
+        guard value != currentLevel else { return UInt8(value) }
+        currentLevel = value
+        onBrightness?(UInt8(value))
+        debugLog("NativeBrightness: control -> \(value)")
+        return UInt8(value)
+    }
+
+    @discardableResult
+    func setNormalizedValue(_ value: Double) -> UInt8 {
+        setLevel(Self.level(forNormalizedValue: value))
+    }
+
     /// Apply a level from the BetterDisplay poller or Settings so the HID
     /// steps remain contiguous (no jump on first F1/F2 after a slider drag).
-    func syncExternalLevel(_ level: UInt8) {
-        let v = max(Self.minValue, min(Self.full, Int(level)))
-        guard v != currentLevel else { return }
+    @discardableResult
+    func syncExternalLevel(_ level: UInt8) -> UInt8 {
+        let v = Self.clampedLevel(Int(level))
+        guard v != currentLevel else { return UInt8(v) }
         currentLevel = v
         debugLog("NativeBrightness: sync external \(v)")
+        return UInt8(v)
     }
 
     /// Force the tablet to our level (e.g. right after connect, before any
@@ -114,7 +176,7 @@ final class NativeBrightnessController {
         // NSEvent global monitor (key-window scope) if creation fails.
         // NX_SYSDEFINED = 14 (brightness keys); CGEventType has no
         // .systemDefined case — use the raw numeric value.
-        let mask = CGEventMask(1 << 14)
+        let mask = CGEventMask(1 << 14) | CGEventMask(1 << CGEventType.keyDown.rawValue)
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap,
             place: .headInsertEventTap,
@@ -127,8 +189,9 @@ final class NativeBrightnessController {
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            debugLog("NativeBrightness: CGEventTap unavailable — using NSEvent fallback (key-window only)")
+            debugLog("NativeBrightness: CGEventTap unavailable — using NSEvent fallback")
             installGlobalMonitor()
+            installFunctionKeyMonitors()
             return
         }
         eventTap = tap
@@ -139,6 +202,7 @@ final class NativeBrightnessController {
         // Also install the AppKit monitor so taps that are filtered by
         // Secure Input still arrive when we are key.
         installGlobalMonitor()
+        installFunctionKeyMonitors()
     }
 
     private func installGlobalMonitor() {
@@ -148,6 +212,22 @@ final class NativeBrightnessController {
         }
     }
 
+    private func installFunctionKeyMonitors() {
+        guard localKeyboardMonitor == nil, globalKeyboardMonitor == nil else { return }
+
+        // A local monitor can consume ordinary F1/F2 events when SideScreen's
+        // Settings window is active. The global monitor covers the same key
+        // path when the app is not key; the HID tap consumes it when available.
+        localKeyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.handleStandardFunctionKey(event) else { return event }
+            return nil
+        }
+        globalKeyboardMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            _ = self?.handleStandardFunctionKey(event)
+        }
+        debugLog("NativeBrightness: F1/F2 keyboard monitors installed")
+    }
+
     // MARK: — CGEventTap path
 
     private func handleCGEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -155,6 +235,12 @@ final class NativeBrightnessController {
             if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
             debugLog("NativeBrightness: tap re-enabled after \(type)")
             return Unmanaged.passUnretained(event)
+        }
+        if type == .keyDown {
+            guard let ns = NSEvent(cgEvent: event) else { return Unmanaged.passUnretained(event) }
+            return handleStandardFunctionKey(ns)
+                ? nil
+                : Unmanaged.passUnretained(event)
         }
         guard type.rawValue == 14 else { return Unmanaged.passUnretained(event) }
         guard let ns = NSEvent(cgEvent: event) else { return Unmanaged.passUnretained(event) }
@@ -220,16 +306,37 @@ final class NativeBrightnessController {
         }
     }
 
-    private func isFineStepHeld() -> Bool {
-        let flags = NSEvent.modifierFlags
+    /// Handle F1/F2 when macOS is configured to deliver them as ordinary
+    /// keyboard events instead of NX_KEYTYPE_BRIGHTNESS_* consumer events.
+    /// Returns true when the event was consumed by the controller.
+    private func handleStandardFunctionKey(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let isDownKey = event.keyCode == Self.standardBrightnessDownKeyCode
+        let isUpKey = event.keyCode == Self.standardBrightnessUpKeyCode
+        guard isDownKey || isUpKey else { return false }
+
+        let blockedModifiers: NSEvent.ModifierFlags = [.command, .control]
+        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).isDisjoint(with: blockedModifiers) else {
+            return false
+        }
+
+        let fine = isFineStepHeld(event.modifierFlags)
+        let changed = step(isDown: isDownKey, fine: fine)
+        guard changed else { return true }
+        onBrightness?(UInt8(currentLevel))
+        debugLog("NativeBrightness: F\(isDownKey ? 1 : 2)\(fine ? " fine" : "") -> \(currentLevel)")
+        return true
+    }
+
+    private func isFineStepHeld(_ flags: NSEvent.ModifierFlags = NSEvent.modifierFlags) -> Bool {
         return flags.contains(.option) && flags.contains(.shift)
     }
 
     @discardableResult
     private func step(isDown: Bool, fine: Bool) -> Bool {
         let delta = fine ? Self.fineStep : Self.coarseStep
-        let next = isDown ? max(Self.minValue, currentLevel - delta)
-                          : min(Self.full, currentLevel + delta)
+        let next = isDown ? max(Self.minimumLevel, currentLevel - delta)
+                          : min(Self.maximumLevel, currentLevel + delta)
         guard next != currentLevel else { return false }
         currentLevel = next
         return true

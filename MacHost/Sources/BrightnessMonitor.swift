@@ -16,7 +16,7 @@ import Foundation
 /// Display IDs change when the sender restarts (new CGVirtualDisplay) — the
 /// monitor re-scans on every plist change, so nothing needs configuring.
 ///
-/// EFFICIENCY: stat-poll 3x/s; parse only when mtime changes (~5ms); the client
+/// EFFICIENCY: stat-poll 1x/s; parse only when mtime changes (~5ms); the client
 /// applies the backlight directly — zero per-frame cost, OLED power saved
 /// (fabricated dimming darkens pixels at full backlight: no power saved, and
 /// the encoder spends bits on darkening).
@@ -38,7 +38,7 @@ final class BrightnessMonitor {
 
     init(
         prefsPath: String = NSHomeDirectory() + "/Library/Preferences/pro.betterdisplay.BetterDisplay.plist",
-        pollS: TimeInterval = 0.33,
+        pollS: TimeInterval = 1.0,
         debounceS: TimeInterval = 0.10,
         displayNames: [String] = ["SideScreen", "BetterCast Display (Android (USB))"]
     ) {

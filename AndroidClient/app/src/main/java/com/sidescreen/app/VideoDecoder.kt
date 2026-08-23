@@ -3,6 +3,7 @@ package com.sidescreen.app
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
@@ -64,8 +65,11 @@ class VideoDecoder(
     private var latencySamples: Int = 0
     private var latencyMaxNs: Long = 0
     private val pendingFrameTraces = ConcurrentHashMap<Long, FrameTrace>()
+    private val pendingSurfaceTraces = ConcurrentHashMap<Long, FrameTrace>()
     private val traceStats = FrameTraceStats()
     private var traceOutputCount = 0L
+    private var selectedDecoder: DecoderCapability? = null
+    private var frameRenderedListenerInstalled = false
 
     private val frameTimes = ArrayDeque<Long>(120)
 
@@ -82,6 +86,9 @@ class VideoDecoder(
     private var lastKeyframeRequestNs = 0L
 
     var onFrameRendered: ((Long) -> Unit)? = null
+    /** First output buffer became available. This is decoder evidence, not
+     *  Surface visibility. */
+    var onFirstFrameDecoded: (() -> Unit)? = null
     var onFrameStats: ((fps: Double, variance: Double) -> Unit)? = null
     var onFrameDecoded: ((ByteArray) -> Unit)? = null
     var onKeyframeRequired: ((force: Boolean, reason: String) -> Unit)? = null
@@ -133,6 +140,8 @@ class VideoDecoder(
     }
 
     private fun setupDecoder() {
+        frameRenderedListenerInstalled = false
+        selectedDecoder = null
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
 
@@ -199,6 +208,23 @@ class VideoDecoder(
             }
         codec.setCallback(callback, decoderHandler)
 
+        if (!bufferOutput && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                codec.setOnFrameRenderedListener({ _, presentationTimeUs, nanoTime ->
+                    val trace = pendingSurfaceTraces.remove(presentationTimeUs)
+                    trace?.let {
+                        recordFrameTrace(it.copy(surfaceRenderedNs = nanoTime))
+                    }
+                    trackFrameTiming(nanoTime)
+                }, decoderHandler)
+                frameRenderedListenerInstalled = true
+                diagLog("OnFrameRenderedListener installed for $mime")
+            } catch (e: Exception) {
+                frameRenderedListenerInstalled = false
+                diagLog("OnFrameRenderedListener unavailable: ${e.message}")
+            }
+        }
+
         val format =
             MediaFormat.createVideoFormat(
                 mime,
@@ -208,63 +234,46 @@ class VideoDecoder(
 
         val targetSurface: Surface? = if (bufferOutput) null else surface
 
-        var configured = false
-
-        // Attempt 1: Full low-latency config
-        try {
+        val lowLatencyAdvertised = selectedDecoder?.supportsLowLatency == true
+        if (lowLatencyAdvertised && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-            format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
-            format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            codec.configure(format, targetSurface, null, 0)
-            configured = true
-            diagLog("Configured with full low-latency${if (bufferOutput) " (buffer output)" else ""}")
-        } catch (e: Exception) {
-            diagLog("Full low-latency config failed: ${e.message}")
-            codec.reset()
-            codec.setCallback(callback, decoderHandler)
         }
+        format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+        format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
 
-        // Attempt 2: Without KEY_LOW_LATENCY
-        if (!configured) {
+        try {
+            codec.configure(format, targetSurface, null, 0)
+            diagLog(
+                "Configured decoder path=${if (lowLatencyAdvertised) "low-latency-capability" else "standard"} " +
+                    "codec=${selectedDecoder?.name ?: "default"}" +
+                    "${if (bufferOutput) " (buffer output)" else ""}",
+            )
+        } catch (e: Exception) {
+            // Retry only with decoder-safe keys. KEY_MAX_B_FRAMES is an
+            // encoder setting and must never be passed to a decoder.
+            diagLog("Capability-selected decoder config failed: ${e.message}; retrying minimal decoder format")
             try {
-                val basicFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
-                basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
-                basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                codec.configure(basicFormat, targetSurface, null, 0)
-                configured = true
-                diagLog("Configured with basic format")
-            } catch (e: Exception) {
-                diagLog("Basic config failed: ${e.message}")
                 codec.reset()
                 codec.setCallback(callback, decoderHandler)
-            }
-        }
-
-        // Attempt 3: Minimal config (just resolution)
-        if (!configured) {
-            try {
-                val minimalFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
+                if (!bufferOutput && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    codec.setOnFrameRenderedListener({ _, presentationTimeUs, nanoTime ->
+                        val trace = pendingSurfaceTraces.remove(presentationTimeUs)
+                        trace?.let { recordFrameTrace(it.copy(surfaceRenderedNs = nanoTime)) }
+                        trackFrameTiming(nanoTime)
+                    }, decoderHandler)
+                    frameRenderedListenerInstalled = true
+                }
+                val minimalFormat = MediaFormat.createVideoFormat(mime, currentWidth, currentHeight)
                 codec.configure(minimalFormat, targetSurface, null, 0)
-                diagLog("Configured with minimal format")
-            } catch (e: Exception) {
-                diagLog("All configure attempts failed: ${e.message}")
-                Log.e(TAG, "All configure attempts failed", e)
+                diagLog("Configured minimal decoder format after capability-path failure")
+            } catch (minimalError: Exception) {
+                diagLog("All decoder configure attempts failed: ${minimalError.message}")
+                Log.e(TAG, "All configure attempts failed", minimalError)
                 codec.release()
                 decoderThread?.quitSafely()
                 decoderThread = null
                 decoderHandler = null
-                throw e
+                throw minimalError
             }
         }
 
@@ -273,9 +282,11 @@ class VideoDecoder(
         isRunning = true
         codec.start()
         decoder = codec
+        runCatching { diagLog("Codec metrics at start: ${codec.metrics}") }
         diagLog(
             "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
-                "surface=$surface, valid=${surface.isValid}",
+                "surface=$surface, valid=${surface.isValid}, " +
+                "renderCallback=$frameRenderedListenerInstalled",
         )
     }
 
@@ -289,68 +300,36 @@ class VideoDecoder(
         height: Int,
     ): String? {
         try {
-            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
             val targetRate = displayRefreshRate.toDouble().coerceAtLeast(30.0)
-            var hwRateDecoder: String? = null
-            var hwSizeDecoder: String? = null
-            var swRateDecoder: String? = null
-            var swSizeDecoder: String? = null
-
-            for (info in codecList.codecInfos) {
-                if (info.isEncoder) continue
-                val caps =
-                    try {
-                        info.getCapabilitiesForType(mime)
-                    } catch (_: Exception) {
-                        continue
-                    }
-
-                val videoCaps = caps.videoCapabilities ?: continue
-                val isHardware =
-                    !info.name.startsWith("c2.android.") &&
-                        !info.name.startsWith("OMX.google.")
-                val supported = videoCaps.isSizeSupported(width, height)
-                val rateSupported =
-                    supported &&
-                        try {
-                            videoCaps.areSizeAndRateSupported(width, height, targetRate)
-                        } catch (_: Exception) {
-                            false
-                        }
-
+            val candidates = CodecCapabilities.decoderCandidates(mime, width, height, targetRate)
+            candidates.forEach { candidate ->
                 diagLog(
-                    "$mime decoder '${info.name}': " +
-                        "width=${videoCaps.supportedWidths}, " +
-                        "height=${videoCaps.supportedHeights}, " +
-                        "hw=$isHardware, supports ${width}x$height=$supported, " +
-                        "supports @${"%.0f".format(targetRate)}fps=$rateSupported",
+                    "$mime decoder '${candidate.name}': hw=${candidate.isHardware} " +
+                        "vendor=${candidate.isVendor} size=${candidate.supportsSize} " +
+                        "rate=${candidate.supportsRate} lowLatency=${candidate.supportsLowLatency} " +
+                        "profiles=${candidate.profileLevels}",
                 )
-
-                if (supported) {
-                    if (isHardware && rateSupported && hwRateDecoder == null) {
-                        hwRateDecoder = info.name
-                    } else if (isHardware && hwSizeDecoder == null) {
-                        hwSizeDecoder = info.name
-                    } else if (!isHardware && rateSupported && swRateDecoder == null) {
-                        swRateDecoder = info.name
-                    } else if (!isHardware && swSizeDecoder == null) {
-                        swSizeDecoder = info.name
-                    }
-                }
             }
 
-            // Prefer hardware that advertises the target refresh rate, then any
-            // hardware decoder for the size, then software as a last resort.
-            val chosen = hwRateDecoder ?: hwSizeDecoder ?: swRateDecoder ?: swSizeDecoder
+            val chosen = candidates
+                .filter { it.supportsSize }
+                .sortedWith(
+                    compareByDescending<DecoderCapability> { it.isHardware }
+                        .thenByDescending { it.supportsLowLatency }
+                        .thenByDescending { it.supportsRate },
+                )
+                .firstOrNull()
+            selectedDecoder = chosen
             if (chosen != null) {
                 diagLog(
-                    "Selected decoder: $chosen " +
-                        "(rateSupported=${chosen == hwRateDecoder || chosen == swRateDecoder})",
+                    "Selected decoder: ${chosen.name} hw=${chosen.isHardware} " +
+                        "vendor=${chosen.isVendor} rate=${chosen.supportsRate} " +
+                        "lowLatency=${chosen.supportsLowLatency} profiles=${chosen.profileLevels}",
                 )
             } else {
-                diagLog("No decoder supports ${width}x$height — will use default")
+                diagLog("No decoder supports ${width}x$height — will use platform default")
             }
-            return chosen
+            return chosen?.name
         } catch (e: Exception) {
             diagLog("Decoder search failed: ${e.message}")
         }
@@ -529,6 +508,9 @@ class VideoDecoder(
         try {
             outputFrameCount++
             if (outputFrameCount == 1L) {
+                onFirstFrameDecoded?.invoke()
+            }
+            if (outputFrameCount == 1L) {
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
             }
 
@@ -549,15 +531,15 @@ class VideoDecoder(
                     }
                 if (sink != null && img != null) {
                     sink(img) {
-                        val renderedAtNs = System.nanoTime()
-                        try {
-                            codec.releaseOutputBuffer(index, false)
+                            val releaseRequestedNs = System.nanoTime()
+                            try {
+                                codec.releaseOutputBuffer(index, false)
                         } catch (_: Exception) {
                         }
                         trace?.let { completedTrace ->
                             val renderedTrace = completedTrace.copy(
                                 outputAvailableNs = outputAvailableNs,
-                                renderedNs = renderedAtNs,
+                                outputReleaseRequestedNs = releaseRequestedNs,
                             )
                             recordFrameTrace(renderedTrace)
                         }
@@ -634,16 +616,19 @@ class VideoDecoder(
                 return
             }
 
-            val renderedAtNs = System.nanoTime()
-            codec.releaseOutputBuffer(index, true)
-            trackFrameTiming(renderedAtNs)
+            val releaseRequestedNs = System.nanoTime()
             trace?.let { completedTrace ->
-                recordFrameTrace(
-                    completedTrace.copy(
-                        outputAvailableNs = nowNs,
-                        renderedNs = renderedAtNs,
-                    )
+                pendingSurfaceTraces[info.presentationTimeUs] = completedTrace.copy(
+                    outputAvailableNs = nowNs,
+                    outputReleaseRequestedNs = releaseRequestedNs,
                 )
+            }
+            codec.releaseOutputBuffer(index, true)
+            if (!frameRenderedListenerInstalled) {
+                // API 23+ normally supplies the callback. If a vendor codec
+                // omits it, keep the metric explicitly named as a release
+                // request and do not call it surface-visible.
+                diagLog("Surface render callback unavailable; output release request recorded only")
             }
             updateStats()
         } catch (e: Exception) {
@@ -694,9 +679,15 @@ class VideoDecoder(
                 } else {
                     0.0
                 }
-            val renderMs =
-                if (trace.renderedNs >= trace.outputAvailableNs) {
-                    (trace.renderedNs - trace.outputAvailableNs) / 1_000_000.0
+            val releaseMs =
+                if (trace.outputReleaseRequestedNs >= trace.outputAvailableNs) {
+                    (trace.outputReleaseRequestedNs - trace.outputAvailableNs) / 1_000_000.0
+                } else {
+                    0.0
+                }
+            val surfaceMs =
+                if (trace.surfaceRenderedNs >= trace.outputReleaseRequestedNs && trace.surfaceRenderedNs > 0L) {
+                    (trace.surfaceRenderedNs - trace.outputReleaseRequestedNs) / 1_000_000.0
                 } else {
                     0.0
                 }
@@ -707,8 +698,9 @@ class VideoDecoder(
                         "capture->receive=${"%.2f".format(receiveMs)}ms " +
                         "receive->queue=${"%.2f".format(queueMs)}ms " +
                         "queue->output=${"%.2f".format(decodeMs)}ms " +
-                        "output->render=${"%.2f".format(renderMs)}ms; " +
-                        "capture->visible p50/p95/p99/max=" +
+                        "output->release=${"%.2f".format(releaseMs)}ms " +
+                        "release->surface=${"%.2f".format(surfaceMs)}ms; " +
+                        "capture->surface-render p50/p95/p99/max=" +
                         "${"%.1f".format(summary.p50Ms)}/" +
                         "${"%.1f".format(summary.p95Ms)}/" +
                         "${"%.1f".format(summary.p99Ms)}/" +
@@ -735,6 +727,7 @@ class VideoDecoder(
         try {
             availableInputBuffers.clear()
             pendingFrameTraces.clear()
+            pendingSurfaceTraces.clear()
             decoder?.stop()
             decoder?.release()
             decoder = null

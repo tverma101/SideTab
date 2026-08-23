@@ -155,8 +155,9 @@ final class AdaptiveRefreshController {
     }
 
     /// ScreenCaptureKit can stop producing buffers entirely on an unchanged
-    /// desktop. A 4-Hz watchdog advances only the *policy clock* after 250 ms
-    /// of silence so the capture rate can still decay 60 -> 30 -> 15 -> 8.
+    /// desktop. A 1-Hz watchdog advances only the *policy clock* after 500 ms
+    /// of silence so the capture rate can still decay 60 -> 30 -> 15 -> 8
+    /// without keeping a utility timer awake four times per second.
     /// It does not inspect pixels and remains dormant while normal frames flow.
     private func ensureIdleTimer() {
         lock.lock()
@@ -168,7 +169,7 @@ final class AdaptiveRefreshController {
         idleTimer = timer
         lock.unlock()
 
-        timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
         timer.setEventHandler { [weak self] in
             self?.idleTick()
         }
@@ -181,7 +182,7 @@ final class AdaptiveRefreshController {
         lock.lock()
         guard lastObservationNs > 0,
               now >= lastObservationNs,
-              now - lastObservationNs >= 250_000_000 else {
+              now - lastObservationNs >= 500_000_000 else {
             lock.unlock()
             return
         }

@@ -15,7 +15,7 @@ class FrameTraceTest {
                     hostCaptureNs = i,
                     captureNs = 1_000_000_000L,
                     receivedNs = 1_000_000_000L,
-                    renderedNs = 1_000_000_000L + i * 1_000_000L,
+                    surfaceRenderedNs = 1_000_000_000L + i * 1_000_000L,
                 ),
             )
         }
