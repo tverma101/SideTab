@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 @preconcurrency import ScreenCaptureKit
+import CoreGraphics
 import CoreMedia
 import CoreVideo
 
@@ -285,33 +286,26 @@ final class AdaptiveRefreshController {
         let status = statusRaw.flatMap { SCFrameStatus(rawValue: $0) }
         let isIdle = status == .idle
 
-        var rects: [CGRect] = []
-        if let values = attachments[.dirtyRects] as? [CGRect] {
-            rects = values
-        } else if let values = attachments[.dirtyRects] as? [NSValue] {
-            rects = values.map { $0.rectValue }
-        }
-
-        let frameArea: Double = {
-            if let rect = attachments[.contentRect] as? CGRect,
-               rect.width > 0, rect.height > 0 {
-                return Double(rect.width * rect.height)
-            }
-            if let value = attachments[.contentRect] as? NSValue {
-                let rect = value.rectValue
-                if rect.width > 0, rect.height > 0 {
-                    return Double(rect.width * rect.height)
-                }
-            }
-            if let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-                return Double(CVPixelBufferGetWidth(buffer) * CVPixelBufferGetHeight(buffer))
-            }
-            return Double(max(1, widthFallback(sampleBuffer)) * max(1, heightFallback(sampleBuffer)))
-        }()
-
         if isIdle {
             return Observation(isIdle: true, dirtyRatio: 0)
         }
+
+        let rects = decodeDirtyRects(attachments[.dirtyRects])
+
+        // SCStreamFrameInfo.dirtyRects is expressed in output pixels. Use the
+        // pixel buffer's physical dimensions as the denominator when possible;
+        // contentRect may be expressed in points and would overstate motion on
+        // HiDPI captures if mixed with pixel-space dirty rectangles.
+        let frameArea: Double = {
+            if let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                return Double(CVPixelBufferGetWidth(buffer) * CVPixelBufferGetHeight(buffer))
+            }
+            if let rect = decodeRect(attachments[.contentRect]),
+               rect.width > 0, rect.height > 0 {
+                return Double(rect.width * rect.height)
+            }
+            return Double(max(1, widthFallback(sampleBuffer)) * max(1, heightFallback(sampleBuffer)))
+        }()
 
         guard !rects.isEmpty, frameArea > 0 else {
             // If a framework/OS version omits dirty rects, stay conservative:
@@ -324,6 +318,43 @@ final class AdaptiveRefreshController {
             partial + Double(max(0, rect.width) * max(0, rect.height))
         }
         return Observation(isIdle: false, dirtyRatio: min(max(dirtyArea / frameArea, 0), 1))
+    }
+
+    /// ScreenCaptureKit has represented CGRect metadata differently across
+    /// framework/bridging layers: Swift CGRects, NSValues, and CoreGraphics
+    /// dictionary representations are all seen in the wild. Accept all three
+    /// so a valid tiny dirty region never falls through to the conservative
+    /// "whole frame changed" path.
+    private static func decodeDirtyRects(_ value: Any?) -> [CGRect] {
+        guard let value else { return [] }
+
+        if let rects = value as? [CGRect] {
+            return rects
+        }
+        if let values = value as? [NSValue] {
+            return values.map { $0.rectValue }
+        }
+        if let array = value as? NSArray {
+            return array.compactMap { decodeRect($0) }
+        }
+        return []
+    }
+
+    private static func decodeRect(_ value: Any?) -> CGRect? {
+        guard let value else { return nil }
+        if let rect = value as? CGRect {
+            return rect
+        }
+        if let boxed = value as? NSValue {
+            return boxed.rectValue
+        }
+        if let dictionary = value as? NSDictionary {
+            var rect = CGRect.zero
+            if CGRectMakeWithDictionaryRepresentation(dictionary as CFDictionary, &rect) {
+                return rect
+            }
+        }
+        return nil
     }
 
     private static func widthFallback(_ sampleBuffer: CMSampleBuffer) -> Int {
