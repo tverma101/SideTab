@@ -225,6 +225,10 @@ the panel crop) and nearest sampling for the general GPU path. CAS and SGSR1
 are optional enhancement modes; they can make edges look more artificial than
 the native Android launcher and are not the native-fidelity profile.
 
+For the transport freshness and live latency-trace contract—including bounded
+Mac sender admission, cross-device clock synchronization, and the dedicated
+touch hot path—see [docs/transport-latency.md](docs/transport-latency.md).
+
 ### Experimental same-aspect Android final upscale (opt-in)
 
 The private USB quality experiment can send a same-aspect `2560x1602` physical
@@ -295,6 +299,15 @@ First-time setup still needs a screen once to grant Screen Recording permission;
 | HiDPI (Retina) | On/Off | Off |
 | Gaming Boost | On/Off (1 Gbps, 120 Hz) | Off |
 | Touch Input | On/Off | On |
+
+Quality presets use bounded encoder targets. If a previous experiment set
+`SideScreen_exp_bitrate`, that override intentionally wins over the bitrate
+slider and quality picker; remove it with
+`defaults delete com.sidescreen.app SideScreen_exp_bitrate` before comparing
+those controls.
+
+On this Apple Silicon target, the private 10-bit/Main10 experiment is capped at
+60 FPS for stable output. Use the 8-bit/Main path when you need 120-FPS capture.
 
 ---
 

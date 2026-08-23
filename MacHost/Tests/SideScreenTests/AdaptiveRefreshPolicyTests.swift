@@ -28,14 +28,21 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
         XCTAssertEqual(decision.reason, .deepIdle)
     }
 
-    func testContinuousInputPreWakesDeepIdleToSessionCeiling() {
+    func testContinuousInputPreWakesDeepIdleToStableSixty() {
         var policy = AdaptiveRefreshPolicy(maxFPS: 120, initialFPS: 120)
         _ = policy.observe(nowNs: 0, isIdle: true, dirtyRatio: 0)
         _ = policy.observe(nowNs: 6_500 * ms, isIdle: true, dirtyRatio: 0)
 
         let decision = policy.noteInteraction(nowNs: 6_600 * ms, highRate: true)
-        XCTAssertEqual(decision.targetFPS, 120)
+        XCTAssertEqual(decision.targetFPS, 60)
         XCTAssertEqual(decision.reason, .interaction)
+
+        // The next low-motion sample must not demote the stream immediately
+        // after touch/drag input. That short-lived demotion was the source of
+        // the visible 120 -> 30 -> 120 cadence sawtooth.
+        let held = policy.observe(nowNs: 6_900 * ms, isIdle: false, dirtyRatio: 0.002)
+        XCTAssertEqual(held.targetFPS, 60)
+        XCTAssertEqual(held.reason, .interaction)
     }
 
     func testDiscreteInputPreWakesDeepIdleToSixty() {

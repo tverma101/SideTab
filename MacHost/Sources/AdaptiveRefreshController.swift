@@ -20,6 +20,7 @@ final class AdaptiveRefreshController {
     private let lock = NSLock()
     private let width: Int
     private let height: Int
+    private let displayBounds: CGRect?
     private var policy: AdaptiveRefreshPolicy
     private var appliedFPS: Int
     private var desiredFPS: Int
@@ -40,9 +41,10 @@ final class AdaptiveRefreshController {
         return true
     }
 
-    init(width: Int, height: Int, maxFPS: Int, gamingBoost: Bool) {
+    init(width: Int, height: Int, maxFPS: Int, gamingBoost: Bool, displayBounds: CGRect? = nil) {
         self.width = width
         self.height = height
+        self.displayBounds = displayBounds
         let safeMax = max(1, maxFPS)
         self.policy = AdaptiveRefreshPolicy(
             maxFPS: safeMax,
@@ -67,6 +69,11 @@ final class AdaptiveRefreshController {
         policy.setGamingBoost(gamingBoost)
         desiredFPS = min(desiredFPS, max(1, maxFPS))
         lock.unlock()
+    }
+
+    static func isPointerInsideCapturedDisplay(_ location: CGPoint, displayBounds: CGRect?) -> Bool {
+        guard let displayBounds else { return false }
+        return displayBounds.contains(location)
     }
 
     /// Feed one sample buffer. Returns true for ScreenCaptureKit `.idle`
@@ -94,13 +101,15 @@ final class AdaptiveRefreshController {
     }
 
     /// Pre-wake from user input before an 8/15-FPS ScreenCaptureKit cadence has
-    /// a chance to add visible latency. Scroll/drag is continuous motion and
-    /// gets the session ceiling; keys/clicks get up to 60 FPS. Plain mouse
-    /// movement is intentionally excluded so moving a cursor on another Mac
-    /// display cannot keep SideScreen at 120 FPS indefinitely.
+    /// a chance to add visible latency. Direct input gets the policy's stable
+    /// 60-FPS interaction window; 120 FPS is reserved for Gaming Boost or
+    /// validated high-cadence screen content. Plain mouse movement is accepted
+    /// only on the captured virtual display, so a cursor on another Mac
+    /// display cannot keep SideScreen warm indefinitely.
     private func installInputMonitor() {
         let mask: NSEvent.EventTypeMask = [
             .keyDown,
+            .mouseMoved,
             .leftMouseDown,
             .rightMouseDown,
             .otherMouseDown,
@@ -124,7 +133,14 @@ final class AdaptiveRefreshController {
     private func handleInput(_ event: NSEvent) {
         let highRate: Bool
         switch event.type {
-        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel:
+        case .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+             .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel:
+            // A mouse move on the Mac's primary display must not keep a remote
+            // SideScreen session warm. AppKit global-monitor locations are in
+            // the same global coordinate space as CGDisplayBounds.
+            guard Self.isPointerInsideCapturedDisplay(event.locationInWindow, displayBounds: displayBounds) else {
+                return
+            }
             highRate = true
         default:
             highRate = false

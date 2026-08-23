@@ -51,7 +51,8 @@ dist/
 *.pem
 
 # Docs (local design docs)
-docs/
+docs/*
+!docs/transport-latency.md
 
 # Temporary
 tmp/

@@ -71,10 +71,38 @@ class ScreenCapture {
     private var currentFrameRate: Int = 60
     private var currentBitrateCapMbps: Int?
 
+    /// The current Apple Silicon capture/HEVC Main10 path does not produce a
+    /// usable stream at the virtual display's 120-FPS request. Keep the
+    /// quality experiment live at a stable 60 FPS until a validated 10-bit
+    /// 120-FPS encoder path exists; 8-bit/Main remains eligible for 120 FPS.
+    private func qualitySafeFrameRate(_ requested: Int) -> Int {
+        let expPixelFormat = UserDefaults.standard.string(forKey: "SideScreen_exp_pixelFormat")
+        let expProfile = UserDefaults.standard.string(forKey: "SideScreen_exp_profile")
+        guard expPixelFormat == "10bit" || expProfile == "main10" else { return requested }
+        let capped = min(requested, 60)
+        if capped < requested {
+            debugLog("10-bit/Main10 cadence capped: " + String(requested) + " -> " + String(capped) + " fps for stable hardware output")
+        }
+        return capped
+    }
+
     // Encoding pipeline state (captured by frame handler closure)
     private var encodeQueue: DispatchQueue?
     private var pendingEncodes: Int32 = 0
+    private let cachedPixelBufferLock = NSLock()
     private var lastPixelBuffer: CVPixelBuffer?
+
+    private func cachedPixelBufferSnapshot() -> CVPixelBuffer? {
+        cachedPixelBufferLock.lock()
+        defer { cachedPixelBufferLock.unlock() }
+        return lastPixelBuffer
+    }
+
+    private func cachePixelBuffer(_ pixelBuffer: CVPixelBuffer?) {
+        cachedPixelBufferLock.lock()
+        lastPixelBuffer = pixelBuffer
+        cachedPixelBufferLock.unlock()
+    }
 
     // Default-on adaptive cadence controller. It consumes ScreenCaptureKit
     // metadata only — no full-frame pixel hashing in the normal path.
@@ -117,15 +145,21 @@ class ScreenCapture {
 
         requestKeyframe()
 
-        guard let encoder, let cached = lastPixelBuffer else { return }
+        guard let encoder, let cached = cachedPixelBufferSnapshot() else { return }
 
         let pts = CMTime(
             value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
             timescale: 1_000_000
         )
 
+        guard currentServer?.shouldEncodeNextFrame() ?? true else { return }
+        let captureTimestampNs = DispatchTime.now().uptimeNanoseconds
         encodeQueue?.async {
-            encoder.encode(pixelBuffer: cached, presentationTimeStamp: pts)
+            encoder.encode(
+                pixelBuffer: cached,
+                presentationTimeStamp: pts,
+                captureTimestampNs: captureTimestampNs
+            )
         }
     }
 
@@ -340,7 +374,7 @@ class ScreenCapture {
         // EXP-FORK: SideScreen_exp_fps caps the capture cadence (e.g. 90) —
         // a stable 90 beats a jittery 120 when the pipeline can't hold 120.
         let expFps = UserDefaults.standard.integer(forKey: "SideScreen_exp_fps")
-        let requestedFrameRate = expFps > 0 ? expFps : refreshRate
+        let requestedFrameRate = qualitySafeFrameRate(expFps > 0 ? expFps : refreshRate)
         let fps = min(requestedFrameRate, frameRateCap ?? Int.max)
 
         streamOutput = StreamOutput()
@@ -372,7 +406,8 @@ class ScreenCapture {
                 width: width,
                 height: height,
                 maxFPS: fps,
-                gamingBoost: currentGamingBoost
+                gamingBoost: currentGamingBoost,
+                displayBounds: CGDisplayBounds(display.displayID)
             )
             debugLog("Adaptive refresh enabled — session ceiling \(fps)fps")
         } else {
@@ -388,7 +423,7 @@ class ScreenCapture {
         let queue = DispatchQueue(label: "encodeQueue.\(label)", qos: .userInteractive)
         encodeQueue = queue
         pendingEncodes = 0
-        lastPixelBuffer = nil
+        cachePixelBuffer(nil)
 
         streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
             guard let self = self else { return }
@@ -424,9 +459,16 @@ class ScreenCapture {
                 self.onCaptureMethodChanged?("SCStream")
             }
 
+            // Keep one retained sample buffer even when ScreenCaptureKit marks
+            // the frame idle. A client can connect while the display is static;
+            // the forced keyframe path must have pixels to replay instead of
+            // leaving the tablet on a black surface until the next change.
+            if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                self.cachePixelBuffer(imageBuffer)
+            }
+
             // ScreenCaptureKit already reports idle frames + changed regions.
-            // Use that metadata before touching the pixel buffer; an idle frame
-            // exits here without dither/HDR/hash/encode/network work.
+            // Use that metadata before dither/HDR/hash/encode/network work.
             if self.adaptiveRefreshController?.observe(
                 sampleBuffer: sampleBuffer,
                 stream: self.stream
@@ -435,6 +477,7 @@ class ScreenCapture {
             }
 
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            let captureTimestampNs = DispatchTime.now().uptimeNanoseconds
 
             // Backpressure: skip if encode queue already has 2+ frames pending
             let pending = OSAtomicAdd32(0, &self.pendingEncodes)
@@ -476,16 +519,35 @@ class ScreenCapture {
                         debugLog("HDRConverter: convert failed — falling back to 8-bit")
                     }
                 }
-                self.lastPixelBuffer = toEncode
+                self.cachePixelBuffer(toEncode)
+                // Keep capture admission ahead of VideoToolbox. Once the
+                // bounded sender is full, sacrificing this capture opportunity
+                // is safe; emitting a P-frame that will later be discarded is
+                // not, because it would invalidate the dependency chain.
+                if let server = self.currentServer, !server.shouldEncodeNextFrame() {
+                    return
+                }
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
-                    self.encoder?.encode(pixelBuffer: toEncode, presentationTimeStamp: pts)
+                    self.encoder?.encode(
+                        pixelBuffer: toEncode,
+                        presentationTimeStamp: pts,
+                        captureTimestampNs: captureTimestampNs
+                    )
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
-            } else if let cached = self.lastPixelBuffer {
+            } else if let cached = self.cachedPixelBufferSnapshot() {
+                if let server = self.currentServer, !server.shouldEncodeNextFrame() {
+                    return
+                }
+                let cachedCaptureTimestampNs = DispatchTime.now().uptimeNanoseconds
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
-                    self.encoder?.encode(pixelBuffer: cached, presentationTimeStamp: pts)
+                    self.encoder?.encode(
+                        pixelBuffer: cached,
+                        presentationTimeStamp: pts,
+                        captureTimestampNs: cachedCaptureTimestampNs
+                    )
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
             }
@@ -503,7 +565,7 @@ class ScreenCapture {
         // A wireless session is hard-capped even if an old experiment knob
         // still requests 90/120 FPS. USB retains the prior exp-fps behavior.
         self.frameRateCap = frameRateCap
-        let requestedFrameRate = expFps > 0 ? expFps : frameRate
+        let requestedFrameRate = qualitySafeFrameRate(expFps > 0 ? expFps : frameRate)
         let effFrameRate = min(requestedFrameRate, frameRateCap ?? Int.max)
         currentBitrateMbps = bitrateMbps
         currentQuality = quality
@@ -528,8 +590,8 @@ class ScreenCapture {
         }
 
         encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: effFrameRate, maxBitrateMbps: bitrateCapMbps)
-        encoder?.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
-            server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
+        encoder?.onEncodedFrame = { [weak server] frame in
+            server?.sendFrame(frame)
         }
 
         // Apply any keyframe request that arrived before the encoder existed
@@ -588,15 +650,22 @@ class ScreenCapture {
             if stalled {
                 let hasHadFrames = self.stateLock.withLock { $0.hasReceivedFirstFrame }
 
-                if hasHadFrames, let lastBuffer = self.lastPixelBuffer {
+                if hasHadFrames, let lastBuffer = self.cachedPixelBufferSnapshot() {
                     // Screen is idle — SCStream is healthy but not delivering frames (macOS optimization).
                     // Re-send the last captured frame as a keepalive so the tablet stays connected.
                     let pts = CMTime(
                         value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
                         timescale: 1_000_000
                     )
-                    self.encodeQueue?.async {
-                        self.encoder?.encode(pixelBuffer: lastBuffer, presentationTimeStamp: pts)
+                    if self.currentServer?.shouldEncodeNextFrame() ?? true {
+                        let captureTimestampNs = DispatchTime.now().uptimeNanoseconds
+                        self.encodeQueue?.async {
+                            self.encoder?.encode(
+                                pixelBuffer: lastBuffer,
+                                presentationTimeStamp: pts,
+                                captureTimestampNs: captureTimestampNs
+                            )
+                        }
                     }
                     self.stateLock.withLock { $0.lastFrameTime = DispatchTime.now() }
                     // Keep monitoring — real errors are handled by the SCStream error delegate
@@ -820,8 +889,8 @@ class ScreenCapture {
         let (width, height) = encodeSize(for: codec)
         let server = currentServer
         let newEncoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: currentBitrateMbps, quality: currentQuality, gamingBoost: currentGamingBoost, frameRate: currentFrameRate, maxBitrateMbps: currentBitrateCapMbps)
-        newEncoder.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
-            server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
+        newEncoder.onEncodedFrame = { [weak server] frame in
+            server?.sendFrame(frame)
         }
         newEncoder.requestKeyframe()
         encoder = newEncoder

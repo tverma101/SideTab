@@ -6,10 +6,11 @@ import os
 class VideoEncoder {
     private struct EncoderState {
         var pendingForceKeyframe = false
+        var nextFrameID: UInt64 = 0
     }
 
     private var compressionSession: VTCompressionSession?
-    var onEncodedFrame: ((Data, UInt64, Bool) -> Void)?  // data, timestamp, isKeyframe
+    var onEncodedFrame: ((EncodedVideoFrame) -> Void)?
     private var width: Int
     private var height: Int
     let codec: StreamCodec
@@ -51,12 +52,17 @@ class VideoEncoder {
     private func setupCompressionSession() {
         var session: VTCompressionSession?
 
+        let encoderSpecification: CFDictionary = [
+            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true,
+            kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true
+        ] as CFDictionary
+
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
             codecType: codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
-            encoderSpecification: [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true] as CFDictionary,
+            encoderSpecification: encoderSpecification,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: encodingOutputCallback,
@@ -73,6 +79,14 @@ class VideoEncoder {
 
         // Ultra-low latency config for real-time streaming
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        // VideoToolbox defaults H.264/HEVC hardware encoders toward quality.
+        // This session is an interactive display path: prefer an earlier
+        // encoded frame over marginal compression refinement.
+        VTSessionSetProperty(
+            session,
+            key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+            value: kCFBooleanTrue
+        )
         // H.264 Main profile: decodable by every AVC hardware decoder
         // (Baseline/Main/High all accept Main-constrained streams' feature
         // set we use). High adds 8x8 transform that some low-end vendor OMX
@@ -142,16 +156,13 @@ class VideoEncoder {
         // Frame rate settings
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
 
-        // IPP with a 1-second GOP, matching the deployed client's stale-
-        // keyframe contract (KEYFRAME_STALE_INTERVAL_NS = 1.5s in
-        // StreamClient.kt): natural IDRs at 1s mean the client NEVER needs to
-        // request one mid-stream, so the rate-control window is fully owned
-        // by the encoder. (GOP > 1.5s was tried 2026-08-16: the client fired
-        // stale-keyframe requests every ~1.5s regardless, desynchronizing
-        // forced IDRs from the encoder's budget. GOP between 1s and 1.5s
-        // behaves the same on static screens, where encoded-frame counting
-        // stalls.) The old unbounded-IDR-burst concern is now contained by
-        // the DataRateLimits hard cap above. SideScreen_exp_gop overrides.
+        // Keep a 1-second GOP as the fallback for encoders that do not honor
+        // the low-latency encoder specification above. Low-latency rate
+        // control may choose an effectively infinite P-frame GOP and owns the
+        // final keyframe cadence; the deployed client still requests a fresh
+        // keyframe when its 1.5-second stale-frame guard fires. The old
+        // unbounded-IDR-burst concern is contained by the DataRateLimits hard
+        // cap above. SideScreen_exp_gop overrides when supported.
         let expGop = UserDefaults.standard.object(forKey: "SideScreen_exp_gop") as? Int
         let gopFrames = expGop ?? frameRate
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
@@ -199,15 +210,32 @@ class VideoEncoder {
         stateLock.withLock { $0.pendingForceKeyframe = true }
     }
 
-    func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
+    func encode(
+        pixelBuffer: CVPixelBuffer,
+        presentationTimeStamp: CMTime,
+        captureTimestampNs: UInt64? = nil
+    ) {
         guard let session = compressionSession else { return }
 
         let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
 
-        // Use system uptime clock — MUST match DispatchTime.now().uptimeNanoseconds
-        let captureNanos = DispatchTime.now().uptimeNanoseconds
-        let refconValue = UnsafeMutableRawPointer.allocate(byteCount: 8, alignment: 8)
-        refconValue.storeBytes(of: captureNanos, as: UInt64.self)
+        // Use system uptime clock — MUST match DispatchTime.now().uptimeNanoseconds.
+        // The capture timestamp is supplied by ScreenCaptureKit's callback;
+        // encodeStart lets the runtime separate capture->encode admission from
+        // VideoToolbox work.
+        let encodeStartNs = DispatchTime.now().uptimeNanoseconds
+        let captureNs = captureTimestampNs ?? encodeStartNs
+        let frameID = stateLock.withLock { state -> UInt64 in
+            state.nextFrameID &+= 1
+            return state.nextFrameID
+        }
+        let context = FrameEncodeContext(
+            frameID: frameID,
+            captureTimestampNs: captureNs,
+            encodeStartTimestampNs: encodeStartNs
+        )
+        let refconValue = UnsafeMutablePointer<FrameEncodeContext>.allocate(capacity: 1)
+        refconValue.initialize(to: context)
 
         let shouldForceKeyframe = stateLock.withLock { state -> Bool in
             guard state.pendingForceKeyframe else { return false }
@@ -240,23 +268,37 @@ class VideoEncoder {
 // Static start code to avoid repeated allocations
 private let nalStartCode: [UInt8] = [0, 0, 0, 1]
 
+private struct FrameEncodeContext {
+    let frameID: UInt64
+    let captureTimestampNs: UInt64
+    let encodeStartTimestampNs: UInt64
+}
+
 private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, _, sampleBuffer) in
-    guard status == noErr,
-          let sampleBuffer = sampleBuffer,
-          let refcon = outputCallbackRefCon else {
+    guard let outputCallbackRefCon = outputCallbackRefCon else {
         return
     }
 
-    let encoder = Unmanaged<VideoEncoder>.fromOpaque(refcon).takeUnretainedValue()
+    let encoder = Unmanaged<VideoEncoder>.fromOpaque(outputCallbackRefCon).takeUnretainedValue()
 
-    // Get timestamp for frame age tracking
-    let timestamp: UInt64
+    // Always release the per-frame context, including failed VideoToolbox
+    // callbacks. The old implementation leaked it on encode failure.
+    let context: FrameEncodeContext
     if let refcon = sourceFrameRefCon {
-        timestamp = refcon.load(as: UInt64.self)
-        refcon.deallocate()
+        let pointer = refcon.assumingMemoryBound(to: FrameEncodeContext.self)
+        context = pointer.pointee
+        pointer.deinitialize(count: 1)
+        pointer.deallocate()
     } else {
-        timestamp = DispatchTime.now().uptimeNanoseconds
+        let now = DispatchTime.now().uptimeNanoseconds
+        context = FrameEncodeContext(
+            frameID: 0,
+            captureTimestampNs: now,
+            encodeStartTimestampNs: now
+        )
     }
+
+    guard status == noErr, let sampleBuffer = sampleBuffer else { return }
 
     // Extract encoded data
     guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
@@ -334,5 +376,14 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         offset += Int(nalLength)
     }
 
-    encoder.onEncodedFrame?(frameData, timestamp, isKeyframe)
+    encoder.onEncodedFrame?(
+        EncodedVideoFrame(
+            frameID: context.frameID,
+            captureTimestampNs: context.captureTimestampNs,
+            encodeStartTimestampNs: context.encodeStartTimestampNs,
+            encodeCompleteTimestampNs: DispatchTime.now().uptimeNanoseconds,
+            data: frameData,
+            isKeyframe: isKeyframe
+        )
+    )
 }

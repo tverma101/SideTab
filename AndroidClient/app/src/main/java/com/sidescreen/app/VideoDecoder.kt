@@ -10,6 +10,7 @@ import android.util.Log
 import android.view.Display
 import android.view.Surface
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 private fun diagLog(msg: String) = DiagLog.log("VD", msg)
@@ -46,8 +47,10 @@ class VideoDecoder(
     // especially destructive for HEVC: one discarded P-frame invalidates the
     // reference chain and the forced IDR used to recover creates another large
     // decode burst. Wait for at most three 120-Hz frame periods instead. The wait
-    // also provides bounded backpressure to the socket when a producer burst
-    // briefly outruns the hardware decoder.
+    // also provides a short, explicit backpressure boundary to the socket when
+    // a producer burst briefly outruns the hardware decoder. The sender-side
+    // Mac credit gate should make this path exceptional rather than a normal
+    // frame cadence.
     private var inputBufferWaitCount = 0L
     private var inputBufferWaitSumNs = 0L
     private var inputBufferWaitMaxNs = 0L
@@ -60,6 +63,9 @@ class VideoDecoder(
     private var latencySumNs: Long = 0
     private var latencySamples: Int = 0
     private var latencyMaxNs: Long = 0
+    private val pendingFrameTraces = ConcurrentHashMap<Long, FrameTrace>()
+    private val traceStats = FrameTraceStats()
+    private var traceOutputCount = 0L
 
     private val frameTimes = ArrayDeque<Long>(120)
 
@@ -95,6 +101,8 @@ class VideoDecoder(
      *  geometry, which can differ from the configured size when the sender's display
      *  message carries logical dims while the SPS carries physical dims). */
     var onDecodedFormat: ((width: Int, height: Int, cropL: Int, cropR: Int, cropT: Int, cropB: Int) -> Unit)? = null
+    /** Called after a decoded frame is released for rendering when trace data exists. */
+    var onFrameTrace: ((FrameTrace) -> Unit)? = null
 
     /** Fired once when the decoder has accepted many frames but never output any —
      *  the black-screen-with-live-stats signature (stream above the device's
@@ -349,11 +357,13 @@ class VideoDecoder(
         return null
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun decode(
         frameData: ByteArray,
         frameSize: Int = frameData.size,
         frameTimestamp: Long = System.nanoTime(),
         isKeyframe: Boolean = false,
+        trace: FrameTrace? = null,
     ) {
         if (!isRunning) {
             diagLog("decode called but isRunning=false")
@@ -430,7 +440,7 @@ class VideoDecoder(
             return
         }
 
-        queueFrame(codec, index, frameData, frameSize, frameTimestamp, isKeyframe)
+        queueFrame(codec, index, frameData, frameSize, isKeyframe, trace)
     }
 
     private fun queueFrame(
@@ -438,16 +448,25 @@ class VideoDecoder(
         index: Int,
         frameData: ByteArray,
         frameSize: Int,
-        frameTimestamp: Long,
         isKeyframe: Boolean,
+        trace: FrameTrace?,
     ) {
+        var queuedPresentationTimeUs: Long? = null
         try {
             val inputBuffer =
                 codec.getInputBuffer(index)
                     ?: throw IllegalStateException("Input buffer $index is null")
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
-            codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
+            // MediaCodec PTS stays in the Android clock domain so decoder
+            // latency remains input-queue -> output. Cross-device capture
+            // timing travels in the side-channel trace map instead of being
+            // confused with codec latency.
+            val queuedAtNs = System.nanoTime()
+            val presentationTimeUs = queuedAtNs / 1000L
+            queuedPresentationTimeUs = presentationTimeUs
+            trace?.let { pendingFrameTraces[presentationTimeUs] = it.copy(inputQueuedNs = queuedAtNs) }
+            codec.queueInputBuffer(index, 0, frameSize, presentationTimeUs, 0)
             queuedInputCount++
             if (queuedInputCount == STALL_DETECT_INPUT_FRAMES && outputFrameCount == 0L && !stallReported) {
                 stallReported = true
@@ -459,6 +478,7 @@ class VideoDecoder(
             }
         } catch (e: Exception) {
             needsKeyframe = true
+            queuedPresentationTimeUs?.let { pendingFrameTraces.remove(it) }
             requestKeyframe("queue input failed")
             Log.e(TAG, "decode direct feed error", e)
         } finally {
@@ -512,6 +532,9 @@ class VideoDecoder(
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
             }
 
+            val outputAvailableNs = System.nanoTime()
+            val trace = pendingFrameTraces.remove(info.presentationTimeUs)
+
             // ByteBuffer mode (CfL): hand the plane-accessible Image to the
             // renderer; it releases the buffer from its render thread via
             // the consumed callback.
@@ -526,9 +549,17 @@ class VideoDecoder(
                     }
                 if (sink != null && img != null) {
                     sink(img) {
+                        val renderedAtNs = System.nanoTime()
                         try {
                             codec.releaseOutputBuffer(index, false)
                         } catch (_: Exception) {
+                        }
+                        trace?.let { completedTrace ->
+                            val renderedTrace = completedTrace.copy(
+                                outputAvailableNs = outputAvailableNs,
+                                renderedNs = renderedAtNs,
+                            )
+                            recordFrameTrace(renderedTrace)
                         }
                         updateStats()
                     }
@@ -547,7 +578,7 @@ class VideoDecoder(
             // Decoder latency: time from queueInputBuffer (where we encoded
             // System.nanoTime()/1000 as PTS) to now. Captures how long the
             // frame spent inside the codec's input/reorder/output queues.
-            val nowNs = System.nanoTime()
+            val nowNs = outputAvailableNs
             val latencyNs = nowNs - info.presentationTimeUs * 1000L
             val hasValidLatency = latencyNs in 0..MAX_REASONABLE_LATENCY_NS
             if (hasValidLatency) {
@@ -603,8 +634,17 @@ class VideoDecoder(
                 return
             }
 
+            val renderedAtNs = System.nanoTime()
             codec.releaseOutputBuffer(index, true)
-            trackFrameTiming(System.nanoTime())
+            trackFrameTiming(renderedAtNs)
+            trace?.let { completedTrace ->
+                recordFrameTrace(
+                    completedTrace.copy(
+                        outputAvailableNs = nowNs,
+                        renderedNs = renderedAtNs,
+                    )
+                )
+            }
             updateStats()
         } catch (e: Exception) {
             Log.e(TAG, "releaseOutputBuffer failed", e)
@@ -631,6 +671,53 @@ class VideoDecoder(
         onFrameRendered?.invoke(timestamp)
     }
 
+    private fun recordFrameTrace(trace: FrameTrace) {
+        traceStats.add(trace)
+        traceOutputCount++
+        onFrameTrace?.invoke(trace)
+        if (traceOutputCount % 60L == 0L) {
+            val receiveMs =
+                if (trace.receivedNs > 0L && trace.receivedNs >= trace.captureNs) {
+                    (trace.receivedNs - trace.captureNs) / 1_000_000.0
+                } else {
+                    0.0
+                }
+            val queueMs =
+                if (trace.inputQueuedNs >= trace.receivedNs) {
+                    (trace.inputQueuedNs - trace.receivedNs) / 1_000_000.0
+                } else {
+                    0.0
+                }
+            val decodeMs =
+                if (trace.outputAvailableNs >= trace.inputQueuedNs) {
+                    (trace.outputAvailableNs - trace.inputQueuedNs) / 1_000_000.0
+                } else {
+                    0.0
+                }
+            val renderMs =
+                if (trace.renderedNs >= trace.outputAvailableNs) {
+                    (trace.renderedNs - trace.outputAvailableNs) / 1_000_000.0
+                } else {
+                    0.0
+                }
+            val summary = traceStats.summary()
+            if (summary != null) {
+                diagLog(
+                    "Trace frame=${trace.frameId} stages=" +
+                        "capture->receive=${"%.2f".format(receiveMs)}ms " +
+                        "receive->queue=${"%.2f".format(queueMs)}ms " +
+                        "queue->output=${"%.2f".format(decodeMs)}ms " +
+                        "output->render=${"%.2f".format(renderMs)}ms; " +
+                        "capture->visible p50/p95/p99/max=" +
+                        "${"%.1f".format(summary.p50Ms)}/" +
+                        "${"%.1f".format(summary.p95Ms)}/" +
+                        "${"%.1f".format(summary.p99Ms)}/" +
+                        "${"%.1f".format(summary.maxMs)}ms n=${summary.count}",
+                )
+            }
+        }
+    }
+
     private fun updateStats() {
         frameCount++
         val now = System.currentTimeMillis()
@@ -647,6 +734,7 @@ class VideoDecoder(
         isRunning = false
         try {
             availableInputBuffers.clear()
+            pendingFrameTraces.clear()
             decoder?.stop()
             decoder?.release()
             decoder = null
@@ -662,7 +750,7 @@ class VideoDecoder(
         private const val STALL_DETECT_INPUT_FRAMES = 120L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 1_000_000_000L
         private const val FORCE_KEYFRAME_REQUEST_INTERVAL_NS = 200_000_000L
-        private const val INPUT_BUFFER_WAIT_MS = 25L
+        private const val INPUT_BUFFER_WAIT_MS = 8L
         private const val MAX_RENDER_LATENCY_NS = 100_000_000L
         private const val MAX_REASONABLE_LATENCY_NS = 2_000_000_000L
     }

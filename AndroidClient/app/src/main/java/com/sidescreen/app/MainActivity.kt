@@ -1400,10 +1400,10 @@ class MainActivity : AppCompatActivity() {
      * Wire up all StreamClient callbacks. Used by both USB connect() and wireless connectWireless().
      */
     private fun setupStreamClientCallbacks() {
-        streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+        streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe, trace ->
             val dec = videoDecoder
             if (dec != null) {
-                dec.decode(frameData, frameSize, timestamp, isKeyframe)
+                dec.decode(frameData, frameSize, timestamp, isKeyframe, trace = trace)
             } else {
                 mainDiag("FRAME DROPPED: videoDecoder is null!")
             }
@@ -1571,11 +1571,11 @@ class MainActivity : AppCompatActivity() {
             try {
                 log("Connecting to $host:$port...")
 
-                client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+                client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe, trace ->
                     if (isCurrentConnection(client, generation)) {
                         val dec = videoDecoder
                         if (dec != null) {
-                            dec.decode(frameData, frameSize, timestamp, isKeyframe)
+                            dec.decode(frameData, frameSize, timestamp, isKeyframe, trace = trace)
                         } else {
                             client.releaseBuffer(frameData)
                         }

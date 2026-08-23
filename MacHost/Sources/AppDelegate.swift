@@ -5,21 +5,56 @@ import ApplicationServices
 import os.log
 @preconcurrency import ScreenCaptureKit
 
-// Debug file logger - writes to /tmp/sidescreen.log
-func debugLog(_ message: String) {
-    let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-    let line = "[\(timestamp)] \(message)\n"
-    print(message)
-    if let data = line.data(using: .utf8) {
-        let url = URL(fileURLWithPath: "/tmp/sidescreen.log")
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            handle.closeFile()
-        } else {
-            try? data.write(to: url)
+private final class AsyncDiagnosticWriter {
+    private let queue = DispatchQueue(label: "diagnosticLog", qos: .utility)
+    private let stateLock = NSLock()
+    private let maxPendingWrites = 256
+    private var pendingWrites = 0
+    private var handle: FileHandle?
+
+    func append(_ message: String) {
+        stateLock.lock()
+        guard pendingWrites < maxPendingWrites else {
+            stateLock.unlock()
+            return
+        }
+        pendingWrites += 1
+        stateLock.unlock()
+
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            defer {
+                self.stateLock.lock()
+                self.pendingWrites = max(0, self.pendingWrites - 1)
+                self.stateLock.unlock()
+            }
+
+            if self.handle == nil {
+                let url = URL(fileURLWithPath: "/tmp/sidescreen.log")
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    FileManager.default.createFile(atPath: url.path, contents: nil)
+                }
+                self.handle = try? FileHandle(forWritingTo: url)
+                _ = try? self.handle?.seekToEnd()
+            }
+
+            let line = String(format: "[%.3f] %@\n", Date().timeIntervalSince1970, message)
+            if let data = line.data(using: .utf8) {
+                try? self.handle?.write(contentsOf: data)
+            }
         }
     }
+}
+
+private let diagnosticLogger = Logger(subsystem: "com.sidescreen.app", category: "runtime")
+private let diagnosticWriter = AsyncDiagnosticWriter()
+
+/// Unified logging is immediate and the legacy file is retained through a
+/// bounded asynchronous writer. No control or touch packet performs file open,
+/// seek, write, or close work inline.
+func debugLog(_ message: String) {
+    diagnosticLogger.log("\(message, privacy: .public)")
+    diagnosticWriter.append(message)
 }
 
 // MARK: - Gesture State Machine
@@ -268,6 +303,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.$touchEnabled
             .dropFirst()
             .sink { [weak self] enabled in
+                self?.setTouchEnabledCache(enabled)
                 self?.streamingServer?.touchEnabled = enabled
             }
             .store(in: &cancellables)
@@ -447,6 +483,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func checkAccessibilityPermission() async {
         let trusted = AXIsProcessTrusted()
+        setAccessibilityCache(trusted)
         await MainActor.run {
             settings.hasAccessibilityPermission = trusted
         }
@@ -462,6 +499,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // This will show the system prompt to grant Accessibility permission
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
+        setAccessibilityCache(trusted)
         settings.hasAccessibilityPermission = trusted
 
         if !trusted {
@@ -712,6 +750,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
             let controlPort: UInt16 = controlOverride > 0 ? UInt16(controlOverride) : settings.port + 1
             streamingServer = StreamingServer(port: settings.port, controlPort: controlPort)
+            setTouchEnabledCache(settings.touchEnabled)
+            if let displayID = virtualDisplayManager?.displayID {
+                setTouchDisplayBounds(CGDisplayBounds(displayID))
+            }
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
@@ -767,8 +809,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
-                self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+            streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2, parsedAtNs in
+                self?.enqueueTouch(
+                    x: x,
+                    y: y,
+                    action: action,
+                    pointerCount: pointerCount,
+                    x2: x2,
+                    y2: y2,
+                    parsedAtNs: parsedAtNs
+                )
             }
 
             streamingServer?.onStats = { [weak self] fps, mbps in
@@ -900,12 +950,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.currentFPS = 0
         settings.currentBitrate = 0
         settings.captureMethod = "Initializing..."
+        setTouchDisplayBounds(nil)
 
         print("⏹️ Server stopped")
     }
 
     // MARK: - Gesture Properties
 
+    private struct CachedTouchState {
+        var enabled = true
+        var accessibilityGranted = false
+        var displayBounds: CGRect?
+    }
+
+    /// Parsed control packets land here without touching the main queue. All
+    /// gesture state, timers, and CGEvent posting remain ordered on this queue.
+    private let inputQueue = DispatchQueue(label: "inputQueue", qos: .userInteractive)
+    private let touchStateLock = NSLock()
+    private var cachedTouchState = CachedTouchState()
     private let eventSource = CGEventSource(stateID: .hidSystemState)
     private var accessibilityWarningShown = false
     private var gestureState: GestureState = .idle
@@ -934,15 +996,70 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastPinchDistance: CGFloat = 0
 
     // Momentum scrolling
-    private var momentumTimer: Timer?
+    private var momentumTimer: DispatchSourceTimer?
     private var momentumVelocityX: CGFloat = 0
     private var momentumVelocityY: CGFloat = 0
     private var lastMomentumPosition: CGPoint = .zero
 
+    private func setTouchEnabledCache(_ enabled: Bool) {
+        touchStateLock.lock()
+        cachedTouchState.enabled = enabled
+        touchStateLock.unlock()
+    }
+
+    private func setAccessibilityCache(_ granted: Bool) {
+        touchStateLock.lock()
+        cachedTouchState.accessibilityGranted = granted
+        touchStateLock.unlock()
+    }
+
+    private func setTouchDisplayBounds(_ bounds: CGRect?) {
+        touchStateLock.lock()
+        cachedTouchState.displayBounds = bounds
+        touchStateLock.unlock()
+    }
+
+    private func readCachedTouchState() -> CachedTouchState {
+        touchStateLock.lock()
+        defer { touchStateLock.unlock() }
+        return cachedTouchState
+    }
+
+    private func enqueueTouch(
+        x: Float,
+        y: Float,
+        action: Int,
+        pointerCount: Int,
+        x2: Float,
+        y2: Float,
+        parsedAtNs: UInt64
+    ) {
+        inputQueue.async { [weak self] in
+            self?.handleTouch(
+                x: x,
+                y: y,
+                action: action,
+                pointerCount: pointerCount,
+                x2: x2,
+                y2: y2,
+                parsedAtNs: parsedAtNs
+            )
+        }
+    }
+
     // MARK: - Touch Entry Point
 
-    func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
-        guard settings.touchEnabled else { return }
+    private func handleTouch(
+        x: Float,
+        y: Float,
+        action: Int,
+        pointerCount: Int = 1,
+        x2: Float = 0,
+        y2: Float = 0,
+        parsedAtNs: UInt64 = 0
+    ) {
+        let cached = readCachedTouchState()
+        guard cached.enabled else { return }
 
         let handledAt = DispatchTime.now().uptimeNanoseconds
         if action == 0 {
@@ -956,11 +1073,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         handledTouchCount += 1
         if handledTouchCount % 120 == 0 {
-            debugLog(String(format: "TOUCH handled: count=%d maxGap=%.2fms", handledTouchCount, maxHandledTouchGapMs))
+            let parseToQueueMs = parsedAtNs > 0 && handledAt >= parsedAtNs
+                ? Double(handledAt - parsedAtNs) / 1_000_000.0
+                : 0
+            debugLog(
+                String(
+                    format: "TOUCH input queue: count=%d maxGap=%.2fms parse->queue=%.3fms",
+                    handledTouchCount,
+                    maxHandledTouchGapMs,
+                    parseToQueueMs
+                )
+            )
             maxHandledTouchGapMs = 0
         }
 
-        if !AXIsProcessTrusted() {
+        if !cached.accessibilityGranted {
             if !accessibilityWarningShown {
                 accessibilityWarningShown = true
                 print("⚠️  Accessibility not granted - touch ignored")
@@ -971,8 +1098,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard let displayID = virtualDisplayManager?.displayID else { return }
-        let bounds = CGDisplayBounds(displayID)
+        guard let bounds = cached.displayBounds else { return }
 
         let p1 = CGPoint(
             x: bounds.origin.x + CGFloat(x) * bounds.width,
@@ -987,6 +1113,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             handleTwoFingerTouch(p1: p1, p2: p2, action: action)
         } else {
             handleOneFingerTouch(at: p1, action: action)
+        }
+
+        let postedAt = DispatchTime.now().uptimeNanoseconds
+        if parsedAtNs > 0, postedAt >= parsedAtNs, handledTouchCount % 120 == 0 {
+            debugLog(
+                String(
+                    format: "TOUCH parsed->CGEvent path=%.3fms",
+                    Double(postedAt - parsedAtNs) / 1_000_000.0
+                )
+            )
         }
     }
 
@@ -1020,7 +1156,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.gestureState = .longPressReady
         }
         longPressTimer = timer
-        DispatchQueue.main.asyncAfter(
+        inputQueue.asyncAfter(
             deadline: .now() + .nanoseconds(Int(GestureThresholds.longPressTime)),
             execute: timer
         )
@@ -1289,9 +1425,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         momentumVelocityX = velocityX
         momentumVelocityY = velocityY
         lastMomentumPosition = position
-        momentumTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
+        let timer = DispatchSource.makeTimerSource(queue: inputQueue)
+        timer.schedule(deadline: .now() + .milliseconds(16), repeating: .milliseconds(16))
+        timer.setEventHandler { [weak self] in
             self?.momentumTick()
         }
+        timer.resume()
+        momentumTimer = timer
     }
 
     private func momentumTick() {
@@ -1309,7 +1449,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func stopMomentumScroll() {
-        momentumTimer?.invalidate()
+        momentumTimer?.cancel()
         momentumTimer = nil
         momentumVelocityX = 0
         momentumVelocityY = 0
@@ -1317,7 +1457,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         // Stop momentum scrolling
-        stopMomentumScroll()
+        inputQueue.sync {
+            stopMomentumScroll()
+        }
 
         // Stop server and cleanup
         stopServer()

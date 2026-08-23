@@ -10,6 +10,15 @@ private enum WireMessage {
     static let videoFrameWithMetadata: UInt8 = 6
     static let keyframeRequest: UInt8 = 7
     static let clientSupportsFrameMetadata: UInt8 = 8
+    /// Client->server, payload-free opt-in for frame IDs and trace timestamps.
+    static let clientSupportsFrameTrace: UInt8 = 13
+    /// Client->server, payload-free opt-in for extended in-band clock-sync
+    /// pongs. This is a fallback when the dedicated control socket is not
+    /// available during startup.
+    static let clientSupportsVideoClockSync: UInt8 = 15
+    /// Server->client, [type][size:4 BE][flags][frameID:8 BE]
+    /// [captureTimestamp:8 BE][encoded bytes].
+    static let videoFrameWithTrace: UInt8 = 14
     /// Client→server, payload-free (old hosts consume 1 byte safely):
     /// "this device has no HEVC decoder".
     static let clientAvcOnly: UInt8 = 9
@@ -23,6 +32,9 @@ private enum WireMessage {
     /// Server→client, 1-byte payload (0..255). Sent ONLY to clients that sent
     /// clientSupportsBrightness — old clients disconnect on unknown types.
     static let bright: UInt8 = 11
+    /// Control-channel client capability: understands the extended NTP-style
+    /// pong [type][t0][t1][t2]. Kept payload-free for old hosts.
+    static let clientSupportsClockSync: UInt8 = 13
     /// Client→server, 4-byte payload: the client's max decode size (issue
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
@@ -66,6 +78,8 @@ class StreamingServer {
     private var lastControlTouchNs: UInt64 = 0
     private var maxControlTouchGapMs = 0.0
     private var clientSupportsBrightness = false
+    private var clientSupportsClockSync = false
+    private var clientSupportsVideoClockSync = false
     private let controlQueue = DispatchQueue(label: "controlQueue", qos: .userInteractive)
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
@@ -73,8 +87,8 @@ class StreamingServer {
     /// config is sent, for every outcome (.hevc or .h264) — so the capture
     /// pipeline can also revert to HEVC after an AVC-only client goes away.
     var onCodecNegotiated: ((StreamCodec) -> Void)?
-    // Touch callback: (x1, y1, action, pointerCount, x2, y2)
-    var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
+    // Touch callback: (x1, y1, action, pointerCount, x2, y2, parsedAtNs)
+    var onTouchEvent: ((Float, Float, Int, Int, Float, Float, UInt64) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
@@ -93,7 +107,6 @@ class StreamingServer {
     private let networkQueue = DispatchQueue(label: "networkQueue", qos: .userInteractive)
     private var bytesSent: UInt64 = 0
     private var frameCount: UInt64 = 0
-    private var droppedFrames: UInt64 = 0
     private var lastStatsTime = DispatchTime.now()
     private var displayWidth = 1920
     private var displayHeight = 1080
@@ -103,12 +116,22 @@ class StreamingServer {
     private var isReceiving = false
     private var isStopped = false
     private var connectionReady = false
-    private var waitingForSyncFrame = false
     private var clientSupportsFrameMetadata = false
+    private var clientSupportsFrameTrace = false
     private var clientIsAvcOnly = false
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
     private var inputBuffer = Data()
+
+    // The reservation happens before frameQueue.async, so this queue can hold
+    // at most the explicitly bounded sender window even when VideoToolbox
+    // produces frames faster than NWConnection drains them.
+    private let backpressure = FrameBackpressureController()
+    private var captureToEncodeLatency = LatencyPercentiles()
+    private var captureToEnqueueLatency = LatencyPercentiles()
+    private var captureToSendCompleteLatency = LatencyPercentiles()
+    private var enqueueToSendCompleteLatency = LatencyPercentiles()
+    private var lastCompletedFrameID: UInt64 = 0
 
     init(port: UInt16, controlPort: UInt16? = nil) {
         self.port = port
@@ -190,6 +213,7 @@ class StreamingServer {
         lastControlTouchNs = 0
         maxControlTouchGapMs = 0
         clientSupportsBrightness = false
+        clientSupportsClockSync = false
         controlConnection = newConnection
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self, let newConnection else { return }
@@ -295,18 +319,26 @@ class StreamingServer {
                 }
 
             case WireMessage.ping:
-                // [type 4][clientTs 8 LE] -> pong [type 5][clientTs 8][serverSendTs 8]
+                // [type 4][clientTs 8 LE]. New clients receive the complete
+                // NTP-style quartet (t0 echoed, Mac t1 receive, Mac t2 send);
+                // old clients retain the original 17-byte pong.
                 guard controlInputBuffer.count >= 9 else { return }
                 let clientTs = controlInputBuffer.withUnsafeBytes {
                     $0.loadUnaligned(fromByteOffset: 1, as: UInt64.self)
                 }
                 controlInputBuffer = Data(controlInputBuffer.dropFirst(9))
                 let receivedAt = DispatchTime.now().uptimeNanoseconds
-                var pong = Data(capacity: 17)
+                var pong = Data(capacity: clientSupportsClockSync ? 25 : 17)
                 pong.append(WireMessage.pong)
                 withUnsafeBytes(of: clientTs) { pong.append(contentsOf: $0) }
                 var sendTs = DispatchTime.now().uptimeNanoseconds
-                withUnsafeBytes(of: &sendTs) { pong.append(contentsOf: $0) }
+                if clientSupportsClockSync {
+                    var receiveTs = receivedAt
+                    withUnsafeBytes(of: &receiveTs) { pong.append(contentsOf: $0) }
+                    withUnsafeBytes(of: &sendTs) { pong.append(contentsOf: $0) }
+                } else {
+                    withUnsafeBytes(of: &sendTs) { pong.append(contentsOf: $0) }
+                }
                 let procDelayMs = Double(sendTs - receivedAt) / 1_000_000.0
                 debugLog(String(format: "CTRL pong: procDelay=%.3fms", procDelayMs))
                 connection.send(content: pong, completion: .contentProcessed { _ in })
@@ -322,6 +354,17 @@ class StreamingServer {
                 controlInputBuffer = Data(controlInputBuffer.dropFirst())
                 clientSupportsBrightness = true
                 debugLog("Client supports brightness (BRIGHT armed)")
+
+            case WireMessage.clientSupportsClockSync:
+                // [type 13] payload-free capability. Old hosts consume this
+                // byte as an unknown control type and keep the channel aligned.
+                controlInputBuffer = Data(controlInputBuffer.dropFirst())
+                clientSupportsClockSync = true
+                debugLog("Client supports clock synchronization")
+                // A one-byte acknowledgement lets a new Android client keep
+                // using the legacy 17-byte pong when it is connected to an
+                // older host that silently ignored the capability.
+                connection.send(content: Data([12]), completion: .contentProcessed { _ in })
 
             default:
                 debugLog("Unknown control type: \(msgType)")
@@ -379,12 +422,13 @@ class StreamingServer {
 
         connectionReady = false
         clientSupportsFrameMetadata = false
+        clientSupportsFrameTrace = false
+        clientSupportsVideoClockSync = false
         clientIsAvcOnly = false
         clientDecodeLimits = nil
-        waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
-        droppedFrames = 0
+        backpressure.resetForNewSession()
 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self = self else { return }
@@ -479,6 +523,7 @@ class StreamingServer {
         isReceiving = false
         connection = nil
         inputBuffer.removeAll(keepingCapacity: true)
+        backpressure.resetForNewSession()
         onClientDisconnected?()
     }
 
@@ -535,7 +580,10 @@ class StreamingServer {
         debugLog("Client connected - sending display config first")
         sendDisplaySize()
         connectionReady = true
-        debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), codec=\(codec))")
+        debugLog(
+            "Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), " +
+                "trace=\(clientSupportsFrameTrace ? "on" : "off"), codec=\(codec))"
+        )
         onClientConnected?()
     }
 
@@ -713,9 +761,15 @@ class StreamingServer {
                 let clientTimestamp = Data(inputBuffer.dropFirst().prefix(8))
                 consumeInputBytes(9)
 
-                var pong = Data(capacity: 9)
+                var pong = Data(capacity: clientSupportsVideoClockSync ? 25 : 9)
                 pong.append(WireMessage.pong) // Type: Pong
                 pong.append(clientTimestamp)
+                if clientSupportsVideoClockSync {
+                    var receiveTs = DispatchTime.now().uptimeNanoseconds
+                    var sendTs = DispatchTime.now().uptimeNanoseconds
+                    withUnsafeBytes(of: &receiveTs) { pong.append(contentsOf: $0) }
+                    withUnsafeBytes(of: &sendTs) { pong.append(contentsOf: $0) }
+                }
                 connection.send(content: pong, completion: .contentProcessed { _ in })
 
             case WireMessage.keyframeRequest:
@@ -736,6 +790,26 @@ class StreamingServer {
                     debugLog("Client supports video frame metadata")
                 }
                 finishProtocolStartup(on: connection)
+
+            case WireMessage.clientSupportsFrameTrace:
+                // One-byte opt-in. The client sends this before type 8 so the
+                // first frame can use the trace header without delaying startup.
+                consumeInputBytes(1)
+                if !clientSupportsFrameTrace {
+                    clientSupportsFrameTrace = true
+                    debugLog("Client supports frame trace metadata")
+                }
+
+            case WireMessage.clientSupportsVideoClockSync:
+                // One-byte opt-in. New clients use the video socket for
+                // clock calibration when the optional dedicated control
+                // socket is unavailable or is closed during startup.
+                consumeInputBytes(1)
+                if !clientSupportsVideoClockSync {
+                    clientSupportsVideoClockSync = true
+                    debugLog("Client supports in-band video clock synchronization")
+                    connection.send(content: Data([12]), completion: .contentProcessed { _ in })
+                }
 
             case WireMessage.clientAvcOnly:
                 // Payload-free opt-in (same convention as type 8): the client
@@ -790,10 +864,12 @@ class StreamingServer {
 
         let actionOffset = 2 + pointerCount * 8
         let action = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: actionOffset, as: Int32.self) }
+        let parsedAtNs = DispatchTime.now().uptimeNanoseconds
 
-        DispatchQueue.main.async {
-            self.onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2)
-        }
+        // The callback is already running on the dedicated control/receive
+        // queue. Do not enqueue through the main actor; AppDelegate hands this
+        // directly to its serial user-interactive input queue.
+        onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2, parsedAtNs)
     }
 
     private func inputByte(at offset: Int) -> UInt8 {
@@ -805,57 +881,119 @@ class StreamingServer {
         inputBuffer.removeSubrange(inputBuffer.startIndex..<endIndex)
     }
 
-    func sendFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool = false) {
-        guard let connection = connection, !isStopped, connectionReady else { return }
+    /// Returns whether capture should start another encode. This is the
+    /// sender-side credit model used before Android decoder feedback exists.
+    /// No client means no encode work is useful; the last pixel buffer remains
+    /// cached for the next connection's forced keyframe replay.
+    func shouldEncodeNextFrame() -> Bool {
+        guard !isStopped, connectionReady else { return false }
+        guard backpressure.canAdmitNextFrame() else {
+            backpressure.recordPreEncodeDrop()
+            return false
+        }
+        return true
+    }
 
-        // With short-GOP encoding, a fresh client must start on a keyframe —
-        // sending P-frames before the first IDR would feed garbage to its decoder.
-        if waitingForSyncFrame {
-            guard isKeyframe else {
-                droppedFrames += 1
-                return
-            }
-            waitingForSyncFrame = false
-            debugLog("First keyframe sent to new client")
+    func sendFrame(_ frame: EncodedVideoFrame) {
+        guard !isStopped, connectionReady, let connection = connection else { return }
+
+        let admission = backpressure.reserve(bytes: frame.data.count, isKeyframe: frame.isKeyframe)
+        let reservation: FrameReservation
+        switch admission {
+        case .admitted(let value):
+            reservation = value
+        case .waitingForSync:
+            // A previous overload/error already invalidated the dependency
+            // chain. The next forced IDR is the only frame that may pass.
+            return
+        case .overloaded:
+            debugLog(
+                "Frame send admission full — waiting for a fresh keyframe " +
+                    "(frame=\(frame.frameID), bytes=\(frame.data.count))"
+            )
+            onKeyframeRequested?(true)
+            return
         }
 
-        // No frame-age dropping or backpressure — send everything immediately.
-        // The encode queue depth limit (2 pending) in ScreenCapture handles flow control.
+        // Reservation precedes this async hop, so at most maxInFlightFrames
+        // tasks can wait on frameQueue or inside NWConnection.
         frameQueue.async { [weak self] in
             guard let self = self else { return }
+            guard self.connection === connection, self.connectionReady, !self.isStopped else {
+                self.backpressure.complete(reservation)
+                return
+            }
 
-            let packet = self.makeFramePacket(data, timestamp: timestamp, isKeyframe: isKeyframe)
+            let packet = self.makeFramePacket(frame)
+            let enqueuedAtNs = DispatchTime.now().uptimeNanoseconds
+            self.captureToEncodeLatency.add(
+                nanoseconds: frame.encodeCompleteTimestampNs >= frame.captureTimestampNs
+                    ? frame.encodeCompleteTimestampNs - frame.captureTimestampNs
+                    : 0
+            )
+            self.captureToEnqueueLatency.add(
+                nanoseconds: enqueuedAtNs >= frame.captureTimestampNs
+                    ? enqueuedAtNs - frame.captureTimestampNs
+                    : 0
+            )
 
-            connection.send(content: packet, completion: .contentProcessed { error in
-                if error != nil {
-                    self.droppedFrames += 1
+            connection.send(content: packet, completion: .contentProcessed { [weak self] error in
+                let completedAtNs = DispatchTime.now().uptimeNanoseconds
+                self?.frameQueue.async {
+                    guard let self = self else { return }
+                    self.backpressure.complete(reservation)
+                    if error != nil {
+                        self.backpressure.markNeedsSyncFrame()
+                        self.onKeyframeRequested?(true)
+                    }
+                    if completedAtNs >= frame.captureTimestampNs {
+                        self.captureToSendCompleteLatency.add(
+                            nanoseconds: completedAtNs - frame.captureTimestampNs
+                        )
+                    }
+                    if completedAtNs >= enqueuedAtNs {
+                        self.enqueueToSendCompleteLatency.add(
+                            nanoseconds: completedAtNs - enqueuedAtNs
+                        )
+                    }
+                    self.lastCompletedFrameID = frame.frameID
+                    self.updateStats(bytes: frame.data.count)
                 }
             })
-
-            // Track frame age at send time for pipeline profiling
-            let sendAge = DispatchTime.now().uptimeNanoseconds - timestamp
-            self.updateStats(bytes: data.count, frameAgeNs: sendAge)
         }
     }
 
-    private func makeFramePacket(_ data: Data, timestamp: UInt64, isKeyframe: Bool) -> Data {
-        if clientSupportsFrameMetadata {
-            var packet = Data(capacity: data.count + 14)
-            packet.append(WireMessage.videoFrameWithMetadata)
-            appendFrameSize(data.count, to: &packet)
-            packet.append(isKeyframe ? 1 : 0)
-            var captureTimestamp = timestamp.bigEndian
+    private func makeFramePacket(_ frame: EncodedVideoFrame) -> Data {
+        if clientSupportsFrameTrace {
+            var packet = Data(capacity: frame.data.count + 22)
+            packet.append(WireMessage.videoFrameWithTrace)
+            appendFrameSize(frame.data.count, to: &packet)
+            packet.append(frame.isKeyframe ? 1 : 0)
+            var frameID = frame.frameID.bigEndian
+            withUnsafeBytes(of: &frameID) { packet.append(contentsOf: $0) }
+            var captureTimestamp = frame.captureTimestampNs.bigEndian
             withUnsafeBytes(of: &captureTimestamp) { packet.append(contentsOf: $0) }
-            packet.append(data)
+            packet.append(frame.data)
+            return packet
+        }
+
+        if clientSupportsFrameMetadata {
+            var packet = Data(capacity: frame.data.count + 14)
+            packet.append(WireMessage.videoFrameWithMetadata)
+            appendFrameSize(frame.data.count, to: &packet)
+            packet.append(frame.isKeyframe ? 1 : 0)
+            var captureTimestamp = frame.captureTimestampNs.bigEndian
+            withUnsafeBytes(of: &captureTimestamp) { packet.append(contentsOf: $0) }
+            packet.append(frame.data)
             return packet
         }
 
         // Keep legacy frame type 0 for clients that do not advertise
         // metadata support; remove after legacy clients age out.
-        var packet = Data(capacity: data.count + 5)
+        var packet = Data(capacity: frame.data.count + 5)
         packet.append(WireMessage.legacyVideoFrame)
-        appendFrameSize(data.count, to: &packet)
-        packet.append(data)
+        appendFrameSize(frame.data.count, to: &packet)
+        packet.append(frame.data)
         return packet
     }
 
@@ -864,17 +1002,9 @@ class StreamingServer {
         withUnsafeBytes(of: &frameSize) { packet.append(contentsOf: $0) }
     }
 
-    // Pipeline profiling: track frame age at send time
-    private var totalFrameAgeNs: UInt64 = 0
-    private var profiledFrameCount: UInt64 = 0
-
-    private func updateStats(bytes: Int, frameAgeNs: UInt64 = 0) {
+    private func updateStats(bytes: Int) {
         bytesSent += UInt64(bytes)
         frameCount += 1
-        if frameAgeNs > 0 {
-            totalFrameAgeNs += frameAgeNs
-            profiledFrameCount += 1
-        }
 
         let now = DispatchTime.now()
         let elapsed = Double(now.uptimeNanoseconds - lastStatsTime.uptimeNanoseconds) / 1_000_000_000
@@ -884,17 +1014,49 @@ class StreamingServer {
             let fps = Double(frameCount) / elapsed
             onStats?(fps, mbps)
 
-            // Log pipeline latency profile
-            if profiledFrameCount > 0 {
-                let avgAgeMs = Double(totalFrameAgeNs) / Double(profiledFrameCount) / 1_000_000.0
-                debugLog("Pipeline: \(String(format: "%.1f", fps))fps, \(String(format: "%.1f", mbps))Mbps, avg frame age: \(String(format: "%.1f", avgAgeMs))ms, dropped: \(droppedFrames)")
-            }
+            let backpressure = self.backpressure.snapshot()
+            let trace = self.captureToSendCompleteLatency.summary()
+            let queue = self.enqueueToSendCompleteLatency.summary()
+            let admission = self.captureToEnqueueLatency.summary()
+            let encode = self.captureToEncodeLatency.summary()
+            let traceText = trace.map {
+                String(
+                    format: "capture->send p50/p95/p99/max=%.1f/%.1f/%.1f/%.1fms n=%d",
+                    $0.p50Ms, $0.p95Ms, $0.p99Ms, $0.maxMs, $0.count
+                )
+            } ?? "capture->send n=0"
+            let queueText = queue.map {
+                String(
+                    format: "send-completion p50/p95/p99/max=%.1f/%.1f/%.1f/%.1fms",
+                    $0.p50Ms, $0.p95Ms, $0.p99Ms, $0.maxMs
+                )
+            } ?? "send-completion n=0"
+            let admissionText = admission.map {
+                String(format: "capture->enqueue p95=%.1fms", $0.p95Ms)
+            } ?? "capture->enqueue n=0"
+            let encodeText = encode.map {
+                String(format: "capture->encode p95=%.1fms", $0.p95Ms)
+            } ?? "capture->encode n=0"
+            debugLog(
+                "Pipeline: \(String(format: "%.1f", fps))fps, " +
+                    "\(String(format: "%.1f", mbps))Mbps, frame=\(lastCompletedFrameID), " +
+                    "inFlight=\(backpressure.inFlightFrames)/\(self.backpressure.limits.maxInFlightFrames) " +
+                    "bytes=\(backpressure.inFlightBytes)/\(self.backpressure.limits.maxInFlightBytes), " +
+                    "preEncodeDrop=\(backpressure.preEncodeDrops), " +
+                    "sendDrop=\(backpressure.sendAdmissionDrops), " +
+                    "syncDrop=\(backpressure.syncDrops), " +
+                    "completed=\(backpressure.completedFrames), " +
+                    "awaitingSync=\(backpressure.awaitingSyncFrame); " +
+                    "\(traceText); \(queueText); \(admissionText); \(encodeText)"
+            )
 
             bytesSent = 0
             frameCount = 0
-            droppedFrames = 0
-            totalFrameAgeNs = 0
-            profiledFrameCount = 0
+            captureToEncodeLatency.removeAll()
+            captureToEnqueueLatency.removeAll()
+            captureToSendCompleteLatency.removeAll()
+            enqueueToSendCompleteLatency.removeAll()
+            self.backpressure.resetIntervalCounters()
             lastStatsTime = now
         }
     }
@@ -913,6 +1075,7 @@ class StreamingServer {
         controlConnection?.cancel()
         controlListener?.cancel()
         if let c = contender { clearContender(c, cancelSocket: true) }
+        backpressure.resetForNewSession()
         connection = nil
         listener = nil
         controlConnection = nil

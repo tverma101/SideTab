@@ -61,8 +61,8 @@ struct AdaptiveRefreshPolicy {
     private static let probeDurationNs: UInt64 = 350_000_000
     private static let probeCooldownNs: UInt64 = 8_000_000_000
     private static let highCadenceTailNs: UInt64 = 350_000_000
-    private static let pointerBoostNs: UInt64 = 300_000_000
-    private static let discreteBoostNs: UInt64 = 160_000_000
+    private static let pointerBoostNs: UInt64 = 900_000_000
+    private static let discreteBoostNs: UInt64 = 500_000_000
     private static let downwardHoldNs: UInt64 = 250_000_000
 
     init(maxFPS: Int, gamingBoost: Bool = false, initialFPS: Int? = nil) {
@@ -83,8 +83,10 @@ struct AdaptiveRefreshPolicy {
     }
 
     /// Pre-wake the capture cadence from direct user input instead of waiting
-    /// for the next low-FPS screen sample. Continuous pointer/scroll/drag input
-    /// gets the session ceiling; discrete key/click input gets up to 60 FPS.
+    /// for the next low-FPS screen sample. Direct input uses a stable 60-FPS
+    /// boost; 120 FPS remains reserved for Gaming Boost or validated
+    /// high-cadence screen content. Promoting every pointer sample to the
+    /// session ceiling made a 120 -> 30 -> 120 sawtooth visible on the tablet.
     mutating func noteInteraction(nowNs: UInt64, highRate: Bool) -> Decision {
         if startedAtNs == nil {
             startedAtNs = nowNs
@@ -92,7 +94,7 @@ struct AdaptiveRefreshPolicy {
             lastRateChangeNs = nowNs
         }
         lastMeaningfulChangeNs = nowNs
-        interactionBoostFPS = capped(highRate ? maxFPS : 60)
+        interactionBoostFPS = capped(60)
         interactionBoostUntilNs = nowNs + (highRate ? Self.pointerBoostNs : Self.discreteBoostNs)
 
         if interactionBoostFPS > currentFPS {

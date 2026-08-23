@@ -36,8 +36,8 @@ class StreamClient(
     private val controlChannel = ControlChannel(controlHost, controlPort)
 
     // Callback includes actual frame size (may differ from buffer.size due to pooling),
-    // receive timestamp, and whether the frame can restart HEVC decoding.
-    var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
+    // local receive timestamp, keyframe state, and optional cross-device trace.
+    var onFrameReceived: ((ByteArray, Int, Long, Boolean, FrameTrace?) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
     var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
     var onStats: ((Double, Double) -> Unit)? = null
@@ -65,6 +65,12 @@ class StreamClient(
     private val keyframeRequestLock = Any()
     private var lastKeyframeRequestNs = 0L
     private var lastKeyframeReceivedNs = 0L
+    @Volatile private var macToAndroidOffsetNs: Long? = null
+    @Volatile private var videoClockSyncReady = false
+    private var videoClockSyncEstimator = ClockOffsetEstimator()
+    private var touchWriteCount = 0L
+    private var touchWriteAccumNs = 0L
+    private var touchWriteMaxNs = 0L
 
     // Buffer pooling to reduce GC pressure from per-frame allocations
     // At 60fps with ~100KB frames, this prevents ~6MB/s of allocations
@@ -138,6 +144,9 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                macToAndroidOffsetNs = null
+                videoClockSyncReady = false
+                videoClockSyncEstimator = ClockOffsetEstimator()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
@@ -267,6 +276,9 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                macToAndroidOffsetNs = null
+                videoClockSyncReady = false
+                videoClockSyncEstimator = ClockOffsetEstimator()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
@@ -306,6 +318,17 @@ class StreamClient(
         controlChannel.onLatencyMeasured = { rttMs ->
             onLatencyMeasured?.invoke(rttMs)
         }
+        controlChannel.onClockSyncMeasured = { estimate ->
+            if (estimate.accepted) {
+                macToAndroidOffsetNs = estimate.offsetNs
+                diagLog(String.format(
+                    "clock sync offset=%.3fms rtt=%.3fms samples=%d",
+                    estimate.offsetNs / 1_000_000.0,
+                    estimate.rttNs / 1_000_000.0,
+                    estimate.sampleCount,
+                ))
+            }
+        }
         controlChannel.onBrightnessCommand = { v ->
             onBrightness?.invoke(v)
         }
@@ -322,9 +345,13 @@ class StreamClient(
 
     private fun advertiseFrameMetadataSupport() {
         outputStream?.let { out ->
+            // Trace capability must precede type 8 because type 8 may cause a
+            // legacy-compatible host to finish protocol startup immediately.
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_VIDEO_CLOCK_SYNC)
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_TRACE)
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
             out.flush()
-            diagLog("Advertised frame metadata support")
+            diagLog("Advertised frame trace/metadata support")
         }
     }
 
@@ -373,6 +400,10 @@ class StreamClient(
                             receiveVideoFrame(input, hasMetadata = true)
                         }
 
+                        MESSAGE_VIDEO_FRAME_WITH_TRACE -> {
+                            receiveVideoFrame(input, hasMetadata = true, hasTrace = true)
+                        }
+
                         1 -> {
                             val width = input.readInt()
                             val height = input.readInt()
@@ -386,10 +417,38 @@ class StreamClient(
                         }
 
                         5 -> { // Pong response — measure round-trip latency
-                            val buf = ByteArray(8)
-                            input.readFully(buf)
-                            val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
-                            val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
+                            val sentTime: Long
+                            val rtt: Double
+                            if (videoClockSyncReady) {
+                                val buf = ByteArray(24)
+                                input.readFully(buf)
+                                val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+                                sentTime = bb.long
+                                val macReceiveNs = bb.long
+                                val macSendNs = bb.long
+                                val receivedNs = System.nanoTime()
+                                val estimate = videoClockSyncEstimator.addSample(
+                                    androidSendNs = sentTime,
+                                    macReceiveNs = macReceiveNs,
+                                    macSendNs = macSendNs,
+                                    androidReceiveNs = receivedNs,
+                                )
+                                rtt = estimate.rttNs / 1_000_000.0
+                                if (estimate.accepted) {
+                                    macToAndroidOffsetNs = estimate.offsetNs
+                                    diagLog(String.format(
+                                        "video clock sync offset=%.3fms rtt=%.3fms samples=%d",
+                                        estimate.offsetNs / 1_000_000.0,
+                                        estimate.rttNs / 1_000_000.0,
+                                        estimate.sampleCount,
+                                    ))
+                                }
+                            } else {
+                                val buf = ByteArray(8)
+                                input.readFully(buf)
+                                sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
+                                rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
+                            }
                             DiagLog.logSampled(
                                 "SC",
                                 "inband-pong",
@@ -397,6 +456,11 @@ class StreamClient(
                                 DIAGNOSTIC_SAMPLE_INTERVAL_MS,
                             )
                             onLatencyMeasured?.invoke(rtt)
+                        }
+
+                        12 -> {
+                            videoClockSyncReady = true
+                            diagLog("Video clock synchronization acknowledged by host")
                         }
 
                         MESSAGE_CODEC_SELECTED -> {
@@ -435,8 +499,10 @@ class StreamClient(
     ) {
         if (!isConnected) return
 
+        val motionReceivedNs = System.nanoTime()
         touchScope.launch {
             if (controlChannel.sendTouch(x, y, action, pointerCount, x2, y2)) {
+                recordTouchWrite(motionReceivedNs)
                 return@launch
             }
             try {
@@ -455,9 +521,28 @@ class StreamClient(
                     buffer.putInt(action)
                     out.write(buffer.array())
                     out.flush()
+                    recordTouchWrite(motionReceivedNs)
                 }
             } catch (_: Exception) {
             }
+        }
+    }
+
+    /** Mac-side parser/CGEvent tracing has a matching Android receipt metric. */
+    private fun recordTouchWrite(motionReceivedNs: Long) {
+        val elapsed = System.nanoTime() - motionReceivedNs
+        touchWriteCount++
+        touchWriteAccumNs += elapsed
+        if (elapsed > touchWriteMaxNs) touchWriteMaxNs = elapsed
+        if (touchWriteCount % 120L == 0L) {
+            DiagLog.log(
+                "SC",
+                "TOUCH motion->socket avg=${"%.3f".format(touchWriteAccumNs / touchWriteCount / 1_000_000.0)}ms " +
+                    "max=${"%.3f".format(touchWriteMaxNs / 1_000_000.0)}ms n=$touchWriteCount",
+            )
+            touchWriteCount = 0
+            touchWriteAccumNs = 0
+            touchWriteMaxNs = 0
         }
     }
 
@@ -561,6 +646,7 @@ class StreamClient(
     private fun receiveVideoFrame(
         input: DataInputStream,
         hasMetadata: Boolean,
+        hasTrace: Boolean = false,
     ) {
         val frameSize = input.readInt()
 
@@ -569,9 +655,12 @@ class StreamClient(
         }
 
         var isKeyframe = false
+        var frameId = 0L
+        var hostCaptureTimestampNs = 0L
         if (hasMetadata) {
             val flags = input.readUnsignedByte()
-            input.readLong() // Host capture timestamp; clocks are not comparable with Android.
+            if (hasTrace) frameId = input.readLong()
+            hostCaptureTimestampNs = input.readLong()
             isKeyframe = (flags and FRAME_FLAG_KEYFRAME) != 0
         }
 
@@ -584,12 +673,25 @@ class StreamClient(
 
         // Capture timestamp after full frame received for accurate age tracking.
         val receiveTimestamp = System.nanoTime()
+        val translatedCaptureNs = macToAndroidOffsetNs?.let { offset ->
+            translateMacTimestampToAndroid(hostCaptureTimestampNs, offset)
+        } ?: 0L
+        val trace = if (hostCaptureTimestampNs > 0L) {
+            FrameTrace(
+                frameId = frameId,
+                hostCaptureNs = hostCaptureTimestampNs,
+                captureNs = translatedCaptureNs,
+                receivedNs = receiveTimestamp,
+            )
+        } else {
+            null
+        }
         checkKeyframeFreshness(receiveTimestamp, isKeyframe)
         diagFrameCount++
         if (diagFrameCount == 1L) {
             diagLog(
-                "First video frame: size=$frameSize, keyframe=$isKeyframe, " +
-                    "metadata=$hasMetadata, callback=${onFrameReceived != null}",
+            "First video frame: size=$frameSize, keyframe=$isKeyframe, " +
+                    "metadata=$hasMetadata trace=$hasTrace callback=${onFrameReceived != null}",
             )
         }
         if (diagFrameCount % 60L == 0L) {
@@ -605,7 +707,7 @@ class StreamClient(
         val cbStart = System.nanoTime()
         val callback = onFrameReceived
         if (callback != null) {
-            callback.invoke(frameData, frameSize, receiveTimestamp, isKeyframe)
+            callback.invoke(frameData, frameSize, receiveTimestamp, isKeyframe, trace)
         } else {
             releaseBuffer(frameData)
         }
@@ -678,8 +780,11 @@ class StreamClient(
         private const val DIAGNOSTIC_SAMPLE_INTERVAL_MS = 10_000L
         private const val MESSAGE_VIDEO_FRAME = 0
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
+        private const val MESSAGE_VIDEO_FRAME_WITH_TRACE = 14
         private const val MESSAGE_KEYFRAME_REQUEST = 7
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
+        private const val MESSAGE_CLIENT_SUPPORTS_FRAME_TRACE = 13
+        private const val MESSAGE_CLIENT_SUPPORTS_VIDEO_CLOCK_SYNC = 15
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 12

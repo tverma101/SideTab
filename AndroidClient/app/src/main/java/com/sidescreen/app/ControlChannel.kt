@@ -24,7 +24,7 @@ import java.nio.ByteOrder
  *   client -> server: PING     = [type 4][clientTs 8]
  *   client -> server: KEYFRAME = [type 7][flags 1]
  *   client -> server: SUPPORT_BRIGHTNESS = [type 3]   (payload-free capability)
- *   server -> client: PONG     = [type 5][clientTs 8 (echo)][serverSendTs 8]
+ *   server -> client: PONG     = [type 5][clientTs 8 (echo)][serverReceiveTs 8][serverSendTs 8]
  *   server -> client: BRIGHT   = [type 11][value 1]   (0..255, real backlight)
  */
 class ControlChannel(
@@ -32,6 +32,7 @@ class ControlChannel(
     private val port: Int,
 ) {
     var onLatencyMeasured: ((Double) -> Unit)? = null
+    var onClockSyncMeasured: ((ClockSyncEstimate) -> Unit)? = null
 
     /** Server→client brightness command: 0..255, apply to the REAL panel. */
     var onBrightnessCommand: ((Int) -> Unit)? = null
@@ -50,6 +51,10 @@ class ControlChannel(
 
     @Volatile
     private var lastPingSentAtNs = 0L
+
+    @Volatile
+    private var clockSyncReady = false
+    private var clockSyncEstimator = ClockOffsetEstimator()
 
     private val sendLock = Any()
     private val connectLock = Any()
@@ -106,12 +111,15 @@ class ControlChannel(
                 output = DataOutputStream(s.getOutputStream())
                 lastPongAtNs = System.nanoTime()
                 lastPingSentAtNs = 0L
+                clockSyncReady = false
+                clockSyncEstimator = ClockOffsetEstimator()
                 // Active from connect, NOT from the first pong: StreamClient
                 // only pings via control when isConnected, so waiting for a
                 // pong before declaring active deadlocks the first ping.
                 tcpActive = true
                 DiagLog.log("CC", "Control channel ACTIVE mode=tcp")
                 declareBrightnessSupport()
+                declareClockSyncSupport()
                 Thread({ tcpReadLoop(s) }, "ControlTcpThread")
                     .apply { isDaemon = true }
                     .start()
@@ -138,14 +146,34 @@ class ControlChannel(
             while (running && socket === s) {
                 val type = input.readByte().toInt()
                 val arrival = System.nanoTime()
-                when (type) {
+                    when (type) {
                     5 -> { // Pong: [clientTs 8][serverSendTs 8]
-                        val buf = ByteArray(16)
+                        // New hosts return t0, t1=Mac receive, t2=Mac send.
+                        // Old hosts return only t0 and t2; capability is sent
+                        // before the first periodic ping.
+                        val buf = ByteArray(if (clockSyncReady) 24 else 16)
                         input.readFully(buf)
                         val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                         val clientTs = bb.long
-                        val serverTs = bb.long
-                        val rtt = (arrival - clientTs) / 1_000_000.0
+                        val rtt: Double
+                        if (clockSyncReady) {
+                            val serverReceiveTs = bb.long
+                            val serverSendTs = bb.long
+                            val receivedAt = System.nanoTime()
+                            val estimate = clockSyncEstimator.addSample(
+                                androidSendNs = clientTs,
+                                macReceiveNs = serverReceiveTs,
+                                macSendNs = serverSendTs,
+                                androidReceiveNs = receivedAt,
+                            )
+                            rtt = estimate.rttNs / 1_000_000.0
+                            if (estimate.accepted) {
+                                onClockSyncMeasured?.invoke(estimate)
+                            }
+                        } else {
+                            bb.long // legacy server send timestamp
+                            rtt = (arrival - clientTs) / 1_000_000.0
+                        }
                         val processedAt = System.nanoTime()
                         lastPongAtNs = arrival
                         val appDelay = (processedAt - arrival) / 1_000_000.0
@@ -173,6 +201,11 @@ class ControlChannel(
                         onBrightnessCommand?.invoke(value)
                     }
 
+                    12 -> { // Clock-sync capability acknowledgement
+                        clockSyncReady = true
+                        DiagLog.log("CC", "Clock synchronization acknowledged by host")
+                    }
+
                     else -> {
                         DiagLog.log("CC", "Unknown control type $type — disconnecting")
                         return
@@ -198,6 +231,20 @@ class ControlChannel(
                 DiagLog.log("CC", "Declared brightness support")
             } catch (e: Exception) {
                 DiagLog.log("CC", "Brightness declaration failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Tell new hosts that extended pong timestamps are safe to send. */
+    private fun declareClockSyncSupport() {
+        val out = output ?: return
+        synchronized(sendLock) {
+            try {
+                out.writeByte(13)
+                out.flush()
+                DiagLog.log("CC", "Advertised clock synchronization support")
+            } catch (e: Exception) {
+                DiagLog.log("CC", "Clock synchronization declaration failed: ${e.message}")
             }
         }
     }
@@ -291,6 +338,7 @@ class ControlChannel(
             socket = null
             lastPongAtNs = 0L
             lastPingSentAtNs = 0L
+            clockSyncReady = false
             try {
                 expectedSocket.close()
             } catch (_: Exception) {
@@ -308,6 +356,7 @@ class ControlChannel(
             output = null
             lastPongAtNs = 0L
             lastPingSentAtNs = 0L
+            clockSyncReady = false
             val activeSocket = socket
             socket = null
             try {
