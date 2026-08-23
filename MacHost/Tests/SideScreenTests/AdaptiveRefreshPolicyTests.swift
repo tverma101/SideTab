@@ -28,6 +28,26 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
         XCTAssertEqual(decision.reason, .deepIdle)
     }
 
+    func testContinuousInputPreWakesDeepIdleToSessionCeiling() {
+        var policy = AdaptiveRefreshPolicy(maxFPS: 120, initialFPS: 120)
+        _ = policy.observe(nowNs: 0, isIdle: true, dirtyRatio: 0)
+        _ = policy.observe(nowNs: 6_500 * ms, isIdle: true, dirtyRatio: 0)
+
+        let decision = policy.noteInteraction(nowNs: 6_600 * ms, highRate: true)
+        XCTAssertEqual(decision.targetFPS, 120)
+        XCTAssertEqual(decision.reason, .interaction)
+    }
+
+    func testDiscreteInputPreWakesDeepIdleToSixty() {
+        var policy = AdaptiveRefreshPolicy(maxFPS: 120, initialFPS: 120)
+        _ = policy.observe(nowNs: 0, isIdle: true, dirtyRatio: 0)
+        _ = policy.observe(nowNs: 6_500 * ms, isIdle: true, dirtyRatio: 0)
+
+        let decision = policy.noteInteraction(nowNs: 6_600 * ms, highRate: false)
+        XCTAssertEqual(decision.targetFPS, 60)
+        XCTAssertEqual(decision.reason, .interaction)
+    }
+
     func testTypingSizedChangePromotesToThirty() {
         var policy = AdaptiveRefreshPolicy(maxFPS: 120, initialFPS: 8)
         _ = policy.observe(nowNs: 0, isIdle: true, dirtyRatio: 0)
@@ -60,7 +80,6 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
         var policy = AdaptiveRefreshPolicy(maxFPS: 120, initialFPS: 60)
         var now: UInt64 = 0
 
-        // Sustained broad motion at ~60 Hz eventually opens a short 120-Hz probe.
         var sawProbe = false
         for _ in 0..<40 {
             let decision = policy.observe(nowNs: now, isIdle: false, dirtyRatio: 0.6)
@@ -71,7 +90,6 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
         }
         XCTAssertTrue(sawProbe)
 
-        // 60-Hz dirty frames are too far apart to validate >74-Hz source motion.
         let settled = policy.observe(nowNs: now + 400 * ms, isIdle: false, dirtyRatio: 0.6)
         XCTAssertEqual(settled.targetFPS, 60)
         XCTAssertEqual(settled.reason, .broadMotion)
@@ -81,7 +99,6 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
         var policy = AdaptiveRefreshPolicy(maxFPS: 120, initialFPS: 60)
         var now: UInt64 = 0
 
-        // Reach the probe using sustained broad 60-Hz observations.
         var probeStarted = false
         for _ in 0..<30 {
             let decision = policy.observe(nowNs: now, isIdle: false, dirtyRatio: 0.7)
@@ -93,7 +110,6 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
         }
         XCTAssertTrue(probeStarted)
 
-        // Once capture is probing at 120, three broad ~8-ms updates validate it.
         let d1 = policy.observe(nowNs: now + 8 * ms, isIdle: false, dirtyRatio: 0.7)
         let d2 = policy.observe(nowNs: now + 16 * ms, isIdle: false, dirtyRatio: 0.7)
         let d3 = policy.observe(nowNs: now + 24 * ms, isIdle: false, dirtyRatio: 0.7)
@@ -113,6 +129,7 @@ final class AdaptiveRefreshPolicyTests: XCTestCase {
             XCTAssertLessThanOrEqual(decision.targetFPS, 60)
             now += 8 * ms
         }
+        XCTAssertEqual(policy.noteInteraction(nowNs: now, highRate: true).targetFPS, 60)
     }
 
     func testGamingBoostKeepsAtLeastSixtyAndAllowsMaximumOnBroadMotion() {
