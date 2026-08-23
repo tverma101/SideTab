@@ -2120,24 +2120,70 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Apply a host-issued brightness (0..255) to the REAL panel backlight.
-     * Settings.System.SCREEN_BRIGHTNESS requires WRITE_SETTINGS (appop,
-     * granted via: adb shell appops set com.sidescreen.app WRITE_SETTINGS allow).
-     * We force manual mode once per apply so the panel honors the value
-     * (auto-brightness would otherwise override it). Runs on the control
-     * thread — the writes are quick binder calls; no UI hop needed.
+     *
+     * Primary path: Settings.System.SCREEN_BRIGHTNESS (requires
+     * android.permission.WRITE_SETTINGS). That permission is special:
+     *    adb shell appops set com.sidescreen.app WRITE_SETTINGS allow
+     * or Settings → Apps → Special access → Modify system settings.
+     * We flip SCREEN_BRIGHTNESS_MODE to manual once per apply so auto-
+     * brightness does not override the value.
+     *
+     * Fallback (no permission / Samsung Knox / One UI quirks): set
+     * WindowManager.LayoutParams.screenBrightness (0..1) on the activity
+     * window. Per-window and does not need WRITE_SETTINGS, but only
+     * dims our activity — so we try the real backlight first and keep
+     * the window fallback for zero-permission and restricted devices.
+     *
+     * Runs on the control thread. Binder calls are quick; the window path
+     * hops to the main thread. Samsung Knox dev docs note that Knox
+     * container policies can block WRITE_SETTINGS silently (no exception);
+     * the fallback covers that case as well — the putInt will just not
+     * change the hardware value.
      */
     private fun applyBacklight(value: Int) {
         val v = value.coerceIn(0, 255)
+        var wroteSystem = false
+        // Respect Android 6+ guard:Settings.System.canWrite() is false until
+        // the user grants Modify system settings (and true after appops allow).
+        // On Knox-managed Samsung tablets the call can return false permanently.
+        val canWriteSystem = try {
+            Settings.System.canWrite(this)
+        } catch (_: Exception) { false }
+        if (canWriteSystem) {
+            try {
+                Settings.System.putInt(
+                    contentResolver,
+                    Settings.System.SCREEN_BRIGHTNESS_MODE,
+                    Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL,
+                )
+                Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, v)
+                wroteSystem = true
+                DiagLog.log("BRT", "system backlight applied value=$v")
+            } catch (e: Exception) {
+                DiagLog.log("BRT", "system backlight failed: ${e.message}")
+            }
+        } else {
+            DiagLog.log("BRT", "WRITE_SETTINGS not granted (Settings.canWrite=false) — will use window fallback")
+        }
+        // Per-window fallback: works without WRITE_SETTINGS and on Knox-
+        // restricted Samsung profiles. Clamp away from 0 — 0 means "use
+        // system default" for this window param, not off.
         try {
-            Settings.System.putInt(
-                contentResolver,
-                Settings.System.SCREEN_BRIGHTNESS_MODE,
-                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL,
-            )
-            Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, v)
-            DiagLog.log("BRT", "backlight applied value=$v")
+            val windowBrightness = (v / 255f).coerceIn(0.02f, 1f)
+            runOnUiThread {
+                try {
+                    val lp = window.attributes
+                    lp.screenBrightness = windowBrightness
+                    window.attributes = lp
+                    if (!wroteSystem) {
+                        DiagLog.log("BRT", "window brightness fallback $windowBrightness for value=$v")
+                    }
+                } catch (e: Exception) {
+                    DiagLog.log("BRT", "window brightness failed: ${e.message}")
+                }
+            }
         } catch (e: Exception) {
-            DiagLog.log("BRT", "backlight failed: ${e.message}")
+            DiagLog.log("BRT", "brightness dispatch failed: ${e.message}")
         }
     }
 }

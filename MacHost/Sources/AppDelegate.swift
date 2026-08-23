@@ -50,6 +50,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var screenCapture: ScreenCapture?
     var virtualDisplayManager: VirtualDisplayManager?
     var brightnessMonitor: BrightnessMonitor?
+    var nativeBrightness: NativeBrightnessController?
     var idleSleepMonitor: IdleSleepMonitor?
     var settings = DisplaySettings()
     var settingsWindow: SettingsWindowController?
@@ -731,6 +732,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
+                // Push the persisted/native level immediately so the panel
+                // matches without requiring an F1/F2 press.
+                self.nativeBrightness?.pushCurrent()
                 Task { @MainActor in
                     self.settings.clientConnected = true
                 }
@@ -775,19 +779,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            // Brightness bridge (experiment-gated): translate BetterDisplay's
+            // Native brightness: F1/F2 control the tablet's real backlight
+            // directly (HID -> BRIGHT on the control channel) with a bezel
+            // HUD. ON by default; `defaults write com.sidescreen.app
+            // SideScreen_brightnessKeys -bool false` to disable.
+            let nb = NativeBrightnessController()
+            nb.onBrightness = { [weak self] level in
+                self?.streamingServer?.sendBrightness(level)
+            }
+            nb.start()
+            nativeBrightness = nb
+
+            // BetterDisplay bridge (experiment-gated): translate BetterDisplay's
             // software-brightness intent for this virtual display into BRIGHT
-            // commands on the control channel (client applies real backlight).
+            // as well. Coexists with the native controller; last write wins.
+            // When both are active, BetterDisplay slider drags stay smooth by
+            // syncing the native controller's level.
             if UserDefaults.standard.bool(forKey: "SideScreen_exp_brightness") {
                 let monitor = BrightnessMonitor()
                 monitor.onBrightness = { [weak self] level in
+                    self?.nativeBrightness?.syncExternalLevel(level)
                     self?.streamingServer?.sendBrightness(level)
                 }
                 monitor.start()
                 brightnessMonitor = monitor
-                debugLog("Brightness bridge ENABLED (SideScreen_exp_brightness)")
+                debugLog("Brightness bridge ENABLED (SideScreen_exp_brightness) + native F1/F2")
             } else {
-                debugLog("Brightness bridge disabled (knob unset)")
+                debugLog("Brightness bridge disabled (knob unset) — native F1/F2 \(nb)")
             }
 
             // Idle sleep (experiment-gated): when no client is connected for
@@ -864,6 +882,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func stopServer() {
         // Save display position before destroying
         virtualDisplayManager?.saveDisplayPosition()
+
+        nativeBrightness?.stop()
+        nativeBrightness = nil
+        brightnessMonitor?.stop()
+        brightnessMonitor = nil
 
         screenCapture?.stopStreaming()
         streamingServer?.stop()

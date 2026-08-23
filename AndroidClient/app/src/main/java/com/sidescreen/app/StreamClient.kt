@@ -682,7 +682,7 @@ class StreamClient(
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
-        private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val MESSAGE_CLIENT_DECODER_LIMITS = 12
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

@@ -26,7 +26,11 @@ private enum WireMessage {
     /// Client→server, 4-byte payload: the client's max decode size (issue
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
-    static let clientDecoderLimits: UInt8 = 11
+    /// Value was 11 (collided with server→client BRIGHT) — bumped to 12
+    /// so a brightness payload byte is never mistaken for a limit frame.
+    static let clientDecoderLimits: UInt8 = 12
+    /// Back-compat alias: old #41 tablets still send 11. Accept either.
+    static let clientDecoderLimitsLegacy: UInt8 = 11
 }
 
 private extension NWEndpoint {
@@ -743,10 +747,13 @@ class StreamingServer {
                     debugLog("Client is AVC-only — will negotiate H.264")
                 }
 
-            case WireMessage.clientDecoderLimits:
+            case WireMessage.clientDecoderLimits, WireMessage.clientDecoderLimitsLegacy:
                 // Type + 4 payload bytes: [w-hi][w-lo][h-hi][h-lo], 7 data
                 // bits each with the high bit always set (old hosts skip the
                 // payload harmlessly). Sent BEFORE type 8, like type 9.
+                // Legacy clients used 11 (now BRIGHT's value on the opposite
+                // direction); accept both with a high-bit guard so a stale
+                // server→client BRIGHT frame is never parsed as a limit.
                 guard inputBuffer.count >= 5 else { return }
 
                 let payload = (1...4).map { inputByte(at: $0) }
@@ -760,7 +767,7 @@ class StreamingServer {
                 // Anything below QVGA-ish is a nonsense report — ignore it.
                 if w >= 256 && h >= 256 {
                     clientDecodeLimits = (w, h)
-                    debugLog("Client decoder limit: \(w)x\(h)")
+                    debugLog("Client decoder limit: \(w)x\(h) (wire \(msgType))")
                 }
 
             default:
