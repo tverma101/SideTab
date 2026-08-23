@@ -8,15 +8,16 @@ import Foundation
 /// `SCStream.updateConfiguration`.
 ///
 /// Design goals:
-/// - rise fast when motion becomes visible;
+/// - rise fast when motion or direct interaction becomes visible;
 /// - fall slowly enough that UI motion does not visibly flap between rates;
 /// - tiny changes (caret/cursor blink) do not keep the stream at 60/120 FPS;
-/// - 120 Hz is a validated burst state, not the default simply because the
+/// - 120 Hz is a validated/burst state, not the default simply because the
 ///   virtual panel advertises 120 Hz;
 /// - sustained 60 FPS video settles at 60 rather than burning a 120 FPS path.
 struct AdaptiveRefreshPolicy {
     enum Reason: String, Equatable {
         case fixed
+        case interaction
         case gaming
         case highCadence
         case highCadenceProbe
@@ -46,6 +47,8 @@ struct AdaptiveRefreshPolicy {
     private var highCadenceValidatedUntilNs: UInt64 = 0
     private var probeUntilNs: UInt64 = 0
     private var probeCooldownUntilNs: UInt64 = 0
+    private var interactionBoostUntilNs: UInt64 = 0
+    private var interactionBoostFPS: Int = 60
     private var lastRateChangeNs: UInt64 = 0
 
     // Tuned for a display-streaming workload rather than a game loop.
@@ -57,12 +60,15 @@ struct AdaptiveRefreshPolicy {
     private static let probeDurationNs: UInt64 = 350_000_000
     private static let probeCooldownNs: UInt64 = 8_000_000_000
     private static let highCadenceTailNs: UInt64 = 350_000_000
+    private static let pointerBoostNs: UInt64 = 300_000_000
+    private static let discreteBoostNs: UInt64 = 160_000_000
     private static let downwardHoldNs: UInt64 = 250_000_000
 
     init(maxFPS: Int, gamingBoost: Bool = false, initialFPS: Int? = nil) {
         self.maxFPS = max(1, maxFPS)
         self.gamingBoost = gamingBoost
         self.currentFPS = min(max(1, initialFPS ?? maxFPS), max(1, maxFPS))
+        self.interactionBoostFPS = min(self.maxFPS, 60)
     }
 
     mutating func setGamingBoost(_ enabled: Bool) {
@@ -72,6 +78,27 @@ struct AdaptiveRefreshPolicy {
     mutating func setMaxFPS(_ value: Int) {
         maxFPS = max(1, value)
         currentFPS = min(currentFPS, maxFPS)
+        interactionBoostFPS = min(interactionBoostFPS, maxFPS)
+    }
+
+    /// Pre-wake the capture cadence from direct user input instead of waiting
+    /// for the next low-FPS screen sample. Continuous pointer/scroll/drag input
+    /// gets the session ceiling; discrete key/click input gets up to 60 FPS.
+    mutating func noteInteraction(nowNs: UInt64, highRate: Bool) -> Decision {
+        if startedAtNs == nil {
+            startedAtNs = nowNs
+            lastMeaningfulChangeNs = nowNs
+            lastRateChangeNs = nowNs
+        }
+        lastMeaningfulChangeNs = nowNs
+        interactionBoostFPS = capped(highRate ? maxFPS : 60)
+        interactionBoostUntilNs = nowNs + (highRate ? Self.pointerBoostNs : Self.discreteBoostNs)
+
+        if interactionBoostFPS > currentFPS {
+            currentFPS = interactionBoostFPS
+            lastRateChangeNs = nowNs
+        }
+        return Decision(targetFPS: currentFPS, reason: .interaction)
     }
 
     /// Feed one ScreenCaptureKit frame observation.
@@ -132,12 +159,13 @@ struct AdaptiveRefreshPolicy {
             probeUntilNs = 0
         }
 
-        // A probe is the only automatic path from 60 -> >60 without Gaming
-        // Boost. At 120 capture, real 120-Hz content produces broad dirty frames
-        // ~8.3 ms apart and validates. A 60-FPS video produces them ~16.7 ms
-        // apart, fails validation, and falls back to 60 with an 8 s cooldown.
+        // A probe is the only automatic path from 60 -> >60 without Gaming or
+        // direct high-rate input. At 120 capture, real 120-Hz content produces
+        // broad dirty frames ~8.3 ms apart and validates. A 60-FPS video
+        // produces them ~16.7 ms apart, fails validation, and falls back to 60.
         if maxFPS > 60,
            !gamingBoost,
+           interactionBoostUntilNs <= nowNs,
            highCadenceValidatedUntilNs <= nowNs,
            probeUntilNs == 0,
            probeCooldownUntilNs <= nowNs,
@@ -159,6 +187,9 @@ struct AdaptiveRefreshPolicy {
                 desired = capped(60)
                 reason = .gaming
             }
+        } else if interactionBoostUntilNs > nowNs {
+            desired = capped(interactionBoostFPS)
+            reason = .interaction
         } else if maxFPS > 60 && highCadenceValidatedUntilNs > nowNs {
             desired = maxFPS
             reason = .highCadence
