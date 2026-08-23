@@ -292,11 +292,22 @@ GPU postprocess time fell from roughly `3.3 ms` to `1.9–2.0 ms`. This measures
 transport/presentation fidelity only; HEVC 4:2:0 compression and the Mac's
 own rasterization still remain upstream limits.
 
-### Headless mode (new in 0.11.0 — no Mac interaction)
+### Headless mode (automatic operation and diagnostics)
 
 In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
 
 First-time setup still needs a screen once to grant Screen Recording permission; after that the Mac runs fully headless. For wireless headless use, give the Mac a static IP or DHCP reservation, and consider enabling macOS Screen Sharing as a fallback way in.
+
+For a diagnostic launch that must not steal focus or open Settings, run the
+installed executable with `--headless`:
+
+```bash
+/Users/$USER/Applications/SideScreen.app/Contents/MacOS/SideScreen --headless
+```
+
+`SIDESCREEN_HEADLESS=1` is also accepted by direct executable launches. A
+normal double-click/Finder/DMG launch does not use this mode: it keeps the
+regular macOS app policy and opens the normal Settings window when appropriate.
 
 ---
 

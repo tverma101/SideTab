@@ -8,7 +8,8 @@ if CaptureSourceBenchmark.runIfRequested(arguments: CommandLine.arguments) {
 
 print("🚀 Side Screen starting...")
 
-// No args needed
+let headlessLaunch = CommandLine.arguments.contains("--headless")
+    || ProcessInfo.processInfo.environment["SIDESCREEN_HEADLESS"] == "1"
 
 // Entry point
 let app = NSApplication.shared
@@ -37,9 +38,11 @@ mainMenu.addItem(editMenuItem)
 
 app.mainMenu = mainMenu
 
-let delegate = AppDelegate()
+let delegate = AppDelegate(headlessLaunch: headlessLaunch)
 
-app.setActivationPolicy(.regular)
+// Normal Finder/DMG launches remain regular foreground apps. Diagnostic
+// launches are accessory-only and never present/activate Settings.
+app.setActivationPolicy(headlessLaunch ? .accessory : .regular)
 
 app.delegate = delegate
 app.run()

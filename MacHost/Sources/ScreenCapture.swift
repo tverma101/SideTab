@@ -89,6 +89,12 @@ class ScreenCapture {
     private let cachedPixelBufferLock = NSLock()
     private var lastPixelBuffer: CVPixelBuffer?
 
+    // ScreenCaptureKit's displayTime and DispatchTime can use different
+    // monotonic clock epochs. Calibrate once per capture session instead of
+    // subtracting the raw values and reporting a multi-hour fake latency.
+    private let displayTimeCalibrationLock = NSLock()
+    private var displayTimeToUptimeOffsetNs: Int64?
+
     private func cachedPixelBufferSnapshot() -> CVPixelBuffer? {
         cachedPixelBufferLock.lock()
         defer { cachedPixelBufferLock.unlock() }
@@ -104,7 +110,7 @@ class ScreenCapture {
     /// ScreenCaptureKit's displayTime is the WindowServer presentation time,
     /// not callback arrival. Keep callback time as a separate stage and use it
     /// only when the attachment is unavailable on an older/legacy path.
-    private func windowServerDisplayTimestampNs(from sampleBuffer: CMSampleBuffer) -> UInt64? {
+    private func rawWindowServerDisplayTimestampNs(from sampleBuffer: CMSampleBuffer) -> UInt64? {
         guard let frameInfo = (CMSampleBufferGetSampleAttachmentsArray(
             sampleBuffer,
             createIfNecessary: false
@@ -130,6 +136,50 @@ class ScreenCapture {
             return number.uint64Value
         }
         return nil
+    }
+
+    private func resetDisplayTimeCalibration() {
+        displayTimeCalibrationLock.lock()
+        displayTimeToUptimeOffsetNs = nil
+        displayTimeCalibrationLock.unlock()
+    }
+
+    private func normalizedWindowServerDisplayTimestampNs(
+        from sampleBuffer: CMSampleBuffer,
+        callbackTimestampNs: UInt64
+    ) -> UInt64? {
+        guard let rawDisplayTimestampNs = rawWindowServerDisplayTimestampNs(from: sampleBuffer) else {
+            return nil
+        }
+
+        displayTimeCalibrationLock.lock()
+        defer { displayTimeCalibrationLock.unlock() }
+
+        let rawDisplayTimestamp = rawDisplayTimestampNs > UInt64(Int64.max)
+            ? Int64.max
+            : Int64(rawDisplayTimestampNs)
+        let callbackTimestamp = callbackTimestampNs > UInt64(Int64.max)
+            ? Int64.max
+            : Int64(callbackTimestampNs)
+
+        if displayTimeToUptimeOffsetNs == nil {
+            let (offset, offsetOverflowed) = callbackTimestamp.subtractingReportingOverflow(rawDisplayTimestamp)
+            guard !offsetOverflowed else {
+                debugLog("ScreenCaptureKit displayTime calibration overflowed; using callback timestamp")
+                return callbackTimestampNs
+            }
+            displayTimeToUptimeOffsetNs = offset
+            debugLog("ScreenCaptureKit displayTime clock calibrated: offset=\(offset)ns")
+        }
+
+        guard let offset = displayTimeToUptimeOffsetNs else {
+            return callbackTimestampNs
+        }
+        let (normalized, normalizedOverflowed) = rawDisplayTimestamp.addingReportingOverflow(offset)
+        guard !normalizedOverflowed, normalized > 0 else {
+            return callbackTimestampNs
+        }
+        return UInt64(normalized)
     }
 
     // Default-on adaptive cadence controller. It consumes ScreenCaptureKit
@@ -507,7 +557,10 @@ class ScreenCapture {
 
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             let callbackTimestampNs = DispatchTime.now().uptimeNanoseconds
-            let windowServerDisplayNs = self.windowServerDisplayTimestampNs(from: sampleBuffer)
+            let windowServerDisplayNs = self.normalizedWindowServerDisplayTimestampNs(
+                from: sampleBuffer,
+                callbackTimestampNs: callbackTimestampNs
+            )
             let captureTimestampNs = windowServerDisplayNs ?? callbackTimestampNs
 
             // Backpressure: skip if encode queue already has 2+ frames pending
@@ -604,6 +657,7 @@ class ScreenCapture {
         adaptiveRefreshController?.update(maxFPS: effFrameRate, gamingBoost: gamingBoost)
 
         isStreaming = true
+        resetDisplayTimeCalibration()
 
         // Keep the display awake for the whole streaming session so the virtual
         // display never idle-sleeps (the sleep/wake cycle is what strands the
@@ -945,6 +999,7 @@ class ScreenCapture {
         // it cannot resurrect capture after this stop.
         isStreaming = false
         streamGeneration &+= 1
+        resetDisplayTimeCalibration()
 
         // Cancel frame flow monitor and adaptive cadence watchdog.
         stopFrameMonitor()

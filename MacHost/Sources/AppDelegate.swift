@@ -81,6 +81,15 @@ struct GestureThresholds {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Command-line diagnostic mode. A headless process may still run the
+    /// server, but it must never present or activate the Settings window.
+    private let headlessLaunch: Bool
+
+    init(headlessLaunch: Bool = false) {
+        self.headlessLaunch = headlessLaunch
+        super.init()
+    }
+
     var streamingServer: StreamingServer?
     var screenCapture: ScreenCapture?
     var virtualDisplayManager: VirtualDisplayManager?
@@ -121,6 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
         logRuntimeIdentity()
+        debugLog("Launch mode: \(headlessLaunch ? "headless" : "normal")")
 
         // Create menu bar item
         setupMenuBar()
@@ -147,7 +157,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             refreshStatusIndicators()
         }
 
-        if #available(macOS 13.0, *) {
+        if headlessLaunch {
+            debugLog("Headless launch: Settings window suppressed; app activation skipped")
+        } else if #available(macOS 13.0, *) {
             if DaemonManager.shared.isEnabled {
                 print("🚀 Launch at Login is enabled - starting silently in background")
                 // Do not show settings window automatically.
@@ -429,8 +441,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showSettings() {
+        guard !headlessLaunch else {
+            debugLog("Headless launch: ignored Settings presentation request")
+            return
+        }
+
+        // Repeated lifecycle/error callbacks may ask for the same window. Do
+        // not repeatedly steal focus when it is already visible and active.
+        let shouldActivate = !(settingsWindow?.window?.isVisible ?? false) || !NSApp.isActive
         settingsWindow?.showWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        if shouldActivate {
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     @MainActor
