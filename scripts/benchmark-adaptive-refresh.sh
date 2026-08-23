@@ -17,7 +17,7 @@ scenario="${1:-manual}"
 duration="${2:-30}"
 output="${3:-adaptive-refresh-${scenario}-$(date +%Y%m%d-%H%M%S).csv}"
 
-if ! [[ "$duration" =~ '^[0-9]+$' ]] || (( duration < 1 )); then
+if ! [[ "$duration" =~ ^[0-9]+$ ]] || (( duration < 1 )); then
   echo "seconds must be a positive integer" >&2
   exit 2
 fi
@@ -108,7 +108,7 @@ done
 
 awk -F, '
   BEGIN { host_n=0; ws_n=0; host_sum=0; ws_sum=0 }
-  /^#/ || NR==1 { next }
+  /^#/ || $1=="timestamp" { next }
   $4 != "nan" { host_sum += $4; host_n++ }
   $5 != "nan" { ws_sum += $5; ws_n++ }
   END {
