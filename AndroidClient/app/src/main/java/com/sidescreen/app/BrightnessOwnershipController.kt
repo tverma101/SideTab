@@ -34,7 +34,7 @@ object BrightnessRestorationPolicy {
 
 /**
  * Owns the tablet's brightness only for one authoritative streaming
- * generation.  System settings are snapshotted before the first mutation;
+ * generation. System settings are snapshotted before the first mutation;
  * teardown restores them only when the current value still matches SideScreen
  * last write, so an independent user change wins.
  */
@@ -84,44 +84,60 @@ class BrightnessOwnershipController(
 
     fun apply(generation: Long, value: Int) {
         val v = value.coerceIn(0, 255)
-        synchronized(lock) {
+
+        // The privileged system path must be part of the same ownership
+        // critical section as release/acquire. Previously we checked the
+        // generation, dropped the lock, then wrote Settings.System. A
+        // disconnect/new generation could slip into that gap and an old
+        // brightness callback could mutate the tablet after ownership ended.
+        val wroteSystem = synchronized(lock) {
             if (ownerGeneration != generation) {
                 DiagLog.log("BRT", "ignored stale brightness value=$v generation=$generation")
                 return
             }
-        }
 
-        var wroteSystem = false
-        val canWriteSystem = runCatching { Settings.System.canWrite(appContext) }.getOrDefault(false)
-        if (canWriteSystem) {
-            try {
-                val modeWritten = Settings.System.putInt(
-                    resolver,
-                    Settings.System.SCREEN_BRIGHTNESS_MODE,
-                    Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL,
-                )
-                val valueWritten = Settings.System.putInt(
-                    resolver,
-                    Settings.System.SCREEN_BRIGHTNESS,
-                    v,
-                )
-                wroteSystem = modeWritten && valueWritten
-                if (wroteSystem) {
-                    synchronized(lock) { lastAppliedSystemValue = v }
-                    DiagLog.log("BRT", "system backlight applied value=$v generation=$generation")
-                } else {
-                    DiagLog.log("BRT", "system brightness write rejected for value=$v")
+            val canWriteSystem = runCatching { Settings.System.canWrite(appContext) }.getOrDefault(false)
+            if (!canWriteSystem) {
+                DiagLog.log("BRT", "WRITE_SETTINGS unavailable — using transactional window fallback")
+                false
+            } else {
+                try {
+                    val modeWritten = Settings.System.putInt(
+                        resolver,
+                        Settings.System.SCREEN_BRIGHTNESS_MODE,
+                        Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL,
+                    )
+                    val valueWritten = Settings.System.putInt(
+                        resolver,
+                        Settings.System.SCREEN_BRIGHTNESS,
+                        v,
+                    )
+                    val applied = modeWritten && valueWritten
+                    if (applied) {
+                        lastAppliedSystemValue = v
+                        DiagLog.log("BRT", "system backlight applied value=$v generation=$generation")
+                    } else {
+                        DiagLog.log("BRT", "system brightness write rejected for value=$v")
+                    }
+                    applied
+                } catch (e: Exception) {
+                    DiagLog.log("BRT", "system backlight failed: ${e.message}")
+                    false
                 }
-            } catch (e: Exception) {
-                DiagLog.log("BRT", "system backlight failed: ${e.message}")
             }
-        } else {
-            DiagLog.log("BRT", "WRITE_SETTINGS unavailable — using transactional window fallback")
         }
 
         if (!wroteSystem) {
             val windowBrightness = (v / 255f).coerceIn(0.02f, 1f)
-            synchronized(lock) { lastAppliedWindowValue = windowBrightness }
+            synchronized(lock) {
+                // A release/new owner may have happened after the system path
+                // returned false. Do not even enqueue a stale window fallback.
+                if (ownerGeneration != generation) {
+                    DiagLog.log("BRT", "ignored stale window fallback value=$v generation=$generation")
+                    return
+                }
+                lastAppliedWindowValue = windowBrightness
+            }
             mainHandler.post {
                 synchronized(lock) {
                     if (ownerGeneration != generation) return@synchronized
