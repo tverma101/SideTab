@@ -37,13 +37,11 @@ internal object SessionLifecyclePolicy {
             EndReason.HOST_SUSPENDED,
             EndReason.VIDEO_TRANSPORT_LOST,
             EndReason.NETWORK_LOST,
-            EndReason.APP_BACKGROUND_RECREATION,
-            -> true
+            EndReason.APP_BACKGROUND_RECREATION -> true
 
             EndReason.USER_DISCONNECTED,
             EndReason.FATAL_PROTOCOL_ERROR,
-            EndReason.AUTH_REVOKED,
-            -> false
+            EndReason.AUTH_REVOKED -> false
         }
     }
 
