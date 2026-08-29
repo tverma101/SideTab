@@ -22,7 +22,10 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            // Intentionally do not fall back to signingConfigs.debug here.
+            // Local release builds may be unsigned; distribution signing must
+            // be supplied by the release environment rather than committed
+            // debug credentials.
         }
     }
 
