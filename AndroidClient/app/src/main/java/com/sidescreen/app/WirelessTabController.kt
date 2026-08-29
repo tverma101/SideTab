@@ -1,10 +1,13 @@
 package com.sidescreen.app
 
-import android.app.Activity
 import android.content.Intent
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * Five-state UI machine for the Wireless tab on Android.
@@ -12,9 +15,13 @@ import android.widget.TextView
  *   ① first-time → ② scanning (QRScannerActivity) → ③ connected
  *                                         ↘ ④ token mismatch / re-pair
  *   ⓹ permission denied permanently
+ *
+ * #46 replaces this private connection-looking state machine with the
+ * authoritative application UI projection. Until then, keep security/storage
+ * work out of the main-thread presentation path.
  */
 class WirelessTabController(
-    private val activity: Activity,
+    private val activity: AppCompatActivity,
     private val views: Views,
     private val storage: PairedHostStorage,
     private val cameraPerm: CameraPermissionManager,
@@ -112,8 +119,8 @@ class WirelessTabController(
      * cached host + camera permission state.
      *
      * No auto-connect: even when a cached pairing exists, the user must press
-     * the Reconnect button to actually start a connection. Auto-connect was
-     * confusing because it could run silently while the user toggled tabs.
+     * the Reconnect button to actually start a connection. #42 replaces this
+     * with lifecycle-aware reconnect after the authoritative runtime lands.
      */
     fun show() {
         when {
@@ -131,7 +138,17 @@ class WirelessTabController(
     fun onScanResult(url: String) {
         val parsed = PairingURL.parse(url) ?: return
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
-        storage.save(PairedHostStorage.Entry(parsed.host, parsed.port, parsed.token, parsed.macName))
+        val entry = PairedHostStorage.Entry(parsed.host, parsed.port, parsed.token, parsed.macName)
+
+        // First-time AndroidKeyStore creation may involve secure hardware. Do
+        // not make QR completion or connection startup wait on that disk/crypto
+        // work. The active connection already has the token in memory.
+        activity.lifecycleScope.launch(Dispatchers.IO) {
+            if (!storage.save(entry)) {
+                DiagLog.log("WirelessTabController", "Pairing credential could not be persisted securely")
+            }
+        }
+
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
     }
