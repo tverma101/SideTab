@@ -6,6 +6,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.security.KeyStore
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 
@@ -21,6 +22,8 @@ class PairedHostStorage(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val keyLock = Any()
+    private val mutationLock = Any()
+    private val mutationEpoch = AtomicLong(0L)
 
     /** Avoid repeated KeyStore decrypts from legacy UI code during one process lifetime. */
     @Volatile
@@ -43,6 +46,10 @@ class PairedHostStorage(context: Context) {
      * Returns false instead of ever falling back to plaintext persistence.
      * Callers may continue the in-memory connection attempt, but the pairing
      * will not survive restart until secure persistence succeeds.
+     *
+     * Crypto/key generation deliberately happens outside [mutationLock]. The
+     * final commit is serialized and guarded by [mutationEpoch], so a later
+     * Forget or newer QR scan wins even if this save was already running.
      */
     fun save(entry: Entry): Boolean {
         if (entry.token.size != TOKEN_BYTES) {
@@ -50,22 +57,29 @@ class PairedHostStorage(context: Context) {
             return false
         }
 
+        val operation = mutationEpoch.incrementAndGet()
         return try {
             val envelope = PairingSecretEnvelope.encrypt(entry.token, getOrCreateKey())
-            val committed =
-                prefs.edit()
-                    .putInt(KEY_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
-                    .putString(KEY_HOST, entry.host)
-                    .putInt(KEY_PORT, entry.port)
-                    .putString(KEY_TOKEN_IV_B64, encode(envelope.iv))
-                    .putString(KEY_TOKEN_CIPHERTEXT_B64, encode(envelope.ciphertext))
-                    .putString(KEY_MAC_NAME, entry.macName)
-                    .remove(KEY_LEGACY_TOKEN_B64)
-                    .commit()
-            if (committed) {
-                cachedEntry = entry.defensiveCopy()
+            synchronized(mutationLock) {
+                if (mutationEpoch.get() != operation) {
+                    DiagLog.log(TAG, "Discarding superseded pairing persistence operation")
+                    return@synchronized false
+                }
+                val committed =
+                    prefs.edit()
+                        .putInt(KEY_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
+                        .putString(KEY_HOST, entry.host)
+                        .putInt(KEY_PORT, entry.port)
+                        .putString(KEY_TOKEN_IV_B64, encode(envelope.iv))
+                        .putString(KEY_TOKEN_CIPHERTEXT_B64, encode(envelope.ciphertext))
+                        .putString(KEY_MAC_NAME, entry.macName)
+                        .remove(KEY_LEGACY_TOKEN_B64)
+                        .commit()
+                if (committed && mutationEpoch.get() == operation) {
+                    cachedEntry = entry.defensiveCopy()
+                }
+                committed && mutationEpoch.get() == operation
             }
-            committed
         } catch (e: Exception) {
             DiagLog.log(TAG, "Secure pairing persistence failed: ${e.javaClass.simpleName}")
             false
@@ -110,9 +124,16 @@ class PairedHostStorage(context: Context) {
     }
 
     fun clear() {
-        cachedEntry = null
-        prefs.edit().clear().commit()
-        deleteKey()
+        // Invalidate in-flight encryptions before waiting for the commit lock.
+        // If an old save committed first, this clear executes after and removes
+        // it. If clear wins first, that save sees a stale epoch and cannot
+        // resurrect the pairing.
+        mutationEpoch.incrementAndGet()
+        synchronized(mutationLock) {
+            cachedEntry = null
+            prefs.edit().clear().commit()
+            deleteKey()
+        }
     }
 
     private fun readEncryptedToken(): ByteArray? {
@@ -151,9 +172,12 @@ class PairedHostStorage(context: Context) {
 
     private fun invalidateStoredPairing(reason: String) {
         DiagLog.log(TAG, "Discarding stored pairing: $reason")
-        cachedEntry = null
-        prefs.edit().clear().commit()
-        deleteKey()
+        mutationEpoch.incrementAndGet()
+        synchronized(mutationLock) {
+            cachedEntry = null
+            prefs.edit().clear().commit()
+            deleteKey()
+        }
     }
 
     private fun deleteKey() {
