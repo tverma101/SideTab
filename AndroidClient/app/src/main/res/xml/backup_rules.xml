@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Pairing credentials are device-bound and must never leave the device backup boundary. -->
+    <exclude domain="sharedpref" path="paired_host.xml" />
+    <!-- Diagnostics can contain local host addresses and runtime/session metadata. -->
+    <exclude domain="file" path="diag.log" />
+    <exclude domain="file" path="diag.log.old" />
+</full-backup-content>
