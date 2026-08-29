@@ -22,6 +22,10 @@ class PairedHostStorage(context: Context) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val keyLock = Any()
 
+    /** Avoid repeated KeyStore decrypts from legacy UI code during one process lifetime. */
+    @Volatile
+    private var cachedEntry: Entry? = null
+
     data class Entry(val host: String, val port: Int, val token: ByteArray, val macName: String) {
         override fun equals(other: Any?): Boolean {
             if (other !is Entry) return false
@@ -31,6 +35,8 @@ class PairedHostStorage(context: Context) {
 
         override fun hashCode(): Int =
             ((host.hashCode() * 31 + port) * 31 + macName.hashCode()) * 31 + token.contentHashCode()
+
+        fun defensiveCopy(): Entry = copy(token = token.copyOf())
     }
 
     /**
@@ -46,15 +52,20 @@ class PairedHostStorage(context: Context) {
 
         return try {
             val envelope = PairingSecretEnvelope.encrypt(entry.token, getOrCreateKey())
-            prefs.edit()
-                .putInt(KEY_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
-                .putString(KEY_HOST, entry.host)
-                .putInt(KEY_PORT, entry.port)
-                .putString(KEY_TOKEN_IV_B64, encode(envelope.iv))
-                .putString(KEY_TOKEN_CIPHERTEXT_B64, encode(envelope.ciphertext))
-                .putString(KEY_MAC_NAME, entry.macName)
-                .remove(KEY_LEGACY_TOKEN_B64)
-                .commit()
+            val committed =
+                prefs.edit()
+                    .putInt(KEY_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
+                    .putString(KEY_HOST, entry.host)
+                    .putInt(KEY_PORT, entry.port)
+                    .putString(KEY_TOKEN_IV_B64, encode(envelope.iv))
+                    .putString(KEY_TOKEN_CIPHERTEXT_B64, encode(envelope.ciphertext))
+                    .putString(KEY_MAC_NAME, entry.macName)
+                    .remove(KEY_LEGACY_TOKEN_B64)
+                    .commit()
+            if (committed) {
+                cachedEntry = entry.defensiveCopy()
+            }
+            committed
         } catch (e: Exception) {
             DiagLog.log(TAG, "Secure pairing persistence failed: ${e.javaClass.simpleName}")
             false
@@ -62,6 +73,8 @@ class PairedHostStorage(context: Context) {
     }
 
     fun load(): Entry? {
+        cachedEntry?.let { return it.defensiveCopy() }
+
         val host = prefs.getString(KEY_HOST, null) ?: return null
         val port = prefs.getInt(KEY_PORT, -1).takeIf { it > 0 } ?: return null
         val macName = prefs.getString(KEY_MAC_NAME, null) ?: "Mac"
@@ -74,7 +87,7 @@ class PairedHostStorage(context: Context) {
                 invalidateStoredPairing("encrypted credential invalid or undecryptable")
                 return null
             }
-            return Entry(host, port, token, macName)
+            return Entry(host, port, token, macName).also { cachedEntry = it.defensiveCopy() }
         }
 
         // One-time migration from the historical Base64 plaintext preference.
@@ -93,10 +106,11 @@ class PairedHostStorage(context: Context) {
             return null
         }
         DiagLog.log(TAG, "Migrated paired-host credential to AndroidKeyStore-backed storage")
-        return entry
+        return entry.defensiveCopy()
     }
 
     fun clear() {
+        cachedEntry = null
         prefs.edit().clear().commit()
         deleteKey()
     }
@@ -137,6 +151,7 @@ class PairedHostStorage(context: Context) {
 
     private fun invalidateStoredPairing(reason: String) {
         DiagLog.log(TAG, "Discarding stored pairing: $reason")
+        cachedEntry = null
         prefs.edit().clear().commit()
         deleteKey()
     }
