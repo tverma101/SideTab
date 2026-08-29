@@ -7,6 +7,7 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /**
@@ -60,19 +61,14 @@ class WirelessTabController(
     enum class State { FIRST_TIME, CONNECTING, CONNECTED, PAIRED_IDLE, REPAIR_NEEDED, PERM_DENIED }
 
     private var state: State = State.FIRST_TIME
+    private var pendingPairingSave: Job? = null
 
     fun bind() {
         views.scanButton.setOnClickListener { triggerScan() }
         views.rescanButton.setOnClickListener { triggerScan() }
         views.openSettingsButton.setOnClickListener { cameraPerm.openAppSettings() }
-        views.forgetButton.setOnClickListener {
-            storage.clear()
-            transition(State.FIRST_TIME)
-        }
-        views.idleForgetButton.setOnClickListener {
-            storage.clear()
-            transition(State.FIRST_TIME)
-        }
+        views.forgetButton.setOnClickListener { forgetPairing() }
+        views.idleForgetButton.setOnClickListener { forgetPairing() }
         views.reconnectButton.setOnClickListener {
             val entry =
                 storage.load() ?: run {
@@ -82,6 +78,16 @@ class WirelessTabController(
             showConnecting("Reconnecting to ${entry.macName}", "${entry.host}:${entry.port}")
             attemptAutoConnect(entry)
         }
+    }
+
+    private fun forgetPairing() {
+        // A first-time KeyStore save runs on Dispatchers.IO. If the user taps
+        // Forget while that write is still queued, cancellation must happen
+        // before clear() or the background save could resurrect credentials.
+        pendingPairingSave?.cancel()
+        pendingPairingSave = null
+        storage.clear()
+        transition(State.FIRST_TIME)
     }
 
     /**
@@ -142,8 +148,10 @@ class WirelessTabController(
 
         // First-time AndroidKeyStore creation may involve secure hardware. Do
         // not make QR completion or connection startup wait on that disk/crypto
-        // work. The active connection already has the token in memory.
-        activity.lifecycleScope.launch(Dispatchers.IO) {
+        // work. Cancel a previous pairing write so only the newest scanned host
+        // may become persistent.
+        pendingPairingSave?.cancel()
+        pendingPairingSave = activity.lifecycleScope.launch(Dispatchers.IO) {
             if (!storage.save(entry)) {
                 DiagLog.log("WirelessTabController", "Pairing credential could not be persisted securely")
             }
