@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - eval/runtime-snapshot-2026-08-23
+      - "ci/**"
   schedule:
     - cron: "41 7 * * 3"
   workflow_dispatch:
