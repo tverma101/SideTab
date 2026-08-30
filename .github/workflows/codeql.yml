@@ -1,0 +1,67 @@
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - eval/runtime-snapshot-2026-08-23
+  schedule:
+    - cron: "41 7 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: ${{ matrix.language }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: java-kotlin
+            os: ubuntu-latest
+          - language: swift
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        if: matrix.language == 'java-kotlin'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: manual
+
+      - name: Build Android for CodeQL
+        if: matrix.language == 'java-kotlin'
+        working-directory: AndroidClient
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Build macOS for CodeQL
+        if: matrix.language == 'swift'
+        working-directory: MacHost
+        run: swift build -c debug
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
