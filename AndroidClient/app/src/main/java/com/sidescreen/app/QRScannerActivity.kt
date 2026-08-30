@@ -1,5 +1,6 @@
 package com.sidescreen.app
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.os.Bundle
 import android.util.Log
@@ -42,6 +43,7 @@ class QRScannerActivity : AppCompatActivity() {
         startCamera()
     }
 
+    @SuppressLint("UnsafeOptInUsageError")
     private fun startCamera() {
         val previewView = findViewById<PreviewView>(R.id.preview)
         val providerFuture = ProcessCameraProvider.getInstance(this)

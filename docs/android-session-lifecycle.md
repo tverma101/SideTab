@@ -40,8 +40,14 @@ ownership.
 `UsbManager.deviceList` is not a valid readiness signal for SideScreen's
 ADB-reverse topology: Android is the USB device and the Mac is the USB host.
 The checklist therefore reports the USB route and Mac listener as “verified
-when you tap Connect.” It still reports local Developer Mode and ADB settings,
-but it never opens a background probe that could contend with the real client.
+when you tap Connect.” The route becomes PASS only after the current Mac bridge
+returns an accepted mode/transport admission; a legacy or prematurely closed
+connection remains UNKNOWN/FAIL with its reason. It still reports local
+Developer Mode and ADB settings, but it never opens a background probe that
+could contend with the real client.
+
+The mode/route admission contract and the compact Android/Mac issue record are
+maintained in [docs/troubleshooting/android-bridge-hardening.md](troubleshooting/android-bridge-hardening.md).
 
 ## Runtime evidence
 

@@ -1,18 +1,22 @@
+import Foundation
 import XCTest
 @testable import SideScreen
 
 final class CaptureFrameRatePolicyTests: XCTestCase {
     private var defaults: UserDefaults!
+    private var suiteName: String!
 
     override func setUp() {
         super.setUp()
-        defaults = UserDefaults(suiteName: "CaptureFrameRatePolicyTests")!
-        defaults.removePersistentDomain(forName: "CaptureFrameRatePolicyTests")
+        suiteName = "CaptureFrameRatePolicyTests.\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
     }
 
     override func tearDown() {
-        defaults.removePersistentDomain(forName: "CaptureFrameRatePolicyTests")
+        defaults.removePersistentDomain(forName: suiteName)
         defaults = nil
+        suiteName = nil
         super.tearDown()
     }
 

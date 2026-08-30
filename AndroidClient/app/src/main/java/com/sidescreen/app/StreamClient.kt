@@ -22,11 +22,16 @@ class StreamClient(
     private val context: Context? = null,
     controlHost: String = host,
     controlPort: Int = port + 1,
+    private val connectionMode: ConnectionMode = ConnectionMode.USB,
 ) {
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
-    private var isConnected = false
+    @Volatile private var isConnected = false
+    private val stateLock = Any()
+    private var closeRequested = false
+    private var connectionStatusSent = false
+    private var resourcesCleaned = false
 
     /**
      * Dedicated out-of-band control channel (ping/pong + keyframe requests).
@@ -50,6 +55,12 @@ class StreamClient(
 
     /** Optional control health; video transport remains authoritative. */
     var onControlChannelState: ((Boolean) -> Unit)? = null
+
+    /** Result of the explicit Android ↔ macOS mode admission handshake. */
+    internal var onModeAdmission: ((ConnectionModeHandshake.ServerResult) -> Unit)? = null
+
+    /** A connected socket can still fail before the first display config. */
+    var onTransportFailure: ((String) -> Unit)? = null
 
     /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
     @Volatile var streamCodecIsHevc = true
@@ -136,47 +147,50 @@ class StreamClient(
     private val touchDispatcher = touchExecutor.asCoroutineDispatcher()
     private val touchScope = CoroutineScope(touchDispatcher)
 
-    suspend fun connect() =
-        withContext(Dispatchers.IO) {
-            try {
-                socket =
-                    Socket(host, port).apply {
-                        tcpNoDelay = true
-                    }
-                inputStream = DataInputStream(java.io.BufferedInputStream(socket?.getInputStream(), 65536))
-                outputStream = java.io.DataOutputStream(socket?.getOutputStream())
-                streamCodecIsHevc = true
-                codecNegotiated = false
-                macToAndroidOffsetNs = null
-                videoClockSyncReady = false
-                videoClockSyncEstimator = ClockOffsetEstimator()
-                advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
-                advertiseDecoderLimits() // Also before type 8, for the same reason
-                advertiseFrameMetadataSupport()
-                isConnected = true
-                lastKeyframeReceivedNs = 0L
-                synchronized(keyframeRequestLock) {
-                    lastKeyframeRequestNs = 0L
+    suspend fun connect() = withContext(Dispatchers.IO) {
+        try {
+            ensureOpen()
+            val connectedSocket = Socket()
+            connectedSocket.connect(java.net.InetSocketAddress(host, port), VIDEO_CONNECT_TIMEOUT_MS)
+            connectedSocket.tcpNoDelay = true
+            synchronized(stateLock) {
+                if (closeRequested) {
+                    connectedSocket.close()
+                    throw IOException("connection cancelled")
                 }
-
-                diagLog("Connected to $host:$port")
-                onConnectionStatus?.invoke(true)
-
-                connectControlChannel()
-                receiveData()
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Connection error", e)
-                onConnectionStatus?.invoke(false)
-                cleanup()
+                socket = connectedSocket
             }
+            inputStream = DataInputStream(java.io.BufferedInputStream(connectedSocket.getInputStream(), 65536))
+            outputStream = java.io.DataOutputStream(connectedSocket.getOutputStream())
+            resetProtocolState()
+            sendConnectionModeHello()
+            advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+            advertiseDecoderLimits() // Also before type 8, for the same reason
+            advertiseFrameMetadataSupport()
+            lastKeyframeReceivedNs = 0L
+            synchronized(keyframeRequestLock) {
+                lastKeyframeRequestNs = 0L
+            }
+
+            ensureOpen()
+            diagLog("Connected to $host:$port mode=${connectionMode.displayName}")
+            publishConnected()
+
+            connectControlChannel()
+            receiveData()
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Connection error", e)
+            disconnect()
+            throw e
         }
+    }
 
     sealed class WirelessConnectError(msg: String) : Exception(msg) {
         object NetworkUnreachable : WirelessConnectError("Mac unreachable — check both on same WiFi")
 
         object TokenRejected : WirelessConnectError("Token rejected — re-pair required")
 
-        object ProtocolError : WirelessConnectError("Connection error, please rescan QR")
+        object ProtocolError : WirelessConnectError("The Mac bridge rejected the connection")
     }
 
     /**
@@ -187,130 +201,169 @@ class StreamClient(
         token: ByteArray,
         deviceName: String,
     ) = withContext(Dispatchers.IO) {
-        Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
+        try {
+            ensureOpen()
+            Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
 
-        // Force the socket onto the active WiFi network. On some Android setups
-        // (especially LG/Android 12), an app's default outbound socket may take
-        // a route that silently drops LAN traffic; binding to the WIFI Network
-        // explicitly avoids that.
-        val s =
-            try {
-                val sock = Socket()
-                WirelessTransportProfile.tuneVideoSocket(sock)
-                val wifiRoute = context?.let { WirelessTransportProfile.findWifiRoute(it) }
-                if (wifiRoute != null && WirelessTransportProfile.bindSocket(sock, wifiRoute)) {
-                    controlChannel.bindTo(wifiRoute.network)
-                    Log.i(
+            // Force the socket onto the active WiFi network. On some Android
+            // setups (especially LG/Android 12), an app's default outbound
+            // socket may take a route that silently drops LAN traffic;
+            // binding to the WIFI Network explicitly avoids that.
+            val s =
+                try {
+                    val sock = Socket()
+                    try {
+                        WirelessTransportProfile.tuneVideoSocket(sock)
+                        val wifiRoute = context?.let { WirelessTransportProfile.findWifiRoute(it) }
+                        if (wifiRoute != null && WirelessTransportProfile.bindSocket(sock, wifiRoute)) {
+                            controlChannel.bindTo(wifiRoute.network)
+                            Log.i(
+                                TAG,
+                                "connectWireless: bound video/control to WiFi " +
+                                    "route=${wifiRoute.network} down=${wifiRoute.downstreamKbps}kbps " +
+                                    "up=${wifiRoute.upstreamKbps}kbps validated=${wifiRoute.validated}",
+                            )
+                        } else if (wifiRoute != null) {
+                            Log.w(TAG, "connectWireless: WiFi route binding failed, using default routing")
+                        } else {
+                            Log.w(TAG, "connectWireless: no WiFi route found, using default routing")
+                        }
+                        sock.connect(java.net.InetSocketAddress(host, port), VIDEO_CONNECT_TIMEOUT_MS)
+                        sock
+                    } catch (error: Exception) {
+                        runCatching { sock.close() }
+                        throw error
+                    }
+                } catch (e: java.net.SocketTimeoutException) {
+                    Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port (5s)")
+                    throw WirelessConnectError.NetworkUnreachable
+                } catch (e: IOException) {
+                    Log.e(
                         TAG,
-                        "connectWireless: bound video/control to WiFi " +
-                            "route=${wifiRoute.network} down=${wifiRoute.downstreamKbps}kbps " +
-                            "up=${wifiRoute.upstreamKbps}kbps validated=${wifiRoute.validated}",
+                        "connectWireless: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}",
                     )
-                } else if (wifiRoute != null) {
-                    Log.w(TAG, "connectWireless: WiFi route binding failed, using default routing")
-                } else {
-                    Log.w(TAG, "connectWireless: no WiFi route found, using default routing")
+                    throw WirelessConnectError.NetworkUnreachable
                 }
-                sock.connect(java.net.InetSocketAddress(host, port), 5000)
-                sock
-            } catch (e: java.net.SocketTimeoutException) {
-                Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port (5s)")
-                throw WirelessConnectError.NetworkUnreachable
+            ensureOpen()
+            Log.i(
+                TAG,
+                "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",
+            )
+
+            val request = AuthHandshake.encodeRequest(token, deviceName)
+            try {
+                s.getOutputStream().write(request)
+                s.getOutputStream().flush()
             } catch (e: IOException) {
-                Log.e(
-                    TAG,
-                    "connectWireless: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}",
-                )
+                runCatching { s.close() }
                 throw WirelessConnectError.NetworkUnreachable
             }
-        Log.i(
-            TAG,
-            "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",
-        )
 
-        val request = AuthHandshake.encodeRequest(token, deviceName)
-        try {
-            s.getOutputStream().write(request)
-            s.getOutputStream().flush()
-        } catch (e: IOException) {
+            val responseBuf = ByteArray(5)
+            var read = 0
             try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            throw WirelessConnectError.NetworkUnreachable
-        }
-
-        val responseBuf = ByteArray(5)
-        var read = 0
-        try {
-            while (read < 5) {
-                val r = s.getInputStream().read(responseBuf, read, 5 - read)
-                if (r <= 0) break
-                read += r
-            }
-        } catch (e: IOException) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            throw WirelessConnectError.NetworkUnreachable
-        }
-        if (read != 5) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            throw WirelessConnectError.ProtocolError
-        }
-
-        val status =
-            AuthHandshake.parseResponse(responseBuf) ?: run {
-                try {
-                    s.close()
-                } catch (_: IOException) {
+                while (read < 5) {
+                    val r = s.getInputStream().read(responseBuf, read, 5 - read)
+                    if (r <= 0) break
+                    read += r
                 }
+            } catch (e: IOException) {
+                runCatching { s.close() }
+                throw WirelessConnectError.NetworkUnreachable
+            }
+            if (read != 5) {
+                runCatching { s.close() }
                 throw WirelessConnectError.ProtocolError
             }
-        Log.i(TAG, "connectWireless: handshake response status=$status")
-        when (status) {
-            AuthHandshake.ResponseStatus.OK -> {
-                socket = s
-                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES))
-                outputStream = java.io.DataOutputStream(s.getOutputStream())
-                streamCodecIsHevc = true
-                codecNegotiated = false
-                macToAndroidOffsetNs = null
-                videoClockSyncReady = false
-                videoClockSyncEstimator = ClockOffsetEstimator()
-                advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
-                advertiseDecoderLimits() // Also before type 8, for the same reason
-                advertiseFrameMetadataSupport()
-                isConnected = true
-                diagLog(
-                    "Wireless connected to $host:$port " +
-                        "profile=${WirelessTransportProfile.TARGET_FPS}fps " +
-                        "rcvBuf=${runCatching { s.receiveBufferSize }.getOrDefault(-1)} " +
-                        "streamBuf=${WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES / 1024}KiB",
-                )
-                onConnectionStatus?.invoke(true)
-                connectControlChannel()
-                receiveData()
-            }
-            AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
-                try {
-                    s.close()
-                } catch (_: IOException) {
+
+            val status =
+                AuthHandshake.parseResponse(responseBuf) ?: run {
+                    runCatching { s.close() }
+                    throw WirelessConnectError.ProtocolError
                 }
-                throw WirelessConnectError.TokenRejected
-            }
-            else -> {
-                try {
-                    s.close()
-                } catch (_: IOException) {
+            Log.i(TAG, "connectWireless: handshake response status=$status")
+            when (status) {
+                AuthHandshake.ResponseStatus.OK -> {
+                    synchronized(stateLock) {
+                        if (closeRequested) {
+                            s.close()
+                            throw IOException("connection cancelled")
+                        }
+                        socket = s
+                    }
+                    inputStream =
+                        DataInputStream(
+                            java.io.BufferedInputStream(
+                                s.getInputStream(),
+                                WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES,
+                            ),
+                        )
+                    outputStream = java.io.DataOutputStream(s.getOutputStream())
+                    resetProtocolState()
+                    sendConnectionModeHello()
+                    advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                    advertiseDecoderLimits() // Also before type 8, for the same reason
+                    advertiseFrameMetadataSupport()
+                    ensureOpen()
+                    diagLog(
+                        "Wireless connected to $host:$port mode=${connectionMode.displayName} " +
+                            "profile=${WirelessTransportProfile.TARGET_FPS}fps " +
+                            "rcvBuf=${runCatching { s.receiveBufferSize }.getOrDefault(-1)} " +
+                            "streamBuf=${WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES / 1024}KiB",
+                    )
+                    publishConnected()
+                    connectControlChannel()
+                    receiveData()
                 }
-                throw WirelessConnectError.ProtocolError
+                AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
+                    runCatching { s.close() }
+                    throw WirelessConnectError.TokenRejected
+                }
+                else -> {
+                    runCatching { s.close() }
+                    throw WirelessConnectError.ProtocolError
+                }
             }
+        } catch (e: WirelessConnectError) {
+            disconnect()
+            throw e
+        } catch (e: Exception) {
+            disconnect()
+            throw e
         }
+    }
+
+    private fun ensureOpen() {
+        synchronized(stateLock) {
+            if (closeRequested) throw IOException("connection cancelled")
+        }
+    }
+
+    private fun publishConnected() {
+        synchronized(stateLock) {
+            if (closeRequested) throw IOException("connection cancelled")
+            isConnected = true
+            connectionStatusSent = true
+        }
+        onConnectionStatus?.invoke(true)
+    }
+
+    private fun resetProtocolState() {
+        streamCodecIsHevc = true
+        codecNegotiated = false
+        macToAndroidOffsetNs = null
+        videoClockSyncReady = false
+        videoClockSyncEstimator = ClockOffsetEstimator()
+    }
+
+    /** Send the mode before the normal V1 capability bytes. V1 hosts safely
+     * skip the marked bytes; current hosts use them to reject a mismatched Mac
+     * mode before a decoder or display is created. */
+    private fun sendConnectionModeHello() {
+        val out = outputStream ?: throw IOException("video output is unavailable")
+        out.write(ConnectionModeHandshake.encodeClientHello(connectionMode))
+        out.flush()
+        diagLog("Sent connection mode hello: ${connectionMode.displayName}")
     }
 
     /** Best-effort: opens the out-of-band control channel after the video
@@ -410,6 +463,19 @@ class StreamClient(
                             receiveVideoFrame(input, hasMetadata = true, hasTrace = true)
                         }
 
+                        ConnectionModeHandshake.SERVER_RESULT_TYPE -> {
+                            val result = ConnectionModeHandshake.decodeServerResult(
+                                type = type.toInt(),
+                                resultCode = input.readUnsignedByte(),
+                                encodedExpectedMode = input.readUnsignedByte(),
+                            ) ?: throw IOException("Malformed connection-mode admission response")
+                            onModeAdmission?.invoke(result)
+                            if (!result.accepted) {
+                                throw IOException(ConnectionModeHandshake.failureMessage(result))
+                            }
+                            diagLog("Mac accepted connection mode: ${result.expectedMode.displayName}")
+                        }
+
                         1 -> {
                             val width = input.readInt()
                             val height = input.readInt()
@@ -493,13 +559,14 @@ class StreamClient(
                                 TAG,
                                 "Unknown message type: ${type.toInt()}, stream may be misaligned — disconnecting",
                             )
-                            break
+                            throw IOException("Unknown video message type: ${type.toInt()}")
                         }
                     }
                 }
             } catch (e: IOException) {
                 if (isConnected) {
                     Log.e(TAG, "❌ Read error", e)
+                    onTransportFailure?.invoke(e.message ?: "Video transport closed")
                 }
             } finally {
                 disconnect()
@@ -707,7 +774,7 @@ class StreamClient(
         diagFrameCount++
         if (diagFrameCount == 1L) {
             diagLog(
-            "First video frame: size=$frameSize, keyframe=$isKeyframe, " +
+                "First video frame: size=$frameSize, keyframe=$isKeyframe, " +
                     "metadata=$hasMetadata trace=$hasTrace callback=${onFrameReceived != null}",
             )
         }
@@ -754,13 +821,24 @@ class StreamClient(
     }
 
     fun disconnect() {
-        isConnected = false
+        val notifyDisconnected: Boolean
+        synchronized(stateLock) {
+            if (closeRequested) return
+            closeRequested = true
+            isConnected = false
+            notifyDisconnected = connectionStatusSent
+            connectionStatusSent = false
+        }
         cleanup()
-        onConnectionStatus?.invoke(false)
+        if (notifyDisconnected) onConnectionStatus?.invoke(false)
         Log.d(TAG, "Disconnected")
     }
 
     private fun cleanup() {
+        synchronized(stateLock) {
+            if (resourcesCleaned) return
+            resourcesCleaned = true
+        }
         try {
             outputStream?.close()
             inputStream?.close()
@@ -798,6 +876,7 @@ class StreamClient(
         private const val MESSAGE_VIDEO_FRAME = 0
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
         private const val MESSAGE_VIDEO_FRAME_WITH_TRACE = 14
+        private const val VIDEO_CONNECT_TIMEOUT_MS = 5_000
         private const val MESSAGE_KEYFRAME_REQUEST = 7
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_TRACE = 13
