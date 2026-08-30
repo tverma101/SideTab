@@ -1,0 +1,51 @@
+name: Stress and Sanitizers
+
+on:
+  schedule:
+    - cron: "17 8 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stress-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  swift-thread-sanitizer:
+    name: Swift Thread Sanitizer
+    runs-on: macos-14
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: MacHost
+    steps:
+      - uses: actions/checkout@v4
+      - name: Thread-sanitized tests
+        run: swift test -c debug --sanitize=thread
+
+  android-repeat:
+    name: Android JVM repeat x5
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: AndroidClient
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+      - name: Repeat the JVM suite to expose flaky races
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run in 1 2 3 4 5; do
+            echo "===== Android JVM stress run $run/5 ====="
+            ./gradlew --no-daemon --stacktrace testDebugUnitTest --rerun-tasks
+          done
