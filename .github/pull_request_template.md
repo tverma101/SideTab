@@ -4,12 +4,13 @@ Brief description of the changes in this PR.
 
 ## Type of Change
 
-- [ ] Bug fix (non-breaking change that fixes an issue)
-- [ ] New feature (non-breaking change that adds functionality)
-- [ ] Breaking change (fix or feature that would cause existing functionality to change)
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Breaking change
 - [ ] Documentation update
 - [ ] Code refactoring
 - [ ] Performance improvement
+- [ ] Test / CI infrastructure
 
 ## Related Issue
 
@@ -21,14 +22,31 @@ Fixes #(issue number)
 - Change 2
 - Change 3
 
-## Testing
+## Hosted CI
 
-Describe how you tested your changes:
+These should be green unless the PR documents why a check is temporarily advisory:
 
-- [ ] Tested on macOS [version]
-- [ ] Tested on Android [device/version]
-- [ ] Tested USB connection
-- [ ] Tested streaming performance
+- [ ] Repository contracts
+- [ ] Android JVM + lint + APK
+- [ ] macOS Swift tests + release build
+- [ ] CodeQL findings reviewed when applicable
+
+## Hardware / Runtime Testing
+
+Only check what this PR actually requires. Hosted CI is not proof of display/codec behavior.
+
+- [ ] Not required for this change
+- [ ] Tested on macOS [version / hardware]
+- [ ] Tested on Android [device / version]
+- [ ] USB / ADB interruption or reconnect tested
+- [ ] Wireless loss / reconnect tested
+- [ ] Surface / decoder lifecycle tested
+- [ ] Screen-off / process-lifecycle tested
+- [ ] Objective quality / cadence receipt attached
+
+Receipt / exact binary or commit:
+
+<!-- Paste concise runtime evidence here. -->
 
 ## Screenshots (if applicable)
 
@@ -36,11 +54,11 @@ Add screenshots for UI changes.
 
 ## Checklist
 
-- [ ] My code follows the project's coding standards
-- [ ] I have tested my changes thoroughly
-- [ ] I have updated documentation if needed
-- [ ] My changes don't introduce new warnings
-- [ ] I have added comments for complex logic
+- [ ] I kept the change scoped and generation/session-safe where applicable
+- [ ] I added or updated deterministic tests for changed behavior
+- [ ] I updated documentation if behavior or architecture changed
+- [ ] I did not add secrets, signing material, device credentials, or local artifacts
+- [ ] I reviewed failure/teardown paths, not only the happy path
 
 ## Additional Notes
 
