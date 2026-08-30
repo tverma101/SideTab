@@ -57,6 +57,28 @@ class SessionControllerTest {
     }
 
     @Test
+    fun readinessFailureInvalidatesTransportBeforeTeardown() {
+        val controller = SessionController()
+        val generation = controller.begin(ConnectionMode.USB)
+        controller.transportConnected(generation)
+        controller.protocolNegotiated(generation)
+        controller.displayConfigured(generation)
+        controller.decoderStarted(generation)
+
+        assertTrue(
+            controller.fail(
+                generation,
+                "Mac accepted the connection, but no video frame was rendered.",
+                SessionLifecyclePolicy.EndReason.VIDEO_TRANSPORT_LOST,
+            ),
+        )
+        assertTrue(controller.state is SessionController.State.Failed)
+        assertFalse(controller.hasTransport())
+        assertFalse(controller.isCurrent(generation))
+        assertFalse(controller.surfaceRendered(generation))
+    }
+
+    @Test
     fun hostSuspendInvalidatesPixelsAndStaleCallbacksCannotRestoreStreaming() {
         val controller = SessionController()
         val generation = controller.begin(ConnectionMode.WIRELESS)

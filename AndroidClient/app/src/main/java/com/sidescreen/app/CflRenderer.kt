@@ -404,6 +404,7 @@ class CflRenderer {
     private var surfaceH = 0
 
     private fun drawFrame() {
+        refreshSurfaceSize()
         GLES31.glViewport(0, 0, surfaceW, surfaceH)
         GLES31.glUseProgram(program)
         GLES31.glUniform2f(srcSizeLoc, codedWidth.toFloat(), codedHeight.toFloat())
@@ -430,6 +431,31 @@ class CflRenderer {
         GLES31.glDisableVertexAttribArray(aTexLoc)
 
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+    }
+
+    /** Keep the GL viewport aligned with a SurfaceView that expands when the
+     * stream-only presentation hides Android's system bars. */
+    private fun refreshSurfaceSize() {
+        val queryW = IntArray(1)
+        val queryH = IntArray(1)
+        if (!EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_WIDTH, queryW, 0) ||
+            !EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_HEIGHT, queryH, 0)
+        ) {
+            return
+        }
+        val width = queryW[0]
+        val height = queryH[0]
+        if (width <= 0 || height <= 0 || (width == surfaceW && height == surfaceH)) {
+            return
+        }
+        val oldWidth = surfaceW
+        val oldHeight = surfaceH
+        surfaceW = width
+        surfaceH = height
+        DiagLog.log(
+            TAG,
+            "window surface resized ${oldWidth}x$oldHeight -> ${width}x$height",
+        )
     }
 
     private fun recordFrame(nanos: Long) {

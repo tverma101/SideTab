@@ -68,6 +68,7 @@ private extension NWEndpoint {
 class StreamingServer {
     private let port: UInt16
     private let serviceName: String
+    private let connectionMode: ConnectionMode
     private var listener: NWListener?
     private var connection: NWConnection?
 
@@ -148,10 +149,16 @@ class StreamingServer {
     private var enqueueToSendCompleteLatency = LatencyPercentiles()
     private var lastCompletedFrameID: UInt64 = 0
 
-    init(port: UInt16, controlPort: UInt16? = nil, serviceName: String = "SideScreen") {
+    init(
+        port: UInt16,
+        controlPort: UInt16? = nil,
+        serviceName: String = "SideScreen",
+        connectionMode: ConnectionMode = .usb
+    ) {
         self.port = port
         self.controlPort = controlPort ?? port + 1
         self.serviceName = serviceName
+        self.connectionMode = connectionMode
     }
 
     func start(initiallySuspended: Bool = false) {
@@ -170,7 +177,12 @@ class StreamingServer {
             }
 
             listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
-            listener?.service = NWListener.Service(name: serviceName, type: "_sidescreen._tcp")
+            // Bonjour is a wireless discovery surface. Do not advertise a
+            // USB-only listener, otherwise a stale wireless pairing can find
+            // it even though the selected Mac mode is USB.
+            if connectionMode == .wireless {
+                listener?.service = NWListener.Service(name: serviceName, type: "_sidescreen._tcp")
+            }
 
             listener?.newConnectionHandler = { [weak self] newConnection in
                 self?.handleConnection(newConnection)
@@ -287,6 +299,14 @@ class StreamingServer {
 
     private func handleControlConnection(_ newConnection: NWConnection) {
         debugLog("Control connection incoming")
+        guard ConnectionModeAdmission.accepts(
+            connectionMode,
+            peerIsLoopback: newConnection.endpoint.isLoopback
+        ) else {
+            debugLog("Rejecting control client: \(ConnectionModeAdmission.rejectionMessage(connectionMode))")
+            newConnection.cancel()
+            return
+        }
         if let old = controlConnection {
             old.cancel()
         }
@@ -509,6 +529,14 @@ class StreamingServer {
             newConnection.cancel()
             return
         }
+        guard ConnectionModeAdmission.accepts(
+            connectionMode,
+            peerIsLoopback: newConnection.endpoint.isLoopback
+        ) else {
+            debugLog("Rejecting video client: \(ConnectionModeAdmission.rejectionMessage(connectionMode))")
+            newConnection.cancel()
+            return
+        }
         if connectionReady, connection != nil {
             debugLog("Live client streaming — new connection held as contender until it speaks")
             armContender(newConnection)
@@ -646,7 +674,13 @@ class StreamingServer {
     }
 
     private func onConnectionReady(_ conn: NWConnection) {
-        if conn.endpoint.isLoopback {
+        let peerIsLoopback = conn.endpoint.isLoopback
+        guard ConnectionModeAdmission.accepts(connectionMode, peerIsLoopback: peerIsLoopback) else {
+            debugLog("Rejecting ready client: \(ConnectionModeAdmission.rejectionMessage(connectionMode))")
+            conn.cancel()
+            return
+        }
+        if connectionMode == .usb {
             debugLog("Client connected via loopback (USB) — skipping auth")
             beginExistingProtocol(on: conn)
             return

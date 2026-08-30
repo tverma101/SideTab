@@ -77,6 +77,10 @@ The Android client keeps a normal app shell while idle: system bars, the user's 
 
 The USB checklist is intentionally advisory. `UsbManager.deviceList` describes Android acting as a USB host, while SideScreen's ADB-reverse route has the Mac as host and the tablet as the USB device. Tap **Connect** to verify the actual route; the checklist does not probe the Mac listener in the background.
 
+Transport selection is strict: USB connects only through the local ADB-reverse endpoint while the Mac is serving USB, and wireless connects only to the authenticated LAN listener while the Mac is serving wireless. SideScreen does not silently fall back between stale wireless addresses and USB, and a failed handshake stays in the Android shell with an actionable retry message. See [the PR #43 connectivity troubleshooting record](docs/troubleshooting/pr43-connectivity.md) for the failure modes and validation evidence.
+
+For a compact operator reference, see the [UI control and resource-impact map](docs/ui-control-impact.md): it records what each button or setting does and which actions add transient or sustained CPU/GPU/network work.
+
 Decoder selection and frame timing are recorded in the Android diagnostic log: codec hardware/vendor/software classification, supported size/rate, low-latency feature, profiles, configure fallback, codec metrics, output release, and `OnFrameRenderedListener` timing. The Mac log separately reports WindowServer display-time → ScreenCaptureKit callback delay and the later encode/send stages. See [docs/android-session-lifecycle.md](docs/android-session-lifecycle.md) for the state contract and evidence checklist.
 
 ### Ultra-Low Latency

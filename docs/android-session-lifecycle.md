@@ -60,6 +60,25 @@ The checklist therefore reports the USB route and Mac listener as “verified
 when you tap Connect.” It still reports local Developer Mode and ADB settings,
 but it never opens a background probe that could contend with the real client.
 
+## Transport admission and presentation geometry
+
+The selected transport is an admission boundary, not only a UI preference:
+
+- USB uses the local ADB-reverse endpoint (`127.0.0.1`/`::1`). The Mac USB
+  listener accepts loopback only and does not advertise a Bonjour service.
+- Wireless uses the paired endpoint or `_sidescreen._tcp.` discovery. The Mac
+  wireless listener accepts authenticated non-loopback LAN peers only.
+- A cached wireless address cannot silently become a USB connection, and a
+  USB reverse endpoint cannot silently become a wireless connection. A mode
+  mismatch is rejected before protocol state is changed.
+
+Android enters fullscreen only after the current generation has rendered a
+  frame. The decoder and optional EGL bridge may be initialized while system
+  bar insets still exist; the renderer therefore re-queries the live window
+  surface and updates its viewport when the presentation surface expands.
+  This prevents a stale inset-sized viewport from leaving a black strip on the
+  tablet after the bars are hidden.
+
 ## Runtime evidence
 
 For an installed run, collect:

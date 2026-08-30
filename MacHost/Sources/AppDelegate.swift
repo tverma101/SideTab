@@ -972,7 +972,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer = StreamingServer(
                 port: settings.port,
                 controlPort: controlPort,
-                serviceName: advertisedName
+                serviceName: advertisedName,
+                connectionMode: settings.connectionMode
             )
             setTouchEnabledCache(settings.touchEnabled)
             if let displayID = virtualDisplayManager?.displayID {

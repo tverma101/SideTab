@@ -530,8 +530,14 @@ class SgsrRenderer(
     fun release() {
         running = false
         synchronized(frameLock) { frameLock.notifyAll() }
-        renderThread?.join(1500)
+        val thread = renderThread
+        thread?.join(1500)
         renderThread = null
+        // initialize() can fail before the render thread is created (for
+        // example when a SurfaceView is still owned by another producer).
+        // In that case the old release path leaked the partially-created EGL
+        // context/display, making a later fallback inherit bad surface state.
+        if (thread == null) teardownGl()
         onStats = null
     }
 
@@ -589,6 +595,7 @@ class SgsrRenderer(
                 backlog++
             }
             if (!waitForPresentationSlot()) break
+            refreshDisplaySize()
             if (backlog > 0) {
                 renderFrame(backlog - 1)
             } else {
@@ -598,6 +605,42 @@ class SgsrRenderer(
             }
         }
         teardownGl()
+    }
+
+    /**
+     * A SurfaceView can be resized after this renderer is initialized. The
+     * session enters fullscreen only after the first rendered frame, so the
+     * EGL window may initially report the inset content height and then grow
+     * to the full panel. Keep the viewport and size-dependent shader choice in
+     * sync with the actual window surface instead of leaving a stale black
+     * strip after the system bars disappear.
+     *
+     * This runs on the render thread, where the EGL surface is current.
+     */
+    private fun refreshDisplaySize() {
+        val queryW = IntArray(1)
+        val queryH = IntArray(1)
+        if (!EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_WIDTH, queryW, 0) ||
+            !EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_HEIGHT, queryH, 0)
+        ) {
+            return
+        }
+        val width = queryW[0]
+        val height = queryH[0]
+        if (width <= 0 || height <= 0 || (width == displayWidth && height == displayHeight)) {
+            return
+        }
+        val oldWidth = displayWidth
+        val oldHeight = displayHeight
+        displayWidth = width
+        displayHeight = height
+        // Exact-size bridge vs. scaled bridge is selected from the output
+        // dimensions, so rebuild only when the window really changed.
+        compilePostProgram()
+        DiagLog.log(
+            "SGSR",
+            "window surface resized ${oldWidth}x$oldHeight -> ${width}x$height",
+        )
     }
 
     private fun waitForPresentationSlot(): Boolean {
@@ -921,27 +964,35 @@ class SgsrRenderer(
     }
 
     private fun teardownGl() {
-        if (postProgram != 0) {
-            GLES31.glDeleteProgram(postProgram)
-            postProgram = 0
+        val canDeleteGlObjects =
+            eglDisplay != EGL14.EGL_NO_DISPLAY &&
+                eglContext != EGL14.EGL_NO_CONTEXT &&
+                EGL14.eglGetCurrentContext() == eglContext
+        if (canDeleteGlObjects) {
+            if (postProgram != 0) {
+                GLES31.glDeleteProgram(postProgram)
+                postProgram = 0
+            }
+            if (blitProgram != 0) {
+                GLES31.glDeleteProgram(blitProgram)
+                blitProgram = 0
+            }
+            if (fboId != 0) {
+                GLES31.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
+                fboId = 0
+            }
+            if (oesTextureId != 0 || fboTextureId != 0) {
+                GLES31.glDeleteTextures(2, intArrayOf(oesTextureId, fboTextureId), 0)
+                oesTextureId = 0
+                fboTextureId = 0
+            }
+            if (gpuQuery != 0) {
+                GLES30.glDeleteQueries(1, intArrayOf(gpuQuery), 0)
+                gpuQuery = 0
+            }
         }
-        if (blitProgram != 0) {
-            GLES31.glDeleteProgram(blitProgram)
-            blitProgram = 0
-        }
-        if (fboId != 0) {
-            GLES31.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
-            fboId = 0
-        }
-        if (oesTextureId != 0 || fboTextureId != 0) {
-            GLES31.glDeleteTextures(2, intArrayOf(oesTextureId, fboTextureId), 0)
-            oesTextureId = 0
-            fboTextureId = 0
-        }
-        if (gpuQuery != 0) {
-            GLES30.glDeleteQueries(1, intArrayOf(gpuQuery), 0)
-            gpuQuery = 0
-        }
+        // These objects are valid to release even when initialization stopped
+        // before an EGL context became current.
         surfaceTexture?.setOnFrameAvailableListener(null)
         surfaceTexture?.release()
         surfaceTexture = null
@@ -961,6 +1012,14 @@ class SgsrRenderer(
             EGL14.eglTerminate(eglDisplay)
             eglDisplay = EGL14.EGL_NO_DISPLAY
         }
+        // A failed initialization may have stopped before allocating all GL
+        // objects. Reset the handles so release() remains idempotent.
+        postProgram = 0
+        blitProgram = 0
+        fboId = 0
+        oesTextureId = 0
+        fboTextureId = 0
+        gpuQuery = 0
         DiagLog.log("SGSR", "teardown complete")
     }
 

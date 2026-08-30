@@ -222,6 +222,10 @@ class StreamClient(
                     Log.w(TAG, "connectWireless: no WiFi route found, using default routing")
                 }
                 sock.connect(java.net.InetSocketAddress(host, port), 5000)
+                // The TCP connect timeout does not cover the authenticated
+                // response. Bound that read too so a half-open Mac listener
+                // cannot hold the Activity in Connecting forever.
+                sock.soTimeout = 5_000
                 sock
             } catch (e: java.net.SocketTimeoutException) {
                 Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port (5s)")
@@ -258,6 +262,12 @@ class StreamClient(
                 if (r <= 0) break
                 read += r
             }
+        } catch (e: java.net.SocketTimeoutException) {
+            try {
+                s.close()
+            } catch (_: IOException) {
+            }
+            throw WirelessConnectError.ProtocolError
         } catch (e: IOException) {
             try {
                 s.close()
@@ -284,6 +294,7 @@ class StreamClient(
         Log.i(TAG, "connectWireless: handshake response status=$status")
         when (status) {
             AuthHandshake.ResponseStatus.OK -> {
+                s.soTimeout = 0
                 socket = s
                 inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES))
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
