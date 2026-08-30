@@ -793,7 +793,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // via `defaults write com.sidescreen.app SideScreen_controlPort -int N`.
             let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
             let controlPort: UInt16 = controlOverride > 0 ? UInt16(controlOverride) : settings.port + 1
-            streamingServer = StreamingServer(port: settings.port, controlPort: controlPort)
+            streamingServer = StreamingServer(
+                port: settings.port,
+                controlPort: controlPort,
+                expectedConnectionMode: settings.connectionMode
+            )
             setTouchEnabledCache(settings.touchEnabled)
             if let displayID = virtualDisplayManager?.displayID {
                 setTouchDisplayBounds(CGDisplayBounds(displayID))

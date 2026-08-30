@@ -152,7 +152,7 @@ class ControlChannel(
             while (running && socket === s) {
                 val type = input.readByte().toInt()
                 val arrival = System.nanoTime()
-                    when (type) {
+                when (type) {
                     5 -> { // Pong: [clientTs 8][serverSendTs 8]
                         // New hosts return t0, t1=Mac receive, t2=Mac send.
                         // Old hosts return only t0 and t2; capability is sent

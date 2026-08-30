@@ -9,6 +9,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Five-state UI machine for the Wireless tab on Android.
@@ -47,6 +48,7 @@ class WirelessTabController(
         val forgetButton: Button,
         val reconnectButton: Button,
         val idleForgetButton: Button,
+        val repairReconnectButton: Button,
         val openSettingsButton: Button,
         val connectedMacName: TextView,
         val connectedMacIp: TextView,
@@ -62,6 +64,8 @@ class WirelessTabController(
 
     private var state: State = State.FIRST_TIME
     private var pendingPairingSave: Job? = null
+    private var pendingStorageLoad: Job? = null
+    private var lastKnownEntry: PairedHostStorage.Entry? = null
 
     fun bind() {
         views.scanButton.setOnClickListener { triggerScan() }
@@ -69,15 +73,8 @@ class WirelessTabController(
         views.openSettingsButton.setOnClickListener { cameraPerm.openAppSettings() }
         views.forgetButton.setOnClickListener { forgetPairing() }
         views.idleForgetButton.setOnClickListener { forgetPairing() }
-        views.reconnectButton.setOnClickListener {
-            val entry =
-                storage.load() ?: run {
-                    transition(State.FIRST_TIME)
-                    return@setOnClickListener
-                }
-            showConnecting("Reconnecting to ${entry.macName}", "${entry.host}:${entry.port}")
-            attemptAutoConnect(entry)
-        }
+        views.reconnectButton.setOnClickListener { reconnect() }
+        views.repairReconnectButton.setOnClickListener { reconnect() }
     }
 
     private fun forgetPairing() {
@@ -86,7 +83,10 @@ class WirelessTabController(
         // before clear() or the background save could resurrect credentials.
         pendingPairingSave?.cancel()
         pendingPairingSave = null
-        storage.clear()
+        pendingStorageLoad?.cancel()
+        pendingStorageLoad = null
+        lastKnownEntry = null
+        activity.lifecycleScope.launch(Dispatchers.IO) { storage.clear() }
         transition(State.FIRST_TIME)
     }
 
@@ -95,18 +95,14 @@ class WirelessTabController(
      * Move the UI to a clean "paired but idle" state showing the Mac info + Reconnect button.
      */
     fun onStreamDisconnected() {
-        android.util.Log.i(
-            "WirelessTabController",
-            "onStreamDisconnected called, current state=$state, storage entry exists=${storage.load() != null}",
-        )
-        val entry =
-            storage.load() ?: run {
+        android.util.Log.i("WirelessTabController", "onStreamDisconnected called, current state=$state")
+        loadStoredEntry { entry ->
+            if (entry == null) {
                 transition(State.FIRST_TIME)
-                return
+            } else {
+                showPairedIdle(entry)
             }
-        views.idleMacName.text = entry.macName
-        views.idleMacIp.text = "${entry.host}:${entry.port}"
-        transition(State.PAIRED_IDLE)
+        }
     }
 
     private fun transition(next: State) {
@@ -131,20 +127,29 @@ class WirelessTabController(
     fun show() {
         when {
             cameraPerm.isPermanentlyDenied() -> transition(State.PERM_DENIED)
-            storage.load() == null -> transition(State.FIRST_TIME)
-            else -> {
-                val entry = storage.load()!!
-                views.idleMacName.text = entry.macName
-                views.idleMacIp.text = "${entry.host}:${entry.port}"
-                transition(State.PAIRED_IDLE)
+            state == State.CONNECTING || state == State.CONNECTED -> Unit
+            else -> loadStoredEntry { entry ->
+                if (entry == null) {
+                    transition(State.FIRST_TIME)
+                } else {
+                    showPairedIdle(entry)
+                }
             }
         }
     }
 
     fun onScanResult(url: String) {
-        val parsed = PairingURL.parse(url) ?: return
+        val parsed = PairingURL.parse(url)
+        if (parsed == null) {
+            views.repairTitle.text = "⚠ Invalid QR code"
+            views.repairMessage.text = "This is not a Side Screen pairing code. Scan the QR shown in the Mac app."
+            views.repairReconnectButton.visibility = if (lastKnownEntry == null) View.GONE else View.VISIBLE
+            transition(State.REPAIR_NEEDED)
+            return
+        }
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
         val entry = PairedHostStorage.Entry(parsed.host, parsed.port, parsed.token, parsed.macName)
+        lastKnownEntry = entry.defensiveCopy()
 
         // First-time AndroidKeyStore creation may involve secure hardware. Do
         // not make QR completion or connection startup wait on that disk/crypto
@@ -161,10 +166,14 @@ class WirelessTabController(
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
     }
 
-    fun onConnectError(error: StreamClient.WirelessConnectError) {
-        val cached = storage.load()
+    fun onConnectError(
+        error: StreamClient.WirelessConnectError,
+        detail: String? = null,
+    ) {
+        val cached = lastKnownEntry
         when (error) {
             is StreamClient.WirelessConnectError.NetworkUnreachable -> {
+                views.repairReconnectButton.visibility = if (cached == null) View.GONE else View.VISIBLE
                 views.repairTitle.text = "⚠ Couldn't reach Mac"
                 views.repairMessage.text =
                     if (cached != null) {
@@ -178,6 +187,7 @@ class WirelessTabController(
                 transition(State.REPAIR_NEEDED)
             }
             is StreamClient.WirelessConnectError.TokenRejected -> {
+                views.repairReconnectButton.visibility = View.GONE
                 views.repairTitle.text = "⚠ Re-pair required"
                 views.repairMessage.text =
                     if (cached != null) {
@@ -189,8 +199,15 @@ class WirelessTabController(
                 transition(State.REPAIR_NEEDED)
             }
             is StreamClient.WirelessConnectError.ProtocolError -> {
+                views.repairReconnectButton.visibility = if (cached == null) View.GONE else View.VISIBLE
                 views.repairTitle.text = "⚠ Connection error"
-                views.repairMessage.text = "Couldn't complete the secure handshake with the Mac. Scan the QR again."
+                val bridgeDetail = detail?.takeIf { it.isNotBlank() }
+                views.repairMessage.text = buildString {
+                    append("The Mac bridge rejected or closed the connection before streaming started.")
+                    if (bridgeDetail != null) append("\n\n").append(bridgeDetail)
+                    append("\n\nConfirm Side Screen is running on the Mac in Wireless mode, then tap Reconnect.")
+                    append(" Scan a new QR only if the Mac pairing token or address changed.")
+                }
                 transition(State.REPAIR_NEEDED)
             }
         }
@@ -205,13 +222,62 @@ class WirelessTabController(
         transition(State.CONNECTING)
     }
 
-    fun onConnectSuccess(
-        macName: String,
-        ip: String,
-    ) {
-        views.connectedMacName.text = macName
-        views.connectedMacIp.text = ip
-        transition(State.CONNECTED)
+    fun onConnectSuccess() {
+        val entry = lastKnownEntry
+        if (entry != null) {
+            views.repairReconnectButton.visibility = View.GONE
+            views.connectedMacName.text = entry.macName
+            views.connectedMacIp.text = "${entry.host}:${entry.port}"
+            transition(State.CONNECTED)
+            return
+        }
+        // A pairing read is still allowed as a fallback, but it stays off the
+        // main thread. This path is only reachable after an unusual lifecycle
+        // race where the cached entry was not populated yet.
+        loadStoredEntry { loaded ->
+            if (loaded == null) {
+                transition(State.FIRST_TIME)
+            } else {
+                views.repairReconnectButton.visibility = View.GONE
+                views.connectedMacName.text = loaded.macName
+                views.connectedMacIp.text = "${loaded.host}:${loaded.port}"
+                transition(State.CONNECTED)
+            }
+        }
+    }
+
+    private fun reconnect() {
+        val cached = lastKnownEntry
+        if (cached != null) {
+            showConnecting("Reconnecting to ${cached.macName}", "${cached.host}:${cached.port}")
+            attemptAutoConnect(cached)
+            return
+        }
+        loadStoredEntry { entry ->
+            if (entry == null) {
+                transition(State.FIRST_TIME)
+            } else {
+                showConnecting("Reconnecting to ${entry.macName}", "${entry.host}:${entry.port}")
+                attemptAutoConnect(entry)
+            }
+        }
+    }
+
+    private fun showPairedIdle(entry: PairedHostStorage.Entry) {
+        lastKnownEntry = entry.defensiveCopy()
+        views.idleMacName.text = entry.macName
+        views.idleMacIp.text = "${entry.host}:${entry.port}"
+        transition(State.PAIRED_IDLE)
+    }
+
+    /** AndroidKeyStore decrypts are intentionally kept off the main thread. */
+    private fun loadStoredEntry(onLoaded: (PairedHostStorage.Entry?) -> Unit) {
+        pendingStorageLoad?.cancel()
+        pendingStorageLoad = activity.lifecycleScope.launch {
+            val entry = withContext(Dispatchers.IO) { storage.load() }
+            lastKnownEntry = entry?.defensiveCopy()
+            onLoaded(entry)
+        }
     }
 
     fun onCameraPermissionResult(granted: Boolean) {

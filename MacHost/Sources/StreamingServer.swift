@@ -104,6 +104,9 @@ class StreamingServer {
     // 32-byte token before being allowed to proceed. nil means wireless mode
     // is inactive — non-loopback connections are rejected immediately.
     var expectedAuthToken: Data?
+    /// The selected Mac UI mode is also a transport admission boundary. USB
+    /// must arrive through loopback/ADB-reverse; wireless must arrive over LAN.
+    var expectedConnectionMode: ConnectionMode
     var onWirelessClientPaired: ((String) -> Void)?
 
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
@@ -138,9 +141,14 @@ class StreamingServer {
     private var enqueueToSendCompleteLatency = LatencyPercentiles()
     private var lastCompletedFrameID: UInt64 = 0
 
-    init(port: UInt16, controlPort: UInt16? = nil) {
+    init(
+        port: UInt16,
+        controlPort: UInt16? = nil,
+        expectedConnectionMode: ConnectionMode = .usb
+    ) {
         self.port = port
         self.controlPort = controlPort ?? port + 1
+        self.expectedConnectionMode = expectedConnectionMode
     }
 
     func start() {
@@ -559,18 +567,29 @@ class StreamingServer {
     }
 
     private func onConnectionReady(_ conn: NWConnection) {
-        if conn.endpoint.isLoopback {
+        switch expectedConnectionMode {
+        case .usb:
+            guard conn.endpoint.isLoopback else {
+                debugLog("Rejecting non-loopback client: Mac is serving USB mode")
+                conn.cancel()
+                return
+            }
             debugLog("Client connected via loopback (USB) — skipping auth")
             beginExistingProtocol(on: conn)
-            return
+        case .wireless:
+            guard !conn.endpoint.isLoopback else {
+                debugLog("Rejecting loopback client: Mac is serving Wireless mode")
+                conn.cancel()
+                return
+            }
+            guard let expected = expectedAuthToken else {
+                debugLog("Rejecting non-loopback client: wireless auth is unavailable")
+                conn.cancel()
+                return
+            }
+            debugLog("Client connected via LAN — running auth handshake")
+            runAuthHandshake(connection: conn, expectedToken: expected)
         }
-        guard let expected = expectedAuthToken else {
-            debugLog("Rejecting non-loopback client: wireless mode not active")
-            conn.cancel()
-            return
-        }
-        debugLog("Client connected via LAN — running auth handshake")
-        runAuthHandshake(connection: conn, expectedToken: expected)
     }
 
     private func beginExistingProtocol(on conn: NWConnection) {
@@ -761,6 +780,36 @@ class StreamingServer {
     private func processInputBuffer(connection: NWConnection) {
         while let msgType = inputBuffer.first {
             switch msgType {
+            case ConnectionModeAdmission.clientHelloType:
+                // [type 16][0x80 | mode]. The marker keeps the payload safe
+                // for V1 hosts that only skip unknown message bytes.
+                guard inputBuffer.count >= 2 else { return }
+                let payload = inputByte(at: 1)
+                consumeInputBytes(2)
+                guard let clientMode = ConnectionModeAdmission.decodeClientHello(
+                    type: msgType,
+                    payload: payload
+                ) else {
+                    debugLog("Invalid connection-mode hello")
+                    sendModeAdmissionResult(.invalidHello, on: connection, closeAfter: true)
+                    return
+                }
+                let result = ConnectionModeAdmission.evaluate(
+                    expectedMode: expectedConnectionMode,
+                    clientMode: clientMode,
+                    isLoopback: connection.endpoint.isLoopback
+                )
+                guard result == .accepted else {
+                    debugLog(
+                        "Connection-mode admission rejected: client=\(clientMode.rawValue) " +
+                            "expected=\(expectedConnectionMode.rawValue) result=\(result)"
+                    )
+                    sendModeAdmissionResult(result, on: connection, closeAfter: true)
+                    return
+                }
+                debugLog("Connection-mode admission accepted: \(clientMode.rawValue)")
+                sendModeAdmissionResult(.accepted, on: connection, closeAfter: false)
+
             case WireMessage.touchEvent:
                 // Touch event: 1 type + 1 pointerCount + N*(4x+4y) + 4 action.
                 // 1 finger: 14 bytes, 2 fingers: 22 bytes.
@@ -910,6 +959,25 @@ class StreamingServer {
     private func consumeInputBytes(_ count: Int) {
         let endIndex = inputBuffer.index(inputBuffer.startIndex, offsetBy: count)
         inputBuffer.removeSubrange(inputBuffer.startIndex..<endIndex)
+    }
+
+    private func sendModeAdmissionResult(
+        _ result: ConnectionModeAdmission.ResultCode,
+        on connection: NWConnection,
+        closeAfter: Bool
+    ) {
+        let message = ConnectionModeAdmission.encodeServerResult(
+            code: result,
+            expectedMode: expectedConnectionMode
+        )
+        connection.send(content: message, completion: .contentProcessed { error in
+            if let error {
+                debugLog("Mode admission response failed: \(error)")
+            }
+            if closeAfter {
+                connection.cancel()
+            }
+        })
     }
 
     /// Returns whether capture should start another encode. This is the

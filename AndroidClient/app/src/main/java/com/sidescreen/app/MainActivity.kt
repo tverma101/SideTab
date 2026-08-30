@@ -80,6 +80,10 @@ class MainActivity : AppCompatActivity() {
     private var pendingBrightnessGeneration: Long? = null
     private var pendingBrightness: Int? = null
     private var restartChecklistAfterDisconnect = true
+    @Volatile private var macBridgeState = MacBridgeState.NOT_CHECKED
+    @Volatile private var displayConfigReceived = false
+    @Volatile private var modeAdmissionAccepted = false
+    @Volatile private var transportFailureGeneration: Long? = null
 
     // All callbacks from an old StreamClient become inert as soon as a newer
     // connect starts. Without this generation fence, a sender restart can
@@ -156,6 +160,15 @@ class MainActivity : AppCompatActivity() {
 
         binding.modeToggleGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked) return@addOnButtonCheckedListener
+            if (hasActiveSession) {
+                // A mode switch changes the Mac-side admission contract and the
+                // encoder profile. Never mutate it underneath a live session.
+                val current = prefs.connectionMode
+                binding.modeToggleGroup.check(
+                    if (current == ConnectionMode.WIRELESS) R.id.modeWireless else R.id.modeUSB,
+                )
+                return@addOnButtonCheckedListener
+            }
             val mode = if (checkedId == R.id.modeWireless) ConnectionMode.WIRELESS else ConnectionMode.USB
             prefs.connectionMode = mode
             applyModeVisibility(mode)
@@ -196,6 +209,7 @@ class MainActivity : AppCompatActivity() {
                         forgetButton = binding.wirelessForgetButton,
                         reconnectButton = binding.wirelessReconnectButton,
                         idleForgetButton = binding.wirelessIdleForgetButton,
+                        repairReconnectButton = binding.wirelessRepairReconnectButton,
                         openSettingsButton = binding.wirelessOpenSettingsButton,
                         connectedMacName = binding.connectedMacName,
                         connectedMacIp = binding.connectedMacIp,
@@ -1028,14 +1042,9 @@ class MainActivity : AppCompatActivity() {
         initializeDecoderForCurrentSurface(sessionController.currentGeneration, streamClient)
     }
 
-    /**
-     * Preserve a one-stream-pixel-to-one-panel-pixel mapping for near-native
-     * direct streams. Stretching a 98-99% stream across the whole panel makes
-     * SurfaceFlinger resample every pixel and visibly softens text. Centering
-     * the surface at its encoded size leaves only a tiny black border while
-     * keeping the decoded image pixel exact. Lower-resolution streams and VSR
-     * modes continue filling the panel as before.
-     */
+    /** Keep the decoder surface aligned to the visible panel, not the encoded
+     * stream dimensions. A fixed stream-sized SurfaceView leaves a border when
+     * the Mac's negotiated capture size differs from the tablet window. */
     private fun applyDirectPixelMapping(
         streamWidth: Int,
         streamHeight: Int,
@@ -1043,26 +1052,22 @@ class MainActivity : AppCompatActivity() {
         binding.surfaceView.post {
             val panelWidth = binding.root.width
             val panelHeight = binding.root.height
-            val usbColorBridgeOn = isUsbColorBridgePathActive()
-            val nearNative =
-                !usbColorBridgeOn &&
-                !prefs.vsrEnabled &&
-                    !shouldUseTextureView() &&
-                    streamWidth in 1..panelWidth &&
-                    streamHeight in 1..panelHeight &&
-                    streamWidth.toFloat() / panelWidth >= DIRECT_PIXEL_MIN_SCALE &&
-                    streamHeight.toFloat() / panelHeight >= DIRECT_PIXEL_MIN_SCALE
-            val targetWidth = if (nearNative) streamWidth else 0
-            val targetHeight = if (nearNative) streamHeight else 0
+            val decision = SurfaceLayoutPolicy.decide(
+                streamWidth = streamWidth,
+                streamHeight = streamHeight,
+                panelWidth = panelWidth,
+                panelHeight = panelHeight,
+            )
             val params = binding.surfaceView.layoutParams as ConstraintLayout.LayoutParams
-            if (params.width != targetWidth || params.height != targetHeight) {
-                params.width = targetWidth
-                params.height = targetHeight
+            if (params.width != decision.width || params.height != decision.height) {
+                params.width = decision.width
+                params.height = decision.height
                 binding.surfaceView.layoutParams = params
             }
             mainDiag(
-                "Surface mapping: ${if (usbColorBridgeOn) "GPU upscale/fill" else if (nearNative) "1:1" else "fill"} " +
-                    "stream=${streamWidth}x$streamHeight panel=${panelWidth}x$panelHeight",
+                "Surface mapping: match-panel " +
+                    "stream=${streamWidth}x$streamHeight panel=${panelWidth}x$panelHeight " +
+                    "geometryKnown=${decision.geometryKnown}",
             )
         }
     }
@@ -1566,6 +1571,7 @@ class MainActivity : AppCompatActivity() {
             state is SessionController.State.WaitingForFirstFrame ||
             state is SessionController.State.Streaming
         val streaming = state is SessionController.State.Streaming
+        binding.modeToggleGroup.isEnabled = !active
 
         when (state) {
             SessionController.State.Idle -> {
@@ -1620,10 +1626,6 @@ class MainActivity : AppCompatActivity() {
                 setStatusIndicator(R.drawable.status_indicator_amber)
                 updateStatus("Connected · negotiating display")
                 stopChecklistUpdates()
-                if (state.details.mode == ConnectionMode.WIRELESS) {
-                    val entry = pairedHostStorage.load()
-                    wirelessController.onConnectSuccess(entry?.macName ?: "Mac", entry?.host ?: "—")
-                }
             }
 
             is SessionController.State.WaitingForFirstFrame -> {
@@ -1639,6 +1641,8 @@ class MainActivity : AppCompatActivity() {
             }
 
             is SessionController.State.Streaming -> {
+                macBridgeState = MacBridgeState.STREAMING
+                renderChecklistEvidence()
                 presentationController.acquire(state.details.generation)
                 binding.settingsPanel.visibility = View.GONE
                 binding.connectButton.isEnabled = false
@@ -1667,8 +1671,7 @@ class MainActivity : AppCompatActivity() {
                     pendingBrightness = null
                 }
                 if (state.details.mode == ConnectionMode.WIRELESS) {
-                    val entry = pairedHostStorage.load()
-                    wirelessController.onConnectSuccess(entry?.macName ?: "Mac", entry?.host ?: "—")
+                    wirelessController.onConnectSuccess()
                 }
             }
 
@@ -1705,6 +1708,7 @@ class MainActivity : AppCompatActivity() {
                 binding.disconnectButton.isEnabled = false
                 setStatusIndicator(R.drawable.status_indicator_red)
                 updateStatus("Connection failed · tap Connect to retry")
+                renderChecklistEvidence()
                 startChecklistUpdates()
             }
         }
@@ -1717,6 +1721,56 @@ class MainActivity : AppCompatActivity() {
     /** One callback route for USB and wireless. The controller owns all UI
      * truth; this method only reports transport/protocol/render evidence. */
     private fun setupStreamClientCallbacks(client: StreamClient, generation: Long) {
+        client.onModeAdmission = modeAdmission@{ result ->
+            if (!isCurrentConnection(client, generation)) return@modeAdmission
+            modeAdmissionAccepted = result.accepted
+            runOnUiThread {
+                if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                macBridgeState = if (result.accepted) {
+                    MacBridgeState.MODE_ACCEPTED
+                } else {
+                    MacBridgeState.REJECTED
+                }
+                renderChecklistEvidence()
+            }
+        }
+
+        client.onTransportFailure = transportFailure@{ reason ->
+            if (!isCurrentConnection(client, generation)) return@transportFailure
+            // receiveData reports the error before its finally block emits the
+            // ordinary disconnected status. Keep that status from replacing
+            // the actionable failure while this generation's UI error is
+            // waiting on the main thread.
+            transportFailureGeneration = generation
+            runOnUiThread {
+                if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                val detail = reason.ifBlank { "the Mac closed the bridge" }
+                if (macBridgeState != MacBridgeState.REJECTED) {
+                    macBridgeState = if (displayConfigReceived) {
+                        MacBridgeState.FAILED
+                    } else {
+                        MacBridgeState.CLOSED_BEFORE_DISPLAY
+                    }
+                }
+                sessionController.fail(generation, detail)
+                if (prefs.connectionMode == ConnectionMode.WIRELESS) {
+                    wirelessController.onConnectError(
+                        StreamClient.WirelessConnectError.ProtocolError,
+                        detail,
+                    )
+                } else {
+                    showError(
+                        "The Mac bridge closed before streaming started.\n\n" +
+                            "$detail\n\n" +
+                            "Confirm Side Screen is running on the Mac in ${prefs.connectionMode.displayName} mode, " +
+                            "then tap Connect again.",
+                    )
+                }
+                transportFailureGeneration = null
+                renderChecklistEvidence()
+            }
+        }
+
         client.onFrameReceived = frameReceived@{ frameData, frameSize, timestamp, isKeyframe, trace ->
             if (!isCurrentConnection(client, generation)) {
                 client.releaseBuffer(frameData)
@@ -1770,9 +1824,27 @@ class MainActivity : AppCompatActivity() {
                 sessionController.transportConnected(generation)
                 startPingTimer()
                 stopChecklistUpdates()
+                runOnUiThread {
+                    if (isCurrentConnection(client, generation)) {
+                        macBridgeState = MacBridgeState.SOCKET_OPEN
+                        renderChecklistEvidence()
+                    }
+                }
             } else {
                 stopPingTimer()
-                sessionController.transportLost(generation)
+                val failureAlreadyReported = transportFailureGeneration == generation
+                if (!displayConfigReceived && !failureAlreadyReported) {
+                    runOnUiThread {
+                        // The terminal transition invalidates the generation;
+                        // the bridge evidence is still useful on the idle
+                        // panel and must not be hidden by that fence.
+                        macBridgeState = MacBridgeState.CLOSED_BEFORE_DISPLAY
+                        renderChecklistEvidence()
+                    }
+                }
+                if (!failureAlreadyReported) {
+                    sessionController.transportLost(generation)
+                }
             }
         }
 
@@ -1786,19 +1858,22 @@ class MainActivity : AppCompatActivity() {
         client.onDisplaySize = displayConfig@{ width, height, rotation, flipHorizontal, flipVertical ->
             if (!isCurrentConnection(client, generation)) return@displayConfig
             mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-            warnIfAvcOnlyWithoutNegotiation(client)
-            sessionController.displayConfigured(generation, legacyProtocolAccepted = true)
-            displayWidth = width
-            displayHeight = height
-            displayRotation = rotation
-            displayFlipHorizontal = flipHorizontal
-            displayFlipVertical = flipVertical
             runOnUiThread {
                 if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                warnIfAvcOnlyWithoutNegotiation(client)
+                displayConfigReceived = true
+                macBridgeState = MacBridgeState.DISPLAY_CONFIGURED
+                sessionController.displayConfigured(generation, legacyProtocolAccepted = true)
+                displayWidth = width
+                displayHeight = height
+                displayRotation = rotation
+                displayFlipHorizontal = flipHorizontal
+                displayFlipVertical = flipVertical
                 binding.resolutionText.text = "${width}x$height"
                 applyRotation(rotation, flipHorizontal, flipVertical)
                 applyDirectPixelMapping(width, height)
                 initializeDecoderForCurrentSurface(generation, client)
+                renderChecklistEvidence()
             }
             log("Display: ${width}x$height @ $rotation°")
         }
@@ -1822,7 +1897,13 @@ class MainActivity : AppCompatActivity() {
         deviceName: String,
     ) {
         val generation = beginConnection(ConnectionMode.WIRELESS)
-        val client = StreamClient(host, port, applicationContext)
+        val client =
+            StreamClient(
+                host,
+                port,
+                applicationContext,
+                connectionMode = ConnectionMode.WIRELESS,
+            )
         streamClient = client
         setupStreamClientCallbacks(client, generation)
         lifecycleScope.launch(Dispatchers.IO) {
@@ -1831,15 +1912,23 @@ class MainActivity : AppCompatActivity() {
                 client.connectWireless(token, deviceName)
             } catch (e: StreamClient.WirelessConnectError) {
                 if (isCurrentConnection(client, generation)) {
-                    sessionController.fail(generation, e.message ?: "Wireless connection failed")
-                    runOnUiThread { wirelessController.onConnectError(e) }
+                    runOnUiThread {
+                        if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                        macBridgeState = MacBridgeState.FAILED
+                        sessionController.fail(generation, e.message ?: "Wireless connection failed")
+                        wirelessController.onConnectError(e)
+                        renderChecklistEvidence()
+                    }
                 }
             } catch (e: Exception) {
                 if (isCurrentConnection(client, generation)) {
                     log("Wireless connect failed: ${e.message}")
-                    sessionController.fail(generation, e.message ?: "Wireless connection failed")
                     runOnUiThread {
+                        if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                        macBridgeState = MacBridgeState.FAILED
+                        sessionController.fail(generation, e.message ?: "Wireless connection failed")
                         wirelessController.onConnectError(StreamClient.WirelessConnectError.NetworkUnreachable)
+                        renderChecklistEvidence()
                     }
                 }
             }
@@ -1863,6 +1952,7 @@ class MainActivity : AppCompatActivity() {
                 applicationContext,
                 controlHost = if (usesE3VideoPath) "127.0.0.1" else host,
                 controlPort = if (usesE3VideoPath) 54322 else port + 1,
+                connectionMode = ConnectionMode.USB,
             )
         streamClient = client
         setupStreamClientCallbacks(client, generation)
@@ -1896,8 +1986,10 @@ class MainActivity : AppCompatActivity() {
                 }
                 runOnUiThread {
                     if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                    macBridgeState = MacBridgeState.FAILED
                     sessionController.fail(generation, errorMessage)
                     showError(errorMessage)
+                    renderChecklistEvidence()
                 }
             }
         }
@@ -1906,6 +1998,11 @@ class MainActivity : AppCompatActivity() {
     private fun beginConnection(mode: ConnectionMode): Long {
         restartChecklistAfterDisconnect = true
         val generation = sessionController.begin(mode)
+        macBridgeState = MacBridgeState.CONNECTING
+        displayConfigReceived = false
+        modeAdmissionAccepted = false
+        transportFailureGeneration = null
+        renderChecklistEvidence()
         pendingBrightnessGeneration = null
         pendingBrightness = null
         streamClient?.disconnect()
@@ -1938,6 +2035,10 @@ class MainActivity : AppCompatActivity() {
         displayRotation = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
+        macBridgeState = MacBridgeState.NOT_CHECKED
+        displayConfigReceived = false
+        modeAdmissionAccepted = false
+        transportFailureGeneration = null
         val resetUi = {
             updateScreenPowerState(false)
             applyDirectPixelMapping(0, 0)
@@ -2170,64 +2271,72 @@ class MainActivity : AppCompatActivity() {
         // active generation. It does not probe the host or USB deviceList.
         if (hasActiveSession) return
 
-        // Check Developer Mode (if we can run this app with USB debugging, dev mode is enabled)
-        val isDeveloperModeEnabled =
-            Settings.Secure.getInt(
+        val items = currentChecklistItems()
+        renderChecklistItems(items)
+        val advisories = items
+            .filter { it.evidence == ChecklistEvidence.FAIL }
+            .map { it.label }
+        sessionController.setPreflight(advisories)
+    }
+
+    /** Render the same evidence model for idle and active bridge updates. */
+    private fun renderChecklistEvidence() {
+        if (!::binding.isInitialized) return
+        renderChecklistItems(currentChecklistItems())
+    }
+
+    private fun currentChecklistItems(): List<ChecklistItem> {
+        val developerModeEnabled = runCatching {
+            Settings.Global.getInt(
                 contentResolver,
                 Settings.Global.DEVELOPMENT_SETTINGS_ENABLED,
                 0,
             ) == 1
-        updateChecklistItem(binding.checkDeveloperMode, isDeveloperModeEnabled)
-
-        // Check USB Debugging (ADB enabled)
-        val isAdbEnabled =
-            Settings.Secure.getInt(
+        }.getOrNull()
+        val adbEnabled = runCatching {
+            Settings.Global.getInt(
                 contentResolver,
                 Settings.Global.ADB_ENABLED,
                 0,
             ) == 1
-        updateChecklistItem(binding.checkUsbDebugging, isAdbEnabled)
-
-        // UsbManager.deviceList describes Android acting as a USB host. In
-        // SideScreen the Mac is host and this tablet is the USB device, so it
-        // is a false-negative for adb reverse. Keep it visibly advisory.
-        binding.textUsbConnected.text = "USB route · verified when you tap Connect"
-        updateChecklistPending(binding.checkUsbConnected)
-
-        // The Mac server is intentionally not probed while idle. A TCP probe
-        // is still a screen-sharing connection from the host's perspective,
-        // and can contend with the real client. The first explicit Connect
-        // is the only server check.
-        binding.textMacServer.text = "Mac server · checked when you tap Connect"
-        updateChecklistPending(binding.checkMacServer)
-
-        val advisories = buildList {
-            if (!isDeveloperModeEnabled) add("Developer mode is not reported")
-            if (!isAdbEnabled) add("ADB debugging is not reported")
-        }
-        sessionController.setPreflight(advisories)
-    }
-
-    private fun updateChecklistItem(
-        indicator: View,
-        isOk: Boolean,
-    ) {
-        indicator.setBackgroundResource(
-            if (isOk) {
-                R.drawable.status_indicator_green
-            } else {
-                R.drawable.status_indicator_red
-            },
+        }.getOrNull()
+        return ConnectionChecklist.usb(
+            developerModeEnabled = developerModeEnabled,
+            adbEnabled = adbEnabled,
+            bridge = macBridgeState,
+            routeAccepted = modeAdmissionAccepted,
         )
     }
 
-    private fun updateChecklistPending(indicator: View) {
-        indicator.setBackgroundResource(R.drawable.status_indicator_pending)
+    private fun renderChecklistItems(items: List<ChecklistItem>) {
+        if (!::binding.isInitialized || items.size != 4) return
+        val textViews = listOf(
+            binding.textDeveloperMode,
+            binding.textUsbDebugging,
+            binding.textUsbConnected,
+            binding.textMacServer,
+        )
+        val indicators = listOf(
+            binding.checkDeveloperMode,
+            binding.checkUsbDebugging,
+            binding.checkUsbConnected,
+            binding.checkMacServer,
+        )
+        items.forEachIndexed { index, item ->
+            textViews[index].text = item.label
+            indicators[index].setBackgroundResource(
+                when (item.evidence) {
+                    ChecklistEvidence.PASS -> R.drawable.status_indicator_green
+                    ChecklistEvidence.FAIL -> R.drawable.status_indicator_red
+                    ChecklistEvidence.PENDING -> R.drawable.status_indicator_amber
+                    ChecklistEvidence.UNKNOWN -> R.drawable.status_indicator_pending
+                },
+            )
+        }
     }
 
 
     private companion object {
-        const val DIRECT_PIXEL_MIN_SCALE = 0.97f
         const val DEFAULT_BACKGROUND_DISCONNECT_SECS = 60
         const val LATENCY_PING_INTERVAL_MS = 2_000L
         const val CHECKLIST_INTERVAL_MS = 10_000L
