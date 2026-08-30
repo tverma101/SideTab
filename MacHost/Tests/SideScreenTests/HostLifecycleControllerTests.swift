@@ -50,5 +50,13 @@ final class HostLifecycleControllerTests: XCTestCase {
         XCTAssertTrue(controller.beginSuspend(.displaySleep))
         XCTAssertFalse(controller.beginSuspend(.displaySleep))
         XCTAssertEqual(controller.suspendReasons, [.displaySleep])
+        XCTAssertEqual(controller.state, .suspending([.displaySleep]))
+    }
+
+    func testSuspendReasonsHaveStableWireIDs() {
+        XCTAssertEqual(HostSuspendReason.sessionInactive.wireID, 1)
+        XCTAssertEqual(HostSuspendReason.screenSaver.wireID, 2)
+        XCTAssertEqual(HostSuspendReason.displaySleep.wireID, 3)
+        XCTAssertEqual(HostSuspendReason.systemSleep.wireID, 4)
     }
 }

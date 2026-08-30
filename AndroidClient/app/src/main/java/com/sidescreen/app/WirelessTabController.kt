@@ -77,10 +77,8 @@ class WirelessTabController(
         }
     }
 
-    /**
-     * Called when the TCP stream goes down (user tapped Disconnect, network drop, etc).
-     * Move the UI to a clean "paired but idle" state showing the Mac info + Reconnect button.
-     */
+    /** Move the UI to a clean paired-but-idle state. MainActivity owns whether
+     * a background automatic attempt is also scheduled. */
     fun onStreamDisconnected() {
         android.util.Log.i(
             "WirelessTabController",
@@ -94,6 +92,28 @@ class WirelessTabController(
         views.idleMacName.text = entry.macName
         views.idleMacIp.text = "${entry.host}:${entry.port}"
         transition(State.PAIRED_IDLE)
+    }
+
+    fun onStreamSuspended(detail: String) {
+        val entry = storage.load() ?: run {
+            transition(State.FIRST_TIME)
+            return
+        }
+        views.idleMacName.text = entry.macName
+        views.idleMacIp.text = "Waiting for host · ${entry.host}:${entry.port}"
+        views.connectingSubtitle.text = detail
+        transition(State.PAIRED_IDLE)
+    }
+
+    fun onAutoReconnectStarted(attempt: Int) {
+        val entry = storage.load() ?: run {
+            transition(State.FIRST_TIME)
+            return
+        }
+        showConnecting(
+            "Reconnecting to ${entry.macName}",
+            "Attempt $attempt · ${entry.host}:${entry.port}",
+        )
     }
 
     private fun transition(next: State) {
@@ -111,9 +131,8 @@ class WirelessTabController(
      * Called when the Wireless tab becomes visible. Decides initial state based on
      * cached host + camera permission state.
      *
-     * No auto-connect: even when a cached pairing exists, the user must press
-     * the Reconnect button to actually start a connection. Auto-connect was
-     * confusing because it could run silently while the user toggled tabs.
+     * Showing the tab is UI-only. MainActivity starts lifecycle reconnect from
+     * onStart, so switching tabs does not create a competing connection.
      */
     fun show() {
         when {

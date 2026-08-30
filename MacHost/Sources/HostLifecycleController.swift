@@ -5,6 +5,17 @@ enum HostSuspendReason: String, CaseIterable, Hashable {
     case screenSaver
     case displaySleep
     case systemSleep
+
+    /// Stable, payload-sized value for the optional HostSuspending wire
+    /// advisory. The enum's raw strings remain the diagnostic vocabulary.
+    var wireID: UInt8 {
+        switch self {
+        case .sessionInactive: return 1
+        case .screenSaver: return 2
+        case .displaySleep: return 3
+        case .systemSleep: return 4
+        }
+    }
 }
 
 enum HostLifecycleState: Equatable {
@@ -36,8 +47,8 @@ final class HostLifecycleController {
     @discardableResult
     func beginSuspend(_ reason: HostSuspendReason) -> Bool {
         let inserted = suspendReasons.insert(reason).inserted
-        let next: HostLifecycleState = .suspending(suspendReasons)
-        publish(next)
+        guard inserted else { return false }
+        publish(.suspending(suspendReasons))
         return inserted
     }
 

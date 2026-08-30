@@ -25,6 +25,7 @@ class SessionController {
         val firstFrameDecoded: Boolean,
         val firstFrameRendered: Boolean,
         val control: ControlHealth,
+        val automaticReconnect: Boolean = false,
     )
 
     sealed interface State {
@@ -42,6 +43,17 @@ class SessionController {
         data class WaitingForFirstFrame(val details: Details) : State
 
         data class Streaming(val details: Details) : State
+
+        data class Reconnecting(
+            val generation: Long,
+            val mode: ConnectionMode,
+            val attempt: Int,
+        ) : State
+
+        data class SuspendedWaitingForHost(
+            val reason: SessionLifecyclePolicy.EndReason,
+            val detail: String,
+        ) : State
 
         data class Disconnecting(
             val generation: Long,
@@ -69,10 +81,15 @@ class SessionController {
     private val lock = Any()
     private var generationValue = 0L
     private var activeDetails: Details? = null
+    private var lastTerminationReasonValue: SessionLifecyclePolicy.EndReason? = null
+
+    val lastTerminationReason: SessionLifecyclePolicy.EndReason?
+        get() = synchronized(lock) { lastTerminationReasonValue }
 
     fun begin(mode: ConnectionMode): Long {
         val next = synchronized(lock) {
             generationValue += 1
+            lastTerminationReasonValue = null
             val details = Details(
                 generation = generationValue,
                 mode = mode,
@@ -88,6 +105,49 @@ class SessionController {
         }
         publish(next)
         return generationValue
+    }
+
+    /** Start a bounded automatic attempt without letting an old generation
+     * or healthy session be replaced. */
+    fun beginAutomaticReconnect(mode: ConnectionMode, attempt: Int): Long? {
+        var transition: Pair<Long, State>? = null
+        synchronized(lock) {
+            val hasHealthySession = activeDetails?.let {
+                it.firstFrameRendered && state is State.Streaming
+            } == true
+            if (hasHealthySession || activeDetails != null) return@synchronized
+
+            generationValue += 1
+            val details = Details(
+                generation = generationValue,
+                mode = mode,
+                protocolReady = false,
+                displayConfigured = false,
+                decoderReady = false,
+                firstFrameDecoded = false,
+                firstFrameRendered = false,
+                control = ControlHealth.UNKNOWN,
+                automaticReconnect = true,
+            )
+            activeDetails = details
+            transition = generationValue to State.Reconnecting(generationValue, mode, attempt)
+        }
+        val (generation, next) = transition ?: return null
+        publish(next)
+        return generation
+    }
+
+    /** Mark that a foreground Activity has a chance to recreate a paired
+     * session. Existing retryable reasons are intentionally preserved. */
+    fun noteForegroundAvailable(): Boolean {
+        synchronized(lock) {
+            if (activeDetails != null) return false
+            if (lastTerminationReasonValue == null) {
+                lastTerminationReasonValue = SessionLifecyclePolicy.EndReason.APP_BACKGROUND_RECREATION
+                return true
+            }
+            return lastTerminationReasonValue == SessionLifecyclePolicy.EndReason.APP_BACKGROUND_RECREATION
+        }
     }
 
     fun transportConnected(generation: Long): Boolean = update(generation) { it }
@@ -127,10 +187,15 @@ class SessionController {
         it.copy(control = if (healthy) ControlHealth.HEALTHY else ControlHealth.DEGRADED)
     }
 
-    fun fail(generation: Long, reason: String): Boolean {
+    fun fail(
+        generation: Long,
+        reason: String,
+        endReason: SessionLifecyclePolicy.EndReason = SessionLifecyclePolicy.EndReason.FATAL_PROTOCOL_ERROR,
+    ): Boolean {
         val next = synchronized(lock) {
             if (!isCurrentLocked(generation)) return false
             activeDetails = null
+            lastTerminationReasonValue = endReason
             State.Failed(reason = reason)
         }
         publish(next)
@@ -144,6 +209,7 @@ class SessionController {
             val oldGeneration = currentGeneration
             generationValue += 1
             activeDetails = null
+            lastTerminationReasonValue = SessionLifecyclePolicy.EndReason.USER_DISCONNECTED
             listOf(
                 State.Disconnecting(oldGeneration, reason),
                 State.Disconnected(reason),
@@ -158,12 +224,33 @@ class SessionController {
     fun transportLost(
         generation: Long,
         reason: String = "video transport closed",
+        endReason: SessionLifecyclePolicy.EndReason = SessionLifecyclePolicy.EndReason.VIDEO_TRANSPORT_LOST,
     ): Boolean {
         val next = synchronized(lock) {
             if (!isCurrentLocked(generation)) return false
             generationValue += 1
             activeDetails = null
+            lastTerminationReasonValue = endReason
             State.Disconnected(reason)
+        }
+        publish(next)
+        return true
+    }
+
+    /** Invalidate the current transport before closing its socket. This makes
+     * HostSuspending and Activity teardown callbacks from the old client
+     * harmless even if they arrive after the new suspended state is rendered. */
+    fun suspend(
+        generation: Long,
+        reason: SessionLifecyclePolicy.EndReason = SessionLifecyclePolicy.EndReason.HOST_SUSPENDED,
+        detail: String = "host suspended",
+    ): Boolean {
+        val next = synchronized(lock) {
+            if (!isCurrentLocked(generation)) return false
+            generationValue += 1
+            activeDetails = null
+            lastTerminationReasonValue = reason
+            State.SuspendedWaitingForHost(reason, detail)
         }
         publish(next)
         return true
@@ -191,7 +278,8 @@ class SessionController {
     fun hasTransport(): Boolean = synchronized(lock) {
         activeDetails?.let { it.protocolReady || it.displayConfigured || it.decoderReady || it.firstFrameDecoded } == true ||
             state is State.Connecting || state is State.Negotiating ||
-            state is State.WaitingForFirstFrame || state is State.Streaming
+            state is State.WaitingForFirstFrame || state is State.Streaming ||
+            state is State.Reconnecting
     }
 
     fun isStreaming(generation: Long? = null): Boolean = synchronized(lock) {

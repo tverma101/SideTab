@@ -55,7 +55,7 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 ### USB-C or Wireless
 
-Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** lets you scan a QR code from the Mac once, then tap **Reconnect** when you choose to start a session over WiFi (5 GHz strongly recommended). Wireless uses a bounded efficiency profile: capture and encode are fixed at 60 FPS with a 40 Mbps average / approximately 60 Mbps one-second peak. The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
+Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** lets you scan a QR code from the Mac once, then automatically reconnects to that paired host when SideScreen returns to the foreground or the host wakes (the **Reconnect** button remains available). Wireless uses a bounded efficiency profile: capture and encode are fixed at 60 FPS with a 40 Mbps average / approximately 60 Mbps one-second peak. The auth token is generated locally and stays on your Mac; reset it any time to revoke access. An explicit **Disconnect** suppresses automatic reconnect until you start a connection or scan a new QR code.
 
 The experimental Android sRGB/BT.709 color bridge is presentation-capped at 60 FPS and asks the tablet decoder for a 60 FPS operating rate. It drains to the newest decoded frame rather than queueing stale frames, so the cap protects smoothness and power without changing the normal USB 10-bit path. The macOS virtual-display mode, ScreenCaptureKit capture ceiling, and encoder now share the same effective rate: Main10 is held at 60 FPS, while 8-bit/Main remains eligible for 120 FPS.
 
@@ -220,7 +220,7 @@ cd AndroidClient && ./gradlew assembleDebug
 
 1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
 2. Open **Side Screen** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
-3. The tablet remembers the Mac. On later launches, tap **Reconnect** when you want to start the session — no rescan and no background reconnect.
+3. The tablet remembers the Mac. On later launches, it retries the paired host automatically while the app is in the foreground; tap **Reconnect** if you want to start it immediately. No rescan is needed unless the pairing token was reset.
 
 Wireless mode requires both devices to be on the same WiFi network. Local-only WiFi/hotspot routes are supported when the Mac is reachable on that LAN, and **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
 
@@ -306,7 +306,7 @@ own rasterization still remain upstream limits.
 
 ### Headless mode (automatic operation and diagnostics)
 
-In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
+In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — open Side Screen on the tablet and let the paired Wireless session reconnect, or tap Connect for USB.
 
 First-time setup still needs a screen once to grant Screen Recording permission; after that the Mac runs fully headless. For wireless headless use, give the Mac a static IP or DHCP reservation, and consider enabling macOS Screen Sharing as a fallback way in.
 

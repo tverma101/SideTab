@@ -88,6 +88,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     init(headlessLaunch: Bool = false) {
         self.headlessLaunch = headlessLaunch
         super.init()
+        hostLifecycleController.onStateChanged = { [weak self] state in
+            self?.handleHostLifecycleStateChange(state)
+        }
     }
 
     var streamingServer: StreamingServer?
@@ -114,6 +117,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
     private var isStartingServer = false
+    /// Owns the macOS lock/screensaver/display/system sleep composition. The
+    /// controller is deliberately the only lifecycle authority; ScreenCapture
+    /// and StreamingServer are workers behind its gate.
+    private let hostLifecycleController = HostLifecycleController()
+    private var hostLifecycleObserverRemovers: [() -> Void] = []
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
 
     /// Keep the bundle path visible in the diagnostic log. Screen Recording
@@ -131,6 +139,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         print("✅ App launched")
         logRuntimeIdentity()
         debugLog("Launch mode: \(headlessLaunch ? "headless" : "normal")")
+        registerHostLifecycleObservers()
 
         // Create menu bar item
         setupMenuBar()
@@ -200,6 +209,170 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // attempt to discover the new state.
         logRuntimeIdentity()
         Task { await checkPermissions() }
+    }
+
+    private func registerHostLifecycleObservers() {
+        guard hostLifecycleObserverRemovers.isEmpty else { return }
+
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        addHostLifecycleObserver(
+            center: workspaceCenter,
+            name: NSWorkspace.sessionDidResignActiveNotification,
+            reason: .sessionInactive,
+            begins: true
+        )
+        addHostLifecycleObserver(
+            center: workspaceCenter,
+            name: NSWorkspace.sessionDidBecomeActiveNotification,
+            reason: .sessionInactive,
+            begins: false
+        )
+        addHostLifecycleObserver(
+            center: workspaceCenter,
+            name: NSWorkspace.screensDidSleepNotification,
+            reason: .displaySleep,
+            begins: true
+        )
+        addHostLifecycleObserver(
+            center: workspaceCenter,
+            name: NSWorkspace.screensDidWakeNotification,
+            reason: .displaySleep,
+            begins: false
+        )
+        addHostLifecycleObserver(
+            center: workspaceCenter,
+            name: NSWorkspace.willSleepNotification,
+            reason: .systemSleep,
+            begins: true
+        )
+        addHostLifecycleObserver(
+            center: workspaceCenter,
+            name: NSWorkspace.didWakeNotification,
+            reason: .systemSleep,
+            begins: false
+        )
+
+        // Screensaver and lock notifications are distributed notifications,
+        // not NSWorkspace notifications. The lock names are a compatibility
+        // fallback for macOS configurations where screensaver start/stop is
+        // not emitted for an immediate lock.
+        let distributedCenter = DistributedNotificationCenter.default
+        addHostLifecycleObserver(
+            center: distributedCenter,
+            name: Notification.Name("com.apple.screensaver.didstart"),
+            reason: .screenSaver,
+            begins: true
+        )
+        addHostLifecycleObserver(
+            center: distributedCenter,
+            name: Notification.Name("com.apple.screensaver.didstop"),
+            reason: .screenSaver,
+            begins: false
+        )
+        addHostLifecycleObserver(
+            center: distributedCenter,
+            name: Notification.Name("com.apple.screenIsLocked"),
+            reason: .sessionInactive,
+            begins: true
+        )
+        addHostLifecycleObserver(
+            center: distributedCenter,
+            name: Notification.Name("com.apple.screenIsUnlocked"),
+            reason: .sessionInactive,
+            begins: false
+        )
+
+        debugLog("Host lifecycle observers registered (workspace + distributed lock/screensaver)")
+    }
+
+    private func addHostLifecycleObserver(
+        center: NotificationCenter,
+        name: Notification.Name,
+        reason: HostSuspendReason,
+        begins: Bool
+    ) {
+        let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            if begins {
+                self.hostLifecycleController.beginSuspend(reason)
+            } else {
+                self.hostLifecycleController.clearSuspendReason(reason)
+            }
+        }
+        hostLifecycleObserverRemovers.append { center.removeObserver(token) }
+    }
+
+    private func unregisterHostLifecycleObservers() {
+        hostLifecycleObserverRemovers.forEach { $0() }
+        hostLifecycleObserverRemovers.removeAll()
+    }
+
+    private func handleHostLifecycleStateChange(_ state: HostLifecycleState) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.handleHostLifecycleStateChange(state) }
+            return
+        }
+
+        switch state {
+        case .active:
+            break
+        case .suspending(let reasons):
+            let reason = reasons.sorted { $0.rawValue < $1.rawValue }.first ?? .sessionInactive
+            streamingServer?.suspendForLifecycle(reason: reason)
+            if let capture = screenCapture {
+                capture.suspendForLifecycle { [weak self] in
+                    self?.hostLifecycleController.suspendCompleted()
+                }
+            } else {
+                hostLifecycleController.suspendCompleted()
+            }
+        case .suspended:
+            // The server/capture gate is already closed. New connections are
+            // rejected until every overlapping reason has cleared.
+            break
+        case .resuming:
+            resumeHostLifecycle()
+        }
+    }
+
+    private func resumeHostLifecycle() {
+        guard let capture = screenCapture else {
+            streamingServer?.resumeFromLifecycle()
+            hostLifecycleController.resumeCompleted()
+            return
+        }
+
+        var recoveredDisplayID: CGDirectDisplayID?
+        if let vdm = virtualDisplayManager {
+            do {
+                recoveredDisplayID = try vdm.recreateDisplayIfNeeded()
+                if let displayID = recoveredDisplayID {
+                    setTouchDisplayBounds(CGDisplayBounds(displayID))
+                }
+            } catch {
+                debugLog("Virtual display could not be recovered on wake: \(error.localizedDescription)")
+            }
+        }
+
+        capture.resumeFromLifecycle(displayID: recoveredDisplayID) { [weak self] captureReady in
+            guard let self else { return }
+            // A new lock/sleep may have arrived while SCStream was rebuilding.
+            // In that case keep the network gate closed; the controller will
+            // settle back into suspended after this completion.
+            guard self.hostLifecycleController.mayEmitDesktopPixels else {
+                self.hostLifecycleController.resumeCompleted()
+                return
+            }
+            if captureReady {
+                self.streamingServer?.resumeFromLifecycle()
+            } else {
+                // Keep the listener discoverable so a future reconnect can
+                // observe the capture failure instead of reviving old pixels.
+                debugLog("Host lifecycle resumed without a ready capture pipeline")
+                self.streamingServer?.resumeFromLifecycle()
+            }
+            self.hostLifecycleController.resumeCompleted()
+        }
     }
 
     @MainActor
@@ -793,7 +966,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // via `defaults write com.sidescreen.app SideScreen_controlPort -int N`.
             let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
             let controlPort: UInt16 = controlOverride > 0 ? UInt16(controlOverride) : settings.port + 1
-            streamingServer = StreamingServer(port: settings.port, controlPort: controlPort)
+            let hostName = (Host.current().localizedName ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let advertisedName = hostName.isEmpty ? "SideScreen" : hostName
+            streamingServer = StreamingServer(
+                port: settings.port,
+                controlPort: controlPort,
+                serviceName: advertisedName
+            )
             setTouchEnabledCache(settings.touchEnabled)
             if let displayID = virtualDisplayManager?.displayID {
                 setTouchDisplayBounds(CGDisplayBounds(displayID))
@@ -939,7 +1119,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 debugLog("Idle-sleep monitor disabled (knob unset)")
             }
 
-            streamingServer?.start()
+            streamingServer?.start(initiallySuspended: !hostLifecycleController.mayEmitDesktopPixels)
             if captureReady {
                 screenCapture?.startStreaming(
                     to: streamingServer,
@@ -948,7 +1128,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     gamingBoost: settings.gamingBoost,
                     frameRate: sessionFrameRate,
                     bitrateCapMbps: sessionBitrateCap,
-                    frameRateCap: isWirelessSession ? WirelessSessionProfile.frameRate : nil
+                    frameRateCap: isWirelessSession ? WirelessSessionProfile.frameRate : nil,
+                    initiallySuspended: !hostLifecycleController.mayEmitDesktopPixels
                 )
             } else {
                 debugLog("Server started without ScreenCaptureKit capture")
@@ -1527,6 +1708,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Cancel all combine subscriptions
         cancellables.removeAll()
+    }
+
+    deinit {
+        unregisterHostLifecycleObservers()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

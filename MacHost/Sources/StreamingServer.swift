@@ -43,6 +43,10 @@ private enum WireMessage {
     static let clientDecoderLimits: UInt8 = 12
     /// Back-compat alias: old #41 tablets still send 11. Accept either.
     static let clientDecoderLimitsLegacy: UInt8 = 11
+    /// Client→server, payload-free opt-in for the HostSuspending advisory.
+    static let clientSupportsLifecycle: UInt8 = 16
+    /// Server→client, [type][reason], sent only to capable clients.
+    static let hostSuspending: UInt8 = 17
 }
 
 private extension NWEndpoint {
@@ -63,6 +67,7 @@ private extension NWEndpoint {
 
 class StreamingServer {
     private let port: UInt16
+    private let serviceName: String
     private var listener: NWListener?
     private var connection: NWConnection?
 
@@ -120,9 +125,14 @@ class StreamingServer {
     private var isReceiving = false
     private var isStopped = false
     private var connectionReady = false
+    private var disconnectNotified = true
     private var clientSupportsFrameMetadata = false
     private var clientSupportsFrameTrace = false
     private var clientIsAvcOnly = false
+    private var clientSupportsLifecycle = false
+    private let lifecycleLock = NSLock()
+    private var lifecycleSuspended = false
+    private var lifecycleTransitionGeneration: UInt64 = 0
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
     private var inputBuffer = Data()
@@ -138,13 +148,18 @@ class StreamingServer {
     private var enqueueToSendCompleteLatency = LatencyPercentiles()
     private var lastCompletedFrameID: UInt64 = 0
 
-    init(port: UInt16, controlPort: UInt16? = nil) {
+    init(port: UInt16, controlPort: UInt16? = nil, serviceName: String = "SideScreen") {
         self.port = port
         self.controlPort = controlPort ?? port + 1
+        self.serviceName = serviceName
     }
 
-    func start() {
+    func start(initiallySuspended: Bool = false) {
         isStopped = false
+        lifecycleLock.lock()
+        lifecycleTransitionGeneration &+= 1
+        lifecycleSuspended = initiallySuspended
+        lifecycleLock.unlock()
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
@@ -155,6 +170,7 @@ class StreamingServer {
             }
 
             listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
+            listener?.service = NWListener.Service(name: serviceName, type: "_sidescreen._tcp")
 
             listener?.newConnectionHandler = { [weak self] newConnection in
                 self?.handleConnection(newConnection)
@@ -176,6 +192,67 @@ class StreamingServer {
             startControlListener()
         } catch {
             debugLog("Failed to start server: \(error)")
+        }
+    }
+
+    private func isLifecycleSuspended() -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return lifecycleSuspended
+    }
+
+    /// Stop admitting pixels immediately, send the advisory when supported,
+    /// and close only the active session. Listeners remain available for a
+    /// fresh authenticated connection after the host wakes.
+    func suspendForLifecycle(reason: HostSuspendReason) {
+        lifecycleLock.lock()
+        let alreadySuspended = lifecycleSuspended
+        lifecycleTransitionGeneration &+= 1
+        lifecycleSuspended = true
+        lifecycleLock.unlock()
+        guard !alreadySuspended else { return }
+
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.connectionReady = false
+            self.isReceiving = false
+            self.backpressure.resetForNewSession()
+            self.controlConnection?.cancel()
+
+            guard let connection = self.connection else { return }
+            if self.clientSupportsLifecycle {
+                let message = Data([WireMessage.hostSuspending, reason.wireID])
+                connection.send(content: message, completion: .contentProcessed { _ in
+                    connection.cancel()
+                })
+            } else {
+                connection.cancel()
+            }
+            debugLog("Host lifecycle suspended video session (reason=\(reason.rawValue))")
+        }
+    }
+
+    /// Re-open frame admission after capture has completed its resume path.
+    /// The old connection is never resurrected; the next client gets a fresh
+    /// protocol startup and keyframe.
+    func resumeFromLifecycle() {
+        lifecycleLock.lock()
+        lifecycleTransitionGeneration &+= 1
+        let generation = lifecycleTransitionGeneration
+        lifecycleLock.unlock()
+        // Keep release ordered behind any queued suspend cleanup. A new
+        // suspend invalidates this generation before the queued release can
+        // open the listener again.
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.lifecycleLock.lock()
+            guard self.lifecycleTransitionGeneration == generation else {
+                self.lifecycleLock.unlock()
+                return
+            }
+            self.lifecycleSuspended = false
+            self.lifecycleLock.unlock()
+            debugLog("Host lifecycle resumed — waiting for a fresh client session")
         }
     }
 
@@ -390,7 +467,7 @@ class StreamingServer {
     /// either path.
     func sendBrightness(_ value: UInt8) {
         lastBrightness = value
-        guard clientSupportsBrightness else {
+        guard !isLifecycleSuspended(), clientSupportsBrightness else {
             debugLog("BRIGHT queued: \(value) (client capability not armed)")
             return
         }
@@ -427,6 +504,11 @@ class StreamingServer {
 
     private func handleConnection(_ newConnection: NWConnection) {
         debugLog("New connection incoming...")
+        if isStopped || isLifecycleSuspended() {
+            debugLog("Rejecting connection while host lifecycle is suspended")
+            newConnection.cancel()
+            return
+        }
         if connectionReady, connection != nil {
             debugLog("Live client streaming — new connection held as contender until it speaks")
             armContender(newConnection)
@@ -448,10 +530,12 @@ class StreamingServer {
         }
 
         connectionReady = false
+        disconnectNotified = false
         clientSupportsFrameMetadata = false
         clientSupportsFrameTrace = false
         clientSupportsVideoClockSync = false
         clientIsAvcOnly = false
+        clientSupportsLifecycle = false
         clientSupportsBrightness = false
         lastBrightness = nil
         clientDecodeLimits = nil
@@ -548,10 +632,13 @@ class StreamingServer {
     /// pipeline stops pushing frames into a corpse (the dropped-frame plateau
     /// after "Connection reset by peer"), and report the disconnect once.
     private func markDisconnected() {
+        guard !disconnectNotified else { return }
+        disconnectNotified = true
         connectionReady = false
         isReceiving = false
         connection = nil
         clientSupportsBrightness = false
+        clientSupportsLifecycle = false
         lastBrightness = nil
         inputBuffer.removeAll(keepingCapacity: true)
         backpressure.resetForNewSession()
@@ -592,7 +679,7 @@ class StreamingServer {
     }
 
     private func finishProtocolStartup(on conn: NWConnection) {
-        guard connection === conn, !isStopped, !connectionReady else { return }
+        guard connection === conn, !isStopped, !connectionReady, !isLifecycleSuspended() else { return }
 
         let codec: StreamCodec = clientIsAvcOnly ? .h264 : .hevc
         if clientIsAvcOnly {
@@ -842,6 +929,13 @@ class StreamingServer {
                     connection.send(content: Data([12]), completion: .contentProcessed { _ in })
                 }
 
+            case WireMessage.clientSupportsLifecycle:
+                // Payload-free capability. Only capable clients receive the
+                // HostSuspending advisory from the server.
+                consumeInputBytes(1)
+                clientSupportsLifecycle = true
+                debugLog("Client supports HostSuspending lifecycle advisory")
+
             case WireMessage.clientAvcOnly:
                 // Payload-free opt-in (same convention as type 8): the client
                 // has no HEVC decoder, stream H.264 instead. Clients send this
@@ -917,7 +1011,7 @@ class StreamingServer {
     /// No client means no encode work is useful; the last pixel buffer remains
     /// cached for the next connection's forced keyframe replay.
     func shouldEncodeNextFrame() -> Bool {
-        guard !isStopped, connectionReady else { return false }
+        guard !isStopped, !isLifecycleSuspended(), connectionReady else { return false }
         guard backpressure.canAdmitNextFrame() else {
             backpressure.recordPreEncodeDrop()
             return false
@@ -926,7 +1020,7 @@ class StreamingServer {
     }
 
     func sendFrame(_ frame: EncodedVideoFrame) {
-        guard !isStopped, connectionReady, let connection = connection else { return }
+        guard !isStopped, !isLifecycleSuspended(), connectionReady, let connection = connection else { return }
 
         let admission = backpressure.reserve(bytes: frame.data.count, isKeyframe: frame.isKeyframe)
         let reservation: FrameReservation
@@ -950,7 +1044,10 @@ class StreamingServer {
         // tasks can wait on frameQueue or inside NWConnection.
         frameQueue.async { [weak self] in
             guard let self = self else { return }
-            guard self.connection === connection, self.connectionReady, !self.isStopped else {
+            guard self.connection === connection,
+                  self.connectionReady,
+                  !self.isStopped,
+                  !self.isLifecycleSuspended() else {
                 self.backpressure.complete(reservation)
                 return
             }
@@ -1108,6 +1205,10 @@ class StreamingServer {
     func stop() {
         isStopped = true
         isReceiving = false
+        lifecycleLock.lock()
+        lifecycleTransitionGeneration &+= 1
+        lifecycleSuspended = true
+        lifecycleLock.unlock()
 
         // Wait for pending operations before cancelling
         frameQueue.sync {}
@@ -1124,5 +1225,6 @@ class StreamingServer {
         listener = nil
         controlConnection = nil
         controlListener = nil
+        disconnectNotified = true
     }
 }

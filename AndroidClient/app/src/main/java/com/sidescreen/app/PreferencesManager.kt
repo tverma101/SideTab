@@ -45,6 +45,13 @@ class PreferencesManager(
         get() = ConnectionMode.fromName(prefs.getString("connection_mode", null))
         set(value) = prefs.edit().putString("connection_mode", value.name).apply()
 
+    /** Explicit Disconnect is sticky until the user starts a connection or
+     * scans a new pairing. Host/network loss and Activity recreation leave
+     * this false so lifecycle reconnect remains eligible. */
+    var autoReconnectSuppressed: Boolean
+        get() = prefs.getBoolean("auto_reconnect_suppressed", false)
+        set(value) = prefs.edit().putBoolean("auto_reconnect_suppressed", value).apply()
+
     // Video Super Resolution (receiver-side GPU postprocess)
     var vsrEnabled: Boolean
         get() = prefs.getBoolean("vsr_enabled", false)

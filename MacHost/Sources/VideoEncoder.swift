@@ -41,12 +41,18 @@ class VideoEncoder {
         self.quality = gamingBoost ? "ultralow" : quality
         self.gamingBoost = gamingBoost
 
-        // Drain pending frames before invalidation
-        if let session = compressionSession {
-            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-            VTCompressionSessionInvalidate(session)
-        }
+        invalidate()
         setupCompressionSession()
+    }
+
+    /// Drain and tear down the current VideoToolbox session. Lifecycle
+    /// suspension uses this to release encoder resources while the host is
+    /// locked/asleep; the next active generation creates a new session.
+    func invalidate() {
+        guard let session = compressionSession else { return }
+        compressionSession = nil
+        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        VTCompressionSessionInvalidate(session)
     }
 
     private func setupCompressionSession() {
@@ -261,10 +267,7 @@ class VideoEncoder {
     }
 
     deinit {
-        if let session = compressionSession {
-            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-            VTCompressionSessionInvalidate(session)
-        }
+        invalidate()
     }
 }
 
