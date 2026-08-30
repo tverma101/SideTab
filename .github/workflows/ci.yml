@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - eval/runtime-snapshot-2026-08-23
+      - "ci/**"
   workflow_dispatch:
 
 permissions:
