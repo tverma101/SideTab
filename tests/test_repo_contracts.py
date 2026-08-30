@@ -14,10 +14,13 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 
 
+def root_version() -> str:
+    return (ROOT / "VERSION").read_text().strip()
+
+
 class RepositoryContractsTest(unittest.TestCase):
     def test_root_version_is_semver(self):
-        version = (ROOT / "VERSION").read_text().strip()
-        self.assertRegex(version, r"^\d+\.\d+\.\d+$")
+        self.assertRegex(root_version(), r"^\d+\.\d+\.\d+$")
 
     def test_android_version_is_derived_from_root_version(self):
         text = ANDROID_APP_GRADLE.read_text()
@@ -25,13 +28,15 @@ class RepositoryContractsTest(unittest.TestCase):
         self.assertIn("versionName = appVersion", text)
         self.assertIn("versionCode = computedVersionCode", text)
 
-    def test_application_identity_matches_on_android_and_mac(self):
+    def test_application_identity_and_tracked_version_match(self):
         gradle = ANDROID_APP_GRADLE.read_text()
         self.assertIn('applicationId = "com.sidescreen.app"', gradle)
         self.assertIn('namespace = "com.sidescreen.app"', gradle)
         with MAC_INFO.open("rb") as handle:
             info = plistlib.load(handle)
         self.assertEqual(info.get("CFBundleIdentifier"), "com.sidescreen.app")
+        self.assertEqual(info.get("CFBundleVersion"), root_version())
+        self.assertEqual(info.get("CFBundleShortVersionString"), root_version())
 
     def test_swift_package_has_real_test_target(self):
         package = MAC_PACKAGE.read_text()
