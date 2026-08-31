@@ -28,6 +28,11 @@ final class ConnectionModeAdmissionTests: XCTestCase {
     }
 
     func testAdmissionRequiresMatchingModeAndTransport() {
+        XCTAssertTrue(ConnectionModeAdmission.routeMatches(expectedMode: .usb, isLoopback: true))
+        XCTAssertFalse(ConnectionModeAdmission.routeMatches(expectedMode: .usb, isLoopback: false))
+        XCTAssertTrue(ConnectionModeAdmission.routeMatches(expectedMode: .wireless, isLoopback: false))
+        XCTAssertFalse(ConnectionModeAdmission.routeMatches(expectedMode: .wireless, isLoopback: true))
+
         XCTAssertEqual(
             ConnectionModeAdmission.evaluate(expectedMode: .usb, clientMode: .usb, isLoopback: true),
             .accepted

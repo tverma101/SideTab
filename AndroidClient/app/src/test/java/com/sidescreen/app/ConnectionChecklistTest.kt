@@ -26,8 +26,27 @@ class ConnectionChecklistTest {
     @Test
     fun bridgeEvidenceProgressesFromPendingToPassOrFail() {
         assertEquals(ChecklistEvidence.PENDING, ConnectionChecklist.usb(true, true, MacBridgeState.CONNECTING)[3].evidence)
-        assertEquals(ChecklistEvidence.PENDING, ConnectionChecklist.usb(true, true, MacBridgeState.DISPLAY_CONFIGURED)[3].evidence)
-        assertEquals(ChecklistEvidence.PASS, ConnectionChecklist.usb(true, true, MacBridgeState.STREAMING)[3].evidence)
+        assertEquals(
+            ChecklistEvidence.UNKNOWN,
+            ConnectionChecklist.usb(true, true, MacBridgeState.DISPLAY_CONFIGURED)[3].evidence,
+        )
+        assertEquals(
+            ChecklistEvidence.PENDING,
+            ConnectionChecklist.usb(
+                true,
+                true,
+                MacBridgeState.DISPLAY_CONFIGURED,
+                routeAccepted = true,
+            )[3].evidence,
+        )
+        assertEquals(
+            ChecklistEvidence.PASS,
+            ConnectionChecklist.usb(true, true, MacBridgeState.STREAMING, routeAccepted = true)[3].evidence,
+        )
+        assertEquals(
+            ChecklistEvidence.UNKNOWN,
+            ConnectionChecklist.usb(true, true, MacBridgeState.STREAMING_UNVERIFIED)[3].evidence,
+        )
         assertEquals(ChecklistEvidence.FAIL, ConnectionChecklist.usb(true, true, MacBridgeState.REJECTED)[3].evidence)
     }
 
@@ -53,6 +72,15 @@ class ConnectionChecklistTest {
         assertEquals(
             ChecklistEvidence.FAIL,
             ConnectionChecklist.usb(true, true, MacBridgeState.REJECTED)[2].evidence,
+        )
+        assertEquals(
+            ChecklistEvidence.FAIL,
+            ConnectionChecklist.usb(
+                true,
+                true,
+                MacBridgeState.REJECTED,
+                routeAccepted = true,
+            )[2].evidence,
         )
     }
 

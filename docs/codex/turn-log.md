@@ -30,3 +30,35 @@
   decoder/power, and installed-artifact acceptance remain.
 - Authoritative troubleshooting record:
   docs/troubleshooting/android-bridge-hardening.md.
+
+## 2026-08-30 — Android bridge second-round hardening
+
+- Goal: continue on the saved hardening branch after the first round; close
+  recovery, route-admission, control-channel, display-metadata, and misleading
+  checklist gaps without reviving PR #43.
+- Canonical target: tverma101/SideScreen; work remained isolated in
+  /Users/tejas/Projects/SideScreen-android-bridge-hardening on
+  codex/android-bridge-hardening. The canonical checkout and PR #43 were not
+  edited, installed, pushed, merged, or run through Actions.
+- Changed: Android StreamClient now bounds pre-display admission reads,
+  validates display geometry/transform data, authenticates the Wireless
+  control socket, preserves actionable protocol errors, and exposes Cancel
+  while connecting or waiting for the first frame. Android checklist evidence
+  distinguishes verified streaming from legacy/unverified streaming.
+- Changed: Mac StreamingServer now sends explicit wrong-route admission
+  results, gates control sockets by route and Wireless token, preserves the
+  active control client while a candidate authenticates, and validates USB
+  contenders or authenticates Wireless contenders before takeover. Added the
+  pure ConnectionAdmissionProbe policy and tests for fragmented, malformed,
+  wrong-mode, wrong-route, legacy, and recognized protocol proofs.
+- Documentation: expanded the issue record with the second-round failure modes,
+  control-channel map, resource-impact notes, and acceptance gaps.
+- Validation: Android Gradle unit tests, lint, and debug assembly passed; Mac
+  Swift tests passed with 69 tests and the release build passed with only
+  pre-existing warnings; repository Python tests (13) and the final diff check
+  passed.
+- Evidence state: implemented and locally tested. Not installed, live-tested,
+  visually checked on the SM-X800, or user-confirmed on USB/Wireless hardware.
+- Residual gap: run the explicit USB/Wireless wrong-route, reconnect, control
+  failover, display-fit/rotation, and sustained CPU/GPU/power scenarios on the
+  target devices after review.

@@ -215,6 +215,7 @@ class MainActivity : AppCompatActivity() {
                         connectedMacIp = binding.connectedMacIp,
                         connectingLabel = binding.connectingLabel,
                         connectingSubtitle = binding.connectingSubtitle,
+                        cancelButton = binding.wirelessCancelButton,
                         idleMacName = binding.idleMacName,
                         idleMacIp = binding.idleMacIp,
                         repairTitle = binding.repairTitle,
@@ -225,6 +226,7 @@ class MainActivity : AppCompatActivity() {
                 onConnectRequested = { host, port, token, deviceName, _ ->
                     connectWireless(host, port, token, deviceName)
                 },
+                onDisconnectRequested = { disconnect() },
             )
         wirelessController.bind()
         binding.wirelessDisconnectButton.setOnClickListener { disconnect() }
@@ -362,6 +364,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupUI() {
         binding.connectButton.setOnClickListener {
+            if (hasActiveSession) {
+                disconnect()
+                return@setOnClickListener
+            }
             var host =
                 binding.hostInput.text
                     .toString()
@@ -1581,6 +1587,7 @@ class MainActivity : AppCompatActivity() {
                 binding.settingsButton.visibility = View.GONE
                 binding.statusBar.visibility = View.GONE
                 binding.connectButton.isEnabled = true
+                binding.connectButton.text = "Connect"
                 binding.disconnectButton.isEnabled = false
                 setStatusIndicator(R.drawable.status_indicator_amber)
                 updateStatus("Ready — tap Connect to start")
@@ -1593,6 +1600,7 @@ class MainActivity : AppCompatActivity() {
                 binding.settingsButton.visibility = View.GONE
                 binding.statusBar.visibility = View.GONE
                 binding.connectButton.isEnabled = true
+                binding.connectButton.text = "Connect"
                 binding.disconnectButton.isEnabled = false
                 setStatusIndicator(R.drawable.status_indicator_amber)
                 updateStatus(
@@ -1609,7 +1617,8 @@ class MainActivity : AppCompatActivity() {
                 binding.settingsPanel.visibility = View.VISIBLE
                 binding.settingsButton.visibility = View.GONE
                 binding.statusBar.visibility = View.GONE
-                binding.connectButton.isEnabled = false
+                binding.connectButton.isEnabled = true
+                binding.connectButton.text = "Cancel"
                 binding.disconnectButton.isEnabled = true
                 setStatusIndicator(R.drawable.status_indicator_amber)
                 updateStatus("Connecting…")
@@ -1621,7 +1630,8 @@ class MainActivity : AppCompatActivity() {
                 binding.settingsPanel.visibility = View.VISIBLE
                 binding.settingsButton.visibility = View.GONE
                 binding.statusBar.visibility = View.GONE
-                binding.connectButton.isEnabled = false
+                binding.connectButton.isEnabled = true
+                binding.connectButton.text = "Cancel"
                 binding.disconnectButton.isEnabled = true
                 setStatusIndicator(R.drawable.status_indicator_amber)
                 updateStatus("Connected · negotiating display")
@@ -1630,10 +1640,14 @@ class MainActivity : AppCompatActivity() {
 
             is SessionController.State.WaitingForFirstFrame -> {
                 presentationController.release()
-                binding.settingsPanel.visibility = View.GONE
+                // Keep recovery controls visible while the decoder waits for
+                // its first frame. A negotiated socket is not usable evidence;
+                // hiding the panel here trapped the user on a blank surface.
+                binding.settingsPanel.visibility = View.VISIBLE
                 binding.settingsButton.visibility = View.GONE
                 binding.statusBar.visibility = View.GONE
-                binding.connectButton.isEnabled = false
+                binding.connectButton.isEnabled = true
+                binding.connectButton.text = "Cancel"
                 binding.disconnectButton.isEnabled = true
                 setStatusIndicator(R.drawable.status_indicator_amber)
                 updateStatus("Connected · waiting for first rendered frame")
@@ -1641,7 +1655,11 @@ class MainActivity : AppCompatActivity() {
             }
 
             is SessionController.State.Streaming -> {
-                macBridgeState = MacBridgeState.STREAMING
+                macBridgeState = if (modeAdmissionAccepted) {
+                    MacBridgeState.STREAMING
+                } else {
+                    MacBridgeState.STREAMING_UNVERIFIED
+                }
                 renderChecklistEvidence()
                 presentationController.acquire(state.details.generation)
                 binding.settingsPanel.visibility = View.GONE
@@ -1687,10 +1705,11 @@ class MainActivity : AppCompatActivity() {
                 binding.settingsButton.visibility = View.GONE
                 binding.statusBar.visibility = View.GONE
                 binding.connectButton.isEnabled = true
-            binding.disconnectButton.isEnabled = false
-            setStatusIndicator(R.drawable.status_indicator_amber)
-            updateStatus("Ready — tap Connect to start")
-            log("Disconnected — ${state.reason}; automatic reconnect is disabled")
+                binding.connectButton.text = "Connect"
+                binding.disconnectButton.isEnabled = false
+                setStatusIndicator(R.drawable.status_indicator_amber)
+                updateStatus("Ready — tap Connect to start")
+                log("Disconnected — ${state.reason}; automatic reconnect is disabled")
                 if (prefs.connectionMode == ConnectionMode.WIRELESS) {
                     wirelessController.onStreamDisconnected()
                 } else if (restartChecklistAfterDisconnect) {
@@ -1705,11 +1724,16 @@ class MainActivity : AppCompatActivity() {
                 binding.settingsButton.visibility = View.GONE
                 binding.statusBar.visibility = View.GONE
                 binding.connectButton.isEnabled = true
+                binding.connectButton.text = "Connect"
                 binding.disconnectButton.isEnabled = false
                 setStatusIndicator(R.drawable.status_indicator_red)
                 updateStatus("Connection failed · tap Connect to retry")
                 renderChecklistEvidence()
-                startChecklistUpdates()
+                if (prefs.connectionMode == ConnectionMode.USB) {
+                    startChecklistUpdates()
+                } else {
+                    stopChecklistUpdates()
+                }
             }
         }
 
@@ -1726,10 +1750,13 @@ class MainActivity : AppCompatActivity() {
             modeAdmissionAccepted = result.accepted
             runOnUiThread {
                 if (!isCurrentConnection(client, generation)) return@runOnUiThread
-                macBridgeState = if (result.accepted) {
-                    MacBridgeState.MODE_ACCEPTED
-                } else {
-                    MacBridgeState.REJECTED
+                macBridgeState = when {
+                    !result.accepted -> MacBridgeState.REJECTED
+                    sessionController.isStreaming(generation) -> {
+                        if (modeAdmissionAccepted) MacBridgeState.STREAMING else MacBridgeState.STREAMING_UNVERIFIED
+                    }
+                    displayConfigReceived -> MacBridgeState.DISPLAY_CONFIGURED
+                    else -> MacBridgeState.MODE_ACCEPTED
                 }
                 renderChecklistEvidence()
             }
@@ -1755,7 +1782,7 @@ class MainActivity : AppCompatActivity() {
                 sessionController.fail(generation, detail)
                 if (prefs.connectionMode == ConnectionMode.WIRELESS) {
                     wirelessController.onConnectError(
-                        StreamClient.WirelessConnectError.ProtocolError,
+                        StreamClient.WirelessConnectError.ProtocolError(detail),
                         detail,
                     )
                 } else {
@@ -1862,7 +1889,11 @@ class MainActivity : AppCompatActivity() {
                 if (!isCurrentConnection(client, generation)) return@runOnUiThread
                 warnIfAvcOnlyWithoutNegotiation(client)
                 displayConfigReceived = true
-                macBridgeState = MacBridgeState.DISPLAY_CONFIGURED
+                macBridgeState = if (sessionController.isStreaming(generation)) {
+                    if (modeAdmissionAccepted) MacBridgeState.STREAMING else MacBridgeState.STREAMING_UNVERIFIED
+                } else {
+                    MacBridgeState.DISPLAY_CONFIGURED
+                }
                 sessionController.displayConfigured(generation, legacyProtocolAccepted = true)
                 displayWidth = width
                 displayHeight = height
@@ -1916,7 +1947,7 @@ class MainActivity : AppCompatActivity() {
                         if (!isCurrentConnection(client, generation)) return@runOnUiThread
                         macBridgeState = MacBridgeState.FAILED
                         sessionController.fail(generation, e.message ?: "Wireless connection failed")
-                        wirelessController.onConnectError(e)
+                        wirelessController.onConnectError(e, e.message)
                         renderChecklistEvidence()
                     }
                 }

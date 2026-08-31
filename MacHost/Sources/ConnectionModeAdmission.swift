@@ -53,7 +53,12 @@ enum ConnectionModeAdmission {
         isLoopback: Bool
     ) -> ResultCode {
         guard expectedMode == clientMode else { return .wrongMode }
-        let routeMatches = expectedMode == .usb ? isLoopback : !isLoopback
-        return routeMatches ? .accepted : .wrongTransport
+        return routeMatches(expectedMode: expectedMode, isLoopback: isLoopback)
+            ? .accepted
+            : .wrongTransport
+    }
+
+    static func routeMatches(expectedMode: ConnectionMode, isLoopback: Bool) -> Bool {
+        expectedMode == .usb ? isLoopback : !isLoopback
     }
 }

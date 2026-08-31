@@ -153,6 +153,7 @@ class StreamClient(
             val connectedSocket = Socket()
             connectedSocket.connect(java.net.InetSocketAddress(host, port), VIDEO_CONNECT_TIMEOUT_MS)
             connectedSocket.tcpNoDelay = true
+            connectedSocket.soTimeout = VIDEO_ADMISSION_TIMEOUT_MS
             synchronized(stateLock) {
                 if (closeRequested) {
                     connectedSocket.close()
@@ -163,6 +164,7 @@ class StreamClient(
             inputStream = DataInputStream(java.io.BufferedInputStream(connectedSocket.getInputStream(), 65536))
             outputStream = java.io.DataOutputStream(connectedSocket.getOutputStream())
             resetProtocolState()
+            controlChannel.configureAuthentication(null, "Android")
             sendConnectionModeHello()
             advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
             advertiseDecoderLimits() // Also before type 8, for the same reason
@@ -190,7 +192,7 @@ class StreamClient(
 
         object TokenRejected : WirelessConnectError("Token rejected — re-pair required")
 
-        object ProtocolError : WirelessConnectError("The Mac bridge rejected the connection")
+        class ProtocolError(message: String = "The Mac bridge rejected the connection") : WirelessConnectError(message)
     }
 
     /**
@@ -259,70 +261,75 @@ class StreamClient(
                 throw WirelessConnectError.NetworkUnreachable
             }
 
-            val responseBuf = ByteArray(5)
-            var read = 0
+            val authInput = DataInputStream(
+                java.io.BufferedInputStream(
+                    s.getInputStream(),
+                    WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES,
+                ),
+            )
+            s.soTimeout = VIDEO_ADMISSION_TIMEOUT_MS
             try {
-                while (read < 5) {
-                    val r = s.getInputStream().read(responseBuf, read, 5 - read)
-                    if (r <= 0) break
-                    read += r
+                val firstByte = authInput.readUnsignedByte()
+                if (firstByte == ConnectionModeHandshake.SERVER_RESULT_TYPE) {
+                    val result = ConnectionModeHandshake.decodeServerResult(
+                        type = firstByte,
+                        resultCode = authInput.readUnsignedByte(),
+                        encodedExpectedMode = authInput.readUnsignedByte(),
+                    ) ?: throw WirelessConnectError.ProtocolError(
+                        "The Mac sent a malformed connection-mode response",
+                    )
+                    throw WirelessConnectError.ProtocolError(
+                        ConnectionModeHandshake.failureMessage(result),
+                    )
+                }
+                val responseBuf = ByteArray(5)
+                responseBuf[0] = firstByte.toByte()
+                authInput.readFully(responseBuf, 1, 4)
+
+                val status = AuthHandshake.parseResponse(responseBuf)
+                    ?: throw WirelessConnectError.ProtocolError("The Mac sent an invalid auth response")
+                Log.i(TAG, "connectWireless: handshake response status=$status")
+                when (status) {
+                    AuthHandshake.ResponseStatus.OK -> {
+                        synchronized(stateLock) {
+                            if (closeRequested) {
+                                s.close()
+                                throw IOException("connection cancelled")
+                            }
+                            socket = s
+                        }
+                        s.soTimeout = VIDEO_ADMISSION_TIMEOUT_MS
+                        inputStream = authInput
+                        outputStream = java.io.DataOutputStream(s.getOutputStream())
+                        controlChannel.configureAuthentication(token, deviceName)
+                        resetProtocolState()
+                        sendConnectionModeHello()
+                        advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                        advertiseDecoderLimits() // Also before type 8, for the same reason
+                        advertiseFrameMetadataSupport()
+                        ensureOpen()
+                        diagLog(
+                            "Wireless connected to $host:$port mode=${connectionMode.displayName} " +
+                                "profile=${WirelessTransportProfile.TARGET_FPS}fps " +
+                                "rcvBuf=${runCatching { s.receiveBufferSize }.getOrDefault(-1)} " +
+                                "streamBuf=${WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES / 1024}KiB",
+                        )
+                        publishConnected()
+                        connectControlChannel()
+                        receiveData()
+                    }
+                    AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
+                        runCatching { s.close() }
+                        throw WirelessConnectError.TokenRejected
+                    }
+                    else -> {
+                        runCatching { s.close() }
+                        throw WirelessConnectError.ProtocolError("The Mac rejected the wireless auth handshake")
+                    }
                 }
             } catch (e: IOException) {
                 runCatching { s.close() }
                 throw WirelessConnectError.NetworkUnreachable
-            }
-            if (read != 5) {
-                runCatching { s.close() }
-                throw WirelessConnectError.ProtocolError
-            }
-
-            val status =
-                AuthHandshake.parseResponse(responseBuf) ?: run {
-                    runCatching { s.close() }
-                    throw WirelessConnectError.ProtocolError
-                }
-            Log.i(TAG, "connectWireless: handshake response status=$status")
-            when (status) {
-                AuthHandshake.ResponseStatus.OK -> {
-                    synchronized(stateLock) {
-                        if (closeRequested) {
-                            s.close()
-                            throw IOException("connection cancelled")
-                        }
-                        socket = s
-                    }
-                    inputStream =
-                        DataInputStream(
-                            java.io.BufferedInputStream(
-                                s.getInputStream(),
-                                WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES,
-                            ),
-                        )
-                    outputStream = java.io.DataOutputStream(s.getOutputStream())
-                    resetProtocolState()
-                    sendConnectionModeHello()
-                    advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
-                    advertiseDecoderLimits() // Also before type 8, for the same reason
-                    advertiseFrameMetadataSupport()
-                    ensureOpen()
-                    diagLog(
-                        "Wireless connected to $host:$port mode=${connectionMode.displayName} " +
-                            "profile=${WirelessTransportProfile.TARGET_FPS}fps " +
-                            "rcvBuf=${runCatching { s.receiveBufferSize }.getOrDefault(-1)} " +
-                            "streamBuf=${WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES / 1024}KiB",
-                    )
-                    publishConnected()
-                    connectControlChannel()
-                    receiveData()
-                }
-                AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
-                    runCatching { s.close() }
-                    throw WirelessConnectError.TokenRejected
-                }
-                else -> {
-                    runCatching { s.close() }
-                    throw WirelessConnectError.ProtocolError
-                }
             }
         } catch (e: WirelessConnectError) {
             disconnect()
@@ -480,12 +487,24 @@ class StreamClient(
                             val width = input.readInt()
                             val height = input.readInt()
                             val transform = input.readInt()
-                            val rotation = transform % 1000
-                            val flags = transform / 1000
-                            val flipHorizontal = flags and 1 == 1
-                            val flipVertical = flags and 2 == 2
-                            diagLog("Display config: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-                            onDisplaySize?.invoke(width, height, rotation, flipHorizontal, flipVertical)
+                            val config = DisplayConfigValidator.decode(width, height, transform)
+                                ?: throw IOException(
+                                    "Invalid display configuration: ${width}x$height transform=$transform",
+                                )
+                            synchronized(stateLock) {
+                                socket?.soTimeout = 0
+                            }
+                            diagLog(
+                                "Display config: ${config.width}x${config.height} @ ${config.rotation}°, " +
+                                    "h=${config.flipHorizontal}, v=${config.flipVertical}",
+                            )
+                            onDisplaySize?.invoke(
+                                config.width,
+                                config.height,
+                                config.rotation,
+                                config.flipHorizontal,
+                                config.flipVertical,
+                            )
                         }
 
                         5 -> { // Pong response — measure round-trip latency
@@ -887,6 +906,7 @@ class StreamClient(
         private const val MESSAGE_BRIGHT = 11
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
+        private const val VIDEO_ADMISSION_TIMEOUT_MS = 5_000
 
         /**
          * Codec-aware sync-frame (keyframe) detection on the legacy
