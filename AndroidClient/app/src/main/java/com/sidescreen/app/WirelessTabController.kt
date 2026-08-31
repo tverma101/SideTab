@@ -34,6 +34,7 @@ class WirelessTabController(
         deviceName: String,
         macName: String,
     ) -> Unit,
+    private val onDisconnectRequested: () -> Unit,
 ) {
     data class Views(
         val connecting: View,
@@ -54,6 +55,7 @@ class WirelessTabController(
         val connectedMacIp: TextView,
         val connectingLabel: TextView,
         val connectingSubtitle: TextView,
+        val cancelButton: Button,
         val idleMacName: TextView,
         val idleMacIp: TextView,
         val repairTitle: TextView,
@@ -75,6 +77,7 @@ class WirelessTabController(
         views.idleForgetButton.setOnClickListener { forgetPairing() }
         views.reconnectButton.setOnClickListener { reconnect() }
         views.repairReconnectButton.setOnClickListener { reconnect() }
+        views.cancelButton.setOnClickListener { onDisconnectRequested() }
     }
 
     private fun forgetPairing() {

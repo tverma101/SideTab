@@ -65,3 +65,16 @@ For an installed run, collect:
 
 The external high-speed-camera measurement of physical panel latency remains a
 separate hardware test; software timestamps do not replace that measurement.
+
+While a generation is connecting, negotiating, or waiting for its first frame,
+the Android recovery controls remain available. The video socket uses a bounded
+admission read while waiting for the Mac mode result and display configuration,
+so a silent or malformed host ends the generation with an actionable failure
+instead of leaving a blank, uncancellable surface indefinitely.
+
+The optional Wireless control socket has its own bounded auth attempt and never
+invalidates healthy video when unavailable. The Mac applies the same route
+boundary to it as to video: USB control must be loopback/ADB-reverse, while
+Wireless control must be LAN traffic with the video pairing token. A new
+Wireless control candidate is authenticated before it can replace the current
+control socket.

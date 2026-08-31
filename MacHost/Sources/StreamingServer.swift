@@ -1,7 +1,7 @@
 import Foundation
 import Network
 
-private enum WireMessage {
+enum WireMessage {
     static let legacyVideoFrame: UInt8 = 0
     static let displayConfig: UInt8 = 1
     static let touchEvent: UInt8 = 2
@@ -76,6 +76,7 @@ class StreamingServer {
     private let controlPort: UInt16
     private var controlListener: NWListener?
     private var controlConnection: NWConnection?
+    private var pendingControlConnection: NWConnection?
     private var controlInputBuffer = Data()
     private var controlTouchCount = 0
     private var lastControlTouchNs: UInt64 = 0
@@ -218,6 +219,35 @@ class StreamingServer {
 
     private func handleControlConnection(_ newConnection: NWConnection) {
         debugLog("Control connection incoming")
+        guard ConnectionModeAdmission.routeMatches(
+            expectedMode: expectedConnectionMode,
+            isLoopback: newConnection.endpoint.isLoopback
+        ) else {
+            debugLog(
+                "Rejecting control client on wrong route: expected " + expectedConnectionMode.rawValue
+            )
+            newConnection.cancel()
+            return
+        }
+
+        if expectedConnectionMode == .wireless {
+            guard let expected = expectedAuthToken else {
+                debugLog("Rejecting control client: wireless auth is unavailable")
+                newConnection.cancel()
+                return
+            }
+            armControlAuthentication(newConnection, expectedToken: expected)
+            return
+        }
+
+        installControlConnection(newConnection)
+    }
+
+    /// Install a control socket only after its route (and, for Wireless, its
+    /// pairing token) has been admitted. A failed candidate must not evict a
+    /// healthy control socket. Brightness is deliberately retained across a
+    /// replacement so the next authenticated client receives the latest value.
+    private func installControlConnection(_ newConnection: NWConnection, alreadyStarted: Bool = false) {
         if let old = controlConnection {
             old.cancel()
         }
@@ -251,6 +281,51 @@ class StreamingServer {
                 newConnection.cancel()
             case .cancelled:
                 self.controlConnection = nil
+            default:
+                break
+            }
+        }
+
+        if alreadyStarted {
+            controlQueue.async { [weak self, weak newConnection] in
+                guard let self, let newConnection, self.controlConnection === newConnection else { return }
+                self.startReceivingControl()
+            }
+        } else {
+            newConnection.start(queue: controlQueue)
+        }
+    }
+
+    /// Wireless control connections use the same token as the video socket,
+    /// but remain pending until the full request has been validated. This
+    /// prevents a rogue or stale control client from replacing touch/brightness
+    /// handling on an active stream.
+    private func armControlAuthentication(_ newConnection: NWConnection, expectedToken: Data) {
+        if let pending = pendingControlConnection, pending !== newConnection {
+            pending.cancel()
+        }
+        pendingControlConnection = newConnection
+        var authStarted = false
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
+            guard let self, let newConnection, self.pendingControlConnection === newConnection else { return }
+            switch state {
+            case .ready:
+                guard !authStarted else { return }
+                authStarted = true
+                self.runAuthHandshake(connection: newConnection, expectedToken: expectedToken) { _ in
+                    guard self.pendingControlConnection === newConnection else {
+                        newConnection.cancel()
+                        return
+                    }
+                    self.pendingControlConnection = nil
+                    self.installControlConnection(newConnection, alreadyStarted: true)
+                }
+            case .failed(let error):
+                debugLog("Pending control auth connection failed: " + String(describing: error))
+                self.pendingControlConnection = nil
+                newConnection.cancel()
+            case .cancelled:
+                self.pendingControlConnection = nil
             default:
                 break
             }
@@ -431,13 +506,35 @@ class StreamingServer {
     // every pass, producing the reset-by-peer reconnect storm (2026-08-16).
     private var contender: NWConnection?
     private var contenderDeadline: DispatchWorkItem?
+    private var contenderInputBuffer = Data()
     private static let contenderProofWindow: TimeInterval = 1.5
+    private static let contenderAuthWindow: TimeInterval = 5.0
 
     private func handleConnection(_ newConnection: NWConnection) {
         debugLog("New connection incoming...")
-        if connectionReady, connection != nil {
-            debugLog("Live client streaming — new connection held as contender until it speaks")
-            armContender(newConnection)
+        if connection != nil {
+            guard ConnectionModeAdmission.routeMatches(
+                expectedMode: expectedConnectionMode,
+                isLoopback: newConnection.endpoint.isLoopback
+            ) else {
+                debugLog("New video client arrived on the wrong route — rejecting without touching live client")
+                rejectUnstartedConnection(newConnection, result: .wrongTransport)
+                return
+            }
+
+            switch expectedConnectionMode {
+            case .usb:
+                debugLog("Existing video client present — holding USB contender until protocol proof")
+                armContender(newConnection)
+            case .wireless:
+                guard let expected = expectedAuthToken else {
+                    debugLog("Wireless auth unavailable — rejecting contender")
+                    rejectUnstartedConnection(newConnection, result: nil)
+                    return
+                }
+                debugLog("Existing video client present — authenticating Wireless contender before takeover")
+                armWirelessContender(newConnection, expectedToken: expected)
+            }
             return
         }
         installConnection(newConnection)
@@ -448,7 +545,11 @@ class StreamingServer {
     /// per-connection protocol state, and waits for .ready. A promoted
     /// contender is already started and .ready — its handler won't see the
     /// .ready transition again, so drive startup directly instead.
-    private func installConnection(_ newConnection: NWConnection, alreadyStarted: Bool = false) {
+    private func installConnection(
+        _ newConnection: NWConnection,
+        alreadyStarted: Bool = false,
+        alreadyAuthenticatedWireless: Bool = false
+    ) {
         // Clean up old connection properly
         if let oldConnection = connection, oldConnection !== newConnection {
             isReceiving = false
@@ -479,7 +580,11 @@ class StreamingServer {
             debugLog("Connection state: \(state)")
             switch state {
             case .ready:
-                self.onConnectionReady(newConnection!)
+                if alreadyAuthenticatedWireless {
+                    self.beginExistingProtocol(on: newConnection!)
+                } else {
+                    self.onConnectionReady(newConnection!)
+                }
             case .failed(let error):
                 debugLog("Connection failed: \(error)")
                 self.markDisconnected()
@@ -493,7 +598,13 @@ class StreamingServer {
 
         if alreadyStarted {
             if newConnection.state == .ready {
-                networkQueue.async { self.onConnectionReady(newConnection) }
+                networkQueue.async {
+                    if alreadyAuthenticatedWireless {
+                        self.beginExistingProtocol(on: newConnection)
+                    } else {
+                        self.onConnectionReady(newConnection)
+                    }
+                }
             }
             // A started-but-not-ready contender reaches .ready through the
             // state handler installed above, like a fresh connection.
@@ -502,12 +613,17 @@ class StreamingServer {
         }
     }
 
-    /// Hold a would-be client until it proves it is real. The first byte it
-    /// sends promotes it via installConnection (seeded with those bytes, so
-    /// no client advertisement is lost); silence past the window cancels it.
+    /// Hold a would-be client until a complete, recognized message proves it.
+    /// The candidate bytes are validated before installConnection; accepted
+    /// bytes are preserved as the seed so no client advertisement is lost.
+    /// Silence or malformed input cancels the candidate without touching the
+    /// live stream.
     private func armContender(_ newConnection: NWConnection) {
-        clearContender(newConnection, cancelSocket: true)  // one contender at a time
+        if let previous = contender {
+            clearContender(previous, cancelSocket: true)
+        }
         contender = newConnection
+        contenderInputBuffer.removeAll(keepingCapacity: true)
 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self = self else { return }
@@ -533,22 +649,128 @@ class StreamingServer {
         contenderDeadline = deadline
         networkQueue.asyncAfter(deadline: .now() + Self.contenderProofWindow, execute: deadline)
 
-        newConnection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self, weak newConnection] data, _, _, error in
+        receiveContenderData(from: newConnection)
+    }
+
+    private func receiveContenderData(from newConnection: NWConnection) {
+        newConnection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self, weak newConnection] data, _, isComplete, error in
             guard let self = self, let newConnection = newConnection else { return }
             guard self.contender === newConnection else { return }
-            guard error == nil, let data, !data.isEmpty else { return }  // deadline handles silence
-            debugLog("Contender spoke (\(data.count)B) — promoting to client")
-            self.clearContender(newConnection, cancelSocket: false)
-            self.installConnection(newConnection, alreadyStarted: true)
-            self.inputBuffer.append(data)
-            self.processInputBuffer(connection: newConnection)
+            guard error == nil, let data, !data.isEmpty else {
+                if isComplete { self.clearContender(newConnection, cancelSocket: false) }
+                return
+            }
+            self.contenderInputBuffer.append(data)
+            switch ConnectionAdmissionProbe.evaluate(
+                data: self.contenderInputBuffer,
+                expectedMode: self.expectedConnectionMode,
+                isLoopback: newConnection.endpoint.isLoopback
+            ) {
+            case .wait:
+                self.receiveContenderData(from: newConnection)
+            case .reject(let result):
+                debugLog("Contender proof rejected — live stream untouched")
+                self.clearContender(newConnection, cancelSocket: false)
+                if let result {
+                    self.sendModeAdmissionResult(result, on: newConnection, closeAfter: true)
+                } else {
+                    newConnection.cancel()
+                }
+            case .accept:
+                let seed = self.contenderInputBuffer
+                debugLog("Contender passed protocol proof (\(seed.count)B) — promoting to client")
+                self.clearContender(newConnection, cancelSocket: false)
+                self.installConnection(newConnection, alreadyStarted: true)
+                self.inputBuffer.append(seed)
+                self.processInputBuffer(connection: newConnection)
+            }
         }
     }
 
+    /// Wireless takeover candidates complete pairing before they can replace
+    /// the existing video socket. The live client stays untouched on auth
+    /// failure or timeout.
+    private func armWirelessContender(_ newConnection: NWConnection, expectedToken: Data) {
+        if let previous = contender {
+            clearContender(previous, cancelSocket: true)
+        }
+        contender = newConnection
+        contenderInputBuffer.removeAll(keepingCapacity: true)
+        var authStarted = false
+
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
+            guard let self, let newConnection, self.contender === newConnection else { return }
+            switch state {
+            case .ready:
+                guard !authStarted else { return }
+                authStarted = true
+                self.runAuthHandshake(connection: newConnection, expectedToken: expectedToken) { deviceName in
+                    guard self.contender === newConnection else {
+                        newConnection.cancel()
+                        return
+                    }
+                    self.clearContender(newConnection, cancelSocket: false)
+                    self.onWirelessClientPaired?(deviceName)
+                    self.installConnection(
+                        newConnection,
+                        alreadyStarted: true,
+                        alreadyAuthenticatedWireless: true
+                    )
+                }
+            case .failed(let error):
+                debugLog("Wireless contender failed before auth: \(error)")
+                self.clearContender(newConnection, cancelSocket: false)
+            case .cancelled:
+                self.clearContender(newConnection, cancelSocket: false)
+            default:
+                break
+            }
+        }
+        newConnection.start(queue: networkQueue)
+
+        let deadline = DispatchWorkItem { [weak self, weak newConnection] in
+            guard let self, let newConnection, self.contender === newConnection else { return }
+            debugLog("Wireless contender auth timed out — live stream untouched")
+            self.clearContender(newConnection, cancelSocket: true)
+        }
+        contenderDeadline = deadline
+        networkQueue.asyncAfter(deadline: .now() + Self.contenderAuthWindow, execute: deadline)
+    }
+
+    /// Start a wrong-route candidate only long enough to return an explicit
+    /// mode result. Android can then explain the route mismatch instead of
+    /// showing a generic socket EOF.
+    private func rejectUnstartedConnection(
+        _ newConnection: NWConnection,
+        result: ConnectionModeAdmission.ResultCode?
+    ) {
+        var handled = false
+        newConnection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                guard !handled else { return }
+                handled = true
+                if let result {
+                    self.sendModeAdmissionResult(result, on: newConnection, closeAfter: true)
+                } else {
+                    newConnection.cancel()
+                }
+            case .failed, .cancelled:
+                handled = true
+            default:
+                break
+            }
+        }
+        newConnection.start(queue: networkQueue)
+    }
+
     private func clearContender(_ c: NWConnection, cancelSocket: Bool) {
-        if contender === c { contender = nil }
+        guard contender === c else { return }
+        contender = nil
         contenderDeadline?.cancel()
         contenderDeadline = nil
+        contenderInputBuffer.removeAll(keepingCapacity: true)
         if cancelSocket { c.cancel() }
     }
 
@@ -569,26 +791,39 @@ class StreamingServer {
     private func onConnectionReady(_ conn: NWConnection) {
         switch expectedConnectionMode {
         case .usb:
-            guard conn.endpoint.isLoopback else {
+            guard ConnectionModeAdmission.routeMatches(
+                expectedMode: .usb,
+                isLoopback: conn.endpoint.isLoopback
+            ) else {
                 debugLog("Rejecting non-loopback client: Mac is serving USB mode")
-                conn.cancel()
+                sendModeAdmissionResult(.wrongTransport, on: conn, closeAfter: true)
                 return
             }
             debugLog("Client connected via loopback (USB) — skipping auth")
             beginExistingProtocol(on: conn)
         case .wireless:
-            guard !conn.endpoint.isLoopback else {
+            guard ConnectionModeAdmission.routeMatches(
+                expectedMode: .wireless,
+                isLoopback: conn.endpoint.isLoopback
+            ) else {
                 debugLog("Rejecting loopback client: Mac is serving Wireless mode")
-                conn.cancel()
+                sendModeAdmissionResult(.wrongTransport, on: conn, closeAfter: true)
                 return
             }
             guard let expected = expectedAuthToken else {
                 debugLog("Rejecting non-loopback client: wireless auth is unavailable")
-                conn.cancel()
+                sendModeAdmissionResult(.invalidHello, on: conn, closeAfter: true)
                 return
             }
             debugLog("Client connected via LAN — running auth handshake")
-            runAuthHandshake(connection: conn, expectedToken: expected)
+            runAuthHandshake(connection: conn, expectedToken: expected) { deviceName in
+                guard self.connection === conn, !self.isStopped else {
+                    conn.cancel()
+                    return
+                }
+                self.onWirelessClientPaired?(deviceName)
+                self.beginExistingProtocol(on: conn)
+            }
         }
     }
 
@@ -637,7 +872,11 @@ class StreamingServer {
         onClientConnected?()
     }
 
-    private func runAuthHandshake(connection conn: NWConnection, expectedToken: Data) {
+    private func runAuthHandshake(
+        connection conn: NWConnection,
+        expectedToken: Data,
+        onSuccess: @escaping (String) -> Void
+    ) {
         // Read fixed prefix [magic 4][token 32][name_len 1] = 37 bytes.
         conn.receive(minimumIncompleteLength: HandshakeCodec.fixedPrefixLen,
                      maximumLength: HandshakeCodec.fixedPrefixLen) { [weak self] prefixData, _, _, error in
@@ -677,9 +916,16 @@ class StreamingServer {
                     let parsed = try HandshakeCodec.parseRequest(full)
                     if WirelessAuth.validate(parsed.token, expected: expectedToken) {
                         debugLog("Wireless auth OK — device: \(parsed.deviceName)")
-                        self.sendAuthResponse(conn, status: .ok, thenClose: false)
-                        self.onWirelessClientPaired?(parsed.deviceName)
-                        self.beginExistingProtocol(on: conn)
+                        self.sendAuthResponse(conn, status: .ok, thenClose: false) { error in
+                            guard error == nil else {
+                                if let error {
+                                    debugLog("Wireless auth response failed: \(error)")
+                                }
+                                conn.cancel()
+                                return
+                            }
+                            onSuccess(parsed.deviceName)
+                        }
                     } else {
                         debugLog("Wireless auth rejected: token mismatch")
                         self.sendAuthResponse(conn, status: .invalidToken, thenClose: true)
@@ -695,13 +941,19 @@ class StreamingServer {
         }
     }
 
-    private func sendAuthResponse(_ conn: NWConnection, status: HandshakeStatus, thenClose: Bool) {
+    private func sendAuthResponse(
+        _ conn: NWConnection,
+        status: HandshakeStatus,
+        thenClose: Bool,
+        completion: ((NWError?) -> Void)? = nil
+    ) {
         let bytes = HandshakeCodec.encodeResponse(status: status)
-        conn.send(content: bytes, completion: .contentProcessed { _ in
+        conn.send(content: bytes, completion: .contentProcessed { error in
             if thenClose {
                 debugLog("Auth rejected (\(status)), closing connection")
                 conn.cancel()
             }
+            completion?(error)
         })
     }
 
@@ -1185,12 +1437,14 @@ class StreamingServer {
         connection?.cancel()
         listener?.cancel()
         controlConnection?.cancel()
+        pendingControlConnection?.cancel()
         controlListener?.cancel()
         if let c = contender { clearContender(c, cancelSocket: true) }
         backpressure.resetForNewSession()
         connection = nil
         listener = nil
         controlConnection = nil
+        pendingControlConnection = nil
         controlListener = nil
     }
 }

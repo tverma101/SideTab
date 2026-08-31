@@ -23,6 +23,7 @@ internal enum class MacBridgeState {
     MODE_ACCEPTED,
     DISPLAY_CONFIGURED,
     STREAMING,
+    STREAMING_UNVERIFIED,
     REJECTED,
     CLOSED_BEFORE_DISPLAY,
     FAILED,
@@ -40,7 +41,7 @@ internal object ConnectionChecklist {
             setting("Developer settings: enabled", developerModeEnabled),
             setting("USB debugging setting: enabled", adbEnabled),
             routeItem(bridge, routeAccepted),
-            bridgeItem(bridge),
+            bridgeItem(bridge, routeAccepted),
         )
 
     private fun routeItem(
@@ -48,6 +49,10 @@ internal object ConnectionChecklist {
         routeAccepted: Boolean,
     ): ChecklistItem =
         when {
+            bridge == MacBridgeState.REJECTED -> ChecklistItem(
+                "USB route: Mac rejected this mode or route",
+                ChecklistEvidence.FAIL,
+            )
             routeAccepted -> ChecklistItem(
                 "USB route: Mac accepted loopback/ADB-reverse",
                 ChecklistEvidence.PASS,
@@ -56,8 +61,8 @@ internal object ConnectionChecklist {
                 "USB route: awaiting Mac admission response",
                 ChecklistEvidence.PENDING,
             )
-            bridge == MacBridgeState.REJECTED -> ChecklistItem(
-                "USB route: Mac rejected this mode or route",
+            bridge == MacBridgeState.CLOSED_BEFORE_DISPLAY || bridge == MacBridgeState.FAILED -> ChecklistItem(
+                "USB route: connection failed before route confirmation",
                 ChecklistEvidence.FAIL,
             )
             else -> ChecklistItem(
@@ -76,7 +81,10 @@ internal object ConnectionChecklist {
             null -> ChecklistItem(label.replace(": enabled", ": unavailable"), ChecklistEvidence.UNKNOWN)
         }
 
-    private fun bridgeItem(state: MacBridgeState): ChecklistItem =
+    private fun bridgeItem(
+        state: MacBridgeState,
+        routeAccepted: Boolean,
+    ): ChecklistItem =
         when (state) {
             MacBridgeState.NOT_CHECKED -> ChecklistItem(
                 "Mac bridge: not checked until you tap Connect",
@@ -95,12 +103,20 @@ internal object ConnectionChecklist {
                 ChecklistEvidence.PENDING,
             )
             MacBridgeState.DISPLAY_CONFIGURED -> ChecklistItem(
-                "Mac bridge: display config received; waiting for first frame",
-                ChecklistEvidence.PENDING,
+                if (routeAccepted) {
+                    "Mac bridge: display config received; waiting for first frame"
+                } else {
+                    "Mac bridge: display config received; mode admission unavailable"
+                },
+                if (routeAccepted) ChecklistEvidence.PENDING else ChecklistEvidence.UNKNOWN,
             )
             MacBridgeState.STREAMING -> ChecklistItem(
                 "Mac bridge: streaming evidence received",
                 ChecklistEvidence.PASS,
+            )
+            MacBridgeState.STREAMING_UNVERIFIED -> ChecklistItem(
+                "Mac bridge: streaming, but Mac mode admission was not reported",
+                ChecklistEvidence.UNKNOWN,
             )
             MacBridgeState.REJECTED -> ChecklistItem(
                 "Mac bridge: Mac rejected this mode or route",

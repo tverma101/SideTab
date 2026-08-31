@@ -63,6 +63,8 @@ class ControlChannel(
     private val sendLock = Any()
     private val connectLock = Any()
     @Volatile private var boundNetwork: Network? = null
+    private var wirelessAuthToken: ByteArray? = null
+    private var authDeviceName = "Android"
 
     val isConnected: Boolean
         get() = tcpActive
@@ -70,6 +72,18 @@ class ControlChannel(
     /** Bind the optional control socket to the same Wi-Fi route as video. */
     fun bindTo(network: Network?) {
         boundNetwork = network
+    }
+
+    /**
+     * Configure the optional control socket to use the same admission
+     * credential as the authenticated video socket. USB clears this value;
+     * Wireless sets it before the one-shot control connection starts.
+     */
+    fun configureAuthentication(token: ByteArray?, deviceName: String) {
+        synchronized(connectLock) {
+            wirelessAuthToken = token?.copyOf()
+            authDeviceName = deviceName.take(64).ifBlank { "Android" }
+        }
     }
 
     /**
@@ -111,6 +125,24 @@ class ControlChannel(
                 }
                 s.connect(InetSocketAddress(host, port), 2000)
                 s.tcpNoDelay = true
+                val input = DataInputStream(BufferedInputStream(s.getInputStream(), 4096))
+                val authToken = wirelessAuthToken?.copyOf()
+                val deviceName = authDeviceName
+                if (authToken != null) {
+                    s.soTimeout = CONTROL_AUTH_TIMEOUT_MS
+                    val authOutput = DataOutputStream(s.getOutputStream())
+                    authOutput.write(AuthHandshake.encodeRequest(authToken, deviceName))
+                    authOutput.flush()
+                    val response = ByteArray(5)
+                    input.readFully(response)
+                    when (AuthHandshake.parseResponse(response)) {
+                        AuthHandshake.ResponseStatus.OK -> Unit
+                        AuthHandshake.ResponseStatus.INVALID_TOKEN ->
+                            throw IllegalStateException("control auth token rejected")
+                        else -> throw IllegalStateException("control auth response invalid")
+                    }
+                }
+                s.soTimeout = 0
                 socket = s
                 output = DataOutputStream(s.getOutputStream())
                 lastPongAtNs = System.nanoTime()
@@ -125,7 +157,7 @@ class ControlChannel(
                 onAvailabilityChanged?.invoke(true)
                 declareBrightnessSupport()
                 declareClockSyncSupport()
-                Thread({ tcpReadLoop(s) }, "ControlTcpThread")
+                Thread({ tcpReadLoop(s, input) }, "ControlTcpThread")
                     .apply { isDaemon = true }
                     .start()
             } catch (e: Exception) {
@@ -142,13 +174,12 @@ class ControlChannel(
         }
     }
 
-    private fun tcpReadLoop(s: Socket) {
+    private fun tcpReadLoop(s: Socket, input: DataInputStream) {
         try {
             Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
         } catch (_: Exception) {
         }
         try {
-            val input = DataInputStream(BufferedInputStream(s.getInputStream(), 4096))
             while (running && socket === s) {
                 val type = input.readByte().toInt()
                 val arrival = System.nanoTime()
@@ -377,6 +408,7 @@ class ControlChannel(
 
     private companion object {
         const val PONG_TIMEOUT_NS = 3_000_000_000L
+        const val CONTROL_AUTH_TIMEOUT_MS = 2_000
         const val DIAGNOSTIC_SAMPLE_INTERVAL_MS = 10_000L
     }
 }
