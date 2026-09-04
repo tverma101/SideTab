@@ -26,6 +26,10 @@ class StreamClient(
     controlPort: Int = port + 1,
 ) {
     private var socket: Socket? = null
+    @Volatile
+    private var pendingSocket: Socket? = null
+    @Volatile
+    private var connectionAttemptCancelled = false
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
     private var isConnected = false
@@ -56,6 +60,10 @@ class StreamClient(
 
     /** True once a MESSAGE_CODEC_SELECTED arrived — distinguishes new Macs from old. */
     @Volatile var codecNegotiated = false
+        private set
+
+    /** True only after the connected Mac explicitly accepts stylus events. */
+    @Volatile var stylusSupported = false
         private set
 
     private var bytesReceived = 0L
@@ -131,6 +139,8 @@ class StreamClient(
 
     suspend fun connect() =
         withContext(Dispatchers.IO) {
+            controlChannel.setAuthToken(null)
+            if (connectionAttemptCancelled) return@withContext
             try {
                 socket =
                     Socket(host, port).apply {
@@ -140,8 +150,10 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                stylusSupported = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseStylusSupport() // Payload-free; old hosts safely skip it.
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 lastKeyframeReceivedNs = 0L
@@ -177,16 +189,21 @@ class StreamClient(
         token: ByteArray,
         deviceName: String,
     ) = withContext(Dispatchers.IO) {
+        if (token.size != PAIRING_TOKEN_SIZE) {
+            throw WirelessConnectError.ProtocolError
+        }
+        controlChannel.setAuthToken(token)
         Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
 
         // Force the socket onto the active WiFi network. On some Android setups
         // (especially LG/Android 12), an app's default outbound socket may take
         // a route that silently drops LAN traffic; binding to the WIFI Network
         // explicitly avoids that.
+        val connectingSocket = Socket()
+        pendingSocket = connectingSocket
         val s =
             try {
-                val sock = Socket()
-                sock.tcpNoDelay = true
+                connectingSocket.tcpNoDelay = true
                 val wifiNetwork =
                     context?.let { ctx ->
                         val cm = ctx.getSystemService(ConnectivityManager::class.java)
@@ -198,28 +215,67 @@ class StreamClient(
                     }
                 if (wifiNetwork != null) {
                     Log.i(TAG, "connectWireless: binding socket to WiFi network $wifiNetwork")
-                    wifiNetwork.bindSocket(sock)
+                    wifiNetwork.bindSocket(connectingSocket)
                 } else {
                     Log.w(TAG, "connectWireless: no WiFi network found, using default routing")
                 }
-                sock.connect(java.net.InetSocketAddress(host, port), 5000)
-                sock
+                connectingSocket.connect(java.net.InetSocketAddress(host, port), 5000)
+                connectingSocket
             } catch (e: java.net.SocketTimeoutException) {
                 Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port (5s)")
+                clearPendingSocket(connectingSocket)
+                try {
+                    connectingSocket.close()
+                } catch (_: IOException) {
+                }
                 throw WirelessConnectError.NetworkUnreachable
             } catch (e: IOException) {
                 Log.e(
                     TAG,
                     "connectWireless: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}",
                 )
+                clearPendingSocket(connectingSocket)
+                try {
+                    connectingSocket.close()
+                } catch (_: IOException) {
+                }
                 throw WirelessConnectError.NetworkUnreachable
             }
+        if (connectionAttemptCancelled) {
+            clearPendingSocket(s)
+            try {
+                s.close()
+            } catch (_: IOException) {
+            }
+            return@withContext
+        }
+        // A reachable but stalled host must not leave the Wireless tab stuck
+        // in Connecting forever while waiting for its application response.
+        s.soTimeout = 5000
         Log.i(
             TAG,
             "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",
         )
 
-        val request = AuthHandshake.encodeRequest(token, deviceName)
+        val request =
+            try {
+                AuthHandshake.encodeRequest(token, deviceName)
+            } catch (_: IllegalArgumentException) {
+                clearPendingSocket(s)
+                try {
+                    s.close()
+                } catch (_: IOException) {
+                }
+                throw WirelessConnectError.ProtocolError
+            }
+        if (connectionAttemptCancelled) {
+            clearPendingSocket(s)
+            try {
+                s.close()
+            } catch (_: IOException) {
+            }
+            return@withContext
+        }
         try {
             s.getOutputStream().write(request)
             s.getOutputStream().flush()
@@ -228,6 +284,7 @@ class StreamClient(
                 s.close()
             } catch (_: IOException) {
             }
+            clearPendingSocket(s)
             throw WirelessConnectError.NetworkUnreachable
         }
 
@@ -244,13 +301,23 @@ class StreamClient(
                 s.close()
             } catch (_: IOException) {
             }
+            clearPendingSocket(s)
             throw WirelessConnectError.NetworkUnreachable
+        }
+        if (connectionAttemptCancelled) {
+            clearPendingSocket(s)
+            try {
+                s.close()
+            } catch (_: IOException) {
+            }
+            return@withContext
         }
         if (read != 5) {
             try {
                 s.close()
             } catch (_: IOException) {
             }
+            clearPendingSocket(s)
             throw WirelessConnectError.ProtocolError
         }
 
@@ -260,18 +327,29 @@ class StreamClient(
                     s.close()
                 } catch (_: IOException) {
                 }
+                clearPendingSocket(s)
                 throw WirelessConnectError.ProtocolError
             }
         Log.i(TAG, "connectWireless: handshake response status=$status")
         when (status) {
             AuthHandshake.ResponseStatus.OK -> {
+                // The timeout only bounds the handshake response. Video is a
+                // long-lived stream and must allow legitimate idle intervals.
+                s.soTimeout = 0
+                clearPendingSocket(s)
                 socket = s
                 inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                stylusSupported = false
+                lastKeyframeReceivedNs = 0L
+                synchronized(keyframeRequestLock) {
+                    lastKeyframeRequestNs = 0L
+                }
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseStylusSupport() // Payload-free; old hosts safely skip it.
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
@@ -284,6 +362,7 @@ class StreamClient(
                     s.close()
                 } catch (_: IOException) {
                 }
+                clearPendingSocket(s)
                 throw WirelessConnectError.TokenRejected
             }
             else -> {
@@ -291,15 +370,21 @@ class StreamClient(
                     s.close()
                 } catch (_: IOException) {
                 }
+                clearPendingSocket(s)
                 throw WirelessConnectError.ProtocolError
             }
         }
     }
 
-    /** Best-effort: opens the out-of-band control channel after the video
+    private fun clearPendingSocket(expected: Socket) {
+        if (pendingSocket === expected) pendingSocket = null
+    }
+
+    /** Best-effort: opens the out-of-band control channel once after the video
      *  connection is up. Failure is non-fatal — ping/pong falls back in-band.
      *  Runs fire-and-forget on its own thread so the video receive loop is
-     *  never delayed by a slow control-channel connect. */
+     *  never delayed by a slow control-channel connect. A later retry requires
+     *  a new, user-requested stream connection. */
     private fun connectControlChannel() {
         controlChannel.onLatencyMeasured = { rttMs ->
             onLatencyMeasured?.invoke(rttMs)
@@ -323,6 +408,14 @@ class StreamClient(
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
             out.flush()
             diagLog("Advertised frame metadata support")
+        }
+    }
+
+    private fun advertiseStylusSupport() {
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_STYLUS)
+            out.flush()
+            diagLog("Advertised S Pen stylus support")
         }
     }
 
@@ -400,6 +493,11 @@ class StreamClient(
                             onCodecSelected?.invoke(streamCodecIsHevc)
                         }
 
+                        MESSAGE_SERVER_SUPPORTS_STYLUS -> {
+                            stylusSupported = true
+                            diagLog("Mac host accepted S Pen stylus events")
+                        }
+
                         else -> {
                             Log.e(
                                 TAG,
@@ -454,6 +552,24 @@ class StreamClient(
         }
     }
 
+    /** Send a direct S Pen event when the Mac host negotiated the extension. */
+    fun sendStylus(event: StylusInputEvent) {
+        if (!isConnected || !stylusSupported) return
+
+        touchScope.launch {
+            if (controlChannel.sendStylus(event)) {
+                return@launch
+            }
+            try {
+                socket?.getOutputStream()?.let { out ->
+                    out.write(StylusProtocol.encode(event))
+                    out.flush()
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     // Callback for latency measurement (round-trip ping/pong)
     var onLatencyMeasured: ((Double) -> Unit)? = null
 
@@ -487,10 +603,14 @@ class StreamClient(
 
         val flags = if (force) KEYFRAME_REQUEST_FLAG_FORCE else 0
         diagLog("Requesting keyframe: reason=$reason, force=$force")
-        if (controlChannel.requestKeyframe(force)) {
-            return
-        }
         touchScope.launch {
+            // Decoder callbacks can arrive on the main or codec callback
+            // thread. Keep every control write off those threads so Android
+            // never turns a valid dedicated channel into a
+            // NetworkOnMainThreadException during decoder startup.
+            if (controlChannel.requestKeyframe(force)) {
+                return@launch
+            }
             try {
                 outputStream?.let { out ->
                     out.write(byteArrayOf(MESSAGE_KEYFRAME_REQUEST.toByte(), flags.toByte()))
@@ -624,6 +744,8 @@ class StreamClient(
 
     fun disconnect() {
         isConnected = false
+        connectionAttemptCancelled = true
+        pendingSocket?.close()
         cleanup()
         onConnectionStatus?.invoke(false)
         Log.d(TAG, "Disconnected")
@@ -634,6 +756,8 @@ class StreamClient(
             outputStream?.close()
             inputStream?.close()
             socket?.close()
+            pendingSocket?.close()
+            pendingSocket = null
             controlChannel.disconnect()
 
             // Properly shutdown executor with timeout to prevent orphaned threads
@@ -670,8 +794,11 @@ class StreamClient(
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val MESSAGE_CLIENT_SUPPORTS_STYLUS = StylusProtocol.CLIENT_SUPPORTS_STYLUS
+        private const val MESSAGE_SERVER_SUPPORTS_STYLUS = StylusProtocol.SERVER_SUPPORTS_STYLUS
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
+        private const val PAIRING_TOKEN_SIZE = 32
 
         /**
          * Codec-aware sync-frame (keyframe) detection on the legacy

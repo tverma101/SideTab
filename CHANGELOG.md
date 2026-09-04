@@ -9,11 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security and maintenance
+- Android pairing tokens are encrypted with the Android Keystore and are excluded from app backup; legacy plaintext preferences migrate on the next successful load.
+- Release APK builds no longer fall back to the debug signing key and fail with an actionable configuration error when release credentials are missing.
+- The VSR A/B broadcast hook is debug-only and is not registered by release builds.
+- USB helper scripts now forward both the active video (`54321`) and control (`54322`) ports. Documentation no longer promises wireless auto-connect when the current UI requires tapping **Reconnect**.
+- Android connections are user initiated: failed or dropped sessions no longer retry indefinitely or resume a saved session on app launch. Tap **Connect** or **Reconnect** when you want another attempt.
+- The idle Android checklist no longer probes the Mac every two seconds; Mac availability is learned from an explicit connection attempt.
+- Android keyframe requests now run on the serialized control I/O executor, so decoder callbacks cannot disable the dedicated control socket with a main-thread network exception.
+- Wireless control connections now require the existing pairing token before accepting touch, ping, or keyframe messages; loopback USB reverse-forwarding remains local-only. Wireless video is still cleartext and should be used only on a trusted network.
+- `scripts/backup_android_apks.sh` now preserves all local Android APK outputs and the installed device APK in timestamped, non-overwriting snapshots before further installs.
+- Android now treats a configured data-only USB/ADB cable as connected in the checklist, and the main activity is single-instance so returning from Home cannot leave a hidden streaming activity behind.
+- Manual Android Disconnect now restores the connection panel, orientation, controls, and idle checklist instead of leaving the streaming UI stuck after the socket closes.
+- Android pauses latency pings while backgrounded and keeps an idle dedicated control socket alive, preventing stale multi-second RTT samples and permanent in-band fallback after foregrounding.
+
+### Added
+- Samsung S Pen drawing support: stylus contact is detected separately from finger touch, starts a direct stroke immediately, forwards normalized pressure/tilt/orientation, and supports hover-cursor movement plus the S Pen secondary button. The negotiated protocol falls back to legacy touch for older Mac hosts.
+
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming
 - Multi-touch gestures
-- Stylus/pen support
 
 ---
 

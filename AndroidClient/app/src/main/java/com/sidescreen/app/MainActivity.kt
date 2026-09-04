@@ -43,8 +43,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -80,19 +78,10 @@ class MainActivity : AppCompatActivity() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
-    // Auto-reconnect: an interrupted session (host restart, transport blip,
-    // or failed connect) retries with capped backoff until the user
-    // explicitly disconnects. Before this, a sender restart left the app on
-    // its disconnected screen until someone tapped CONNECT — while the
-    // checklist probe hammered the Mac video port every 2s (2026-08-16).
-    private var autoReconnectJob: Job? = null
-    private var autoReconnectAttempt = 0
     // All callbacks from an old StreamClient become inert as soon as a newer
     // connect starts. Without this generation fence, a sender restart can
     // leave several clients reconnecting at once and starve the decoder.
     @Volatile private var activeConnectionGeneration = 0L
-
-    @Volatile private var userRequestedDisconnect = false
 
     // For dragging stats overlay
     private var isDraggingOverlay = false
@@ -101,11 +90,20 @@ class MainActivity : AppCompatActivity() {
 
     // Input prediction for low-latency gaming
     private val inputPredictor = InputPredictor()
+    // S Pen contact is a drawing stroke, not a touch gesture. Keep its
+    // pointer id across ACTION_MOVE/ACTION_POINTER_UP because Android may
+    // reorder pointer indexes when a finger is also on the panel.
+    private var activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
+    private var regularTouchActive = false
 
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
     private var checklistRunnable: Runnable? = null
     private var isConnected = false // Track connection state to prevent checklist conflicts
+    // A server status is only learned from an explicit stream attempt. Keeping
+    // this as a local last-known value prevents the idle checklist from opening
+    // a socket every few seconds and looking like a reconnect loop.
+    private var macServerKnownAvailable = false
 
     // Auto-disconnect: if the app stays backgrounded past the configured
     // window (default 5 min; adb-tunable via
@@ -153,31 +151,9 @@ class MainActivity : AppCompatActivity() {
         setupWirelessController()
         setupVsrCommandReceiver()
 
-        // Boot-to-stream: resume the last live session automatically (an
-        // explicit disconnect() clears it). USB/E3 path only — wireless
-        // pairing has its own controller flow.
-        val savedSession = getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
-        val savedHost = savedSession.getString("host", null)
-        val savedPort = savedSession.getInt("port", 0)
-        if (savedHost != null && savedPort > 0 && prefs.connectionMode == ConnectionMode.USB) {
-            // Older E3 experiments persisted 10.77.0.1:54326 as the USB
-            // video endpoint. The current Mac host exposes the normal USB
-            // stream through adb-reverse on 127.0.0.1:54321; only its control
-            // channel remains on 54322. Do not resurrect the obsolete video
-            // endpoint on every app launch.
-            if (savedHost == LEGACY_E3_HOST && savedPort == LEGACY_E3_PORT) {
-                log("🔁 Migrating stale E3 session $savedHost:$savedPort -> $DEFAULT_USB_HOST:$DEFAULT_USB_PORT")
-                savedSession
-                    .edit()
-                    .putString("host", DEFAULT_USB_HOST)
-                    .putInt("port", DEFAULT_USB_PORT)
-                    .apply()
-                connect(DEFAULT_USB_HOST, DEFAULT_USB_PORT)
-            } else {
-                log("🔁 Resuming last session $savedHost:$savedPort")
-                connect(savedHost, savedPort)
-            }
-        }
+        // Connections are user initiated. Keep the last-session preference
+        // out of startup so a stale host, a sleeping Mac, or a transport
+        // blip cannot make the tablet reconnect without a button press.
     }
 
     private fun setupModeToggle() {
@@ -242,8 +218,8 @@ class MainActivity : AppCompatActivity() {
                     ),
                 storage = pairedHostStorage,
                 cameraPerm = cameraPerm,
-                onConnectRequested = { host, port, token, deviceName, macName ->
-                    connectWireless(host, port, token, deviceName, macName)
+                onConnectRequested = { host, port, token, deviceName, _ ->
+                    connectWireless(host, port, token, deviceName)
                 },
             )
         wirelessController.bind()
@@ -364,7 +340,10 @@ class MainActivity : AppCompatActivity() {
                     width: Int,
                     height: Int,
                 ) {
-                    mainDiag("surfaceChanged: ${width}x$height")
+                    mainDiag(
+                        "surfaceChanged: ${width}x$height connected=$isConnected " +
+                            "display=${displayWidth}x$displayHeight client=${streamClient != null}",
+                    )
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
                     initializeDecoderForCurrentSurface()
@@ -432,6 +411,12 @@ class MainActivity : AppCompatActivity() {
         binding.textureView.setOnTouchListener { view, event ->
             handleTouch(view, event)
             true
+        }
+        binding.surfaceView.setOnHoverListener { view, event ->
+            handleStylusHover(view, event)
+        }
+        binding.textureView.setOnHoverListener { view, event ->
+            handleStylusHover(view, event)
         }
     }
 
@@ -1111,9 +1096,9 @@ class MainActivity : AppCompatActivity() {
 
     private var vsrCmdReceiver: BroadcastReceiver? = null
 
-    /** Debug A/B hook: adb broadcast to switch VSR modes headlessly (no UI taps, no reconnect). */
+    /** Debug-only A/B hook; never registers an externally reachable receiver in release builds. */
     private fun setupVsrCommandReceiver() {
-        if (vsrCmdReceiver != null) return
+        if (!BuildConfig.DEBUG || vsrCmdReceiver != null) return
         val receiver =
             object : BroadcastReceiver() {
                 override fun onReceive(
@@ -1326,39 +1311,64 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Wire up all StreamClient callbacks. Used by both USB connect() and wireless connectWireless().
+     * Wire up the wireless client's callbacks with the same generation fence
+     * used by the USB path. A wireless connect can be cancelled while its
+     * handshake socket is still local to the IO coroutine, so every callback
+     * must remain tied to this exact client instance.
      */
-    private fun setupStreamClientCallbacks() {
-        streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-            val dec = videoDecoder
-            if (dec != null) {
-                dec.decode(frameData, frameSize, timestamp, isKeyframe)
+    private fun setupStreamClientCallbacks(
+        client: StreamClient,
+        generation: Long,
+        host: String,
+    ) {
+        client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+            if (isCurrentConnection(client, generation)) {
+                val dec = videoDecoder
+                if (dec != null) {
+                    dec.decode(frameData, frameSize, timestamp, isKeyframe)
+                } else {
+                    client.releaseBuffer(frameData)
+                    mainDiag("FRAME DROPPED: videoDecoder is null!")
+                }
             } else {
-                mainDiag("FRAME DROPPED: videoDecoder is null!")
+                client.releaseBuffer(frameData)
             }
         }
 
         videoDecoder?.onFrameDecoded = { buffer ->
-            streamClient?.releaseBuffer(buffer)
+            client.releaseBuffer(buffer)
+        }
+        videoDecoder?.onKeyframeRequired = { force, reason ->
+            if (isCurrentConnection(client, generation)) {
+                client.requestKeyframe(force = force, reason = reason)
+            }
         }
 
-        streamClient?.onLatencyMeasured = { rttMs ->
-            runOnUiThread {
-                binding.latencyText.text = String.format("%.1f ms", rttMs)
+        client.onLatencyMeasured = { rttMs ->
+            if (isCurrentConnection(client, generation)) {
+                runOnUiThread {
+                    if (isCurrentConnection(client, generation)) {
+                        binding.latencyText.text = String.format("%.1f ms", rttMs)
+                    }
+                }
             }
         }
 
         // Real panel backlight from the host (BRIGHT over control channel).
-        streamClient?.onBrightness = { v -> applyBacklight(v) }
+        client.onBrightness = { v ->
+            if (isCurrentConnection(client, generation)) applyBacklight(v)
+        }
 
-        streamClient?.onConnectionStatus = { connected ->
+        client.onConnectionStatus = { connected ->
             runOnUiThread {
-                isConnected = connected
-                if (connected) {
-                    updateStatus("Connected - Streaming active")
-                } else {
-                    updateStatus("Disconnected")
+                if (!isCurrentConnection(client, generation)) {
+                    if (connected) client.disconnect()
+                    return@runOnUiThread
                 }
+
+                isConnected = connected
+                macServerKnownAvailable = connected
+                updateStatus(if (connected) "Connected - Streaming active" else "Disconnected")
                 binding.connectButton.isEnabled = !connected
                 binding.disconnectButton.isEnabled = connected
                 binding.statusIndicator.setBackgroundResource(
@@ -1372,65 +1382,59 @@ class MainActivity : AppCompatActivity() {
                     applySettingsButtonVisibility()
                     restoreSettingsButtonPosition()
                     updateOverlayVisibility(prefs.showStatsOverlay)
-                    // For wireless mode, transition controller to CONNECTED here —
-                    // not in MainActivity.connectWireless's coroutine after the
-                    // receive loop returns (that runs AFTER disconnect, causing
-                    // a stale CONNECTED transition that hides the PAIRED_IDLE UI).
-                    if (prefs.connectionMode == ConnectionMode.WIRELESS) {
-                        val entry = pairedHostStorage.load()
-                        wirelessController.onConnectSuccess(
-                            entry?.macName ?: "Mac",
-                            entry?.host ?: "—",
-                        )
-                    }
+                    val entry = pairedHostStorage.load()
+                    wirelessController.onConnectSuccess(
+                        entry?.macName ?: "Mac",
+                        entry?.host ?: host,
+                    )
                 } else {
+                    streamClient = null
                     stopPingTimer()
                     disableFullscreenMode()
                     resetOrientationToSensor()
                     binding.settingsPanel.visibility = View.VISIBLE
                     binding.settingsButton.visibility = View.GONE
                     binding.statusBar.visibility = View.GONE
-                    val mode = prefs.connectionMode
-                    val willTransition = mode == ConnectionMode.WIRELESS
-                    android.util.Log.i(
-                        "MainActivity",
-                        "onConnectionStatus(false) — mode=$mode, willTransition=$willTransition",
-                    )
-                    if (mode == ConnectionMode.WIRELESS) {
-                        // Don't restart checklist (it conflicts with wireless on Mac).
-                        // Tell wireless controller to show the idle/reconnect UI.
-                        wirelessController.onStreamDisconnected()
-                    } else {
-                        log("📋 Restarting checklist updates")
-                        startChecklistUpdates()
-                    }
+                    // Do not restart the USB checklist: its loopback probes can
+                    // contend with a wireless session on the Mac.
+                    wirelessController.onStreamDisconnected()
                 }
             }
         }
 
-        streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
-
-        streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
-            mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-            warnIfAvcOnlyWithoutNegotiation()
-            displayWidth = width
-            displayHeight = height
-            displayRotation = rotation
-            displayFlipHorizontal = flipHorizontal
-            displayFlipVertical = flipVertical
-            runOnUiThread {
-                binding.resolutionText.text = "${width}x$height"
-                applyRotation(rotation, flipHorizontal, flipVertical)
-                applyDirectPixelMapping(width, height)
-                initializeDecoderForCurrentSurface()
-            }
-            log("Display: ${width}x$height @ $rotation°")
+        client.onCodecSelected = { isHevc ->
+            if (isCurrentConnection(client, generation)) onStreamCodecSelected(isHevc)
         }
 
-        streamClient?.onStats = { fps, mbps ->
-            runOnUiThread {
-                binding.fpsText.text = String.format("%.1f", fps)
-                binding.bitrateText.text = String.format("%.1f Mbps", mbps)
+        client.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
+            if (isCurrentConnection(client, generation)) {
+                mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
+                warnIfAvcOnlyWithoutNegotiation()
+                displayWidth = width
+                displayHeight = height
+                displayRotation = rotation
+                displayFlipHorizontal = flipHorizontal
+                displayFlipVertical = flipVertical
+                runOnUiThread {
+                    if (isCurrentConnection(client, generation)) {
+                        binding.resolutionText.text = "${width}x$height"
+                        applyRotation(rotation, flipHorizontal, flipVertical)
+                        applyDirectPixelMapping(width, height)
+                        initializeDecoderForCurrentSurface()
+                    }
+                }
+                log("Display: ${width}x$height @ $rotation°")
+            }
+        }
+
+        client.onStats = { fps, mbps ->
+            if (isCurrentConnection(client, generation)) {
+                runOnUiThread {
+                    if (isCurrentConnection(client, generation)) {
+                        binding.fpsText.text = String.format("%.1f", fps)
+                        binding.bitrateText.text = String.format("%.1f Mbps", mbps)
+                    }
+                }
             }
         }
     }
@@ -1440,26 +1444,37 @@ class MainActivity : AppCompatActivity() {
         port: Int,
         token: ByteArray,
         deviceName: String,
-        macName: String,
     ) {
+        val generation = activeConnectionGeneration + 1
+        activeConnectionGeneration = generation
+        streamClient?.disconnect()
+        streamClient = null
+        isConnected = false
+
+        val client = StreamClient(host, port, applicationContext)
+        streamClient = client
+        setupStreamClientCallbacks(client, generation, host)
+
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
-                streamClient = StreamClient(host, port, applicationContext)
-                setupStreamClientCallbacks()
-                streamClient?.connectWireless(token, deviceName)
+                client.connectWireless(token, deviceName)
                 // NOTE: onConnectSuccess is fired from the onConnectionStatus(true)
                 // listener (above) right after handshake OK — not here. This line
                 // would otherwise run AFTER the receive loop exits, i.e. AFTER
                 // disconnect, incorrectly transitioning back to CONNECTED.
             } catch (e: StreamClient.WirelessConnectError) {
+                if (!isCurrentConnection(client, generation)) return@launch
                 runOnUiThread {
-                    wirelessController.onConnectError(e)
+                    if (isCurrentConnection(client, generation)) wirelessController.onConnectError(e)
                 }
             } catch (e: Exception) {
+                if (!isCurrentConnection(client, generation)) return@launch
                 log("Wireless connect failed: ${e.message}")
                 runOnUiThread {
-                    wirelessController.onConnectError(StreamClient.WirelessConnectError.NetworkUnreachable)
+                    if (isCurrentConnection(client, generation)) {
+                        wirelessController.onConnectError(StreamClient.WirelessConnectError.NetworkUnreachable)
+                    }
                 }
             }
         }
@@ -1469,12 +1484,6 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
-        // A fresh/explicit connect re-arms auto-reconnect (it is only
-        // disarmed by an explicit user disconnect()).
-        userRequestedDisconnect = false
-        autoReconnectJob?.cancel()
-        autoReconnectJob = null
-
         // Invalidate and close the previous client before creating its
         // replacement. Older callbacks are fenced by this generation.
         val generation = activeConnectionGeneration + 1
@@ -1543,13 +1552,14 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         if (!isCurrentConnection(client, generation)) {
                             // A stale client must never flip the UI to
-                            // disconnected or schedule another reconnect.
+                            // disconnected or alter the active session.
                             if (connected) client.disconnect()
                             return@runOnUiThread
                         }
 
                         // Update connection state flag
                         isConnected = connected
+                        macServerKnownAvailable = connected
 
                         if (connected) {
                             updateStatus("Connected - Streaming active")
@@ -1572,15 +1582,6 @@ class MainActivity : AppCompatActivity() {
                         if (connected) {
                             // Start periodic ping for latency measurement
                             startPingTimer()
-                            autoReconnectAttempt = 0
-
-                            // Remember the live session for boot-to-stream
-                            // resume after an app/device restart.
-                            getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
-                                .edit()
-                                .putString("host", host)
-                                .putInt("port", port)
-                                .apply()
 
                             // Stop checklist updates when connected (prevents socket conflicts)
                             stopChecklistUpdates()
@@ -1593,6 +1594,7 @@ class MainActivity : AppCompatActivity() {
                             restoreSettingsButtonPosition()
                             updateOverlayVisibility(prefs.showStatsOverlay)
                         } else {
+                            streamClient = null
                             // Stop ping timer
                             stopPingTimer()
 
@@ -1610,9 +1612,9 @@ class MainActivity : AppCompatActivity() {
                             log("📋 Restarting checklist updates")
                             startChecklistUpdates()
 
-                            // Session dropped without the user asking — bring
-                            // it back (host restart, transport blip).
-                            scheduleAutoReconnect(host, port)
+                            // A dropped session stays disconnected until the
+                            // user presses Connect again.
+                            log("Connection lost — tap Connect to retry")
                         }
                     }
                 }
@@ -1682,9 +1684,6 @@ class MainActivity : AppCompatActivity() {
                     if (!isCurrentConnection(client, generation)) return@runOnUiThread
                     updateStatus("Connection failed")
                     showError(errorMessage)
-                    // Retryable failure (server restarting, transport down):
-                    // schedule instead of leaving the app dead on its checklist.
-                    scheduleAutoReconnect(host, port)
                 }
             }
         }
@@ -1695,58 +1694,36 @@ class MainActivity : AppCompatActivity() {
         generation: Long,
     ): Boolean = activeConnectionGeneration == generation && streamClient === client
 
-    /**
-     * Retry a dropped or failed session with capped exponential backoff
-     * (1s, 2s, 4s, 8s, then every 10s). Cancelled by an explicit disconnect()
-     * or a newer schedule. The reconnect attempt itself re-enters connect(),
-     * so each failure reschedules naturally until it succeeds.
-     */
-    private fun scheduleAutoReconnect(
-        host: String,
-        port: Int,
-    ) {
-        if (userRequestedDisconnect || isFinishing) return
-        // A single failed client can report through both its receive loop and
-        // its connect path. Keep one scheduled retry instead of continuously
-        // cancelling/restarting the backoff and creating overlapping clients.
-        if (autoReconnectJob?.isActive == true) return
-        val delayMs = (1000L shl autoReconnectAttempt.coerceAtMost(3)).coerceAtMost(10_000L)
-        autoReconnectAttempt += 1
-        log("🔁 Auto-reconnect to $host:$port in ${delayMs / 1000.0}s (attempt $autoReconnectAttempt)")
-        autoReconnectJob =
-            lifecycleScope.launch(Dispatchers.Main) {
-                kotlinx.coroutines.delay(delayMs)
-                if (!userRequestedDisconnect && !isConnected && !isFinishing) {
-                    updateStatus("Reconnecting...")
-                    connect(host, port)
-                }
-            }
-    }
-
     private fun disconnect() {
-        userRequestedDisconnect = true
         activeConnectionGeneration += 1
-        autoReconnectJob?.cancel()
-        autoReconnectJob = null
-        autoReconnectAttempt = 0
-        // Explicit disconnect ends the session for good — do not resume it
-        // on next launch.
-        getSharedPreferences("sidescreen_session", Context.MODE_PRIVATE)
-            .edit()
-            .clear()
-            .apply()
         stopPingTimer()
         streamClient?.disconnect()
         streamClient = null
+        isConnected = false
+        macServerKnownAvailable = false
+        activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
+        regularTouchActive = false
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
         runOnUiThread {
+            updateStatus("Disconnected")
+            binding.connectButton.isEnabled = true
+            binding.disconnectButton.isEnabled = false
+            binding.statusIndicator.setBackgroundResource(android.R.color.holo_red_light)
+            disableFullscreenMode()
+            resetOrientationToSensor()
+            binding.settingsPanel.visibility = View.VISIBLE
+            binding.settingsButton.visibility = View.GONE
+            binding.statusBar.visibility = View.GONE
             applyDirectPixelMapping(0, 0)
             binding.textureView.visibility = View.GONE
             applyTextureTransform()
+            if (prefs.connectionMode == ConnectionMode.USB) {
+                startChecklistUpdates()
+            }
         }
         log("Disconnected")
     }
@@ -1798,6 +1775,66 @@ class MainActivity : AppCompatActivity() {
         view: View,
         event: MotionEvent,
     ) {
+        val action = event.actionMasked
+        val stylusIndex = findStylusPointerIndex(event)
+
+        // A pen touching the display must start a direct mouse stroke. If a
+        // finger gesture was already pending, close that gesture before
+        // handing ownership to the pen so the Mac never sees two active input
+        // modes at once.
+        if ((action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) && stylusIndex >= 0) {
+            if (regularTouchActive) {
+                val touchIndex = findNonStylusPointerIndex(event)
+                if (touchIndex >= 0) {
+                    sendTouchSample(view, event, touchIndex, 2)
+                }
+                regularTouchActive = false
+            }
+            if (activeStylusPointerId == MotionEvent.INVALID_POINTER_ID) {
+                activeStylusPointerId = event.getPointerId(stylusIndex)
+                sendStylusSample(view, event, stylusIndex, StylusProtocol.ACTION_DOWN)
+            }
+            return
+        }
+
+        // Once the pen owns the sequence, ignore any companion finger
+        // pointers. This keeps an S Pen stroke continuous when the heel of a
+        // hand rests on the tablet.
+        if (activeStylusPointerId != MotionEvent.INVALID_POINTER_ID) {
+            val activeIndex = event.findPointerIndex(activeStylusPointerId)
+            when {
+                action == MotionEvent.ACTION_CANCEL -> {
+                    if (activeIndex >= 0) {
+                        sendStylusSample(view, event, activeIndex, StylusProtocol.ACTION_UP)
+                    }
+                    activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
+                }
+
+                activeIndex >= 0 &&
+                    (action == MotionEvent.ACTION_MOVE ||
+                        (action == MotionEvent.ACTION_POINTER_UP && event.getPointerId(event.actionIndex) == activeStylusPointerId) ||
+                        (action == MotionEvent.ACTION_UP && event.getPointerId(0) == activeStylusPointerId)) -> {
+                    val stylusAction =
+                        if (action == MotionEvent.ACTION_MOVE) StylusProtocol.ACTION_MOVE else StylusProtocol.ACTION_UP
+                    sendStylusSample(view, event, activeIndex, stylusAction)
+                    if (stylusAction == StylusProtocol.ACTION_UP) {
+                        activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
+                    }
+                }
+            }
+            return
+        }
+
+        // If a device reports a stylus move without delivering its initial
+        // ACTION_DOWN (seen after a surface recreation on some Samsung
+        // firmware), recover the stroke instead of feeding it into touch
+        // prediction.
+        if (action == MotionEvent.ACTION_MOVE && stylusIndex >= 0) {
+            activeStylusPointerId = event.getPointerId(stylusIndex)
+            sendStylusSample(view, event, stylusIndex, StylusProtocol.ACTION_DOWN)
+            return
+        }
+
         val rawX = event.x / view.width.toFloat()
         val rawY = event.y / view.height.toFloat()
         val x = if (displayFlipHorizontal) 1f - rawX else rawX
@@ -1813,8 +1850,9 @@ class MainActivity : AppCompatActivity() {
             y2 = if (displayFlipVertical) 1f - rawY2 else rawY2
         }
 
-        when (event.actionMasked) {
+        when (action) {
             MotionEvent.ACTION_DOWN -> {
+                regularTouchActive = true
                 inputPredictor.reset()
                 inputPredictor.addSample(x, y)
                 streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
@@ -1835,6 +1873,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             MotionEvent.ACTION_UP -> {
+                regularTouchActive = false
                 inputPredictor.reset()
                 streamClient?.sendTouch(x, y, 2, 1)
             }
@@ -1844,9 +1883,98 @@ class MainActivity : AppCompatActivity() {
             }
 
             MotionEvent.ACTION_CANCEL -> {
+                regularTouchActive = false
                 inputPredictor.reset()
                 streamClient?.sendTouch(x, y, 2, 1)
             }
+        }
+    }
+
+    private fun handleStylusHover(
+        view: View,
+        event: MotionEvent,
+    ): Boolean {
+        val action = event.actionMasked
+        if (action != MotionEvent.ACTION_HOVER_ENTER &&
+            action != MotionEvent.ACTION_HOVER_MOVE &&
+            action != MotionEvent.ACTION_HOVER_EXIT
+        ) {
+            return false
+        }
+        val stylusIndex = findStylusPointerIndex(event)
+        if (stylusIndex < 0) return false
+        sendStylusSample(view, event, stylusIndex, StylusProtocol.ACTION_HOVER)
+        return true
+    }
+
+    private fun findStylusPointerIndex(event: MotionEvent): Int {
+        val active = activeStylusPointerId
+        if (active != MotionEvent.INVALID_POINTER_ID) {
+            val activeIndex = event.findPointerIndex(active)
+            if (activeIndex >= 0 && isStylusTool(event.getToolType(activeIndex))) {
+                return activeIndex
+            }
+        }
+        for (index in 0 until event.pointerCount) {
+            if (isStylusTool(event.getToolType(index))) return index
+        }
+        return -1
+    }
+
+    private fun findNonStylusPointerIndex(event: MotionEvent): Int {
+        for (index in 0 until event.pointerCount) {
+            if (!isStylusTool(event.getToolType(index))) return index
+        }
+        return -1
+    }
+
+    private fun isStylusTool(toolType: Int): Boolean =
+        toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
+
+    private fun sendTouchSample(
+        view: View,
+        event: MotionEvent,
+        pointerIndex: Int,
+        action: Int,
+    ) {
+        if (view.width <= 0 || view.height <= 0) return
+        val x = (event.getX(pointerIndex) / view.width.toFloat()).coerceIn(0f, 1f)
+        val y = (event.getY(pointerIndex) / view.height.toFloat()).coerceIn(0f, 1f)
+        streamClient?.sendTouch(x, y, action, 1)
+    }
+
+    private fun sendStylusSample(
+        view: View,
+        event: MotionEvent,
+        pointerIndex: Int,
+        action: Int,
+    ) {
+        if (view.width <= 0 || view.height <= 0 || pointerIndex !in 0 until event.pointerCount) return
+
+        val rawX = (event.getX(pointerIndex) / view.width.toFloat()).coerceIn(0f, 1f)
+        val rawY = (event.getY(pointerIndex) / view.height.toFloat()).coerceIn(0f, 1f)
+        val x = if (displayFlipHorizontal) 1f - rawX else rawX
+        val y = if (displayFlipVertical) 1f - rawY else rawY
+        val pressure = if (action == StylusProtocol.ACTION_HOVER) 0f else event.getPressure(pointerIndex)
+        val sample =
+            StylusInputEvent(
+                x = x,
+                y = y,
+                action = action,
+                toolType = event.getToolType(pointerIndex),
+                pressure = pressure,
+                tilt = event.getAxisValue(MotionEvent.AXIS_TILT, pointerIndex),
+                orientation = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, pointerIndex),
+                buttonState = event.buttonState,
+            )
+
+        val client = streamClient ?: return
+        if (client.stylusSupported) {
+            client.sendStylus(sample)
+        } else if (action != StylusProtocol.ACTION_HOVER) {
+            // Older hosts do not acknowledge the extension. Preserve basic
+            // touch compatibility until the host is updated.
+            client.sendTouch(x, y, action.coerceAtMost(2), 1)
         }
     }
 
@@ -1909,14 +2037,38 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        mainDiag(
+            "onStart connected=$isConnected display=${displayWidth}x$displayHeight " +
+                "client=${streamClient != null}",
+        )
         // Back in the foreground — cancel any pending auto-disconnect.
         backgroundedAtMs = 0L
         autoDisconnectJob?.cancel()
         autoDisconnectJob = null
+        if (isConnected) {
+            // Samsung firmware can defer background socket delivery. Do not
+            // queue pings while stopped; resume fresh RTT samples only after
+            // the activity and decoder surface are visible again.
+            startPingTimer()
+            // Some Android builds recreate the SurfaceView without delivering a
+            // second display-config packet. Rebind the decoder to the new
+            // surface using the last negotiated stream dimensions.
+            binding.surfaceView.post {
+                if (isConnected) initializeDecoderForCurrentSurface()
+            }
+        }
     }
 
     override fun onStop() {
         super.onStop()
+        mainDiag(
+            "onStop connected=$isConnected display=${displayWidth}x$displayHeight " +
+                "client=${streamClient != null}",
+        )
+        // Do not queue pings while the activity is backgrounded. If Android
+        // delays delivery, those pongs would otherwise be measured as
+        // multi-second latency after the next foreground transition.
+        stopPingTimer()
         // Backgrounded while streaming: arm the auto-disconnect timer.
         if (!isConnected) return
         backgroundedAtMs = System.currentTimeMillis()
@@ -1938,6 +2090,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        vsrCmdReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: IllegalArgumentException) {
+                // The activity context already removed the receiver.
+            }
+            vsrCmdReceiver = null
+        }
         super.onDestroy()
         stopChecklistUpdates()
         cleanup()
@@ -1946,7 +2106,9 @@ class MainActivity : AppCompatActivity() {
     // ==================== Connection Checklist ====================
 
     private fun startChecklistUpdates() {
-        // Stop any existing runnable first to prevent duplicates
+        // Stop any existing runnable first to prevent duplicates. This loop
+        // updates device-local prerequisites only; it never opens a network
+        // socket. The Mac status is learned only from an explicit Connect.
         checklistRunnable?.let {
             checklistHandler.removeCallbacks(it)
         }
@@ -1955,7 +2117,7 @@ class MainActivity : AppCompatActivity() {
             object : Runnable {
                 override fun run() {
                     updateChecklist()
-                    checklistHandler.postDelayed(this, 2000) // Update every 2 seconds
+                    checklistHandler.postDelayed(this, 2000) // Update local state every 2 seconds
                 }
             }
         checklistHandler.post(checklistRunnable!!)
@@ -1969,8 +2131,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateChecklist() {
-        // Skip if connected (to prevent socket conflicts)
-        if (isConnected) return
+        // Skip while connected or while an explicit connection attempt is in
+        // flight. There are no automatic network probes here: a Mac status is
+        // known only after the user has pressed Connect/Reconnect.
+        if (isConnected || streamClient != null) return
 
         // Check Developer Mode (if we can run this app with USB debugging, dev mode is enabled)
         val isDeveloperModeEnabled =
@@ -1990,48 +2154,31 @@ class MainActivity : AppCompatActivity() {
             ) == 1
         updateChecklistItem(binding.checkUsbDebugging, isAdbEnabled)
 
-        // Check USB connected (check if any USB device is connected)
+        // In device/peripheral mode Android does not expose the Mac as a
+        // UsbManager device. Read the protected sticky USB-state broadcast so
+        // a data-only ADB cable is not reported as disconnected just because
+        // the tablet is not charging and has no USB host peripherals.
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-        val isUsbConnected = usbManager.deviceList.isNotEmpty() || isCharging()
+        val usbState =
+            runCatching {
+                registerReceiver(null, IntentFilter("android.hardware.usb.action.USB_STATE"))
+            }.getOrNull()
+        val isUsbConnected =
+            usbState?.getBooleanExtra("connected", false) == true ||
+                usbState?.getBooleanExtra("configured", false) == true ||
+                usbManager.deviceList.isNotEmpty() ||
+                isCharging()
         updateChecklistItem(binding.checkUsbConnected, isUsbConnected)
 
-        // Check Mac Server (try to connect to port)
-        lifecycleScope.launch(Dispatchers.IO) {
-            // Double-check connection state before socket test
-            if (isConnected) return@launch
+        // Do not probe the Mac here. A short health-check socket is still an
+        // unsolicited connection and can be mistaken for a reconnect by the
+        // host or by a user watching its logs.
+        updateChecklistItem(binding.checkMacServer, macServerKnownAvailable)
 
-            val port =
-                binding.portInput.text
-                    .toString()
-                    .toIntOrNull() ?: DEFAULT_USB_PORT
-            val host =
-                binding.hostInput.text
-                    .toString()
-                    .ifEmpty { DEFAULT_USB_HOST }
-            // Probe the CONTROL listener with a PING/PONG exchange first:
-            // it never touches the video port, so it cannot disturb a live
-            // or starting video session (the old video-port probe is what
-            // fed the 2026-08-16 reset storm), and the server does not burn
-            // an IDR on it while idle. A null result (nothing answered on
-            // the control port — pre-control-channel hosts, or adbd-only
-            // listeners) falls back to the legacy video-port probe.
-            val usesE3VideoPath = host == LEGACY_E3_HOST && port == LEGACY_E3_PORT
-            val controlHost = if (usesE3VideoPath) "127.0.0.1" else host
-            val controlPort = if (usesE3VideoPath) 54322 else port + 1
-            val isServerRunning =
-                checkServerRunningControl(controlHost, controlPort)
-                    ?: checkServerRunning(host, port)
-            runOnUiThread {
-                // Final check before updating UI
-                if (isConnected) return@runOnUiThread
-
-                updateChecklistItem(binding.checkMacServer, isServerRunning)
-
-                // Update main status indicator based on all checklist items
-                val allReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected && isServerRunning
-                updateMainStatus(allReady)
-            }
-        }
+        // Update main status indicator based on local prerequisites plus the
+        // last explicit connection result.
+        val allReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected && macServerKnownAvailable
+        updateMainStatus(allReady)
     }
 
     private fun updateMainStatus(allReady: Boolean) {
@@ -2064,99 +2211,6 @@ class MainActivity : AppCompatActivity() {
         val status = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
         return status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
             status == android.os.BatteryManager.BATTERY_STATUS_FULL
-    }
-
-    /**
-     * Check if Mac server is actually running (not just ADB reverse)
-     *
-     * Problem: When `adb reverse tcp:8888 tcp:8888` is active, ADB daemon listens on port 8888.
-     * A simple socket connect will succeed to ADB daemon, not the actual Mac server.
-     *
-     * Solution: After connecting, try to read data with a short timeout.
-     * Mac server sends display config (type=1) immediately upon connection.
-     * ADB daemon doesn't send anything, so read will timeout → false.
-     */
-    /**
-     * Server-alive probe on the dedicated CONTROL port: send PING
-     * ([4][clientTs 8] little-endian), expect PONG ([5][clientTs 8][serverTs 8]).
-     * Only a real SideScreen host answers with type 5, so this cannot be
-     * fooled by adbd listeners the way a bare TCP connect can.
-     *
-     * @return true  — control port answered with a PONG (server running)
-     *         null  — nothing usable on the control port (old host without a
-     *                 control listener, or connect refused); caller falls
-     *                 back to the legacy video-port probe
-     *         false — control port present but the exchange failed
-     */
-    private fun checkServerRunningControl(
-        host: String,
-        port: Int,
-    ): Boolean? {
-        var socket: Socket? = null
-        return try {
-            socket = Socket()
-            socket.connect(InetSocketAddress(host, port), 300)
-            socket.tcpNoDelay = true
-            socket.soTimeout = 300
-            val ping =
-                ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN).apply {
-                    put(4.toByte())
-                    putLong(System.nanoTime())
-                }
-            socket.getOutputStream().apply {
-                write(ping.array())
-                flush()
-            }
-            val input = socket.getInputStream()
-            val type = input.read()
-            if (type != 5) return null
-            // Drain the 16 payload bytes so the close is a clean FIN, not an RST.
-            val rest = ByteArray(16)
-            var read = 0
-            while (read < 16) {
-                val r = input.read(rest, read, 16 - read)
-                if (r <= 0) break
-                read += r
-            }
-            true
-        } catch (e: Exception) {
-            null
-        } finally {
-            try {
-                socket?.close()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    private fun checkServerRunning(
-        host: String,
-        port: Int,
-    ): Boolean {
-        var socket: Socket? = null
-        return try {
-            socket = Socket()
-            socket.connect(InetSocketAddress(host, port), 300) // 300ms connect timeout
-            socket.soTimeout = 200 // 200ms read timeout
-
-            // Try to read - Mac server sends display config immediately
-            // ADB daemon doesn't send anything, so read will timeout
-            val input = socket.getInputStream()
-            val firstByte = input.read() // Blocks up to soTimeout
-
-            // If we got data (>= 0), it's the real Mac server
-            // -1 means EOF (connection closed), anything else is data
-            firstByte >= 0
-        } catch (e: Exception) {
-            // Timeout, connection refused, or other error = server not running
-            false
-        } finally {
-            try {
-                socket?.close()
-            } catch (e: Exception) {
-                // ignore
-            }
-        }
     }
 
     private companion object {

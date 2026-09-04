@@ -3,6 +3,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/android_ports.sh"
 VERSION=$(cat "$ROOT_DIR/VERSION" | tr -d '[:space:]')
 APP_DIR="$ROOT_DIR/SideScreen.app"
 
@@ -64,7 +65,20 @@ echo "  OK"
 # 3. Build Android
 echo "[3/5] Building Android..."
 cd "$ROOT_DIR/AndroidClient"
-export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+if [ -z "${JAVA_HOME:-}" ] && [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
+    export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+fi
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+    if [ -x "/usr/libexec/java_home" ]; then
+        detected_java_home=$(/usr/libexec/java_home 2>/dev/null || true)
+        if [ -x "$detected_java_home/bin/java" ]; then
+            export JAVA_HOME="$detected_java_home"
+        fi
+    fi
+fi
+if [ -z "${ANDROID_HOME:-}" ] && [ -z "${ANDROID_SDK_ROOT:-}" ] && [ -d "$HOME/Library/Android/sdk" ]; then
+    export ANDROID_SDK_ROOT="$HOME/Library/Android/sdk"
+fi
 ./gradlew assembleDebug -q
 APK="$ROOT_DIR/AndroidClient/app/build/outputs/apk/debug/app-debug.apk"
 echo "  OK"
@@ -72,6 +86,7 @@ echo "  OK"
 # 4. Install APK on device
 echo "[4/5] Installing APK..."
 if adb devices | grep -q "device$"; then
+    "$SCRIPT_DIR/backup_android_apks.sh"
     adb install -r "$APK" 2>&1 | tail -1
 else
     echo "  No device connected, skipping install"
@@ -79,10 +94,11 @@ fi
 
 # 5. Run macOS app
 echo "[5/5] Starting macOS app..."
-pkill -f "SideScreen.app" 2>/dev/null || true
+pkill -x SideScreen 2>/dev/null || true
 sleep 0.5
 
-adb reverse tcp:8888 tcp:8888 2>/dev/null || true
+adb reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
+adb reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
 open "$APP_DIR"
 
 echo ""
@@ -94,7 +110,7 @@ echo "======================================="
 echo ""
 read -p "Test result? [y=OK / n=failed]: " RESULT
 
-pkill -f "SideScreen.app" 2>/dev/null || true
+pkill -x SideScreen 2>/dev/null || true
 
 if [ "$RESULT" = "y" ]; then
     echo ""

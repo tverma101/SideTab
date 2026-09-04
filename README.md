@@ -55,7 +55,7 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 ### USB-C or Wireless
 
-Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** lets you scan a QR code from the Mac once and the tablet auto-reconnects on every future launch over WiFi (5 GHz strongly recommended). The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
+Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — the Mac app sets up adb-reverse forwarding for video on port `54321` and control on `54322`. **Wireless** lets you scan a QR code from the Mac; the tablet remembers the pairing and you can tap **Reconnect** on later launches (5 GHz strongly recommended). The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
 
 ### Virtual Display
 
@@ -77,17 +77,19 @@ Hardware-accelerated H.265 encoding on Mac and decoding on Android. Async pipeli
 
 Use your tablet's touchscreen to interact with macOS. Touch prediction compensates for network latency, making taps and drags feel natural.
 
+Samsung S Pen contact is handled as a direct drawing stroke rather than a touch scroll gesture. Current Mac/Android builds also forward pen pressure, hover movement, tilt/orientation metadata, and the S Pen secondary button. Pressure is delivered through macOS's tablet-style mouse event fields, so apps that read mouse/tablet pressure can vary brush width; this is not a kernel-level Wacom/Apple tablet driver.
+
 ### HiDPI (Retina) Support
 
 Enable HiDPI mode to render at 2× resolution internally — text and icons are sharp at any logical resolution, just like a MacBook Retina display. Perfect for users with 2K/4K tablets who want a readable workspace without sacrificing sharpness.
 
 ### Gaming Mode
 
-Enable Gaming Boost for optimized settings: 1 Gbps bitrate, ultra-low latency encoding, 120 FPS.
+Enable Gaming Boost for the bounded ultra-low-latency encoder profile. The host pins this mode to its low-bitrate real-time profile; actual throughput depends on the selected display and device.
 
 ### Customizable
 
-Configure resolution (up to 4K/8K), frame rate (30–120 FPS), bitrate (20–5000 Mbps), and quality presets from the Mac app.
+Configure resolution (up to 4K/8K), frame rate (30–120 FPS; 60 FPS is the current balanced default), bitrate and quality presets from the Mac app. The host applies a bounded encoder ladder rather than treating the UI bitrate as an unrestricted wire rate.
 
 <div align="center">
   <img src="resources/screenshots/mac_settings_1.png" alt="macOS Settings — Display & FPS" height="500"/>
@@ -153,8 +155,18 @@ cd SideScreen
 cd MacHost && swift build -c release
 
 # Android
-cd AndroidClient && ./gradlew assembleDebug
+(cd AndroidClient && ./gradlew assembleDebug)
+
+# Preserve every local APK and the currently installed APK before installing
+./scripts/backup_android_apks.sh
 ```
+
+The backup helper creates a non-overwriting snapshot under
+`backups/apk/<UTC-timestamp>/`. Each snapshot includes the available debug and
+release APK outputs, `installed-base.apk` when a connected ADB device has Side
+Screen installed, and `MANIFEST.txt` with version, signing-certificate, source
+revision, device, and SHA-256 details. Set `SIDESCREEN_ADB_SERIAL` when more
+than one Android device is connected.
 </details>
 
 ---
@@ -172,9 +184,9 @@ cd AndroidClient && ./gradlew assembleDebug
 
 1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
 2. Open **Side Screen** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
-3. The tablet remembers the Mac. Subsequent launches auto-reconnect — no rescan.
+3. The tablet remembers the Mac. On subsequent launches, open the Wireless tab and tap **Reconnect** — no rescan is needed unless the token or Mac address changed.
 
-Wireless mode requires both devices to be on the same WiFi network. **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
+Wireless mode requires both devices to be on the same WiFi network. **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. The pairing token authenticates the wireless stream but does not currently provide end-to-end encryption, so use a trusted network. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
 
 USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wireless adds 10–50 ms depending on WiFi quality.
 
@@ -191,11 +203,11 @@ First-time setup still needs a screen once to grant Screen Recording permission;
 | Setting | Options | Default |
 |---------|---------|---------|
 | Resolution | 720p to 8K, 30+ presets + custom | 1920x1200 |
-| Frame Rate | 30, 60, 90, 120 FPS | 120 |
-| Bitrate | 20–5000 Mbps | 1000 Mbps |
+| Frame Rate | 30, 60, 90, 120 FPS | 60 |
+| Bitrate | Host-bounded quality ladder | Host preset |
 | Quality | Ultra Low, Low, Medium, High | Ultra Low |
 | HiDPI (Retina) | On/Off | Off |
-| Gaming Boost | On/Off (1 Gbps, 120 Hz) | Off |
+| Gaming Boost | On/Off (bounded low-latency profile) | Off |
 | Touch Input | On/Off | On |
 
 ---
@@ -216,6 +228,14 @@ Then open the app again.
 <summary><strong>"Connection refused" on Android</strong></summary>
 
 The Mac app sets up `adb reverse` automatically when streaming starts. If it still fails, make sure `adb` is installed (via Android SDK or Homebrew: `brew install android-platform-tools`) and your device has USB debugging enabled.
+</details>
+
+<details>
+<summary><strong>Android keeps trying to reconnect</strong></summary>
+
+Current Android builds only connect after you tap **Connect** or **Reconnect**. They do not resume a saved session or retry a dropped connection by themselves. Reinstall the current APK if an older build is still running, then launch the app again.
+
+The connection checklist checks tablet-local prerequisites while idle; it does not open a Mac socket until you explicitly connect.
 </details>
 
 <details>

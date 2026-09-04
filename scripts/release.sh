@@ -25,28 +25,36 @@ if command -v ktlint &>/dev/null; then
     echo "  Kotlin lint OK"
 fi
 
-# 2. Commit & push
-echo "[2/3] Pushing to GitHub..."
-cd "$ROOT_DIR"
-if [ -n "$(git status --porcelain)" ]; then
-    git add -A
-    git status --short
-    read -p "Commit message: " MSG
-    git commit -m "$MSG"
+# 2. Build and verify local release artifacts
+echo "[2/3] Building release artifacts..."
+cd "$ROOT_DIR/AndroidClient"
+if [ -z "${ANDROID_HOME:-}" ] && [ -z "${ANDROID_SDK_ROOT:-}" ] && [ -d "$HOME/Library/Android/sdk" ]; then
+    export ANDROID_SDK_ROOT="$HOME/Library/Android/sdk"
 fi
-git push
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+    if [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
+        export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    elif [ -x "/usr/libexec/java_home" ]; then
+        detected_java_home=$(/usr/libexec/java_home 2>/dev/null || true)
+        if [ -x "$detected_java_home/bin/java" ]; then
+            export JAVA_HOME="$detected_java_home"
+        fi
+    fi
+fi
+./gradlew assembleRelease
+APK="$ROOT_DIR/AndroidClient/app/build/outputs/apk/release/app-release.apk"
+if [ ! -f "$APK" ]; then
+    echo "❌ Release APK was not produced"
+    exit 1
+fi
+shasum -a 256 "$APK"
 
-# 3. Tag & release
-echo "[3/3] Creating release tag..."
-if git rev-parse "$VERSION" >/dev/null 2>&1; then
-    echo "  Tag $VERSION already exists, skipping"
-else
-    git tag "$VERSION"
-    git push origin "$VERSION"
-    echo "  Tag $VERSION pushed - GitHub Actions will build the release"
-fi
+# 3. Release handoff (publishing is intentionally manual)
+echo "[3/3] Release handoff"
+echo "  Build and checksum complete. Create/publish the tag and release only after review."
 
 echo ""
 echo "======================================="
-echo "  Done! Check: gh release view $VERSION"
+echo "  APK: $ROOT_DIR/AndroidClient/app/build/outputs/apk/release/app-release.apk"
+echo "  Done! Verify and publish the APK manually; no hosted workflow is configured."
 echo "======================================="

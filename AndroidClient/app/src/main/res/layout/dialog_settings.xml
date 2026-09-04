@@ -251,7 +251,7 @@
                 android:layout_height="wrap_content"
                 android:valueFrom="0.0"
                 android:valueTo="0.1"
-                android:value="0.031"
+                android:value="0.03"
                 android:stepSize="0.005"
                 app:thumbColor="@color/ss_text_primary"
                 app:trackColorActive="@color/ss_accent"

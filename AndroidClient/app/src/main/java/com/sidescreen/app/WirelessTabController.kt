@@ -73,7 +73,7 @@ class WirelessTabController(
                     return@setOnClickListener
                 }
             showConnecting("Reconnecting to ${entry.macName}", "${entry.host}:${entry.port}")
-            attemptAutoConnect(entry)
+            attemptReconnect(entry)
         }
     }
 
@@ -216,7 +216,7 @@ class WirelessTabController(
         activity.startActivityForResult(intent, REQ_SCAN)
     }
 
-    private fun attemptAutoConnect(entry: PairedHostStorage.Entry) {
+    private fun attemptReconnect(entry: PairedHostStorage.Entry) {
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
         onConnectRequested(entry.host, entry.port, entry.token, deviceName, entry.macName)
     }

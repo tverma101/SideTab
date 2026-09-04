@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/android_ports.sh"
+
 echo "🔧 Setting up USB port forwarding..."
 
 # Check ADB connection
@@ -24,11 +27,13 @@ adb reverse --remove-all 2>/dev/null || true
 sleep 0.5
 
 # Setup new reverse
-echo "  Setting up port 8888..."
-adb reverse tcp:8888 tcp:8888
+echo "  Setting up ports $ANDROID_USB_VIDEO_PORT (video) and $ANDROID_USB_CONTROL_PORT (control)..."
+adb reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
+adb reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
 
 # Verify
-if adb reverse --list | grep -q "tcp:8888"; then
+if adb reverse --list | grep -q "tcp:$ANDROID_USB_VIDEO_PORT" && \
+   adb reverse --list | grep -q "tcp:$ANDROID_USB_CONTROL_PORT"; then
     echo ""
     echo "✅ USB port forwarding active!"
     echo ""

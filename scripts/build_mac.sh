@@ -13,7 +13,9 @@ cd "$ROOT_DIR/MacHost"
 
 # Kill running instance
 echo "Stopping running Side Screen..."
-pkill -f SideScreen 2>/dev/null || true
+# Match the executable name only; a broad `pkill -f SideScreen` can also
+# match this build script because the checkout path contains SideScreen.
+pkill -x SideScreen 2>/dev/null || true
 sleep 0.5
 
 # Clean old build

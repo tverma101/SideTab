@@ -2,6 +2,19 @@ package com.sidescreen.app
 
 import android.content.Context
 import android.content.SharedPreferences
+import kotlin.math.roundToInt
+
+internal fun snapToStep(
+    raw: Float,
+    valueFrom: Float,
+    valueTo: Float,
+    stepSize: Float,
+): Float {
+    val safe = if (raw.isFinite()) raw else valueFrom
+    val clamped = safe.coerceIn(valueFrom, valueTo)
+    val steps = ((clamped - valueFrom) / stepSize).roundToInt()
+    return (valueFrom + steps * stepSize).coerceIn(valueFrom, valueTo)
+}
 
 class PreferencesManager(
     context: Context,
@@ -13,8 +26,8 @@ class PreferencesManager(
         set(value) = prefs.edit().putBoolean("show_stats", value).apply()
 
     var overlayOpacity: Float
-        get() = prefs.getFloat("overlay_opacity", 0.8f)
-        set(value) = prefs.edit().putFloat("overlay_opacity", value).apply()
+        get() = snapToStep(prefs.getFloat("overlay_opacity", 0.8f), 0.2f, 1.0f, 0.05f)
+        set(value) = prefs.edit().putFloat("overlay_opacity", snapToStep(value, 0.2f, 1.0f, 0.05f)).apply()
 
     var overlayX: Float
         get() = prefs.getFloat("overlay_x", -1f)
@@ -55,8 +68,8 @@ class PreferencesManager(
         set(value) = prefs.edit().putString("vsr_mode", value).apply()
 
     var vsrSharpness: Float
-        get() = prefs.getFloat("vsr_sharpness", 0.8f)
-        set(value) = prefs.edit().putFloat("vsr_sharpness", value).apply()
+        get() = snapToStep(prefs.getFloat("vsr_sharpness", 0.8f), 0.0f, 1.0f, 0.05f)
+        set(value) = prefs.edit().putFloat("vsr_sharpness", snapToStep(value, 0.0f, 1.0f, 0.05f)).apply()
 
     /** CfL chroma reconstruction strength. Kept separate from CAS/SGSR
      * sharpness because strong luma-derived chroma detail can look glossy. */
@@ -65,6 +78,6 @@ class PreferencesManager(
         set(value) = prefs.edit().putFloat("cfl_strength", value.coerceIn(0f, 1f)).apply()
 
     var vsrEdgeThreshold: Float
-        get() = prefs.getFloat("vsr_edge_threshold", 8.0f / 255.0f)
-        set(value) = prefs.edit().putFloat("vsr_edge_threshold", value).apply()
+        get() = snapToStep(prefs.getFloat("vsr_edge_threshold", 0.03f), 0.0f, 0.1f, 0.005f)
+        set(value) = prefs.edit().putFloat("vsr_edge_threshold", snapToStep(value, 0.0f, 0.1f, 0.005f)).apply()
 }

@@ -4,18 +4,31 @@ set -e
 # Navigate to project root (parent of scripts directory)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/android_ports.sh"
 cd "$ROOT_DIR"
 
 echo "🚀 Installing Side Screen..."
 echo ""
 
-# Set JAVA_HOME for Android Studio's bundled JDK
-export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+# Prefer an explicitly configured JDK, then Android Studio or the macOS Java locator.
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+    if [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
+        export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    elif [ -x "/usr/libexec/java_home" ]; then
+        detected_java_home=$(/usr/libexec/java_home 2>/dev/null || true)
+        if [ -x "$detected_java_home/bin/java" ]; then
+            export JAVA_HOME="$detected_java_home"
+        fi
+    fi
+fi
+
+if [ -z "${ANDROID_HOME:-}" ] && [ -z "${ANDROID_SDK_ROOT:-}" ] && [ -d "$HOME/Library/Android/sdk" ]; then
+    export ANDROID_SDK_ROOT="$HOME/Library/Android/sdk"
+fi
 
 # Check Java
-if [ ! -d "$JAVA_HOME" ]; then
-    echo "❌ Java not found at: $JAVA_HOME"
-    echo "   Please install Android Studio or set JAVA_HOME manually"
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+    echo "❌ Java 11+ not found. Set JAVA_HOME or install Android Studio."
     exit 1
 fi
 
@@ -31,61 +44,8 @@ echo ""
 
 # Build macOS app
 echo "📦 Building macOS app..."
-cd MacHost
-swift build -c release
-cd "$ROOT_DIR"
-echo "  ✓ macOS app built"
-
-# Create macOS .app bundle
-echo "📦 Creating macOS .app bundle..."
-APP_NAME="SideScreen.app"
-APP_DIR="$APP_NAME/Contents"
-rm -rf "$APP_NAME"
-mkdir -p "$APP_DIR/MacOS"
-mkdir -p "$APP_DIR/Resources"
-
-# Copy executable
-cp MacHost/.build/release/SideScreen "$APP_DIR/MacOS/SideScreen"
-
-# Create Info.plist
-cat > "$APP_DIR/Info.plist" << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>
-    <string>Side Screen</string>
-    <key>CFBundleDisplayName</key>
-    <string>Side Screen</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.sidescreen.app</string>
-    <key>CFBundleVersion</key>
-    <string>1.0</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
-    <key>CFBundleExecutable</key>
-    <string>SideScreen</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSSupportsAutomaticGraphicsSwitching</key>
-    <true/>
-    <key>NSScreenCaptureUsageDescription</key>
-    <string>Side Screen needs screen recording access to capture your virtual display and stream it to your Android device.</string>
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>Side Screen needs Local Network access so your Android tablet can connect to the Mac.</string>
-    <key>LSUIElement</key>
-    <false/>
-</dict>
-</plist>
-PLIST
-
-"$SCRIPT_DIR/sign_mac_app.sh" "$ROOT_DIR/$APP_NAME"
-
-echo "  ✓ macOS .app bundle created: $APP_NAME"
+"$SCRIPT_DIR/build_mac.sh"
+echo "  ✓ universal macOS app built and signed"
 echo ""
 
 # Build Android app
@@ -98,20 +58,24 @@ echo ""
 
 # Install Android app
 echo "📱 Installing Android app..."
+"$SCRIPT_DIR/backup_android_apks.sh"
 adb install -r AndroidClient/app/build/outputs/apk/debug/app-debug.apk
 echo "  ✓ Android app installed"
 echo ""
 
 # Setup ADB reverse (with retry)
 echo "🔧 Setting up USB port forwarding..."
-adb reverse --remove tcp:8888 2>/dev/null || true
+adb reverse --remove tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
+adb reverse --remove tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
 sleep 0.5
-adb reverse tcp:8888 tcp:8888
+adb reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
+adb reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
 
 # Verify ADB reverse is active
 echo "🔍 Verifying port forwarding..."
-if adb reverse --list | grep -q "tcp:8888"; then
-    echo "  ✓ Port 8888 forwarded successfully"
+if adb reverse --list | grep -q "tcp:$ANDROID_USB_VIDEO_PORT" && \
+   adb reverse --list | grep -q "tcp:$ANDROID_USB_CONTROL_PORT"; then
+    echo "  ✓ Ports $ANDROID_USB_VIDEO_PORT and $ANDROID_USB_CONTROL_PORT forwarded successfully"
 else
     echo "  ⚠️  Port forwarding setup but verification failed"
     echo "  Run './scripts/setup-usb.sh' if connection issues occur"
@@ -129,6 +93,6 @@ echo "  3. Tap Connect"
 echo ""
 echo "💡 Troubleshooting:"
 echo "  • Connection fails: ./scripts/setup-usb.sh"
-echo "  • Check server: lsof -i :8888"
-echo "  • Check forwarding: adb reverse --list"
+echo "  • Check server: lsof -i :$ANDROID_USB_VIDEO_PORT"
+echo "  • Check forwarding: adb reverse --list (ports $ANDROID_USB_VIDEO_PORT/$ANDROID_USB_CONTROL_PORT)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

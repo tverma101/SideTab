@@ -27,6 +27,29 @@ private enum WireMessage {
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
     static let clientDecoderLimits: UInt8 = 11
+    /// Client→server, payload-free capability: "I understand direct stylus
+    /// events". Older hosts consume this unknown type as one byte and keep
+    /// the legacy touch protocol aligned.
+    static let clientSupportsStylus: UInt8 = 12
+    /// Server→client, payload-free acknowledgement for clientSupportsStylus.
+    /// It is sent only after the client opted in, so older Android clients
+    /// never see an unknown server message.
+    static let serverSupportsStylus: UInt8 = 13
+    /// Client→server, fixed 28-byte direct stylus event.
+    static let stylusEvent: UInt8 = 14
+}
+
+private let controlAuthMagic = Data([0x53, 0x53, 0x57, 0x43]) // "SSWC"
+
+struct StylusEvent {
+    let x: Float
+    let y: Float
+    let action: Int
+    let toolType: Int
+    let pressure: Float
+    let tilt: Float
+    let orientation: Float
+    let buttonState: UInt32
 }
 
 private extension NWEndpoint {
@@ -58,6 +81,7 @@ class StreamingServer {
     private var controlListener: NWListener?
     private var controlConnection: NWConnection?
     private var controlInputBuffer = Data()
+    private var controlAuthenticated = false
     private var controlTouchCount = 0
     private var lastControlTouchNs: UInt64 = 0
     private var maxControlTouchGapMs = 0.0
@@ -71,6 +95,9 @@ class StreamingServer {
     var onCodecNegotiated: ((StreamCodec) -> Void)?
     // Touch callback: (x1, y1, action, pointerCount, x2, y2)
     var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
+    /// Direct S Pen callback. Stylus contact bypasses the touch gesture
+    /// state-machine so drawing starts on the first pen move.
+    var onStylusEvent: ((StylusEvent) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
@@ -102,6 +129,7 @@ class StreamingServer {
     private var waitingForSyncFrame = false
     private var clientSupportsFrameMetadata = false
     private var clientIsAvcOnly = false
+    private var clientSupportsStylus = false
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
     private var inputBuffer = Data()
@@ -178,15 +206,140 @@ class StreamingServer {
 
     private func handleControlConnection(_ newConnection: NWConnection) {
         debugLog("Control connection incoming")
-        if let old = controlConnection {
-            old.cancel()
+        let requiresAuth = expectedAuthToken != nil && !newConnection.endpoint.isLoopback
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
+            guard let self, let newConnection else { return }
+            switch state {
+            case .ready:
+                if requiresAuth {
+                    debugLog("Control candidate READY — authenticating before promotion")
+                    self.authenticateControlCandidate(newConnection)
+                } else if self.controlConnection != nil {
+                    // A loopback control contender can be a short-lived probe
+                    // or another client racing the active session. Inspect its
+                    // first message before allowing it to replace control.
+                    self.routeLoopbackControlCandidate(newConnection)
+                } else {
+                    self.installControlConnection(newConnection, initialBuffer: Data())
+                }
+            case .failed(let error):
+                debugLog("Control candidate failed: \(error)")
+                newConnection.cancel()
+            case .cancelled:
+                break
+            default:
+                break
+            }
         }
-        controlInputBuffer = Data()  // fresh storage — never keep poisoned inline slices
+        newConnection.start(queue: controlQueue)
+    }
+
+    /// Inspect a loopback control candidate only when a control client is
+    /// already active. A readiness probe starts with PING (type 4); answer it
+    /// directly and close it. A real client starts with the BRIGHT capability
+    /// (type 3), so promote it and preserve the bytes already received.
+    private func routeLoopbackControlCandidate(_ candidate: NWConnection) {
+        var buffer = Data()
+        var receiveNext: (() -> Void)!
+        receiveNext = { [weak self, weak candidate] in
+            guard let self, let candidate else { return }
+            candidate.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, isComplete, error in
+                guard error == nil, !isComplete else {
+                    candidate.cancel()
+                    return
+                }
+                if let data, !data.isEmpty {
+                    buffer.append(data)
+                }
+                guard let first = buffer.first else {
+                    receiveNext()
+                    return
+                }
+
+                if first == WireMessage.ping {
+                    guard buffer.count >= 9 else {
+                        receiveNext()
+                        return
+                    }
+                    let clientTimestamp = Data(buffer.dropFirst().prefix(8))
+                    var pong = Data(capacity: 17)
+                    pong.append(WireMessage.pong)
+                    pong.append(clientTimestamp)
+                    var serverTimestamp = DispatchTime.now().uptimeNanoseconds
+                    withUnsafeBytes(of: &serverTimestamp) { pong.append(contentsOf: $0) }
+                    debugLog("Loopback control probe answered without replacing active control")
+                    candidate.send(content: pong, completion: .contentProcessed { _ in
+                        candidate.cancel()
+                    })
+                } else {
+                    debugLog("Loopback control client replacing prior control connection")
+                    self.installControlConnection(candidate, initialBuffer: buffer)
+                }
+            }
+        }
+        receiveNext()
+    }
+
+    /// Authenticate a wireless contender without evicting the current client.
+    /// This prevents unauthenticated LAN connections from suppressing control.
+    private func authenticateControlCandidate(_ candidate: NWConnection) {
+        guard let expected = expectedAuthToken else {
+            candidate.cancel()
+            return
+        }
+        let requiredBytes = controlAuthMagic.count + expected.count
+        var buffer = Data()
+        let timeout = DispatchWorkItem { candidate.cancel() }
+        controlQueue.asyncAfter(deadline: .now() + 5, execute: timeout)
+
+        var receiveNext: (() -> Void)!
+        receiveNext = { [weak self, weak candidate] in
+            guard let self, let candidate else { return }
+            candidate.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, isComplete, error in
+                if error != nil || isComplete {
+                    timeout.cancel()
+                    candidate.cancel()
+                    return
+                }
+                if let data, !data.isEmpty {
+                    buffer.append(data)
+                }
+                guard buffer.count >= requiredBytes else {
+                    receiveNext()
+                    return
+                }
+                let magic = Data(buffer.prefix(controlAuthMagic.count))
+                let tokenStart = buffer.index(buffer.startIndex, offsetBy: controlAuthMagic.count)
+                let tokenEnd = buffer.index(tokenStart, offsetBy: expected.count)
+                let token = Data(buffer[tokenStart..<tokenEnd])
+                guard magic == controlAuthMagic, WirelessAuth.validate(token, expected: expected) else {
+                    debugLog("Control authentication rejected")
+                    timeout.cancel()
+                    candidate.cancel()
+                    return
+                }
+                timeout.cancel()
+                debugLog("Control authentication accepted")
+                self.installControlConnection(
+                    candidate,
+                    initialBuffer: Data(buffer.dropFirst(requiredBytes)),
+                )
+            }
+        }
+        receiveNext()
+    }
+
+    /// Promote an authenticated connection, replacing the prior client only now.
+    private func installControlConnection(_ newConnection: NWConnection, initialBuffer: Data) {
+        controlConnection?.cancel()
+        controlInputBuffer = initialBuffer  // fresh storage — never keep poisoned inline slices
+        controlAuthenticated = true
         controlTouchCount = 0
         lastControlTouchNs = 0
         maxControlTouchGapMs = 0
         clientSupportsBrightness = false
         controlConnection = newConnection
+        let wasAlreadyReady = newConnection.state == .ready
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self, let newConnection else { return }
             // A terminal callback from a cancelled/replaced connection must
@@ -203,6 +356,7 @@ class StreamingServer {
             switch state {
             case .ready:
                 debugLog("Control connection READY — arming receive")
+                self.processControlBuffer(connection: newConnection)
                 self.startReceivingControl()
             case .failed(let error):
                 debugLog("Control connection failed: \(error)")
@@ -214,7 +368,21 @@ class StreamingServer {
                 break
             }
         }
-        newConnection.start(queue: controlQueue)
+
+        // A wireless candidate is authenticated from its receive callback after
+        // the connection has already reached .ready. Network.framework does not
+        // guarantee that assigning a state handler at that point replays the
+        // ready transition, so explicitly arm the protocol in that case.
+        if wasAlreadyReady {
+            controlQueue.async { [weak self, weak newConnection] in
+                guard let self, let newConnection,
+                      self.controlConnection === newConnection,
+                      newConnection.state == .ready else { return }
+                debugLog("Control connection already READY — arming receive")
+                self.processControlBuffer(connection: newConnection)
+                self.startReceivingControl()
+            }
+        }
     }
 
     private func startReceivingControl() {
@@ -248,6 +416,32 @@ class StreamingServer {
     }
 
     private func processControlBuffer(connection: NWConnection) {
+        if !controlAuthenticated {
+            guard let expected = expectedAuthToken else {
+                debugLog("Rejecting non-loopback control connection without wireless auth")
+                controlConnection = nil
+                connection.cancel()
+                return
+            }
+            let requiredBytes = controlAuthMagic.count + expected.count
+            guard controlInputBuffer.count >= requiredBytes else { return }
+            let magic = Data(controlInputBuffer.prefix(controlAuthMagic.count))
+            let tokenStart = controlInputBuffer.index(
+                controlInputBuffer.startIndex,
+                offsetBy: controlAuthMagic.count,
+            )
+            let token = Data(controlInputBuffer[tokenStart..<controlInputBuffer.index(tokenStart, offsetBy: expected.count)])
+            guard magic == controlAuthMagic, WirelessAuth.validate(token, expected: expected) else {
+                debugLog("Control authentication rejected")
+                controlConnection = nil
+                connection.cancel()
+                return
+            }
+            controlInputBuffer = Data(controlInputBuffer.dropFirst(requiredBytes))
+            controlAuthenticated = true
+            debugLog("Control authentication accepted")
+        }
+
         while let msgType = controlInputBuffer.first {
             switch msgType {
             case WireMessage.touchEvent:
@@ -288,6 +482,16 @@ class StreamingServer {
 
                 if touchEnabled {
                     handleTouchMessage(message, pointerCount: pointerCount)
+                }
+
+            case WireMessage.stylusEvent:
+                guard controlInputBuffer.count >= Self.stylusEventSize else { return }
+                let message = Data(controlInputBuffer.prefix(Self.stylusEventSize))
+                controlInputBuffer = Data(controlInputBuffer.dropFirst(Self.stylusEventSize))
+                if touchEnabled, clientSupportsStylus {
+                    handleStylusMessage(message)
+                } else {
+                    debugLog("Ignoring stylus event before capability negotiation or with touch disabled")
                 }
 
             case WireMessage.ping:
@@ -350,6 +554,7 @@ class StreamingServer {
     private var contender: NWConnection?
     private var contenderDeadline: DispatchWorkItem?
     private static let contenderProofWindow: TimeInterval = 1.5
+    private static let authenticatedContenderWindow: TimeInterval = 5.0
 
     private func handleConnection(_ newConnection: NWConnection) {
         debugLog("New connection incoming...")
@@ -366,7 +571,11 @@ class StreamingServer {
     /// per-connection protocol state, and waits for .ready. A promoted
     /// contender is already started and .ready — its handler won't see the
     /// .ready transition again, so drive startup directly instead.
-    private func installConnection(_ newConnection: NWConnection, alreadyStarted: Bool = false) {
+    private func installConnection(
+        _ newConnection: NWConnection,
+        alreadyStarted: Bool = false,
+        alreadyAuthenticated: Bool = false,
+    ) {
         // Clean up old connection properly
         if let oldConnection = connection, oldConnection !== newConnection {
             isReceiving = false
@@ -376,6 +585,7 @@ class StreamingServer {
         connectionReady = false
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
+        clientSupportsStylus = false
         clientDecodeLimits = nil
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
@@ -394,7 +604,7 @@ class StreamingServer {
             debugLog("Connection state: \(state)")
             switch state {
             case .ready:
-                self.onConnectionReady(newConnection!)
+                self.onConnectionReady(newConnection!, alreadyAuthenticated: alreadyAuthenticated)
             case .failed(let error):
                 debugLog("Connection failed: \(error)")
                 self.markDisconnected()
@@ -408,7 +618,9 @@ class StreamingServer {
 
         if alreadyStarted {
             if newConnection.state == .ready {
-                networkQueue.async { self.onConnectionReady(newConnection) }
+                networkQueue.async {
+                    self.onConnectionReady(newConnection, alreadyAuthenticated: alreadyAuthenticated)
+                }
             }
             // A started-but-not-ready contender reaches .ready through the
             // state handler installed above, like a fresh connection.
@@ -423,11 +635,32 @@ class StreamingServer {
     private func armContender(_ newConnection: NWConnection) {
         clearContender(newConnection, cancelSocket: true)  // one contender at a time
         contender = newConnection
+        let isWireless = !newConnection.endpoint.isLoopback
 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self = self else { return }
             guard self.contender === newConnection else { return }
             switch state {
+            case .ready:
+                guard let candidate = newConnection else { return }
+                if isWireless {
+                    guard let expected = self.expectedAuthToken else {
+                        debugLog("Wireless contender rejected — wireless mode is not active")
+                        self.clearContender(candidate, cancelSocket: true)
+                        return
+                    }
+                    debugLog("Wireless contender READY — authenticating before promotion")
+                    self.runAuthHandshake(
+                        connection: candidate,
+                        expectedToken: expected,
+                        onSuccess: { [weak self, weak candidate] in
+                            guard let self, let candidate else { return }
+                            self.promoteAuthenticatedContender(candidate)
+                        },
+                    )
+                } else {
+                    self.armLoopbackContenderProof(candidate)
+                }
             case .failed(let error):
                 debugLog("Contender failed before proving: \(error)")
                 self.clearContender(newConnection!, cancelSocket: false)
@@ -439,15 +672,20 @@ class StreamingServer {
         }
         newConnection.start(queue: networkQueue)
 
+        let proofWindow = isWireless ? Self.authenticatedContenderWindow : Self.contenderProofWindow
         let deadline = DispatchWorkItem { [weak self, weak newConnection] in
             guard let self = self, let newConnection = newConnection else { return }
             guard self.contender === newConnection else { return }
-            debugLog("Contender silent \(Int(Self.contenderProofWindow * 1000))ms — rejecting (probe?), live stream untouched")
+            debugLog("Contender silent \(Int(proofWindow * 1000))ms — rejecting, live stream untouched")
             self.clearContender(newConnection, cancelSocket: true)
         }
         contenderDeadline = deadline
-        networkQueue.asyncAfter(deadline: .now() + Self.contenderProofWindow, execute: deadline)
+        networkQueue.asyncAfter(deadline: .now() + proofWindow, execute: deadline)
+    }
 
+    /// A loopback USB contender proves itself by sending any protocol byte.
+    /// Wireless contenders use the full auth handshake above instead.
+    private func armLoopbackContenderProof(_ newConnection: NWConnection) {
         newConnection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self, weak newConnection] data, _, _, error in
             guard let self = self, let newConnection = newConnection else { return }
             guard self.contender === newConnection else { return }
@@ -458,6 +696,15 @@ class StreamingServer {
             self.inputBuffer.append(data)
             self.processInputBuffer(connection: newConnection)
         }
+    }
+
+    private func promoteAuthenticatedContender(_ candidate: NWConnection) {
+        guard contender === candidate else {
+            candidate.cancel()
+            return
+        }
+        clearContender(candidate, cancelSocket: false)
+        installConnection(candidate, alreadyStarted: true, alreadyAuthenticated: true)
     }
 
     private func clearContender(_ c: NWConnection, cancelSocket: Bool) {
@@ -478,7 +725,15 @@ class StreamingServer {
         onClientDisconnected?()
     }
 
-    private func onConnectionReady(_ conn: NWConnection) {
+    private func onConnectionReady(_ conn: NWConnection, alreadyAuthenticated: Bool = false) {
+        if alreadyAuthenticated {
+            guard !isStopped else {
+                conn.cancel()
+                return
+            }
+            beginExistingProtocol(on: conn)
+            return
+        }
         if conn.endpoint.isLoopback {
             debugLog("Client connected via loopback (USB) — skipping auth")
             beginExistingProtocol(on: conn)
@@ -535,38 +790,54 @@ class StreamingServer {
         onClientConnected?()
     }
 
-    private func runAuthHandshake(connection conn: NWConnection, expectedToken: Data) {
+    private func runAuthHandshake(
+        connection conn: NWConnection,
+        expectedToken: Data,
+        onSuccess: (() -> Void)? = nil,
+    ) {
+        let deadline = DispatchWorkItem {
+            debugLog("Wireless auth timed out — closing connection")
+            conn.cancel()
+        }
+        networkQueue.asyncAfter(deadline: .now() + 5, execute: deadline)
+
         // Read fixed prefix [magic 4][token 32][name_len 1] = 37 bytes.
         conn.receive(minimumIncompleteLength: HandshakeCodec.fixedPrefixLen,
                      maximumLength: HandshakeCodec.fixedPrefixLen) { [weak self] prefixData, _, _, error in
             guard let self = self else { return }
             if let error = error {
+                deadline.cancel()
                 debugLog("Auth read error: \(error)")
                 conn.cancel()
                 return
             }
             guard let prefix = prefixData, prefix.count == HandshakeCodec.fixedPrefixLen else {
+                deadline.cancel()
                 self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
                 return
             }
             let prefixBytes = Array(prefix)
             guard Array(prefixBytes[0..<4]) == HandshakeCodec.requestMagic else {
+                deadline.cancel()
                 self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
                 return
             }
             let nameLen = Int(prefixBytes[36])
             guard (1...64).contains(nameLen) else {
+                deadline.cancel()
                 self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
                 return
             }
             // Read variable name.
             conn.receive(minimumIncompleteLength: nameLen, maximumLength: nameLen) { nameData, _, _, error in
                 if let error = error {
+                    deadline.cancel()
                     debugLog("Auth name read error: \(error)")
                     conn.cancel()
                     return
                 }
                 guard let nameData = nameData, nameData.count == nameLen else {
+                    deadline.cancel()
                     self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
                     return
                 }
@@ -574,19 +845,28 @@ class StreamingServer {
                 do {
                     let parsed = try HandshakeCodec.parseRequest(full)
                     if WirelessAuth.validate(parsed.token, expected: expectedToken) {
+                        deadline.cancel()
                         debugLog("Wireless auth OK — device: \(parsed.deviceName)")
                         self.sendAuthResponse(conn, status: .ok, thenClose: false)
                         self.onWirelessClientPaired?(parsed.deviceName)
-                        self.beginExistingProtocol(on: conn)
+                        if let onSuccess {
+                            onSuccess()
+                        } else {
+                            self.beginExistingProtocol(on: conn)
+                        }
                     } else {
+                        deadline.cancel()
                         debugLog("Wireless auth rejected: token mismatch")
                         self.sendAuthResponse(conn, status: .invalidToken, thenClose: true)
                     }
                 } catch HandshakeError.invalidMagic {
+                    deadline.cancel()
                     self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
                 } catch HandshakeError.invalidName {
+                    deadline.cancel()
                     self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
                 } catch {
+                    deadline.cancel()
                     self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
                 }
             }
@@ -702,6 +982,19 @@ class StreamingServer {
                     handleTouchMessage(message, pointerCount: pointerCount)
                 }
 
+            case WireMessage.stylusEvent:
+                guard inputBuffer.count >= Self.stylusEventSize else { return }
+                let message = Data(inputBuffer.prefix(Self.stylusEventSize))
+                consumeInputBytes(Self.stylusEventSize)
+                // A stylus packet is accepted only after the client has
+                // advertised support. This keeps old hosts from seeing the
+                // extended packet and gives old clients their legacy path.
+                if touchEnabled, clientSupportsStylus {
+                    handleStylusMessage(message)
+                } else {
+                    debugLog("Ignoring stylus event before capability negotiation or with touch disabled")
+                }
+
             case WireMessage.ping:
                 // Ping from client: echo back as pong (type=5) with client's timestamp.
                 guard inputBuffer.count >= 9 else { return }
@@ -763,6 +1056,20 @@ class StreamingServer {
                     debugLog("Client decoder limit: \(w)x\(h)")
                 }
 
+            case WireMessage.clientSupportsStylus:
+                // Payload-free opt-in. The acknowledgement is emitted only
+                // for a client that explicitly sent this byte, so old Android
+                // clients never receive an unknown server message.
+                consumeInputBytes(1)
+                if !clientSupportsStylus {
+                    clientSupportsStylus = true
+                    connection.send(
+                        content: Data([WireMessage.serverSupportsStylus]),
+                        completion: .contentProcessed { _ in },
+                    )
+                    debugLog("Client supports S Pen stylus events")
+                }
+
             default:
                 debugLog("Unknown client input type: \(msgType)")
                 consumeInputBytes(1)
@@ -788,6 +1095,60 @@ class StreamingServer {
             self.onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2)
         }
     }
+
+    private func handleStylusMessage(_ data: Data) {
+        guard let event = decodeStylusEvent(data) else {
+            debugLog("Invalid stylus event payload")
+            return
+        }
+        DispatchQueue.main.async {
+            self.onStylusEvent?(event)
+        }
+    }
+
+    private func decodeStylusEvent(_ data: Data) -> StylusEvent? {
+        guard data.count >= Self.stylusEventSize,
+              data[data.startIndex] == WireMessage.stylusEvent else { return nil }
+
+        let action = Int(data[data.index(data.startIndex, offsetBy: 1)])
+        guard (0...3).contains(action) else { return nil }
+        let toolType = Int(data[data.index(data.startIndex, offsetBy: 2)])
+        let x = readFloatLE(data, offset: 4)
+        let y = readFloatLE(data, offset: 8)
+        let pressure = readFloatLE(data, offset: 12)
+        let tilt = readFloatLE(data, offset: 16)
+        let orientation = readFloatLE(data, offset: 20)
+        let buttons = readUInt32LE(data, offset: 24)
+        guard x.isFinite, y.isFinite, pressure.isFinite,
+              tilt.isFinite, orientation.isFinite else { return nil }
+
+        return StylusEvent(
+            x: x,
+            y: y,
+            action: action,
+            toolType: toolType,
+            pressure: pressure,
+            tilt: tilt,
+            orientation: orientation,
+            buttonState: buttons,
+        )
+    }
+
+    private func readFloatLE(_ data: Data, offset: Int) -> Float {
+        let raw = data.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
+        }
+        return Float(bitPattern: UInt32(littleEndian: raw))
+    }
+
+    private func readUInt32LE(_ data: Data, offset: Int) -> UInt32 {
+        let raw = data.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
+        }
+        return UInt32(littleEndian: raw)
+    }
+
+    private static let stylusEventSize = 28
 
     private func inputByte(at offset: Int) -> UInt8 {
         inputBuffer[inputBuffer.index(inputBuffer.startIndex, offsetBy: offset)]

@@ -4,6 +4,20 @@ plugins {
 }
 
 val appVersion = rootProject.file("../VERSION").readText().trim()
+val releaseKeystore = providers.environmentVariable("SIDESCREEN_RELEASE_KEYSTORE").orNull
+val releaseStorePassword = providers.environmentVariable("SIDESCREEN_RELEASE_STORE_PASSWORD").orNull
+val releaseKeyAlias = providers.environmentVariable("SIDESCREEN_RELEASE_KEY_ALIAS").orNull
+val releaseKeyPassword = providers.environmentVariable("SIDESCREEN_RELEASE_KEY_PASSWORD").orNull
+val releaseSigningConfigured = listOf(
+    releaseKeystore,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+).all { !it.isNullOrBlank() }
+
+if (releaseSigningConfigured && !file(releaseKeystore!!).isFile) {
+    error("SIDESCREEN_RELEASE_KEYSTORE does not point to a file: $releaseKeystore")
+}
 val versionParts = appVersion.split(".")
 val computedVersionCode = versionParts[0].toInt() * 10000 + versionParts[1].toInt() * 100 + versionParts[2].toInt()
 
@@ -19,10 +33,23 @@ android {
         versionName = appVersion
     }
 
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(releaseKeystore!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            if (releaseSigningConfigured) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
@@ -37,7 +64,24 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
+}
+
+val verifyReleaseSigning by tasks.registering {
+    doLast {
+        if (!releaseSigningConfigured) {
+            error(
+                "Release signing is not configured. Set SIDESCREEN_RELEASE_KEYSTORE, " +
+                    "SIDESCREEN_RELEASE_STORE_PASSWORD, SIDESCREEN_RELEASE_KEY_ALIAS, " +
+                    "and SIDESCREEN_RELEASE_KEY_PASSWORD before assembling a release APK.",
+            )
+        }
+    }
+}
+
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    dependsOn(verifyReleaseSigning)
 }
 
 dependencies {

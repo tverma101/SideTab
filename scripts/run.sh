@@ -3,11 +3,12 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/android_ports.sh"
 
 echo "🚀 Starting Side Screen..."
 
 # Kill any existing instance
-pkill -f SideScreen 2>/dev/null || true
+pkill -x SideScreen 2>/dev/null || true
 sleep 0.3
 
 # Check if app bundle exists
@@ -35,9 +36,11 @@ echo ""
 # Setup USB if device connected
 if adb devices 2>/dev/null | grep -q "device$"; then
     echo "📱 Android device detected, setting up USB..."
-    adb reverse --remove tcp:8888 2>/dev/null || true
-    adb reverse tcp:8888 tcp:8888
-    echo "  ✓ Port forwarding ready"
+    adb reverse --remove tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
+    adb reverse --remove tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
+    adb reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
+    adb reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
+    echo "  ✓ Video/control port forwarding ready"
 fi
 
 echo ""

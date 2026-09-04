@@ -45,6 +45,10 @@ struct GestureThresholds {
     static let minTouchInterval: UInt64 = 8_000_000    // ~120Hz
 }
 
+private extension Float {
+    var clampedUnit: Float { isFinite ? Swift.min(Swift.max(self, 0), 1) : 0 }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var streamingServer: StreamingServer?
     var screenCapture: ScreenCapture?
@@ -669,6 +673,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             streamingServer?.onClientDisconnected = { [weak self] in
                 guard let self = self else { return }
+                self.releaseStylusIfNeeded()
                 Task { @MainActor in
                     self.settings.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment, then
@@ -684,6 +689,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
                 self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+            }
+            streamingServer?.onStylusEvent = { [weak self] event in
+                self?.handleStylus(event)
             }
 
             streamingServer?.onStats = { [weak self] fps, mbps in
@@ -777,6 +785,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Save display position before destroying
         virtualDisplayManager?.saveDisplayPosition()
 
+        releaseStylusIfNeeded()
+
         screenCapture?.stopStreaming()
         streamingServer?.stop()
         virtualDisplayManager?.destroyDisplay()
@@ -807,6 +817,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var touchLastMoveTime: UInt64 = 0
     private var lastScrollDeltaX: CGFloat = 0
     private var lastScrollDeltaY: CGFloat = 0
+    // Direct S Pen stroke state. Pen contact deliberately bypasses the
+    // touch gesture classifier so a fast first stroke cannot become a scroll.
+    private var stylusIsDown = false
 
     // Double tap tracking
     private var lastTapTime: UInt64 = 0
@@ -828,7 +841,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Touch Entry Point
 
     func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
-        guard settings.touchEnabled else { return }
+        guard settings.touchEnabled, !stylusIsDown else { return }
 
         let handledAt = DispatchTime.now().uptimeNanoseconds
         if action == 0 {
@@ -874,6 +887,137 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             handleOneFingerTouch(at: p1, action: action)
         }
+    }
+
+    // MARK: - S Pen Entry Point
+
+    /// Handle a negotiated Android stylus packet as a direct mouse/tablet
+    /// stroke. Generic touch uses a tap/scroll/long-press classifier; using it
+    /// for a pen would turn the first quick stroke into a scroll. CoreGraphics
+    /// documents mouse pressure as the path for tablet pens mimicking a mouse,
+    /// so the pressure value is preserved on every event.
+    func handleStylus(_ event: StylusEvent) {
+        guard settings.touchEnabled else { return }
+
+        if !AXIsProcessTrusted() {
+            if !accessibilityWarningShown {
+                accessibilityWarningShown = true
+                print("⚠️  Accessibility not granted - S Pen input ignored")
+                Task { @MainActor in
+                    settings.hasAccessibilityPermission = false
+                }
+            }
+            return
+        }
+
+        guard let displayID = virtualDisplayManager?.displayID else { return }
+        let bounds = CGDisplayBounds(displayID)
+        let point = CGPoint(
+            x: bounds.origin.x + CGFloat(event.x.clampedUnit) * bounds.width,
+            y: bounds.origin.y + CGFloat(event.y.clampedUnit) * bounds.height,
+        )
+
+        switch event.action {
+        case 0: // Down
+            // Finish any touch drag before taking ownership of the pointer.
+            if gestureState == .dragging {
+                injectMouseUp(at: touchLastPosition)
+            }
+            cancelLongPressTimer()
+            stopMomentumScroll()
+            gestureState = .idle
+            stylusIsDown = true
+            stylusLastPosition = point
+            stylusUsesRightButton = (event.buttonState & Self.stylusSecondaryButtonMask) != 0
+            injectStylusMouseDown(at: point, pressure: event.pressure, tilt: event.tilt, orientation: event.orientation)
+            debugLog(String(format: "S PEN down x=%.3f y=%.3f pressure=%.3f tilt=%.3f", event.x, event.y, event.pressure, event.tilt))
+
+        case 1: // Move
+            if stylusIsDown {
+                stylusLastPosition = point
+                injectStylusMouseDragged(to: point, pressure: event.pressure, tilt: event.tilt, orientation: event.orientation)
+            } else {
+                // Recover gracefully if a contact move arrives after the
+                // initial packet was lost; moving the cursor does not
+                // synthesize a click.
+                moveCursor(to: point)
+            }
+
+        case 2: // Up/cancel
+            if stylusIsDown {
+                stylusLastPosition = point
+                injectStylusMouseUp(at: point)
+                stylusIsDown = false
+                stylusUsesRightButton = false
+                debugLog("S PEN up")
+            }
+
+        case 3: // Hover
+            if !stylusIsDown {
+                moveCursor(to: point)
+            }
+
+        default:
+            break
+        }
+    }
+
+    private var stylusLastPosition: CGPoint = .zero
+    private var stylusUsesRightButton = false
+
+    private static let stylusSecondaryButtonMask: UInt32 = 1 << 6 // Android BUTTON_STYLUS_SECONDARY
+
+    private func releaseStylusIfNeeded() {
+        guard stylusIsDown else { return }
+        injectStylusMouseUp(at: stylusLastPosition)
+        stylusIsDown = false
+        stylusUsesRightButton = false
+        debugLog("S PEN released during connection/server cleanup")
+    }
+
+    private func injectStylusMouseDown(at point: CGPoint, pressure: Float, tilt: Float, orientation: Float) {
+        let mouseType: CGEventType = stylusUsesRightButton ? .rightMouseDown : .leftMouseDown
+        let button: CGMouseButton = stylusUsesRightButton ? .right : .left
+        if let event = CGEvent(mouseEventSource: eventSource, mouseType: mouseType, mouseCursorPosition: point, mouseButton: button) {
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
+            applyStylusMetadata(to: event, pressure: pressure, tilt: tilt, orientation: orientation)
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func injectStylusMouseDragged(to point: CGPoint, pressure: Float, tilt: Float, orientation: Float) {
+        let mouseType: CGEventType = stylusUsesRightButton ? .rightMouseDragged : .leftMouseDragged
+        let button: CGMouseButton = stylusUsesRightButton ? .right : .left
+        if let event = CGEvent(mouseEventSource: eventSource, mouseType: mouseType, mouseCursorPosition: point, mouseButton: button) {
+            applyStylusMetadata(to: event, pressure: pressure, tilt: tilt, orientation: orientation)
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func injectStylusMouseUp(at point: CGPoint) {
+        let mouseType: CGEventType = stylusUsesRightButton ? .rightMouseUp : .leftMouseUp
+        let button: CGMouseButton = stylusUsesRightButton ? .right : .left
+        if let event = CGEvent(mouseEventSource: eventSource, mouseType: mouseType, mouseCursorPosition: point, mouseButton: button) {
+            applyStylusMetadata(to: event, pressure: 0, tilt: 0, orientation: 0)
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func applyStylusMetadata(to event: CGEvent, pressure: Float, tilt: Float, orientation: Float) {
+        // CoreGraphics documents subtype TabletPoint plus these fields as the
+        // supported path for tablet pens that mimic a mouse. Android reports
+        // tilt as an angle from perpendicular; project it into the two
+        // normalized CoreGraphics tilt axes using the pen orientation.
+        event.setIntegerValueField(.mouseEventSubtype, value: 1) // kCGEventMouseSubtypeTabletPoint
+        let normalizedPressure = pressure.clampedUnit
+        event.setDoubleValueField(.mouseEventPressure, value: Double(normalizedPressure))
+        event.setDoubleValueField(.tabletEventPointPressure, value: Double(normalizedPressure))
+
+        let normalizedTilt = (tilt / (.pi / 2)).clampedUnit
+        let angle = Double(orientation.isFinite ? orientation : 0)
+        event.setDoubleValueField(.tabletEventTiltX, value: sin(angle) * Double(normalizedTilt))
+        event.setDoubleValueField(.tabletEventTiltY, value: cos(angle) * Double(normalizedTilt))
+        event.setDoubleValueField(.tabletEventRotation, value: angle)
     }
 
     // MARK: - 1-Finger Gesture State Machine
