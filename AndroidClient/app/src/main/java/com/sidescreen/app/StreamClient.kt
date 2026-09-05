@@ -2,17 +2,21 @@ package com.sidescreen.app
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
 import java.io.IOException
+import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
@@ -26,18 +30,22 @@ class StreamClient(
     controlPort: Int = port + 1,
 ) {
     private var socket: Socket? = null
+
     @Volatile
     private var pendingSocket: Socket? = null
+
     @Volatile
     private var connectionAttemptCancelled = false
+
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
+
+    @Volatile
     private var isConnected = false
 
     /**
-     * Dedicated out-of-band control channel (ping/pong + keyframe requests).
-     * Pongs are answered on this connection, so measured RTT never waits on
-     * the video read loop. Falls back to in-band ping/pong when unavailable.
+     * Dedicated out-of-band control channel (ping/pong + keyframe/input).
+     * It self-heals independently and falls back in-band while unavailable.
      */
     private val controlChannel = ControlChannel(controlHost, controlPort)
 
@@ -76,15 +84,10 @@ class StreamClient(
     private var lastKeyframeRequestNs = 0L
     private var lastKeyframeReceivedNs = 0L
 
-    // Buffer pooling to reduce GC pressure from per-frame allocations
-    // At 60fps with ~100KB frames, this prevents ~6MB/s of allocations
+    // Buffer pooling to reduce GC pressure from per-frame allocations.
     private val bufferPool = ArrayDeque<ByteArray>(8)
     private val poolLock = Any()
 
-    /**
-     * Acquire a buffer from pool or allocate new one if needed
-     * @param minSize Minimum size required for the buffer
-     */
     private fun acquireBuffer(minSize: Int): ByteArray {
         synchronized(poolLock) {
             val iterator = bufferPool.iterator()
@@ -96,33 +99,23 @@ class StreamClient(
                 }
             }
         }
-        // No suitable buffer found, allocate new one
         return ByteArray(minSize)
     }
 
-    /**
-     * Release a buffer back to the pool for reuse
-     * Called after decode completes via onFrameDecoded callback
-     */
     fun releaseBuffer(buffer: ByteArray) {
         synchronized(poolLock) {
-            // Keep pool size limited to prevent memory bloat
             if (bufferPool.size < 8) {
                 bufferPool.addLast(buffer)
             }
-            // If pool is full, let buffer be GC'd
         }
     }
 
-    // High-priority thread for touch events to minimize latency
-    // Use THREAD_PRIORITY_DISPLAY instead of URGENT_DISPLAY to avoid starving system processes
+    // High-priority single writer preserves input ordering across touch, S Pen,
+    // pings, and keyframe requests without doing network I/O on UI/codec threads.
     private val touchExecutor =
         Executors.newSingleThreadExecutor { runnable ->
             Thread(
                 {
-                    // Use DISPLAY priority (less aggressive than URGENT_DISPLAY).
-                    // ThreadFactory runs on the caller thread, so set Linux priority
-                    // from inside the worker thread before processing touch writes.
                     try {
                         Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
                     } catch (_: Exception) {
@@ -137,39 +130,43 @@ class StreamClient(
     private val touchDispatcher = touchExecutor.asCoroutineDispatcher()
     private val touchScope = CoroutineScope(touchDispatcher)
 
+    /** USB/E3 connection. A dropped session remains terminal for this client. */
     suspend fun connect() =
         withContext(Dispatchers.IO) {
+            connectionAttemptCancelled = false
             controlChannel.setAuthToken(null)
-            if (connectionAttemptCancelled) return@withContext
+            controlChannel.setNetwork(null)
+            var announcedConnected = false
             try {
-                socket =
-                    Socket(host, port).apply {
-                        tcpNoDelay = true
-                    }
-                inputStream = DataInputStream(java.io.BufferedInputStream(socket?.getInputStream(), 65536))
-                outputStream = java.io.DataOutputStream(socket?.getOutputStream())
-                streamCodecIsHevc = true
-                codecNegotiated = false
-                stylusSupported = false
-                advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
-                advertiseDecoderLimits() // Also before type 8, for the same reason
-                advertiseStylusSupport() // Payload-free; old hosts safely skip it.
-                advertiseFrameMetadataSupport()
-                isConnected = true
-                lastKeyframeReceivedNs = 0L
-                synchronized(keyframeRequestLock) {
-                    lastKeyframeRequestNs = 0L
+                val s = Socket()
+                pendingSocket = s
+                s.tcpNoDelay = true
+                s.keepAlive = true
+                s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+                clearPendingSocket(s)
+                if (connectionAttemptCancelled) {
+                    s.close()
+                    return@withContext
                 }
-
+                installConnectedSocket(s)
+                announcedConnected = true
                 diagLog("Connected to $host:$port")
                 onConnectionStatus?.invoke(true)
-
                 connectControlChannel()
                 receiveData()
             } catch (e: Exception) {
-                Log.e(TAG, "❌ Connection error", e)
-                onConnectionStatus?.invoke(false)
-                cleanup()
+                if (!connectionAttemptCancelled) {
+                    Log.e(TAG, "❌ Connection error", e)
+                }
+            } finally {
+                isConnected = false
+                cleanupTransport(stopControl = true)
+                shutdownTouchExecutor()
+                if (announcedConnected && !connectionAttemptCancelled) {
+                    onConnectionStatus?.invoke(false)
+                } else if (!announcedConnected && !connectionAttemptCancelled) {
+                    onConnectionStatus?.invoke(false)
+                }
             }
         }
 
@@ -182,8 +179,13 @@ class StreamClient(
     }
 
     /**
-     * Wireless connect: opens TCP, performs auth handshake, then resumes the existing receive loop on success.
-     * Throws WirelessConnectError on any failure.
+     * Wireless connection with session-level recovery.
+     *
+     * Initial connection failures are reported immediately so pairing errors do
+     * not masquerade as retries. After one successful session, ordinary TCP or
+     * Wi-Fi loss is retried on the same StreamClient with capped exponential
+     * backoff. The input executor is intentionally kept alive across retries.
+     * Explicit Disconnect cancels the pending socket and exits immediately.
      */
     suspend fun connectWireless(
         token: ByteArray,
@@ -192,199 +194,248 @@ class StreamClient(
         if (token.size != PAIRING_TOKEN_SIZE) {
             throw WirelessConnectError.ProtocolError
         }
+        connectionAttemptCancelled = false
         controlChannel.setAuthToken(token)
-        Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
 
-        // Force the socket onto the active WiFi network. On some Android setups
-        // (especially LG/Android 12), an app's default outbound socket may take
-        // a route that silently drops LAN traffic; binding to the WIFI Network
-        // explicitly avoids that.
-        val connectingSocket = Socket()
-        pendingSocket = connectingSocket
-        val s =
-            try {
-                connectingSocket.tcpNoDelay = true
-                val wifiNetwork =
-                    context?.let { ctx ->
-                        val cm = ctx.getSystemService(ConnectivityManager::class.java)
-                        cm.allNetworks.firstOrNull { net ->
-                            val caps = cm.getNetworkCapabilities(net)
-                            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                        }
+        var everConnected = false
+        var reconnectAttempt = 0
+        var terminalError: WirelessConnectError? = null
+
+        try {
+            while (!connectionAttemptCancelled) {
+                try {
+                    openWirelessTransport(token, deviceName)
+                    if (connectionAttemptCancelled) break
+
+                    val wasReconnect = everConnected
+                    everConnected = true
+                    reconnectAttempt = 0
+                    isConnected = true
+                    diagLog(
+                        if (wasReconnect) {
+                            "Wireless session recovered to $host:$port"
+                        } else {
+                            "Wireless connected to $host:$port"
+                        },
+                    )
+                    onConnectionStatus?.invoke(true)
+                    connectControlChannel()
+
+                    // Returns only on EOF/unknown protocol or throws on I/O.
+                    receiveData()
+                    if (!connectionAttemptCancelled) {
+                        throw IOException("Wireless stream ended")
                     }
-                if (wifiNetwork != null) {
-                    Log.i(TAG, "connectWireless: binding socket to WiFi network $wifiNetwork")
-                    wifiNetwork.bindSocket(connectingSocket)
-                } else {
-                    Log.w(TAG, "connectWireless: no WiFi network found, using default routing")
+                } catch (e: WirelessConnectError) {
+                    cleanupTransport(stopControl = false)
+                    isConnected = false
+                    if (!everConnected ||
+                        e is WirelessConnectError.TokenRejected ||
+                        e is WirelessConnectError.ProtocolError
+                    ) {
+                        throw e
+                    }
+                    terminalError = e
+                } catch (e: IOException) {
+                    cleanupTransport(stopControl = false)
+                    isConnected = false
+                    if (!everConnected) {
+                        throw WirelessConnectError.NetworkUnreachable
+                    }
+                    terminalError = WirelessConnectError.NetworkUnreachable
+                    Log.w(TAG, "Wireless stream lost: ${e.javaClass.simpleName}: ${e.message}")
                 }
-                connectingSocket.connect(java.net.InetSocketAddress(host, port), 5000)
-                connectingSocket
-            } catch (e: java.net.SocketTimeoutException) {
-                Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port (5s)")
-                clearPendingSocket(connectingSocket)
-                try {
-                    connectingSocket.close()
-                } catch (_: IOException) {
+
+                if (connectionAttemptCancelled) break
+                reconnectAttempt += 1
+                if (reconnectAttempt > MAX_WIRELESS_RECONNECT_ATTEMPTS) {
+                    Log.e(TAG, "Wireless reconnect exhausted after $MAX_WIRELESS_RECONNECT_ATTEMPTS attempts")
+                    break
                 }
-                throw WirelessConnectError.NetworkUnreachable
-            } catch (e: IOException) {
-                Log.e(
+                val delayMs = reconnectDelayMs(reconnectAttempt)
+                Log.w(
                     TAG,
-                    "connectWireless: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}",
+                    "Wireless reconnect attempt $reconnectAttempt/$MAX_WIRELESS_RECONNECT_ATTEMPTS in ${delayMs}ms",
                 )
-                clearPendingSocket(connectingSocket)
-                try {
-                    connectingSocket.close()
-                } catch (_: IOException) {
-                }
-                throw WirelessConnectError.NetworkUnreachable
+                delay(delayMs)
             }
+        } finally {
+            isConnected = false
+            cleanupTransport(stopControl = true)
+            shutdownTouchExecutor()
+        }
+
         if (connectionAttemptCancelled) {
-            clearPendingSocket(s)
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
             return@withContext
         }
-        // A reachable but stalled host must not leave the Wireless tab stuck
-        // in Connecting forever while waiting for its application response.
-        s.soTimeout = 5000
-        Log.i(
-            TAG,
-            "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",
-        )
 
+        // Do not transition the UI to idle during recoverable attempts; only
+        // report disconnected once recovery is truly exhausted/terminal.
+        if (everConnected) {
+            onConnectionStatus?.invoke(false)
+        }
+        throw terminalError ?: WirelessConnectError.NetworkUnreachable
+    }
+
+    /** Establish and authenticate one wireless video socket. */
+    private fun openWirelessTransport(
+        token: ByteArray,
+        deviceName: String,
+    ) {
+        Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
+        val connectingSocket = Socket()
+        pendingSocket = connectingSocket
+
+        val wifiNetwork = selectWifiNetwork()
+        controlChannel.setNetwork(wifiNetwork)
+
+        try {
+            connectingSocket.tcpNoDelay = true
+            connectingSocket.keepAlive = true
+            if (wifiNetwork != null) {
+                Log.i(TAG, "connectWireless: binding video/control to WiFi network $wifiNetwork")
+                wifiNetwork.bindSocket(connectingSocket)
+            } else {
+                Log.w(TAG, "connectWireless: no WiFi Network handle found, using default routing")
+            }
+            connectingSocket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+        } catch (e: SocketTimeoutException) {
+            closePending(connectingSocket)
+            Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port")
+            throw WirelessConnectError.NetworkUnreachable
+        } catch (e: IOException) {
+            closePending(connectingSocket)
+            Log.e(TAG, "connectWireless: TCP connect failed: ${e.javaClass.simpleName}: ${e.message}")
+            throw WirelessConnectError.NetworkUnreachable
+        }
+
+        if (connectionAttemptCancelled) {
+            closePending(connectingSocket)
+            return
+        }
+
+        connectingSocket.soTimeout = HANDSHAKE_TIMEOUT_MS
         val request =
             try {
                 AuthHandshake.encodeRequest(token, deviceName)
             } catch (_: IllegalArgumentException) {
-                clearPendingSocket(s)
-                try {
-                    s.close()
-                } catch (_: IOException) {
-                }
+                closePending(connectingSocket)
                 throw WirelessConnectError.ProtocolError
             }
-        if (connectionAttemptCancelled) {
-            clearPendingSocket(s)
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            return@withContext
-        }
+
         try {
-            s.getOutputStream().write(request)
-            s.getOutputStream().flush()
-        } catch (e: IOException) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            clearPendingSocket(s)
+            connectingSocket.getOutputStream().write(request)
+            connectingSocket.getOutputStream().flush()
+        } catch (_: IOException) {
+            closePending(connectingSocket)
             throw WirelessConnectError.NetworkUnreachable
         }
 
-        val responseBuf = ByteArray(5)
+        val responseBuf = ByteArray(AUTH_RESPONSE_SIZE)
         var read = 0
         try {
-            while (read < 5) {
-                val r = s.getInputStream().read(responseBuf, read, 5 - read)
-                if (r <= 0) break
-                read += r
+            while (read < responseBuf.size) {
+                val count = connectingSocket.getInputStream().read(responseBuf, read, responseBuf.size - read)
+                if (count <= 0) break
+                read += count
             }
-        } catch (e: IOException) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            clearPendingSocket(s)
+        } catch (e: SocketTimeoutException) {
+            closePending(connectingSocket)
+            throw WirelessConnectError.NetworkUnreachable
+        } catch (_: IOException) {
+            closePending(connectingSocket)
             throw WirelessConnectError.NetworkUnreachable
         }
+
         if (connectionAttemptCancelled) {
-            clearPendingSocket(s)
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            return@withContext
+            closePending(connectingSocket)
+            return
         }
-        if (read != 5) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            clearPendingSocket(s)
+        if (read != responseBuf.size) {
+            closePending(connectingSocket)
             throw WirelessConnectError.ProtocolError
         }
 
-        val status =
-            AuthHandshake.parseResponse(responseBuf) ?: run {
-                try {
-                    s.close()
-                } catch (_: IOException) {
-                }
-                clearPendingSocket(s)
-                throw WirelessConnectError.ProtocolError
-            }
+        val status = AuthHandshake.parseResponse(responseBuf) ?: run {
+            closePending(connectingSocket)
+            throw WirelessConnectError.ProtocolError
+        }
         Log.i(TAG, "connectWireless: handshake response status=$status")
+
         when (status) {
             AuthHandshake.ResponseStatus.OK -> {
-                // The timeout only bounds the handshake response. Video is a
-                // long-lived stream and must allow legitimate idle intervals.
-                s.soTimeout = 0
-                clearPendingSocket(s)
-                socket = s
-                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
-                outputStream = java.io.DataOutputStream(s.getOutputStream())
-                streamCodecIsHevc = true
-                codecNegotiated = false
-                stylusSupported = false
-                lastKeyframeReceivedNs = 0L
-                synchronized(keyframeRequestLock) {
-                    lastKeyframeRequestNs = 0L
-                }
-                advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
-                advertiseDecoderLimits() // Also before type 8, for the same reason
-                advertiseStylusSupport() // Payload-free; old hosts safely skip it.
-                advertiseFrameMetadataSupport()
-                isConnected = true
-                diagLog("Wireless connected to $host:$port")
-                onConnectionStatus?.invoke(true)
-                connectControlChannel()
-                receiveData()
+                connectingSocket.soTimeout = 0
+                clearPendingSocket(connectingSocket)
+                installConnectedSocket(connectingSocket)
             }
+
             AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
-                try {
-                    s.close()
-                } catch (_: IOException) {
-                }
-                clearPendingSocket(s)
+                closePending(connectingSocket)
                 throw WirelessConnectError.TokenRejected
             }
+
             else -> {
-                try {
-                    s.close()
-                } catch (_: IOException) {
-                }
-                clearPendingSocket(s)
+                closePending(connectingSocket)
                 throw WirelessConnectError.ProtocolError
             }
         }
+    }
+
+    /**
+     * Prefer the active Wi-Fi network, but do not require INTERNET/VALIDATED.
+     * SideScreen is a LAN app and must work on local-only Wi-Fi, travel-router,
+     * hotspot, and captive-portal networks where Internet capability is absent.
+     */
+    private fun selectWifiNetwork(): Network? {
+        val ctx = context ?: return null
+        val cm = ctx.getSystemService(ConnectivityManager::class.java)
+        cm.activeNetwork?.let { active ->
+            val caps = cm.getNetworkCapabilities(active)
+            if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                return active
+            }
+        }
+        return cm.allNetworks.firstOrNull { network ->
+            cm.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
+    }
+
+    private fun installConnectedSocket(s: Socket) {
+        socket = s
+        inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
+        outputStream = java.io.DataOutputStream(s.getOutputStream())
+        streamCodecIsHevc = true
+        codecNegotiated = false
+        stylusSupported = false
+        lastKeyframeReceivedNs = 0L
+        synchronized(keyframeRequestLock) {
+            lastKeyframeRequestNs = 0L
+        }
+        bytesReceived = 0L
+        framesReceived = 0L
+        lastStatsTime = System.currentTimeMillis()
+
+        // MUST precede type 8: type 8 can trigger the server's early protocol finish.
+        advertiseAvcOnlyIfNeeded()
+        advertiseDecoderLimits()
+        advertiseStylusSupport()
+        advertiseFrameMetadataSupport()
+        isConnected = true
     }
 
     private fun clearPendingSocket(expected: Socket) {
         if (pendingSocket === expected) pendingSocket = null
     }
 
-    /** Best-effort: opens the out-of-band control channel once after the video
-     *  connection is up. Failure is non-fatal — ping/pong falls back in-band.
-     *  Runs fire-and-forget on its own thread so the video receive loop is
-     *  never delayed by a slow control-channel connect. A later retry requires
-     *  a new, user-requested stream connection. */
+    private fun closePending(expected: Socket) {
+        clearPendingSocket(expected)
+        try {
+            expected.close()
+        } catch (_: IOException) {
+        }
+    }
+
+    /** Start the self-healing out-of-band channel after video authentication. */
     private fun connectControlChannel() {
         controlChannel.onLatencyMeasured = { rttMs ->
             onLatencyMeasured?.invoke(rttMs)
@@ -392,15 +443,7 @@ class StreamClient(
         controlChannel.onBrightnessCommand = { v ->
             onBrightness?.invoke(v)
         }
-        Thread({
-            try {
-                controlChannel.connect()
-            } catch (_: Exception) {
-            }
-        }, "ControlConnect").apply {
-            isDaemon = true
-            priority = Thread.MAX_PRIORITY
-        }.start()
+        controlChannel.connect()
     }
 
     private fun advertiseFrameMetadataSupport() {
@@ -447,72 +490,58 @@ class StreamClient(
         }
     }
 
+    /** Receive until disconnect/EOF. I/O failures bubble to the session owner. */
     private suspend fun receiveData() =
         withContext(Dispatchers.IO) {
-            val input = inputStream ?: return@withContext
+            val input = inputStream ?: throw IOException("Missing stream input")
 
-            try {
-                while (isConnected) {
-                    val type = input.readByte()
+            while (isConnected && !connectionAttemptCancelled) {
+                val type = input.readByte()
 
-                    when (type.toInt()) {
-                        MESSAGE_VIDEO_FRAME -> {
-                            receiveVideoFrame(input, hasMetadata = false)
-                        }
+                when (type.toInt()) {
+                    MESSAGE_VIDEO_FRAME -> receiveVideoFrame(input, hasMetadata = false)
+                    MESSAGE_VIDEO_FRAME_WITH_METADATA -> receiveVideoFrame(input, hasMetadata = true)
 
-                        MESSAGE_VIDEO_FRAME_WITH_METADATA -> {
-                            receiveVideoFrame(input, hasMetadata = true)
-                        }
+                    1 -> {
+                        val width = input.readInt()
+                        val height = input.readInt()
+                        val transform = input.readInt()
+                        val rotation = transform % 1000
+                        val flags = transform / 1000
+                        val flipHorizontal = flags and 1 == 1
+                        val flipVertical = flags and 2 == 2
+                        diagLog("Display config: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
+                        onDisplaySize?.invoke(width, height, rotation, flipHorizontal, flipVertical)
+                    }
 
-                        1 -> {
-                            val width = input.readInt()
-                            val height = input.readInt()
-                            val transform = input.readInt()
-                            val rotation = transform % 1000
-                            val flags = transform / 1000
-                            val flipHorizontal = flags and 1 == 1
-                            val flipVertical = flags and 2 == 2
-                            diagLog("Display config: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-                            onDisplaySize?.invoke(width, height, rotation, flipHorizontal, flipVertical)
-                        }
+                    5 -> {
+                        val buf = ByteArray(8)
+                        input.readFully(buf)
+                        val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
+                        val rtt = (System.nanoTime() - sentTime) / 1_000_000.0
+                        diagLog(String.format("PONG rtt=%.2fms", rtt))
+                        onLatencyMeasured?.invoke(rtt)
+                    }
 
-                        5 -> { // Pong response — measure round-trip latency
-                            val buf = ByteArray(8)
-                            input.readFully(buf)
-                            val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
-                            val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
-                            diagLog(String.format("PONG rtt=%.2fms", rtt))
-                            onLatencyMeasured?.invoke(rtt)
-                        }
+                    MESSAGE_CODEC_SELECTED -> {
+                        val codecId = input.readByte().toInt()
+                        streamCodecIsHevc = codecId == 0
+                        codecNegotiated = true
+                        diagLog("Server selected codec: ${if (streamCodecIsHevc) "HEVC" else "H.264"}")
+                        onCodecSelected?.invoke(streamCodecIsHevc)
+                    }
 
-                        MESSAGE_CODEC_SELECTED -> {
-                            val codecId = input.readByte().toInt()
-                            streamCodecIsHevc = codecId == 0
-                            codecNegotiated = true
-                            diagLog("Server selected codec: ${if (streamCodecIsHevc) "HEVC" else "H.264"}")
-                            onCodecSelected?.invoke(streamCodecIsHevc)
-                        }
+                    MESSAGE_SERVER_SUPPORTS_STYLUS -> {
+                        stylusSupported = true
+                        diagLog("Mac host accepted S Pen stylus events")
+                    }
 
-                        MESSAGE_SERVER_SUPPORTS_STYLUS -> {
-                            stylusSupported = true
-                            diagLog("Mac host accepted S Pen stylus events")
-                        }
-
-                        else -> {
-                            Log.e(
-                                TAG,
-                                "Unknown message type: ${type.toInt()}, stream may be misaligned — disconnecting",
-                            )
-                            break
-                        }
+                    else -> {
+                        throw IOException(
+                            "Unknown message type ${type.toInt()}; stream may be misaligned",
+                        )
                     }
                 }
-            } catch (e: IOException) {
-                if (isConnected) {
-                    Log.e(TAG, "❌ Read error", e)
-                }
-            } finally {
-                disconnect()
             }
         }
 
@@ -524,7 +553,7 @@ class StreamClient(
         x2: Float = 0f,
         y2: Float = 0f,
     ) {
-        if (!isConnected) return
+        if (!isConnected || touchExecutor.isShutdown) return
 
         touchScope.launch {
             if (controlChannel.sendTouch(x, y, action, pointerCount, x2, y2)) {
@@ -533,7 +562,7 @@ class StreamClient(
             try {
                 socket?.getOutputStream()?.let { out ->
                     val count = pointerCount.coerceIn(1, 2)
-                    val size = 6 + count * 8 // 1 type + 1 count + N*(4x+4y) + 4 action
+                    val size = 6 + count * 8
                     val buffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
                     buffer.put(2.toByte())
                     buffer.put(count.toByte())
@@ -554,7 +583,7 @@ class StreamClient(
 
     /** Send a direct S Pen event when the Mac host negotiated the extension. */
     fun sendStylus(event: StylusInputEvent) {
-        if (!isConnected || !stylusSupported) return
+        if (!isConnected || !stylusSupported || touchExecutor.isShutdown) return
 
         touchScope.launch {
             if (controlChannel.sendStylus(event)) {
@@ -570,22 +599,13 @@ class StreamClient(
         }
     }
 
-    // Callback for latency measurement (round-trip ping/pong)
     var onLatencyMeasured: ((Double) -> Unit)? = null
 
-    /**
-     * Ask the host to send an IDR/sync frame.
-     *
-     * Non-forced requests are rate-limited here so all callers share the same
-     * backpressure guard. Forced requests are reserved for startup and hard
-     * decoder recovery paths where waiting for the throttle would leave the
-     * client black or unsynchronized.
-     */
     fun requestKeyframe(
         force: Boolean = false,
         reason: String = "client request",
     ) {
-        if (!isConnected) return
+        if (!isConnected || touchExecutor.isShutdown) return
         val now = System.nanoTime()
         val shouldSend =
             synchronized(keyframeRequestLock) {
@@ -604,10 +624,6 @@ class StreamClient(
         val flags = if (force) KEYFRAME_REQUEST_FLAG_FORCE else 0
         diagLog("Requesting keyframe: reason=$reason, force=$force")
         touchScope.launch {
-            // Decoder callbacks can arrive on the main or codec callback
-            // thread. Keep every control write off those threads so Android
-            // never turns a valid dedicated channel into a
-            // NetworkOnMainThreadException during decoder startup.
             if (controlChannel.requestKeyframe(force)) {
                 return@launch
             }
@@ -621,13 +637,8 @@ class StreamClient(
         }
     }
 
-    /**
-     * Send a ping to measure round-trip latency. Prefers the dedicated control
-     * channel (pong comes back on its own connection, never queued behind
-     * video frames); falls back to the in-band path when control is down.
-     */
     fun sendPing() {
-        if (!isConnected) return
+        if (!isConnected || touchExecutor.isShutdown) return
         if (controlChannel.sendPing()) {
             return
         }
@@ -638,7 +649,7 @@ class StreamClient(
                     val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
                     val writeTime = System.nanoTime()
                     diagLog(String.format("PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6))
-                    buffer.put(4.toByte()) // Type 4: ping
+                    buffer.put(4.toByte())
                     buffer.putLong(writeTime)
                     out.write(buffer.array())
                     out.flush()
@@ -684,13 +695,19 @@ class StreamClient(
         }
 
         val frameData = acquireBuffer(frameSize)
-        input.readFully(frameData, 0, frameSize)
+        try {
+            input.readFully(frameData, 0, frameSize)
+        } catch (e: IOException) {
+            // A partial frame never reaches the decoder, so return its pooled
+            // buffer here instead of leaking one on every reconnect.
+            releaseBuffer(frameData)
+            throw e
+        }
 
         if (!hasMetadata && !isKeyframe) {
             isKeyframe = isSyncFrame(frameData, frameSize, streamCodecIsHevc)
         }
 
-        // Capture timestamp after full frame received for accurate age tracking.
         val receiveTimestamp = System.nanoTime()
         checkKeyframeFreshness(receiveTimestamp, isKeyframe)
         diagFrameCount++
@@ -742,49 +759,77 @@ class StreamClient(
         }
     }
 
+    /** Explicit/user disconnect: cancel retries and tear down all resources. */
     fun disconnect() {
-        isConnected = false
         connectionAttemptCancelled = true
-        pendingSocket?.close()
-        cleanup()
+        isConnected = false
+        try {
+            pendingSocket?.close()
+        } catch (_: Exception) {
+        }
+        cleanupTransport(stopControl = true)
+        shutdownTouchExecutor()
         onConnectionStatus?.invoke(false)
         Log.d(TAG, "Disconnected")
     }
 
-    private fun cleanup() {
-        try {
-            outputStream?.close()
-            inputStream?.close()
-            socket?.close()
-            pendingSocket?.close()
-            pendingSocket = null
-            controlChannel.disconnect()
-
-            // Properly shutdown executor with timeout to prevent orphaned threads
-            touchExecutor.shutdown()
-            try {
-                if (!touchExecutor.awaitTermination(500, TimeUnit.MILLISECONDS)) {
-                    touchExecutor.shutdownNow()
-                    // Wait a bit more for forced shutdown
-                    touchExecutor.awaitTermination(200, TimeUnit.MILLISECONDS)
-                }
-            } catch (e: InterruptedException) {
-                touchExecutor.shutdownNow()
-                Thread.currentThread().interrupt()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during cleanup", e)
-        }
+    /** Close only transport state; optionally keep self-healing control alive. */
+    private fun cleanupTransport(stopControl: Boolean) {
+        val out = outputStream
+        val input = inputStream
+        val activeSocket = socket
+        val pending = pendingSocket
         outputStream = null
         inputStream = null
         socket = null
+        pendingSocket = null
+
+        try {
+            out?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            input?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            activeSocket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            pending?.close()
+        } catch (_: Exception) {
+        }
+        if (stopControl) {
+            controlChannel.disconnect()
+        }
+    }
+
+    private fun shutdownTouchExecutor() {
+        if (touchExecutor.isShutdown) return
+        touchExecutor.shutdown()
+        try {
+            if (!touchExecutor.awaitTermination(500, TimeUnit.MILLISECONDS)) {
+                touchExecutor.shutdownNow()
+                touchExecutor.awaitTermination(200, TimeUnit.MILLISECONDS)
+            }
+        } catch (e: InterruptedException) {
+            touchExecutor.shutdownNow()
+            Thread.currentThread().interrupt()
+        }
     }
 
     private fun diagLog(msg: String) = DiagLog.log("SC", msg)
 
     companion object {
         private const val TAG = "StreamClient"
-        private const val MAX_FRAME_SIZE = 5 * 1024 * 1024 // 5MB
+        private const val MAX_FRAME_SIZE = 5 * 1024 * 1024
+        private const val CONNECT_TIMEOUT_MS = 5_000
+        private const val HANDSHAKE_TIMEOUT_MS = 5_000
+        private const val AUTH_RESPONSE_SIZE = 5
+        private const val MAX_WIRELESS_RECONNECT_ATTEMPTS = 12
+        private const val WIRELESS_RECONNECT_INITIAL_MS = 250L
+        private const val WIRELESS_RECONNECT_MAX_MS = 5_000L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
         private const val MESSAGE_VIDEO_FRAME = 0
@@ -800,11 +845,16 @@ class StreamClient(
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
         private const val PAIRING_TOKEN_SIZE = 32
 
+        /** Pure reconnect policy for deterministic unit testing. Attempt is 1-based. */
+        internal fun reconnectDelayMs(attempt: Int): Long {
+            val shift = (attempt - 1).coerceIn(0, 20)
+            return (WIRELESS_RECONNECT_INITIAL_MS shl shift).coerceAtMost(WIRELESS_RECONNECT_MAX_MS)
+        }
+
         /**
          * Codec-aware sync-frame (keyframe) detection on the legacy
          * MESSAGE_VIDEO_FRAME path. HEVC: IRAP NAL types 16..21 from
          * (header and 0x7E) shr 1. H.264: IDR slice, (header and 0x1F) == 5.
-         * Internal (not private) so unit tests can exercise both branches.
          */
         internal fun isSyncFrame(
             data: ByteArray,
