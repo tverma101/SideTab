@@ -37,8 +37,26 @@ object StylusProtocol {
 
     const val EVENT_SIZE: Int = 28
 
-    fun encode(event: StylusInputEvent): ByteArray {
-        val buffer = ByteBuffer.allocate(EVENT_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+    fun encode(event: StylusInputEvent): ByteArray =
+        ByteArray(EVENT_SIZE).also { encodeInto(event, it) }
+
+    /**
+     * Encode into caller-owned storage. The 120 Hz S Pen path reuses one
+     * scratch buffer under its send lock instead of allocating a ByteBuffer
+     * and ByteArray for every sample.
+     */
+    fun encodeInto(
+        event: StylusInputEvent,
+        target: ByteArray,
+        offset: Int = 0,
+    ): Int {
+        require(offset >= 0 && target.size - offset >= EVENT_SIZE) {
+            "target must have at least $EVENT_SIZE writable bytes"
+        }
+        val buffer =
+            ByteBuffer
+                .wrap(target, offset, EVENT_SIZE)
+                .order(ByteOrder.LITTLE_ENDIAN)
         buffer.put(STYLUS_EVENT.toByte())
         buffer.put(event.action.coerceIn(ACTION_DOWN, ACTION_HOVER).toByte())
         buffer.put(event.toolType.coerceIn(0, 0xFF).toByte())
@@ -49,7 +67,7 @@ object StylusProtocol {
         buffer.putFloat(event.tilt.finiteOr(0f))
         buffer.putFloat(event.orientation.finiteOr(0f))
         buffer.putInt(event.buttonState)
-        return buffer.array()
+        return EVENT_SIZE
     }
 
     private fun Float.finiteOr(fallback: Float): Float = if (isFinite()) this else fallback
