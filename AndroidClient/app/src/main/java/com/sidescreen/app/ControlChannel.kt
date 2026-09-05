@@ -45,25 +45,17 @@ class ControlChannel(
 
     private var socket: Socket? = null
     private var output: DataOutputStream? = null
-
-    /** Monotonic identity for each installed control TCP transport. */
     private var connectionGeneration = 0L
 
     @Volatile
     private var tcpActive = false
 
-    /** Desired lifetime of the channel, not the state of the current socket. */
     @Volatile
     private var running = false
 
     @Volatile
     private var connecting = false
 
-    /**
-     * Video-session generation supplied by StreamClient. Input/control work
-     * queued for an older recovered video session is intentionally consumed
-     * (dropped) rather than being replayed into the new session.
-     */
     @Volatile
     private var sessionGeneration = 0L
 
@@ -87,11 +79,6 @@ class ControlChannel(
     val isConnected: Boolean
         get() = tcpActive
 
-    /**
-     * Start (or keep) the self-healing control channel. Idempotent.
-     * Connection failures never fail the video session; they retry with capped
-     * backoff while callers use the in-band fallback.
-     */
     fun connect() {
         synchronized(connectLock) {
             if (running) return
@@ -146,9 +133,13 @@ class ControlChannel(
             connecting = true
         }
 
+        // Snapshot the Android Network used for this attempt. If a roam occurs
+        // while connect/auth is in flight, the completed socket is discarded
+        // rather than installing a route that was obsolete before promotion.
+        val targetNetwork = boundNetwork
         val s = Socket()
         return try {
-            boundNetwork?.let { network ->
+            targetNetwork?.let { network ->
                 network.bindSocket(s)
                 DiagLog.log("CC", "Control socket bound to Android network $network")
             }
@@ -162,7 +153,10 @@ class ControlChannel(
             val installedGeneration =
                 synchronized(connectLock) {
                     connecting = false
-                    if (!running || socket != null) {
+                    if (!running || socket != null || boundNetwork != targetNetwork) {
+                        if (boundNetwork != targetNetwork) {
+                            DiagLog.log("CC", "Control connect finished on retired Android network — retrying")
+                        }
                         try {
                             s.close()
                         } catch (_: Exception) {
@@ -272,16 +266,24 @@ class ControlChannel(
         controlAuthToken = token?.clone()
     }
 
+    /**
+     * Rebind immediately when Android gives the video path a different Network
+     * handle. Keeping the previous control TCP socket until its 4s ping timeout
+     * would lose low-latency input after an otherwise successful Wi-Fi roam.
+     */
     fun setNetwork(network: Network?) {
+        val previous = boundNetwork
+        if (previous == network) return
         boundNetwork = network
+
+        val activeSocket = synchronized(connectLock) { socket }
+        if (activeSocket != null) {
+            DiagLog.log("CC", "Android network changed $previous -> $network — rebinding control")
+            markTcpInactive(activeSocket)
+        }
     }
 
-    /**
-     * Fence queued input against StreamClient's current recovered video
-     * transport. Cleanup and install can race on different threads; generations
-     * therefore advance only. A late cleanup from generation N must never move
-     * the persistent control channel backward after generation N+1 is live.
-     */
+    /** Generations advance only; late cleanup cannot move control backward. */
     fun setSessionGeneration(generation: Long) {
         synchronized(sendLock) {
             if (generation > sessionGeneration) {
