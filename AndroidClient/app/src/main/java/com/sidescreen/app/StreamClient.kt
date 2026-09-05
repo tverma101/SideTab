@@ -19,6 +19,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
 private fun resolveControlPort(
@@ -194,6 +195,20 @@ class StreamClient(
         }
     private val touchDispatcher = touchExecutor.asCoroutineDispatcher()
     private val touchScope = CoroutineScope(touchDispatcher)
+
+    /**
+     * High-rate input does not need coroutine jobs/continuations: the dispatcher
+     * above is backed by this same single-thread executor. Queue a lightweight
+     * Runnable directly and tolerate the narrow shutdown race.
+     */
+    private fun enqueueInputWork(work: Runnable) {
+        if (touchExecutor.isShutdown) return
+        try {
+            touchExecutor.execute(work)
+        } catch (_: RejectedExecutionException) {
+            // disconnect()/cleanup won the race after the isShutdown check.
+        }
+    }
 
     // High-rate MOVE/HOVER samples are replaceable; boundary events are not.
     // A blocked Wi-Fi write therefore retains at most one future finger move
@@ -700,20 +715,22 @@ class StreamClient(
         // epoch both discards obsolete motion and makes any already-queued drain
         // unable to consume samples from the next gesture.
         touchMoveCoalescer.advanceBoundary()
-        touchScope.launch { sendTouchNow(write) }
+        enqueueInputWork(Runnable { sendTouchNow(write) })
     }
 
     private fun scheduleTouchMoveDrain(epoch: Long) {
         if (touchExecutor.isShutdown) return
-        touchScope.launch {
-            repeat(COALESCED_INPUT_BURST) {
-                val write = touchMoveCoalescer.takeLatest(epoch) ?: return@repeat
-                sendTouchNow(write)
-            }
-            if (touchMoveCoalescer.finishBurst(epoch) && !touchExecutor.isShutdown) {
-                scheduleTouchMoveDrain(epoch)
-            }
-        }
+        enqueueInputWork(
+            Runnable {
+                repeat(COALESCED_INPUT_BURST) {
+                    val write = touchMoveCoalescer.takeLatest(epoch) ?: return@repeat
+                    sendTouchNow(write)
+                }
+                if (touchMoveCoalescer.finishBurst(epoch) && !touchExecutor.isShutdown) {
+                    scheduleTouchMoveDrain(epoch)
+                }
+            },
+        )
     }
 
     private fun sendTouchNow(write: TouchWrite) {
@@ -769,20 +786,22 @@ class StreamClient(
         }
 
         stylusMotionCoalescer.advanceBoundary()
-        touchScope.launch { sendStylusNow(write) }
+        enqueueInputWork(Runnable { sendStylusNow(write) })
     }
 
     private fun scheduleStylusMotionDrain(epoch: Long) {
         if (touchExecutor.isShutdown) return
-        touchScope.launch {
-            repeat(COALESCED_INPUT_BURST) {
-                val write = stylusMotionCoalescer.takeLatest(epoch) ?: return@repeat
-                sendStylusNow(write)
-            }
-            if (stylusMotionCoalescer.finishBurst(epoch) && !touchExecutor.isShutdown) {
-                scheduleStylusMotionDrain(epoch)
-            }
-        }
+        enqueueInputWork(
+            Runnable {
+                repeat(COALESCED_INPUT_BURST) {
+                    val write = stylusMotionCoalescer.takeLatest(epoch) ?: return@repeat
+                    sendStylusNow(write)
+                }
+                if (stylusMotionCoalescer.finishBurst(epoch) && !touchExecutor.isShutdown) {
+                    scheduleStylusMotionDrain(epoch)
+                }
+            },
+        )
     }
 
     private fun sendStylusNow(write: StylusWrite) {
