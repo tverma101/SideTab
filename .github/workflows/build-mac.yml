@@ -2,8 +2,16 @@ name: macOS build and tests
 
 on:
   push:
+    paths:
+      - 'MacHost/**'
+      - 'VERSION'
+      - '.github/workflows/build-mac.yml'
   pull_request:
     branches: [main]
+    paths:
+      - 'MacHost/**'
+      - 'VERSION'
+      - '.github/workflows/build-mac.yml'
   workflow_dispatch:
 
 permissions:
