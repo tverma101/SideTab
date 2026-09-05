@@ -51,8 +51,16 @@ class SideScreenDiscovery(context: Context) {
             mainHandler.post { callback(endpoint) }
         }
 
+        fun resetBurstAfterFinalFailure(attempt: Int) {
+            if (attempt >= MAX_RESOLVE_ATTEMPTS) {
+                // Keep the overall discovery alive until its bounded timeout.
+                // A later mDNS announcement starts a fresh short retry burst.
+                resolveAttempts.set(0)
+            }
+        }
+
         fun launchResolve(serviceInfo: NsdServiceInfo) {
-            if (finished.get() || resolveAttempts.get() >= MAX_RESOLVE_ATTEMPTS) return
+            if (finished.get()) return
             if (!resolving.compareAndSet(false, true)) return
             val attempt = resolveAttempts.incrementAndGet()
             Log.i(TAG, "NSD resolving ${serviceInfo.serviceName} (attempt $attempt/$MAX_RESOLVE_ATTEMPTS)")
@@ -64,6 +72,8 @@ class SideScreenDiscovery(context: Context) {
                 Log.w(TAG, "NSD resolve launch failed on attempt $attempt: ${e.message}")
                 if (attempt < MAX_RESOLVE_ATTEMPTS && !finished.get()) {
                     mainHandler.postDelayed({ launchResolve(serviceInfo) }, RESOLVE_RETRY_DELAY_MS)
+                } else {
+                    resetBurstAfterFinalFailure(attempt)
                 }
             }
         }
@@ -76,10 +86,9 @@ class SideScreenDiscovery(context: Context) {
                     Log.w(TAG, "NSD resolve failed for ${serviceInfo.serviceName} on attempt $attempt: $errorCode")
                     if (attempt < MAX_RESOLVE_ATTEMPTS && !finished.get()) {
                         mainHandler.postDelayed({ launchResolve(serviceInfo) }, RESOLVE_RETRY_DELAY_MS)
+                    } else {
+                        resetBurstAfterFinalFailure(attempt)
                     }
-                    // Do not finish early after the final resolver failure.
-                    // Discovery remains active until its bounded timeout, so a
-                    // fresh service announcement still has a chance to arrive.
                 }
 
                 @Suppress("DEPRECATION")
@@ -92,6 +101,8 @@ class SideScreenDiscovery(context: Context) {
                         Log.w(TAG, "NSD resolved an unusable endpoint on attempt $attempt")
                         if (attempt < MAX_RESOLVE_ATTEMPTS && !finished.get()) {
                             mainHandler.postDelayed({ launchResolve(serviceInfo) }, RESOLVE_RETRY_DELAY_MS)
+                        } else {
+                            resetBurstAfterFinalFailure(attempt)
                         }
                     } else {
                         Log.i(TAG, "NSD recovered SideScreen endpoint $host:$port")
