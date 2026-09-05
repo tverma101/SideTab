@@ -84,6 +84,15 @@ class StreamClient(
     private var lastKeyframeRequestNs = 0L
     private var lastKeyframeReceivedNs = 0L
 
+    /**
+     * The video socket needs its own liveness signal. A healthy dedicated
+     * control socket does not prove the ordered video TCP path is alive or
+     * uncongested, and a half-open video read can otherwise block forever.
+     */
+    private val videoProbeLock = Any()
+    private var videoProbeOutstandingNs = 0L
+    private var lastVideoProbeSentNs = 0L
+
     // Buffer pooling to reduce GC pressure from per-frame allocations.
     private val bufferPool = ArrayDeque<ByteArray>(8)
     private val poolLock = Any()
@@ -162,9 +171,7 @@ class StreamClient(
                 isConnected = false
                 cleanupTransport(stopControl = true)
                 shutdownTouchExecutor()
-                if (announcedConnected && !connectionAttemptCancelled) {
-                    onConnectionStatus?.invoke(false)
-                } else if (!announcedConnected && !connectionAttemptCancelled) {
+                if (!connectionAttemptCancelled) {
                     onConnectionStatus?.invoke(false)
                 }
             }
@@ -269,8 +276,8 @@ class StreamClient(
             return@withContext
         }
 
-        // Do not transition the UI to idle during recoverable attempts; only
-        // report disconnected once recovery is truly exhausted/terminal.
+        // The false status callback intentionally drives the controller's
+        // terminal-drop Bonjour recovery before this error reaches the caller.
         if (everConnected) {
             onConnectionStatus?.invoke(false)
         }
@@ -411,6 +418,7 @@ class StreamClient(
         synchronized(keyframeRequestLock) {
             lastKeyframeRequestNs = 0L
         }
+        resetVideoProbeState()
         bytesReceived = 0L
         framesReceived = 0L
         lastStatsTime = System.currentTimeMillis()
@@ -519,8 +527,22 @@ class StreamClient(
                         input.readFully(buf)
                         val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                         val rtt = (System.nanoTime() - sentTime) / 1_000_000.0
-                        diagLog(String.format("PONG rtt=%.2fms", rtt))
-                        onLatencyMeasured?.invoke(rtt)
+                        val matchedProbe =
+                            synchronized(videoProbeLock) {
+                                if (videoProbeOutstandingNs == sentTime) {
+                                    videoProbeOutstandingNs = 0L
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                        diagLog(String.format("VIDEO PONG rtt=%.2fms matched=%s", rtt, matchedProbe))
+                        // When the dedicated channel is down this remains the
+                        // user's latency measurement fallback. Otherwise the
+                        // in-band pong is primarily a video-path watchdog.
+                        if (!controlChannel.isConnected) {
+                            onLatencyMeasured?.invoke(rtt)
+                        }
                     }
 
                     MESSAGE_CODEC_SELECTED -> {
@@ -576,7 +598,8 @@ class StreamClient(
                     out.write(buffer.array())
                     out.flush()
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                failVideoTransport("in-band touch write failed", e)
             }
         }
     }
@@ -594,7 +617,8 @@ class StreamClient(
                     out.write(StylusProtocol.encode(event))
                     out.flush()
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                failVideoTransport("in-band stylus write failed", e)
             }
         }
     }
@@ -632,30 +656,82 @@ class StreamClient(
                     out.write(byteArrayOf(MESSAGE_KEYFRAME_REQUEST.toByte(), flags.toByte()))
                     out.flush()
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                failVideoTransport("in-band keyframe request failed", e)
             }
         }
     }
 
+    /**
+     * Called once per second by MainActivity. Control RTT remains on the
+     * dedicated socket, but every few seconds we also probe the video TCP path.
+     * An unanswered in-band probe means that ordered video traffic is frozen or
+     * catastrophically backlogged, so closing the socket lets wireless recovery
+     * create a clean session instead of hanging indefinitely.
+     */
     fun sendPing() {
         if (!isConnected || touchExecutor.isShutdown) return
-        if (controlChannel.sendPing()) {
+
+        val now = System.nanoTime()
+        val outstanding = synchronized(videoProbeLock) { videoProbeOutstandingNs }
+        if (outstanding != 0L && now - outstanding > VIDEO_PROBE_TIMEOUT_NS) {
+            failVideoTransport("video-path ping timed out", null)
             return
         }
-        val queuedAt = System.nanoTime()
+
+        val controlSent = controlChannel.sendPing()
+        val shouldProbeVideo =
+            synchronized(videoProbeLock) {
+                videoProbeOutstandingNs == 0L &&
+                    (!controlSent || now - lastVideoProbeSentNs >= VIDEO_PROBE_INTERVAL_NS)
+            }
+        if (!shouldProbeVideo) return
+
+        val queuedAt = now
         touchScope.launch {
+            val writeTime = System.nanoTime()
+            synchronized(videoProbeLock) {
+                // A prior queued probe may have won while this task waited.
+                if (videoProbeOutstandingNs != 0L) return@launch
+                videoProbeOutstandingNs = writeTime
+                lastVideoProbeSentNs = writeTime
+            }
             try {
-                socket?.getOutputStream()?.let { out ->
+                outputStream?.let { out ->
                     val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
-                    val writeTime = System.nanoTime()
-                    diagLog(String.format("PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6))
+                    diagLog(String.format("VIDEO PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6))
                     buffer.put(4.toByte())
                     buffer.putLong(writeTime)
                     out.write(buffer.array())
                     out.flush()
+                } ?: throw IOException("video output unavailable")
+            } catch (e: Exception) {
+                synchronized(videoProbeLock) {
+                    if (videoProbeOutstandingNs == writeTime) videoProbeOutstandingNs = 0L
                 }
-            } catch (_: Exception) {
+                failVideoTransport("video-path ping write failed", e)
             }
+        }
+    }
+
+    /** Close the active video socket; receiveData owns the actual retry path. */
+    private fun failVideoTransport(reason: String, error: Exception?) {
+        val active = socket ?: return
+        if (error == null) {
+            diagLog("Video transport unhealthy: $reason — forcing reconnect")
+        } else {
+            diagLog("Video transport unhealthy: $reason (${error.javaClass.simpleName}: ${error.message}) — forcing reconnect")
+        }
+        try {
+            active.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun resetVideoProbeState() {
+        synchronized(videoProbeLock) {
+            videoProbeOutstandingNs = 0L
+            lastVideoProbeSentNs = 0L
         }
     }
 
@@ -783,6 +859,7 @@ class StreamClient(
         inputStream = null
         socket = null
         pendingSocket = null
+        resetVideoProbeState()
 
         try {
             out?.close()
@@ -827,9 +904,11 @@ class StreamClient(
         private const val CONNECT_TIMEOUT_MS = 5_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         private const val AUTH_RESPONSE_SIZE = 5
-        private const val MAX_WIRELESS_RECONNECT_ATTEMPTS = 12
+        private const val MAX_WIRELESS_RECONNECT_ATTEMPTS = 6
         private const val WIRELESS_RECONNECT_INITIAL_MS = 250L
         private const val WIRELESS_RECONNECT_MAX_MS = 5_000L
+        private const val VIDEO_PROBE_INTERVAL_NS = 3_000_000_000L
+        private const val VIDEO_PROBE_TIMEOUT_NS = 6_000_000_000L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
         private const val MESSAGE_VIDEO_FRAME = 0
