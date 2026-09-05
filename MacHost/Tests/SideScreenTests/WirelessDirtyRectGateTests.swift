@@ -3,14 +3,13 @@ import XCTest
 @testable import SideScreen
 
 final class WirelessDirtyRectGateTests: XCTestCase {
-    func testSkipsOnlyExplicitlyCleanWirelessFramesWithoutPressure() {
+    func testSkipsOnlyExplicitlyCleanWirelessFramesUnderNormalAdmission() {
         XCTAssertTrue(
             WirelessDirtyRectGate.shouldSkip(
                 wireless: true,
                 frameHasChanges: false,
                 mutatesCapturedPixels: false,
-                transportPressured: false,
-                forcedCapturePending: false
+                captureAdmission: .normal
             )
         )
         XCTAssertFalse(
@@ -18,8 +17,7 @@ final class WirelessDirtyRectGateTests: XCTestCase {
                 wireless: true,
                 frameHasChanges: true,
                 mutatesCapturedPixels: false,
-                transportPressured: false,
-                forcedCapturePending: false
+                captureAdmission: .normal
             )
         )
         XCTAssertFalse(
@@ -27,44 +25,40 @@ final class WirelessDirtyRectGateTests: XCTestCase {
                 wireless: true,
                 frameHasChanges: nil,
                 mutatesCapturedPixels: false,
-                transportPressured: false,
-                forcedCapturePending: false
+                captureAdmission: .normal
             )
         )
     }
 
-    func testTransportPressureSkipsRoutineWirelessCaptureBeforePixelWork() {
+    func testPauseAdmissionSkipsRoutineWirelessCaptureBeforePixelWork() {
         XCTAssertTrue(
             WirelessDirtyRectGate.shouldSkip(
                 wireless: true,
                 frameHasChanges: true,
                 mutatesCapturedPixels: true,
-                transportPressured: true,
-                forcedCapturePending: false
+                captureAdmission: .pause
             )
         )
     }
 
-    func testForcedRecoveryFrameBypassesPressureAndDirtyRectGate() {
+    func testForcedAdmissionBypassesPressureAndDirtyRectGate() {
         XCTAssertFalse(
             WirelessDirtyRectGate.shouldSkip(
                 wireless: true,
                 frameHasChanges: false,
                 mutatesCapturedPixels: false,
-                transportPressured: true,
-                forcedCapturePending: true
+                captureAdmission: .forced
             )
         )
     }
 
-    func testNeverSkipsUsbOrSyntheticPixelMutationWithoutPressure() {
+    func testNeverSkipsUsbOrSyntheticPixelMutationUnderNormalAdmission() {
         XCTAssertFalse(
             WirelessDirtyRectGate.shouldSkip(
                 wireless: false,
                 frameHasChanges: false,
                 mutatesCapturedPixels: false,
-                transportPressured: true,
-                forcedCapturePending: false
+                captureAdmission: .pause
             )
         )
         XCTAssertFalse(
@@ -72,8 +66,7 @@ final class WirelessDirtyRectGateTests: XCTestCase {
                 wireless: true,
                 frameHasChanges: false,
                 mutatesCapturedPixels: true,
-                transportPressured: false,
-                forcedCapturePending: false
+                captureAdmission: .normal
             )
         )
     }
