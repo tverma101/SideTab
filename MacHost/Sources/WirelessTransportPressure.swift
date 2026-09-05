@@ -57,10 +57,15 @@ enum WirelessTransportPressure {
 
     /// Sample real TCP sender headroom before submitting an encoded frame.
     ///
-    /// If the socket cannot currently hold at least one frame (or a small 32 KiB
-    /// floor for tiny frames), pause *future pre-encode* routine captures for a
-    /// short bounded window. The deadline always expires by itself, guaranteeing
-    /// that a probe frame eventually gets through and re-samples the socket.
+    /// `availableSendBuffer` describes capacity *before* this frame is handed to
+    /// Network.framework. Predict the residual headroom after the frame too; if
+    /// this send would leave less than a small reserve, pause future pre-encode
+    /// routine captures immediately instead of waiting for the next already-
+    /// encoded frame to discover that the TCP queue is nearly full.
+    ///
+    /// The pause is short and bounded, so a probe frame always gets another
+    /// chance to sample current socket headroom. Forced recovery keyframes still
+    /// bypass this gate in VideoEncoder.
     static func observeSendBuffer(
         generation: UInt64,
         availableBytes: UInt32,
@@ -72,16 +77,20 @@ enum WirelessTransportPressure {
         guard state.generation == generation, state.wireless, state.ready else { return }
 
         state.lastAvailableSendBuffer = availableBytes
-        let required = UInt64(max(minimumHeadroomBytes, max(1, frameBytes)))
-        if UInt64(availableBytes) < required {
+        let available = UInt64(availableBytes)
+        let frame = UInt64(max(1, frameBytes))
+        let residual = available > frame ? available - frame : 0
+        let lowHeadroom = available < frame || residual < UInt64(minimumHeadroomBytes)
+
+        if lowHeadroom {
             let deadline = nowNs &+ sendBufferPauseNs
             if deadline > state.pauseUntilNs {
                 state.pauseUntilNs = deadline
             }
         } else {
-            // Fresh evidence that the TCP queue has room should release an older
-            // buffer-pressure hold immediately. Local sends-in-flight pressure is
-            // still evaluated independently below.
+            // Fresh evidence that this frame still leaves useful TCP headroom
+            // should release an older buffer-pressure hold immediately. Local
+            // sends-in-flight pressure is evaluated independently below.
             state.pauseUntilNs = 0
         }
     }
