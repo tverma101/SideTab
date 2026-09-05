@@ -1,8 +1,5 @@
 package com.sidescreen.app
 
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-
 /**
  * Android-to-Mac stylus protocol.
  *
@@ -41,9 +38,9 @@ object StylusProtocol {
         ByteArray(EVENT_SIZE).also { encodeInto(event, it) }
 
     /**
-     * Encode into caller-owned storage. The 120 Hz S Pen path reuses one
-     * scratch buffer under its send lock instead of allocating a ByteBuffer
-     * and ByteArray for every sample.
+     * Encode directly into caller-owned storage. The 120 Hz S Pen path reuses
+     * one scratch buffer under its send lock, and these scalar LE writes avoid
+     * allocating a ByteBuffer wrapper for every packet.
      */
     fun encodeInto(
         event: StylusInputEvent,
@@ -53,21 +50,35 @@ object StylusProtocol {
         require(offset >= 0 && target.size - offset >= EVENT_SIZE) {
             "target must have at least $EVENT_SIZE writable bytes"
         }
-        val buffer =
-            ByteBuffer
-                .wrap(target, offset, EVENT_SIZE)
-                .order(ByteOrder.LITTLE_ENDIAN)
-        buffer.put(STYLUS_EVENT.toByte())
-        buffer.put(event.action.coerceIn(ACTION_DOWN, ACTION_HOVER).toByte())
-        buffer.put(event.toolType.coerceIn(0, 0xFF).toByte())
-        buffer.put(0) // reserved for a future protocol flag byte
-        buffer.putFloat(event.x.finiteOr(0f).coerceIn(0f, 1f))
-        buffer.putFloat(event.y.finiteOr(0f).coerceIn(0f, 1f))
-        buffer.putFloat(event.pressure.finiteOr(0f).coerceIn(0f, 1f))
-        buffer.putFloat(event.tilt.finiteOr(0f))
-        buffer.putFloat(event.orientation.finiteOr(0f))
-        buffer.putInt(event.buttonState)
+
+        target[offset] = STYLUS_EVENT.toByte()
+        target[offset + 1] = event.action.coerceIn(ACTION_DOWN, ACTION_HOVER).toByte()
+        target[offset + 2] = event.toolType.coerceIn(0, 0xFF).toByte()
+        target[offset + 3] = 0 // reserved for a future protocol flag byte
+        putFloatLE(target, offset + 4, event.x.finiteOr(0f).coerceIn(0f, 1f))
+        putFloatLE(target, offset + 8, event.y.finiteOr(0f).coerceIn(0f, 1f))
+        putFloatLE(target, offset + 12, event.pressure.finiteOr(0f).coerceIn(0f, 1f))
+        putFloatLE(target, offset + 16, event.tilt.finiteOr(0f))
+        putFloatLE(target, offset + 20, event.orientation.finiteOr(0f))
+        putIntLE(target, offset + 24, event.buttonState)
         return EVENT_SIZE
+    }
+
+    private fun putFloatLE(
+        target: ByteArray,
+        offset: Int,
+        value: Float,
+    ) = putIntLE(target, offset, value.toRawBits())
+
+    private fun putIntLE(
+        target: ByteArray,
+        offset: Int,
+        value: Int,
+    ) {
+        target[offset] = value.toByte()
+        target[offset + 1] = (value ushr 8).toByte()
+        target[offset + 2] = (value ushr 16).toByte()
+        target[offset + 3] = (value ushr 24).toByte()
     }
 
     private fun Float.finiteOr(fallback: Float): Float = if (isFinite()) this else fallback
