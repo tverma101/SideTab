@@ -6,6 +6,7 @@ import os
 class VideoEncoder {
     private struct EncoderState {
         var pendingForceKeyframe = false
+        var pendingForcePressureGeneration: UInt64?
     }
 
     private var compressionSession: VTCompressionSession?
@@ -194,7 +195,11 @@ class VideoEncoder {
     /// Used when a fresh client connects so its decoder can start immediately
     /// instead of waiting up to one full GOP for the next scheduled keyframe.
     func requestKeyframe() {
-        stateLock.withLock { $0.pendingForceKeyframe = true }
+        let pressureGeneration = WirelessTransportPressure.noteForcedCapturePending()
+        stateLock.withLock { state in
+            state.pendingForceKeyframe = true
+            state.pendingForcePressureGeneration = pressureGeneration
+        }
     }
 
     func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
@@ -203,17 +208,22 @@ class VideoEncoder {
         // Consume the force request first: recovery/startup keyframes must cut
         // through congestion. Routine captures, however, can be skipped safely
         // BEFORE VideoToolbox sees them when the wireless sender is backed up.
-        let shouldForceKeyframe = stateLock.withLock { state -> Bool in
-            guard state.pendingForceKeyframe else { return false }
+        let forceState = stateLock.withLock { state -> (force: Bool, pressureGeneration: UInt64?) in
+            guard state.pendingForceKeyframe else { return (false, nil) }
             state.pendingForceKeyframe = false
-            return true
+            let pressureGeneration = state.pendingForcePressureGeneration
+            state.pendingForcePressureGeneration = nil
+            return (true, pressureGeneration)
         }
-        if !shouldForceKeyframe && WirelessTransportPressure.shouldPauseEncoding {
+        if let pressureGeneration = forceState.pressureGeneration {
+            WirelessTransportPressure.clearForcedCapturePending(generation: pressureGeneration)
+        }
+        if !forceState.force && WirelessTransportPressure.shouldPauseEncoding {
             return
         }
 
         let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
-        let frameProperties: CFDictionary? = shouldForceKeyframe
+        let frameProperties: CFDictionary? = forceState.force
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             : nil
 
