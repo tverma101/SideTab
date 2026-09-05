@@ -71,6 +71,21 @@ class StreamClient(
         val sentAtNs: Long,
     )
 
+    private data class TouchWrite(
+        val transport: TransportSnapshot,
+        val x: Float,
+        val y: Float,
+        val action: Int,
+        val pointerCount: Int,
+        val x2: Float,
+        val y2: Float,
+    )
+
+    private data class StylusWrite(
+        val transport: TransportSnapshot,
+        val event: StylusInputEvent,
+    )
+
     private val transportLock = Any()
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
@@ -176,6 +191,12 @@ class StreamClient(
         }
     private val touchDispatcher = touchExecutor.asCoroutineDispatcher()
     private val touchScope = CoroutineScope(touchDispatcher)
+
+    // High-rate MOVE/HOVER samples are replaceable; boundary events are not.
+    // A blocked Wi-Fi write therefore retains at most one future finger move
+    // and one future S Pen motion sample instead of queuing stale cursor replay.
+    private val touchMoveCoalescer = LatestSampleCoalescer<TouchWrite>()
+    private val stylusMotionCoalescer = LatestSampleCoalescer<StylusWrite>()
 
     // Fallback writes are serialized by touchExecutor. Reuse packet storage so
     // a temporary control-channel outage does not turn 120 Hz input into a GC
@@ -653,61 +674,116 @@ class StreamClient(
     ) {
         if (touchExecutor.isShutdown) return
         val transport = currentTransport() ?: return
+        val write = TouchWrite(transport, x, y, action, pointerCount, x2, y2)
 
+        if (action == TOUCH_ACTION_MOVE) {
+            if (touchMoveCoalescer.offer(write)) {
+                scheduleTouchMoveDrain()
+            }
+            return
+        }
+
+        // Boundary packets carry the current/final coordinates themselves, so
+        // an unsent earlier MOVE is obsolete. Drop it before queuing DOWN/UP.
+        touchMoveCoalescer.clearPending()
+        touchScope.launch { sendTouchNow(write) }
+    }
+
+    private fun scheduleTouchMoveDrain() {
+        if (touchExecutor.isShutdown) return
         touchScope.launch {
-            if (!isTransportCurrent(transport)) return@launch
-            if (
-                controlChannel.sendTouch(
-                    x,
-                    y,
-                    action,
-                    pointerCount,
-                    x2,
-                    y2,
-                    expectedSessionGeneration = transport.generation,
-                )
-            ) {
-                return@launch
+            repeat(COALESCED_INPUT_BURST) {
+                val write = touchMoveCoalescer.takeLatest() ?: return@repeat
+                sendTouchNow(write)
             }
-            if (!isTransportCurrent(transport)) return@launch
+            if (touchMoveCoalescer.finishBurst() && !touchExecutor.isShutdown) {
+                scheduleTouchMoveDrain()
+            }
+        }
+    }
 
-            try {
-                val count = pointerCount.coerceIn(1, 2)
-                inBandTouchPacket[0] = MESSAGE_TOUCH.toByte()
-                inBandTouchPacket[1] = count.toByte()
-                putFloatLE(inBandTouchPacket, 2, x)
-                putFloatLE(inBandTouchPacket, 6, y)
-                var offset = 10
-                if (count == 2) {
-                    putFloatLE(inBandTouchPacket, offset, x2)
-                    putFloatLE(inBandTouchPacket, offset + 4, y2)
-                    offset += 8
-                }
-                putIntLE(inBandTouchPacket, offset, action)
-                transport.output.write(inBandTouchPacket, 0, 6 + count * 8)
-            } catch (e: Exception) {
-                failVideoTransport(transport, "in-band touch write failed", e)
+    private fun sendTouchNow(write: TouchWrite) {
+        val transport = write.transport
+        if (!isTransportCurrent(transport)) return
+        if (
+            controlChannel.sendTouch(
+                write.x,
+                write.y,
+                write.action,
+                write.pointerCount,
+                write.x2,
+                write.y2,
+                expectedSessionGeneration = transport.generation,
+            )
+        ) {
+            return
+        }
+        if (!isTransportCurrent(transport)) return
+
+        try {
+            val count = write.pointerCount.coerceIn(1, 2)
+            inBandTouchPacket[0] = MESSAGE_TOUCH.toByte()
+            inBandTouchPacket[1] = count.toByte()
+            putFloatLE(inBandTouchPacket, 2, write.x)
+            putFloatLE(inBandTouchPacket, 6, write.y)
+            var offset = 10
+            if (count == 2) {
+                putFloatLE(inBandTouchPacket, offset, write.x2)
+                putFloatLE(inBandTouchPacket, offset + 4, write.y2)
+                offset += 8
             }
+            putIntLE(inBandTouchPacket, offset, write.action)
+            transport.output.write(inBandTouchPacket, 0, 6 + count * 8)
+        } catch (e: Exception) {
+            failVideoTransport(transport, "in-band touch write failed", e)
         }
     }
 
     fun sendStylus(event: StylusInputEvent) {
         if (!stylusSupported || touchExecutor.isShutdown) return
         val transport = currentTransport() ?: return
+        val write = StylusWrite(transport, event)
+        val replaceable =
+            event.action == StylusProtocol.ACTION_MOVE ||
+                event.action == StylusProtocol.ACTION_HOVER
 
+        if (replaceable) {
+            if (stylusMotionCoalescer.offer(write)) {
+                scheduleStylusMotionDrain()
+            }
+            return
+        }
+
+        stylusMotionCoalescer.clearPending()
+        touchScope.launch { sendStylusNow(write) }
+    }
+
+    private fun scheduleStylusMotionDrain() {
+        if (touchExecutor.isShutdown) return
         touchScope.launch {
-            if (!isTransportCurrent(transport)) return@launch
-            if (controlChannel.sendStylus(event, expectedSessionGeneration = transport.generation)) {
-                return@launch
+            repeat(COALESCED_INPUT_BURST) {
+                val write = stylusMotionCoalescer.takeLatest() ?: return@repeat
+                sendStylusNow(write)
             }
-            if (!isTransportCurrent(transport)) return@launch
+            if (stylusMotionCoalescer.finishBurst() && !touchExecutor.isShutdown) {
+                scheduleStylusMotionDrain()
+            }
+        }
+    }
 
-            try {
-                val size = StylusProtocol.encodeInto(event, inBandStylusPacket)
-                transport.output.write(inBandStylusPacket, 0, size)
-            } catch (e: Exception) {
-                failVideoTransport(transport, "in-band stylus write failed", e)
-            }
+    private fun sendStylusNow(write: StylusWrite) {
+        val transport = write.transport
+        if (!isTransportCurrent(transport)) return
+        if (controlChannel.sendStylus(write.event, expectedSessionGeneration = transport.generation)) {
+            return
+        }
+        if (!isTransportCurrent(transport)) return
+
+        try {
+            val size = StylusProtocol.encodeInto(write.event, inBandStylusPacket)
+            transport.output.write(inBandStylusPacket, 0, size)
+        } catch (e: Exception) {
+            failVideoTransport(transport, "in-band stylus write failed", e)
         }
     }
 
@@ -945,6 +1021,11 @@ class StreamClient(
     }
 
     private fun cleanupTransport(stopControl: Boolean) {
+        // Release references to old sockets/samples immediately. A currently
+        // executing write is still protected by the transport generation fence.
+        touchMoveCoalescer.clearPending()
+        stylusMotionCoalescer.clearPending()
+
         val retired =
             synchronized(transportLock) {
                 transportGeneration += 1
@@ -1058,6 +1139,8 @@ class StreamClient(
         private const val VIDEO_PROBE_TIMEOUT_NS = 6_000_000_000L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
+        private const val COALESCED_INPUT_BURST = 2
+        private const val TOUCH_ACTION_MOVE = 1
 
         private const val MESSAGE_VIDEO_FRAME = 0
         private const val MESSAGE_DISPLAY_CONFIG = 1
