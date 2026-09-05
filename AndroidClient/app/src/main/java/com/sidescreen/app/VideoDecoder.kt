@@ -439,6 +439,7 @@ class VideoDecoder(
         frameTimestamp: Long,
         isKeyframe: Boolean,
     ) {
+        var submitted = false
         try {
             val inputBuffer =
                 codec.getInputBuffer(index)
@@ -446,6 +447,7 @@ class VideoDecoder(
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
+            submitted = true
             queuedInputCount++
             if (queuedInputCount == STALL_DETECT_INPUT_FRAMES && outputFrameCount == 0L && !stallReported) {
                 stallReported = true
@@ -456,6 +458,18 @@ class VideoDecoder(
                 needsKeyframe = false
             }
         } catch (e: Exception) {
+            // onInputBufferAvailable transfers ownership of this index to us.
+            // If preparation/copying failed before the real frame was queued,
+            // return the slot with an empty input buffer. Otherwise repeated
+            // exceptional frames can strand every codec input slot and turn a
+            // recoverable feed error into a permanent black screen.
+            if (!submitted) {
+                try {
+                    codec.queueInputBuffer(index, 0, 0, 0, 0)
+                } catch (returnError: Exception) {
+                    diagLog("Failed to return input slot $index after feed error: ${returnError.message}")
+                }
+            }
             needsKeyframe = true
             requestKeyframe("queue input failed")
             Log.e(TAG, "decode direct feed error", e)
