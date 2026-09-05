@@ -496,7 +496,13 @@ class VideoDecoder(
             queuedInputCount++
             if (queuedInputCount == STALL_DETECT_INPUT_FRAMES && outputFrameCount == 0L && !stallReported) {
                 stallReported = true
-                diagLog("Decoder stalled: $queuedInputCount frames queued, none out")
+                diagLog("Decoder stalled: $queuedInputCount frames queued, none out — forcing a fresh IDR")
+                // A decoder that accepted a reference chain but produced no
+                // output may be stuck behind a damaged/missing reference. Stop
+                // feeding dependent P-frames and force a clean random-access
+                // point before escalating to a full decoder rebuild.
+                needsKeyframe = true
+                requestKeyframe("decoder stalled", force = true)
                 onDecoderStalled?.invoke()
             }
             if (isKeyframe) {
