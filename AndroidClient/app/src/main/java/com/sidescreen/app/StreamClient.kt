@@ -497,8 +497,6 @@ class StreamClient(
                 transportGeneration
             }
 
-        // Fence queued control work for the retired video generation before the
-        // replacement becomes writable.
         controlChannel.setSessionGeneration(generation)
         resetVideoProbeState()
 
@@ -524,11 +522,6 @@ class StreamClient(
         return generation
     }
 
-    /**
-     * Emit all startup capabilities in one TCP write. Metadata remains last
-     * because receiving type 8 is allowed to finish protocol startup on the
-     * Mac; the bytes before it must already contain AVC/decoder/stylus state.
-     */
     private fun advertiseCapabilities(out: DataOutputStream) {
         val packet = ByteArray(8)
         var size = 0
@@ -677,27 +670,28 @@ class StreamClient(
         val write = TouchWrite(transport, x, y, action, pointerCount, x2, y2)
 
         if (action == TOUCH_ACTION_MOVE) {
-            if (touchMoveCoalescer.offer(write)) {
-                scheduleTouchMoveDrain()
+            touchMoveCoalescer.offer(write)?.let { epoch ->
+                scheduleTouchMoveDrain(epoch)
             }
             return
         }
 
-        // Boundary packets carry the current/final coordinates themselves, so
-        // an unsent earlier MOVE is obsolete. Drop it before queuing DOWN/UP.
-        touchMoveCoalescer.clearPending()
+        // The boundary packet carries current/final coordinates. Advancing the
+        // epoch both discards obsolete motion and makes any already-queued drain
+        // unable to consume samples from the next gesture.
+        touchMoveCoalescer.advanceBoundary()
         touchScope.launch { sendTouchNow(write) }
     }
 
-    private fun scheduleTouchMoveDrain() {
+    private fun scheduleTouchMoveDrain(epoch: Long) {
         if (touchExecutor.isShutdown) return
         touchScope.launch {
             repeat(COALESCED_INPUT_BURST) {
-                val write = touchMoveCoalescer.takeLatest() ?: return@repeat
+                val write = touchMoveCoalescer.takeLatest(epoch) ?: return@repeat
                 sendTouchNow(write)
             }
-            if (touchMoveCoalescer.finishBurst() && !touchExecutor.isShutdown) {
-                scheduleTouchMoveDrain()
+            if (touchMoveCoalescer.finishBurst(epoch) && !touchExecutor.isShutdown) {
+                scheduleTouchMoveDrain(epoch)
             }
         }
     }
@@ -748,25 +742,25 @@ class StreamClient(
                 event.action == StylusProtocol.ACTION_HOVER
 
         if (replaceable) {
-            if (stylusMotionCoalescer.offer(write)) {
-                scheduleStylusMotionDrain()
+            stylusMotionCoalescer.offer(write)?.let { epoch ->
+                scheduleStylusMotionDrain(epoch)
             }
             return
         }
 
-        stylusMotionCoalescer.clearPending()
+        stylusMotionCoalescer.advanceBoundary()
         touchScope.launch { sendStylusNow(write) }
     }
 
-    private fun scheduleStylusMotionDrain() {
+    private fun scheduleStylusMotionDrain(epoch: Long) {
         if (touchExecutor.isShutdown) return
         touchScope.launch {
             repeat(COALESCED_INPUT_BURST) {
-                val write = stylusMotionCoalescer.takeLatest() ?: return@repeat
+                val write = stylusMotionCoalescer.takeLatest(epoch) ?: return@repeat
                 sendStylusNow(write)
             }
-            if (stylusMotionCoalescer.finishBurst() && !touchExecutor.isShutdown) {
-                scheduleStylusMotionDrain()
+            if (stylusMotionCoalescer.finishBurst(epoch) && !touchExecutor.isShutdown) {
+                scheduleStylusMotionDrain(epoch)
             }
         }
     }
@@ -1021,10 +1015,10 @@ class StreamClient(
     }
 
     private fun cleanupTransport(stopControl: Boolean) {
-        // Release references to old sockets/samples immediately. A currently
-        // executing write is still protected by the transport generation fence.
-        touchMoveCoalescer.clearPending()
-        stylusMotionCoalescer.clearPending()
+        // Advance both motion epochs so an already-scheduled drain from the
+        // retired socket cannot consume or retain samples from a future session.
+        touchMoveCoalescer.advanceBoundary()
+        stylusMotionCoalescer.advanceBoundary()
 
         val retired =
             synchronized(transportLock) {
