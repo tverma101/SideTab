@@ -2,102 +2,117 @@ package com.sidescreen.app
 
 import android.os.SystemClock
 
+/** Two floats packed into one unboxed Long on the hot prediction path. */
+@JvmInline
+value class PredictedPosition private constructor(private val packed: Long) {
+    operator fun component1(): Float = Float.fromBits((packed ushr 32).toInt())
+
+    operator fun component2(): Float = Float.fromBits(packed.toInt())
+
+    companion object {
+        fun of(
+            x: Float,
+            y: Float,
+        ): PredictedPosition =
+            PredictedPosition(
+                (x.toRawBits().toLong() shl 32) or
+                    (y.toRawBits().toLong() and 0xffff_ffffL),
+            )
+    }
+}
+
 /**
- * Predicts touch input position based on velocity to reduce perceived latency
- * Critical for FPS gaming where every millisecond counts
+ * Predicts touch input position based on velocity to reduce perceived latency.
+ *
+ * The finger MOVE path runs at display/input cadence, so history is stored in
+ * five primitive-array slots instead of allocating a TouchSample object for
+ * every event. predictPosition() returns an inline packed value instead of a
+ * Pair<Float, Float>, avoiding two boxed Floats plus the Pair allocation.
  */
 class InputPredictor {
-    private data class TouchSample(
-        val x: Float,
-        val y: Float,
-        // Timestamp in nanoseconds
-        val timestamp: Long,
-    )
+    private val sampleX = FloatArray(HISTORY_SIZE)
+    private val sampleY = FloatArray(HISTORY_SIZE)
+    private val sampleTimeNs = LongArray(HISTORY_SIZE)
+    private var sampleCount = 0
+    private var nextIndex = 0
 
-    private val history = ArrayDeque<TouchSample>(5)
-    private val minSamplesForPrediction = 2
-
-    /**
-     * Add a new touch sample to the history
-     */
+    /** Add a new touch sample using the monotonic Android elapsed clock. */
     fun addSample(
         x: Float,
         y: Float,
     ) {
-        val timestamp = SystemClock.elapsedRealtimeNanos()
-        history.addLast(TouchSample(x, y, timestamp))
+        addSample(x, y, SystemClock.elapsedRealtimeNanos())
+    }
 
-        // Keep only last 5 samples for velocity calculation
-        if (history.size > 5) {
-            history.removeFirst()
-        }
+    /** Deterministic timestamp overload for local unit tests. */
+    internal fun addSample(
+        x: Float,
+        y: Float,
+        timestampNs: Long,
+    ) {
+        sampleX[nextIndex] = x
+        sampleY[nextIndex] = y
+        sampleTimeNs[nextIndex] = timestampNs
+        nextIndex = (nextIndex + 1) % HISTORY_SIZE
+        if (sampleCount < HISTORY_SIZE) sampleCount++
     }
 
     /**
-     * Predict position after given latency in milliseconds
-     * Uses linear extrapolation based on recent velocity
-     *
-     * @param latencyMs Expected latency in milliseconds (typically 10-20ms)
-     * @return Pair of predicted (x, y) coordinates
+     * Predict position after given latency in milliseconds using linear
+     * extrapolation from the two newest samples.
      */
-    fun predictPosition(latencyMs: Float): Pair<Float, Float> {
-        if (history.size < minSamplesForPrediction) {
-            // Not enough data, return last known position
-            return if (history.isEmpty()) {
-                Pair(0f, 0f)
-            } else {
-                Pair(history.last().x, history.last().y)
-            }
+    fun predictPosition(latencyMs: Float): PredictedPosition {
+        if (sampleCount == 0) return PredictedPosition.of(0f, 0f)
+
+        val currentIndex = indexFromNewest(0)
+        val currX = sampleX[currentIndex]
+        val currY = sampleY[currentIndex]
+        if (sampleCount < MIN_SAMPLES_FOR_PREDICTION) {
+            return PredictedPosition.of(currX, currY)
         }
 
-        // Calculate velocity from last 2 samples (most recent)
-        val prev = history[history.size - 2]
-        val curr = history.last()
-
-        // Time delta in milliseconds
-        val dt = (curr.timestamp - prev.timestamp) / 1_000_000f
-
-        if (dt < 0.1f) {
-            // Samples too close together, might be noise
-            return Pair(curr.x, curr.y)
+        val previousIndex = indexFromNewest(1)
+        val dtMs = (sampleTimeNs[currentIndex] - sampleTimeNs[previousIndex]) / 1_000_000f
+        if (dtMs < 0.1f) {
+            return PredictedPosition.of(currX, currY)
         }
 
-        // Velocity in units per millisecond
-        val vx = (curr.x - prev.x) / dt
-        val vy = (curr.y - prev.y) / dt
-
-        // Extrapolate forward by latency amount
-        val predictedX = curr.x + (vx * latencyMs)
-        val predictedY = curr.y + (vy * latencyMs)
-
-        return Pair(predictedX, predictedY)
+        val vx = (currX - sampleX[previousIndex]) / dtMs
+        val vy = (currY - sampleY[previousIndex]) / dtMs
+        return PredictedPosition.of(
+            currX + vx * latencyMs,
+            currY + vy * latencyMs,
+        )
     }
 
-    /**
-     * Get current velocity in units per second
-     * Useful for debugging and adaptive latency compensation
-     */
+    /** Get current velocity in units per second; debug/non-hot path. */
     fun getCurrentVelocity(): Pair<Float, Float> {
-        if (history.size < 2) return Pair(0f, 0f)
+        if (sampleCount < 2) return Pair(0f, 0f)
 
-        val prev = history[history.size - 2]
-        val curr = history.last()
-        val dt = (curr.timestamp - prev.timestamp) / 1_000_000_000f // nanoseconds to seconds
-
-        return if (dt > 0) {
+        val currentIndex = indexFromNewest(0)
+        val previousIndex = indexFromNewest(1)
+        val dt = (sampleTimeNs[currentIndex] - sampleTimeNs[previousIndex]) / 1_000_000_000f
+        return if (dt > 0f) {
             Pair(
-                (curr.x - prev.x) / dt,
-                (curr.y - prev.y) / dt,
+                (sampleX[currentIndex] - sampleX[previousIndex]) / dt,
+                (sampleY[currentIndex] - sampleY[previousIndex]) / dt,
             )
         } else {
             Pair(0f, 0f)
         }
     }
 
-    /**
-     * Reset predictor state (call when touch sequence ends)
-     */
+    /** Reset predictor state when a touch sequence ends. */
     fun reset() {
-        history.clear()
+        sampleCount = 0
+        nextIndex = 0
+    }
+
+    private fun indexFromNewest(offset: Int): Int =
+        (nextIndex - 1 - offset + HISTORY_SIZE) % HISTORY_SIZE
+
+    private companion object {
+        const val HISTORY_SIZE = 5
+        const val MIN_SAMPLES_FOR_PREDICTION = 2
     }
 }
