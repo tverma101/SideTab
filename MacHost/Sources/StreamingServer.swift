@@ -151,6 +151,15 @@ class StreamingServer {
             }
 
             listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
+            if let token = expectedAuthToken {
+                var service = NWListener.Service(
+                    name: WirelessServiceIdentity.name(for: token),
+                    type: WirelessServiceIdentity.serviceType
+                )
+                service.noAutoRename = true
+                listener?.service = service
+                debugLog("Advertising Bonjour service \(WirelessServiceIdentity.name(for: token)).\(WirelessServiceIdentity.serviceType)")
+            }
 
             listener?.newConnectionHandler = { [weak self] newConnection in
                 self?.handleConnection(newConnection)
