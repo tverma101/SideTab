@@ -23,14 +23,6 @@ import java.nio.ByteOrder
  * The channel is deliberately self-healing. A video session can survive a
  * control-port restart, Wi-Fi roam, NAT/ARP hiccup, or half-open TCP socket;
  * while control reconnects, callers transparently use the in-band fallback.
- *
- * Wire format (little-endian):
- *   client -> server: PING     = [type 4][clientTs 8]
- *   client -> server: KEYFRAME = [type 7][flags 1]
- *   client -> server: SUPPORT_BRIGHTNESS = [type 3]   (payload-free capability)
- *   client -> server: STYLUS = [type 14][fixed 27-byte stylus payload]
- *   server -> client: PONG     = [type 5][clientTs 8 (echo)][serverSendTs 8]
- *   server -> client: BRIGHT   = [type 11][value 1]   (0..255, real backlight)
  */
 class ControlChannel(
     private val host: String,
@@ -48,11 +40,14 @@ class ControlChannel(
 
     var onLatencyMeasured: ((Double) -> Unit)? = null
 
-    /** Server→client brightness command: 0..255, apply to the REAL panel. */
+    /** Server→client brightness command: 0..255, apply to the real panel. */
     var onBrightnessCommand: ((Int) -> Unit)? = null
 
     private var socket: Socket? = null
     private var output: DataOutputStream? = null
+
+    /** Monotonic identity for each installed control TCP transport. */
+    private var connectionGeneration = 0L
 
     @Volatile
     private var tcpActive = false
@@ -64,9 +59,27 @@ class ControlChannel(
     @Volatile
     private var connecting = false
 
-    /** First ping for which no pong has arrived yet; zero means none outstanding. */
+    /**
+     * Video-session generation supplied by StreamClient. Input/control work
+     * queued for an older recovered video session is intentionally consumed
+     * (dropped) rather than being replayed into the new session.
+     */
     @Volatile
-    private var firstUnansweredPingAtNs = 0L
+    private var sessionGeneration = 0L
+
+    private data class ActiveTransport(
+        val socket: Socket,
+        val output: DataOutputStream,
+        val generation: Long,
+    )
+
+    private data class OutstandingPing(
+        val connectionGeneration: Long,
+        val sentAtNs: Long,
+    )
+
+    @Volatile
+    private var outstandingPing: OutstandingPing? = null
 
     private val sendLock = Any()
     private val connectLock = Any()
@@ -104,15 +117,16 @@ class ControlChannel(
                 continue
             }
 
-            // A quiet control channel is valid. Only declare it half-open when
-            // we actually sent a ping and failed to receive its pong for long
-            // enough; background/idle periods therefore never trip the timer.
-            val unansweredAt = firstUnansweredPingAtNs
-            if (unansweredAt != 0L && System.nanoTime() - unansweredAt > PONG_TIMEOUT_NS) {
-                val activeSocket = synchronized(connectLock) { socket }
-                if (activeSocket != null) {
+            val probe = outstandingPing
+            if (probe != null && System.nanoTime() - probe.sentAtNs > PONG_TIMEOUT_NS) {
+                val active = activeTransport()
+                if (active != null && active.generation == probe.connectionGeneration) {
                     DiagLog.log("CC", "Control pong timeout — reconnecting")
-                    markTcpInactive(activeSocket)
+                    markTcpInactive(active.socket)
+                } else if (active == null || active.generation != probe.connectionGeneration) {
+                    // A stale probe from a retired socket must never kill the
+                    // replacement control connection.
+                    outstandingPing = null
                 }
             }
             sleepInterruptibly(HEALTH_POLL_MS)
@@ -148,24 +162,27 @@ class ControlChannel(
             // Idle is legitimate. Half-open detection is ping-driven above.
             s.soTimeout = 0
 
-            synchronized(connectLock) {
-                connecting = false
-                if (!running || socket != null) {
-                    try {
-                        s.close()
-                    } catch (_: Exception) {
+            val installedGeneration =
+                synchronized(connectLock) {
+                    connecting = false
+                    if (!running || socket != null) {
+                        try {
+                            s.close()
+                        } catch (_: Exception) {
+                        }
+                        return false
                     }
-                    return false
+                    connectionGeneration += 1
+                    socket = s
+                    output = controlOutput
+                    tcpActive = true
+                    outstandingPing = null
+                    connectionGeneration
                 }
-                socket = s
-                output = controlOutput
-                tcpActive = true
-                firstUnansweredPingAtNs = 0L
-            }
 
-            DiagLog.log("CC", "Control channel ACTIVE mode=tcp")
+            DiagLog.log("CC", "Control channel ACTIVE mode=tcp generation=$installedGeneration")
             declareBrightnessSupport()
-            Thread({ tcpReadLoop(s) }, "ControlTcpThread")
+            Thread({ tcpReadLoop(s, installedGeneration) }, "ControlTcpThread")
                 .apply {
                     isDaemon = true
                     priority = Thread.MAX_PRIORITY
@@ -175,9 +192,11 @@ class ControlChannel(
             synchronized(connectLock) {
                 connecting = false
                 if (socket === s) {
+                    connectionGeneration += 1
                     socket = null
                     output = null
                     tcpActive = false
+                    outstandingPing = null
                 }
             }
             DiagLog.log(
@@ -192,14 +211,17 @@ class ControlChannel(
         }
     }
 
-    private fun tcpReadLoop(s: Socket) {
+    private fun tcpReadLoop(
+        s: Socket,
+        generation: Long,
+    ) {
         try {
             Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
         } catch (_: Exception) {
         }
         try {
             val input = DataInputStream(BufferedInputStream(s.getInputStream(), 4096))
-            while (running && socket === s) {
+            while (running && isTransportCurrent(s, generation)) {
                 val type = input.readByte().toInt()
                 val arrival = System.nanoTime()
                 when (type) {
@@ -208,9 +230,10 @@ class ControlChannel(
                         input.readFully(buf)
                         val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                         val clientTs = bb.long
-                        bb.long // server send timestamp; RTT uses the echoed client timestamp.
-                        if (firstUnansweredPingAtNs == clientTs) {
-                            firstUnansweredPingAtNs = 0L
+                        bb.long // Server timestamp; RTT uses echoed client timestamp.
+                        val probe = outstandingPing
+                        if (probe?.connectionGeneration == generation && probe.sentAtNs == clientTs) {
+                            outstandingPing = null
                         }
                         val rtt = (arrival - clientTs) / 1_000_000.0
                         val processedAt = System.nanoTime()
@@ -227,7 +250,7 @@ class ControlChannel(
                         onLatencyMeasured?.invoke(rtt)
                     }
 
-                    11 -> { // Bright: [value 1] 0..255 — REAL panel backlight
+                    11 -> { // Bright: [value 1] 0..255 — real panel backlight
                         val value = input.readByte().toInt() and 0xFF
                         DiagLog.log("CC", "BRIGHT command value=$value")
                         onBrightnessCommand?.invoke(value)
@@ -240,7 +263,7 @@ class ControlChannel(
                 }
             }
         } catch (e: Exception) {
-            if (running) {
+            if (running && isTransportCurrent(s, generation)) {
                 DiagLog.log("CC", "Control read error: ${e.javaClass.simpleName}: ${e.message}")
             }
         } finally {
@@ -258,6 +281,17 @@ class ControlChannel(
         boundNetwork = network
     }
 
+    /**
+     * Fence queued input against StreamClient's current recovered video
+     * transport. Synchronizing with sendLock makes the generation transition
+     * atomic relative to an actual control write.
+     */
+    fun setSessionGeneration(generation: Long) {
+        synchronized(sendLock) {
+            sessionGeneration = generation
+        }
+    }
+
     private fun writeAuthenticationPreamble(out: DataOutputStream) {
         val token = controlAuthToken ?: return // Loopback USB tunnel is already local.
         require(token.size == 32) { "Control auth token must be 32 bytes" }
@@ -268,59 +302,91 @@ class ControlChannel(
         }
     }
 
+    private fun activeTransport(): ActiveTransport? =
+        synchronized(connectLock) {
+            val activeSocket = socket ?: return@synchronized null
+            val activeOutput = output ?: return@synchronized null
+            if (!tcpActive) return@synchronized null
+            ActiveTransport(activeSocket, activeOutput, connectionGeneration)
+        }
+
+    private fun isTransportCurrent(transport: ActiveTransport): Boolean =
+        synchronized(connectLock) {
+            tcpActive &&
+                socket === transport.socket &&
+                output === transport.output &&
+                connectionGeneration == transport.generation
+        }
+
+    private fun isTransportCurrent(
+        expectedSocket: Socket,
+        expectedGeneration: Long,
+    ): Boolean =
+        synchronized(connectLock) {
+            tcpActive && socket === expectedSocket && connectionGeneration == expectedGeneration
+        }
+
     /** Tell the server we understand BRIGHT (type 11). Old servers log-only. */
     private fun declareBrightnessSupport() {
-        val activeSocket = synchronized(connectLock) { socket } ?: return
-        val out = synchronized(connectLock) { output } ?: return
+        val transport = activeTransport() ?: return
         synchronized(sendLock) {
+            if (!isTransportCurrent(transport)) return
             try {
-                out.write(byteArrayOf(3))
-                out.flush()
+                transport.output.write(byteArrayOf(3))
+                transport.output.flush()
                 DiagLog.log("CC", "Declared brightness support")
             } catch (e: Exception) {
                 DiagLog.log("CC", "Brightness declaration failed: ${e.javaClass.simpleName}: ${e.message}")
-                markTcpInactive(activeSocket)
+                markTcpInactive(transport.socket)
             }
         }
     }
 
     /** Returns false when the caller should use its in-band fallback. */
     fun sendPing(): Boolean {
-        val activeSocket = synchronized(connectLock) { socket } ?: return false
-        val out = synchronized(connectLock) { output } ?: return false
+        val transport = activeTransport() ?: return false
         val ts = System.nanoTime()
         synchronized(sendLock) {
+            if (!isTransportCurrent(transport)) return false
             return try {
                 val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
                 buffer.put(4.toByte())
                 buffer.putLong(ts)
-                // Mark the oldest unanswered ping before the bytes become
-                // visible on the wire. A loopback/LAN-fast pong can otherwise
-                // race the post-flush assignment and leave a stale timeout.
-                if (firstUnansweredPingAtNs == 0L) firstUnansweredPingAtNs = ts
-                out.write(buffer.array())
-                out.flush()
+                val existing = outstandingPing
+                if (existing == null || existing.connectionGeneration != transport.generation) {
+                    outstandingPing = OutstandingPing(transport.generation, ts)
+                }
+                transport.output.write(buffer.array())
+                transport.output.flush()
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control ping write failed: ${e.javaClass.simpleName}: ${e.message}")
-                markTcpInactive(activeSocket)
+                markTcpInactive(transport.socket)
                 false
             }
         }
     }
 
-    /** Returns false when the caller should use its in-band fallback. */
-    fun requestKeyframe(force: Boolean): Boolean {
-        val activeSocket = synchronized(connectLock) { socket } ?: return false
-        val out = synchronized(connectLock) { output } ?: return false
+    /**
+     * Returns false when the caller should use its in-band fallback. When an
+     * expectedSessionGeneration is supplied and is stale, true means the
+     * obsolete operation was intentionally consumed/dropped.
+     */
+    fun requestKeyframe(
+        force: Boolean,
+        expectedSessionGeneration: Long? = null,
+    ): Boolean {
+        val transport = activeTransport() ?: return false
         synchronized(sendLock) {
+            if (expectedSessionGeneration != null && sessionGeneration != expectedSessionGeneration) return true
+            if (!isTransportCurrent(transport)) return false
             return try {
-                out.write(byteArrayOf(7.toByte(), if (force) 1 else 0))
-                out.flush()
+                transport.output.write(byteArrayOf(7.toByte(), if (force) 1 else 0))
+                transport.output.flush()
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control keyframe write failed: ${e.javaClass.simpleName}: ${e.message}")
-                markTcpInactive(activeSocket)
+                markTcpInactive(transport.socket)
                 false
             }
         }
@@ -334,9 +400,9 @@ class ControlChannel(
         pointerCount: Int,
         x2: Float,
         y2: Float,
+        expectedSessionGeneration: Long? = null,
     ): Boolean {
-        val activeSocket = synchronized(connectLock) { socket } ?: return false
-        val out = synchronized(connectLock) { output } ?: return false
+        val transport = activeTransport() ?: return false
         val count = pointerCount.coerceIn(1, 2)
         val buffer = ByteBuffer.allocate(6 + count * 8).order(ByteOrder.LITTLE_ENDIAN)
         buffer.put(2.toByte())
@@ -350,31 +416,37 @@ class ControlChannel(
         buffer.putInt(action)
 
         synchronized(sendLock) {
+            if (expectedSessionGeneration != null && sessionGeneration != expectedSessionGeneration) return true
+            if (!isTransportCurrent(transport)) return false
             return try {
-                out.write(buffer.array())
-                out.flush()
+                transport.output.write(buffer.array())
+                transport.output.flush()
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control touch write failed: ${e.javaClass.simpleName}: ${e.message}")
-                markTcpInactive(activeSocket)
+                markTcpInactive(transport.socket)
                 false
             }
         }
     }
 
     /** Send one negotiated S Pen event without passing through touch gestures. */
-    fun sendStylus(event: StylusInputEvent): Boolean {
-        val activeSocket = synchronized(connectLock) { socket } ?: return false
-        val out = synchronized(connectLock) { output } ?: return false
+    fun sendStylus(
+        event: StylusInputEvent,
+        expectedSessionGeneration: Long? = null,
+    ): Boolean {
+        val transport = activeTransport() ?: return false
         val bytes = StylusProtocol.encode(event)
         synchronized(sendLock) {
+            if (expectedSessionGeneration != null && sessionGeneration != expectedSessionGeneration) return true
+            if (!isTransportCurrent(transport)) return false
             return try {
-                out.write(bytes)
-                out.flush()
+                transport.output.write(bytes)
+                transport.output.flush()
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control stylus write failed: ${e.javaClass.simpleName}: ${e.message}")
-                markTcpInactive(activeSocket)
+                markTcpInactive(transport.socket)
                 false
             }
         }
@@ -383,10 +455,11 @@ class ControlChannel(
     private fun markTcpInactive(expectedSocket: Socket) {
         synchronized(connectLock) {
             if (socket !== expectedSocket) return
+            connectionGeneration += 1
             tcpActive = false
             output = null
             socket = null
-            firstUnansweredPingAtNs = 0L
+            outstandingPing = null
             try {
                 expectedSocket.close()
             } catch (_: Exception) {
@@ -401,9 +474,10 @@ class ControlChannel(
         synchronized(connectLock) {
             running = false
             connecting = false
+            connectionGeneration += 1
             tcpActive = false
             output = null
-            firstUnansweredPingAtNs = 0L
+            outstandingPing = null
             val activeSocket = socket
             socket = null
             try {
