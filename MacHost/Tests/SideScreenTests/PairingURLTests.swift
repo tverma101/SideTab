@@ -45,7 +45,7 @@ final class PairingURLTests: XCTestCase {
             host: "192.168.1.20",
             port: 54321,
             token: Data(repeating: 1, count: 32),
-            name: "Mac",
+            name: "Mac"
         )
         XCTAssertFalse(url.contains("&c="))
     }
@@ -56,7 +56,7 @@ final class PairingURLTests: XCTestCase {
             host: "192.168.1.20",
             port: 54321,
             token: Data(repeating: 2, count: 32),
-            name: "Mac",
+            name: "Mac"
         )
         XCTAssertTrue(url.contains("&c=55123"))
     }
@@ -67,7 +67,7 @@ final class PairingURLTests: XCTestCase {
             host: "192.168.1.20",
             port: 54321,
             token: Data(repeating: 3, count: 32),
-            name: "Mac",
+            name: "Mac"
         )
         XCTAssertFalse(url.contains("&c="))
     }

@@ -909,7 +909,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let bounds = CGDisplayBounds(displayID)
         let point = CGPoint(
             x: bounds.origin.x + CGFloat(event.x.clampedUnit) * bounds.width,
-            y: bounds.origin.y + CGFloat(event.y.clampedUnit) * bounds.height,
+            y: bounds.origin.y + CGFloat(event.y.clampedUnit) * bounds.height
         )
 
         switch event.action {

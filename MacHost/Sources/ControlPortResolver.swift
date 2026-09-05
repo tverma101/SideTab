@@ -17,7 +17,7 @@ enum ControlPortResolver {
     /// that nonstandard pairing so Android never has to guess it.
     static func effective(
         videoPort: UInt16,
-        defaults: UserDefaults = .standard,
+        defaults: UserDefaults = .standard
     ) -> UInt16 {
         if let override = explicitOverride(defaults: defaults) {
             return override
@@ -29,7 +29,7 @@ enum ControlPortResolver {
     /// QR when control is exactly video+1.
     static func qrOverride(
         videoPort: UInt16,
-        defaults: UserDefaults = .standard,
+        defaults: UserDefaults = .standard
     ) -> UInt16? {
         let effectivePort = effective(videoPort: videoPort, defaults: defaults)
         if videoPort < UInt16.max && effectivePort == videoPort + 1 {

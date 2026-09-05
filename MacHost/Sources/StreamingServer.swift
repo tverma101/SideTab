@@ -352,7 +352,7 @@ class StreamingServer {
                 debugLog("Control authentication accepted")
                 self.installControlConnection(
                     candidate,
-                    initialBuffer: Data(buffer.dropFirst(requiredBytes)),
+                    initialBuffer: Data(buffer.dropFirst(requiredBytes))
                 )
             }
         }
@@ -461,7 +461,7 @@ class StreamingServer {
             let magic = Data(controlInputBuffer.prefix(controlAuthMagic.count))
             let tokenStart = controlInputBuffer.index(
                 controlInputBuffer.startIndex,
-                offsetBy: controlAuthMagic.count,
+                offsetBy: controlAuthMagic.count
             )
             let token = Data(controlInputBuffer[tokenStart..<controlInputBuffer.index(tokenStart, offsetBy: expected.count)])
             guard magic == controlAuthMagic, WirelessAuth.validate(token, expected: expected) else {
@@ -607,7 +607,7 @@ class StreamingServer {
     private func installConnection(
         _ newConnection: NWConnection,
         alreadyStarted: Bool = false,
-        alreadyAuthenticated: Bool = false,
+        alreadyAuthenticated: Bool = false
     ) {
         // Publish the replacement before cancelling the prior client. The old
         // connection's .cancelled/.failed callback then cannot pass the
@@ -738,7 +738,7 @@ class StreamingServer {
                         onSuccess: { [weak self, weak candidate] in
                             guard let self, let candidate else { return }
                             self.promoteAuthenticatedContender(candidate)
-                        },
+                        }
                     )
                 } else {
                     self.armLoopbackContenderProof(candidate)
@@ -878,7 +878,7 @@ class StreamingServer {
     private func runAuthHandshake(
         connection conn: NWConnection,
         expectedToken: Data,
-        onSuccess: (() -> Void)? = nil,
+        onSuccess: (() -> Void)? = nil
     ) {
         let deadline = DispatchWorkItem {
             debugLog("Wireless auth timed out — closing connection")
@@ -1150,7 +1150,7 @@ class StreamingServer {
                     clientSupportsStylus = true
                     connection.send(
                         content: Data([WireMessage.serverSupportsStylus]),
-                        completion: .contentProcessed { _ in },
+                        completion: .contentProcessed { _ in }
                     )
                     debugLog("Client supports S Pen stylus events")
                 }
@@ -1215,7 +1215,7 @@ class StreamingServer {
             pressure: pressure,
             tilt: tilt,
             orientation: orientation,
-            buttonState: buttons,
+            buttonState: buttons
         )
     }
 
