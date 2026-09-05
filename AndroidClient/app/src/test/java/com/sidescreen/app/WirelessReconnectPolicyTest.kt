@@ -22,13 +22,13 @@ class WirelessReconnectPolicyTest {
     @Test
     fun quietVideoGapRequiresStrictlyMoreThanFreshnessWindow() {
         val previous = 10_000_000_000L
-        assertFalse(StreamClient.isLongVideoGap(previous, previous + 1_500_000_000L))
-        assertTrue(StreamClient.isLongVideoGap(previous, previous + 1_500_000_001L))
+        assertFalse(StreamClient.isLongVideoGap(previous, previous + 6_000_000_000L))
+        assertTrue(StreamClient.isLongVideoGap(previous, previous + 6_000_000_001L))
     }
 
     @Test
     fun missingOrReversedVideoTimestampIsNeverQuietGap() {
-        assertFalse(StreamClient.isLongVideoGap(0L, 5_000_000_000L))
-        assertFalse(StreamClient.isLongVideoGap(5_000_000_000L, 4_000_000_000L))
+        assertFalse(StreamClient.isLongVideoGap(0L, 7_000_000_000L))
+        assertFalse(StreamClient.isLongVideoGap(7_000_000_000L, 4_000_000_000L))
     }
 }
