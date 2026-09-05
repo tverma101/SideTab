@@ -19,14 +19,30 @@ class AuthHandshakeTest {
     }
 
     @Test
-    fun rejectsNameLongerThan64() {
-        val longName = "x".repeat(65)
-        try {
-            AuthHandshake.encodeRequest(ByteArray(32), longName)
-            error("expected IllegalArgumentException")
-        } catch (e: IllegalArgumentException) {
-            // OK
-        }
+    fun truncatesAsciiNameTo64Bytes() {
+        val bytes = AuthHandshake.encodeRequest(ByteArray(32), "x".repeat(65))
+        val nameLength = bytes[36].toInt() and 0xff
+
+        assertEquals(64, nameLength)
+        assertEquals("x".repeat(64), bytes.copyOfRange(37, 37 + nameLength).toString(Charsets.UTF_8))
+    }
+
+    @Test
+    fun truncatesUnicodeOnCodePointBoundary() {
+        val bytes = AuthHandshake.encodeRequest(ByteArray(32), "😀".repeat(20))
+        val nameLength = bytes[36].toInt() and 0xff
+        val decoded = bytes.copyOfRange(37, 37 + nameLength).toString(Charsets.UTF_8)
+
+        assertEquals(64, nameLength)
+        assertEquals("😀".repeat(16), decoded)
+    }
+
+    @Test
+    fun blankDeviceNameFallsBackToAndroid() {
+        val bytes = AuthHandshake.encodeRequest(ByteArray(32), "   ")
+        val nameLength = bytes[36].toInt() and 0xff
+
+        assertEquals("Android", bytes.copyOfRange(37, 37 + nameLength).toString(Charsets.UTF_8))
     }
 
     @Test
