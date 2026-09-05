@@ -153,29 +153,16 @@ class StreamClient(
     private var videoProbeOutstanding: VideoProbe? = null
     private var lastVideoProbeSentNs = 0L
 
-    private val bufferPool = ArrayDeque<ByteArray>(8)
-    private val poolLock = Any()
+    // The TCP receive loop is sequential: a compressed frame is copied into
+    // MediaCodec (or explicitly dropped/released) before the next frame is read.
+    // One largest reusable array is therefore sufficient and avoids retaining
+    // up to eight multi-megabyte buffers after motion/IDR size changes.
+    private val bufferPool = CompressedFrameBufferPool()
 
-    private fun acquireBuffer(minSize: Int): ByteArray {
-        synchronized(poolLock) {
-            val iterator = bufferPool.iterator()
-            while (iterator.hasNext()) {
-                val buffer = iterator.next()
-                if (buffer.size >= minSize) {
-                    iterator.remove()
-                    return buffer
-                }
-            }
-        }
-        return ByteArray(minSize)
-    }
+    private fun acquireBuffer(minSize: Int): ByteArray = bufferPool.acquire(minSize)
 
     fun releaseBuffer(buffer: ByteArray) {
-        synchronized(poolLock) {
-            if (bufferPool.size < 8) {
-                bufferPool.addLast(buffer)
-            }
-        }
+        bufferPool.release(buffer)
     }
 
     private val touchExecutor =
@@ -388,6 +375,15 @@ class StreamClient(
         try {
             connectingSocket.tcpNoDelay = true
             connectingSocket.keepAlive = true
+            // Keep the LAN receive window large enough for the 90 Mbps maximum
+            // bounded VideoToolbox burst plus the decoder's <=25 ms input wait,
+            // but small enough that Android cannot silently absorb megabytes of
+            // stale video before TCP pressure propagates back to the Mac.
+            try {
+                connectingSocket.receiveBufferSize = WIRELESS_RECEIVE_BUFFER_BYTES
+            } catch (e: IOException) {
+                Log.w(TAG, "connectWireless: couldn't set SO_RCVBUF: ${e.message}")
+            }
             if (wifiNetwork != null) {
                 Log.i(TAG, "connectWireless: binding video/control to WiFi network $wifiNetwork")
                 wifiNetwork.bindSocket(connectingSocket)
@@ -395,6 +391,9 @@ class StreamClient(
                 Log.w(TAG, "connectWireless: no WiFi Network handle found, using default routing")
             }
             connectingSocket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+            runCatching { connectingSocket.receiveBufferSize }.getOrNull()?.let { actual ->
+                diagLog("Wireless video SO_RCVBUF requested=$WIRELESS_RECEIVE_BUFFER_BYTES actual=$actual")
+            }
         } catch (e: SocketTimeoutException) {
             closePending(connectingSocket)
             Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port")
@@ -1207,6 +1206,10 @@ class StreamClient(
     companion object {
         private const val TAG = "StreamClient"
         private const val MAX_FRAME_SIZE = 5 * 1024 * 1024
+        // 60 Mbps wireless target has a 1.5x/1s VideoToolbox hard cap (90 Mbps).
+        // 90 Mbps * 25 ms decoder wait ~= 281 KiB; 384 KiB leaves LAN/Burst
+        // headroom while remaining far below multi-megabyte autotuned windows.
+        private const val WIRELESS_RECEIVE_BUFFER_BYTES = 384 * 1024
         private const val CONNECT_TIMEOUT_MS = 5_000
         private const val RECONNECT_CONNECT_TIMEOUT_MS = 1_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
