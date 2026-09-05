@@ -444,6 +444,22 @@ class ScreenCapture {
                 self.onCaptureMethodChanged?("SCStream")
             }
 
+            // ScreenCaptureKit already tells us whether anything in the frame
+            // changed. On wireless, an explicitly empty dirty-rect array lets
+            // us avoid pixel work, VideoToolbox, Wi-Fi airtime, Android decode,
+            // and presentation. Missing/unrecognized metadata encodes normally.
+            // Synthetic pattern/dither experiments mutate pixels after capture,
+            // so they deliberately bypass this gate.
+            let wireless = UserDefaults.standard.string(forKey: "SideScreen_connectionMode") == "wireless"
+            let mutatesCapturedPixels = PatternInjector.isActive() || DitherPass.enabled
+            if WirelessDirtyRectGate.shouldSkip(
+                wireless: wireless,
+                frameHasChanges: WirelessDirtyRectGate.frameHasChanges(sampleBuffer),
+                mutatesCapturedPixels: mutatesCapturedPixels
+            ) {
+                return
+            }
+
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
             // Backpressure: skip if encode queue already has 2+ frames pending
