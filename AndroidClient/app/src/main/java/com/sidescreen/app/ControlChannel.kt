@@ -7,8 +7,6 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 /**
  * Out-of-band control channel: ping/pong RTT measurement + keyframe requests
@@ -76,6 +74,14 @@ class ControlChannel(
     private val sendLock = Any()
     private val connectLock = Any()
 
+    // Steady-state control traffic is high-frequency but tiny. These buffers
+    // are reused under sendLock so 120 Hz touch/S Pen input does not create a
+    // ByteBuffer + ByteArray pair for every packet and wake the GC mid-stroke.
+    private val pingPacketScratch = ByteArray(9)
+    private val keyframePacketScratch = ByteArray(2)
+    private val touchPacketScratch = ByteArray(22)
+    private val stylusPacketScratch = ByteArray(StylusProtocol.EVENT_SIZE)
+
     val isConnected: Boolean
         get() = tcpActive
 
@@ -104,6 +110,9 @@ class ControlChannel(
                 continue
             }
 
+            // MainActivity already calls sendPing once per second. This slower
+            // safety poll is only a backstop for a ping whose caller disappears
+            // before the next tick; 4 wakeups/sec bought no useful latency.
             val probe = outstandingPing
             if (probe != null && System.nanoTime() - probe.sentAtNs > PONG_TIMEOUT_NS) {
                 val active = activeTransport()
@@ -210,6 +219,8 @@ class ControlChannel(
             Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
         } catch (_: Exception) {
         }
+        // Reuse the pong payload buffer for the life of this control socket.
+        val pongBuffer = ByteArray(16)
         try {
             val input = DataInputStream(BufferedInputStream(s.getInputStream(), 4096))
             while (running && isTransportCurrent(s, generation)) {
@@ -217,11 +228,8 @@ class ControlChannel(
                 val arrival = System.nanoTime()
                 when (type) {
                     5 -> {
-                        val buf = ByteArray(16)
-                        input.readFully(buf)
-                        val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
-                        val clientTs = bb.long
-                        bb.long
+                        input.readFully(pongBuffer)
+                        val clientTs = readLongLE(pongBuffer, 0)
                         val probe = outstandingPing
                         if (probe?.connectionGeneration == generation && probe.sentAtNs == clientTs) {
                             outstandingPing = null
@@ -268,7 +276,7 @@ class ControlChannel(
 
     /**
      * Rebind immediately when Android gives the video path a different Network
-     * handle. Keeping the previous control TCP socket until its 4s ping timeout
+     * handle. Keeping the previous control TCP socket until its ping timeout
      * would lose low-latency input after an otherwise successful Wi-Fi roam.
      */
     fun setNetwork(network: Network?) {
@@ -331,8 +339,7 @@ class ControlChannel(
         synchronized(sendLock) {
             if (!isTransportCurrent(transport)) return
             try {
-                transport.output.write(byteArrayOf(3))
-                transport.output.flush()
+                transport.output.write(BRIGHTNESS_CAPABILITY)
                 DiagLog.log("CC", "Declared brightness support")
             } catch (e: Exception) {
                 DiagLog.log("CC", "Brightness declaration failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -343,21 +350,31 @@ class ControlChannel(
 
     fun sendPing(): Boolean {
         val transport = activeTransport() ?: return false
-        val ts = System.nanoTime()
+        val now = System.nanoTime()
         synchronized(sendLock) {
             if (!isTransportCurrent(transport)) return false
-            return try {
-                val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
-                buffer.put(4.toByte())
-                buffer.putLong(ts)
-                val existing = outstandingPing
-                if (existing == null || existing.connectionGeneration != transport.generation) {
-                    outstandingPing = OutstandingPing(transport.generation, ts)
+
+            // Never stack RTT probes. On a congested control socket an older
+            // ping is the liveness measurement that matters; adding more only
+            // consumes airtime/queue space and makes diagnosis noisier.
+            val existing = outstandingPing
+            if (existing?.connectionGeneration == transport.generation) {
+                if (now - existing.sentAtNs <= PONG_TIMEOUT_NS) {
+                    return true
                 }
-                transport.output.write(buffer.array())
-                transport.output.flush()
+                DiagLog.log("CC", "Control pong timeout detected by ping sender — reconnecting")
+                markTcpInactive(transport.socket)
+                return false
+            }
+
+            return try {
+                pingPacketScratch[0] = MESSAGE_PING.toByte()
+                putLongLE(pingPacketScratch, 1, now)
+                outstandingPing = OutstandingPing(transport.generation, now)
+                transport.output.write(pingPacketScratch)
                 true
             } catch (e: Exception) {
+                outstandingPing = null
                 DiagLog.log("CC", "Control ping write failed: ${e.javaClass.simpleName}: ${e.message}")
                 markTcpInactive(transport.socket)
                 false
@@ -374,8 +391,9 @@ class ControlChannel(
             if (expectedSessionGeneration != null && sessionGeneration != expectedSessionGeneration) return true
             if (!isTransportCurrent(transport)) return false
             return try {
-                transport.output.write(byteArrayOf(7.toByte(), if (force) 1 else 0))
-                transport.output.flush()
+                keyframePacketScratch[0] = MESSAGE_KEYFRAME_REQUEST.toByte()
+                keyframePacketScratch[1] = if (force) 1 else 0
+                transport.output.write(keyframePacketScratch)
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control keyframe write failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -395,24 +413,26 @@ class ControlChannel(
         expectedSessionGeneration: Long? = null,
     ): Boolean {
         val transport = activeTransport() ?: return false
-        val count = pointerCount.coerceIn(1, 2)
-        val buffer = ByteBuffer.allocate(6 + count * 8).order(ByteOrder.LITTLE_ENDIAN)
-        buffer.put(2.toByte())
-        buffer.put(count.toByte())
-        buffer.putFloat(x)
-        buffer.putFloat(y)
-        if (count == 2) {
-            buffer.putFloat(x2)
-            buffer.putFloat(y2)
-        }
-        buffer.putInt(action)
-
         synchronized(sendLock) {
             if (expectedSessionGeneration != null && sessionGeneration != expectedSessionGeneration) return true
             if (!isTransportCurrent(transport)) return false
+
+            val count = pointerCount.coerceIn(1, 2)
+            touchPacketScratch[0] = MESSAGE_TOUCH.toByte()
+            touchPacketScratch[1] = count.toByte()
+            putFloatLE(touchPacketScratch, 2, x)
+            putFloatLE(touchPacketScratch, 6, y)
+            var offset = 10
+            if (count == 2) {
+                putFloatLE(touchPacketScratch, offset, x2)
+                putFloatLE(touchPacketScratch, offset + 4, y2)
+                offset += 8
+            }
+            putIntLE(touchPacketScratch, offset, action)
+            val packetSize = 6 + count * 8
+
             return try {
-                transport.output.write(buffer.array())
-                transport.output.flush()
+                transport.output.write(touchPacketScratch, 0, packetSize)
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control touch write failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -427,13 +447,12 @@ class ControlChannel(
         expectedSessionGeneration: Long? = null,
     ): Boolean {
         val transport = activeTransport() ?: return false
-        val bytes = StylusProtocol.encode(event)
         synchronized(sendLock) {
             if (expectedSessionGeneration != null && sessionGeneration != expectedSessionGeneration) return true
             if (!isTransportCurrent(transport)) return false
             return try {
-                transport.output.write(bytes)
-                transport.output.flush()
+                val size = StylusProtocol.encodeInto(event, stylusPacketScratch)
+                transport.output.write(stylusPacketScratch, 0, size)
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control stylus write failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -478,11 +497,54 @@ class ControlChannel(
         }
     }
 
+    private fun putFloatLE(
+        target: ByteArray,
+        offset: Int,
+        value: Float,
+    ) = putIntLE(target, offset, value.toRawBits())
+
+    private fun putIntLE(
+        target: ByteArray,
+        offset: Int,
+        value: Int,
+    ) {
+        target[offset] = value.toByte()
+        target[offset + 1] = (value ushr 8).toByte()
+        target[offset + 2] = (value ushr 16).toByte()
+        target[offset + 3] = (value ushr 24).toByte()
+    }
+
+    private fun putLongLE(
+        target: ByteArray,
+        offset: Int,
+        value: Long,
+    ) {
+        for (i in 0 until 8) {
+            target[offset + i] = (value ushr (i * 8)).toByte()
+        }
+    }
+
+    private fun readLongLE(
+        source: ByteArray,
+        offset: Int,
+    ): Long {
+        var value = 0L
+        for (i in 0 until 8) {
+            value = value or ((source[offset + i].toLong() and 0xFFL) shl (i * 8))
+        }
+        return value
+    }
+
     private companion object {
+        const val MESSAGE_TOUCH = 2
+        const val MESSAGE_PING = 4
+        const val MESSAGE_KEYFRAME_REQUEST = 7
+        val BRIGHTNESS_CAPABILITY = byteArrayOf(3)
+
         const val CONNECT_TIMEOUT_MS = 2_000
         const val INITIAL_RETRY_MS = 250L
         const val MAX_RETRY_MS = 5_000L
-        const val HEALTH_POLL_MS = 250L
+        const val HEALTH_POLL_MS = 1_000L
         const val PONG_TIMEOUT_NS = 4_000_000_000L
     }
 }
