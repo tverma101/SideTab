@@ -59,7 +59,7 @@ class VideoDecoder(
     private var latencySamples: Int = 0
     private var latencyMaxNs: Long = 0
 
-    private val frameTimes = ArrayDeque<Long>(120)
+    private val frameTimingWindow = FrameTimingWindow()
 
     private val displayRefreshRate = display?.refreshRate ?: 60f
 
@@ -122,6 +122,7 @@ class VideoDecoder(
     }
 
     private fun setupDecoder() {
+        frameTimingWindow.reset()
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
 
@@ -613,17 +614,8 @@ class VideoDecoder(
     }
 
     private fun trackFrameTiming(timestamp: Long) {
-        frameTimes.addLast(timestamp)
-        if (frameTimes.size > 120) frameTimes.removeFirst()
-
-        if (frameTimes.size >= 60 && frameCount % 60L == 0L) {
-            val deltas = frameTimes.zipWithNext { a, b -> (b - a) / 1_000_000.0 }
-            if (deltas.isNotEmpty()) {
-                val avgDelta = deltas.average()
-                val variance = deltas.map { (it - avgDelta) * (it - avgDelta) }.average()
-                val stdDev = kotlin.math.sqrt(variance)
-                onFrameStats?.invoke(1000.0 / avgDelta, stdDev)
-            }
+        if (frameTimingWindow.add(timestamp)) {
+            onFrameStats?.invoke(frameTimingWindow.fps, frameTimingWindow.stdDevMs)
         }
         onFrameRendered?.invoke(timestamp)
     }
@@ -642,6 +634,7 @@ class VideoDecoder(
 
     fun release() {
         isRunning = false
+        frameTimingWindow.reset()
         try {
             availableInputBuffers.clear()
             decoder?.stop()
