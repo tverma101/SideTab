@@ -141,7 +141,15 @@ class WirelessTabController(
     fun onScanResult(url: String) {
         val parsed = PairingURL.parse(url) ?: return
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
-        storage.save(PairedHostStorage.Entry(parsed.host, parsed.port, parsed.token, parsed.macName))
+        storage.save(
+            PairedHostStorage.Entry(
+                host = parsed.host,
+                port = parsed.port,
+                token = parsed.token,
+                macName = parsed.macName,
+                controlPort = parsed.controlPort,
+            ),
+        )
         discoveryRecoveryArmed = true
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
