@@ -86,8 +86,10 @@ class PairedHostStorage(context: Context) {
         }
     }
 
+    /** Forget means a genuinely fresh pairing, including fresh Keystore material. */
     fun clear() {
         prefs.edit().clear().apply()
+        deleteKeyBestEffort()
     }
 
     private fun loadEncryptedToken(): ByteArray? {
@@ -96,13 +98,17 @@ class PairedHostStorage(context: Context) {
         return try {
             decrypt(decode(ciphertext), decode(iv))
         } catch (_: Exception) {
-            // A restored preference without its Keystore key is unusable. Clear
-            // only the credential fields and force an explicit re-pair.
+            // Android backup can restore SharedPreferences without restoring the
+            // hardware-backed Keystore key. Corruption/key invalidation has the
+            // same observable result. Remove both halves of the credential so
+            // scanning a new QR creates fresh key material instead of repeatedly
+            // trying to reuse an unusable alias.
             prefs.edit()
                 .remove("token_ciphertext_b64")
                 .remove("token_iv_b64")
                 .remove("token_b64")
                 .apply()
+            deleteKeyBestEffort()
             null
         }
     }
@@ -162,6 +168,19 @@ class PairedHostStorage(context: Context) {
                     .build(),
             )
         }.generateKey()
+    }
+
+    private fun deleteKeyBestEffort() {
+        try {
+            val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (store.containsAlias(KEY_ALIAS)) {
+                store.deleteEntry(KEY_ALIAS)
+            }
+        } catch (_: Exception) {
+            // Preference removal is still sufficient to force the UI back to
+            // pairing. If Keystore is temporarily unavailable, a future clean
+            // install/re-pair can recreate or replace its entry.
+        }
     }
 
     private fun encode(bytes: ByteArray): String =
