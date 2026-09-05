@@ -16,22 +16,35 @@ class PairedHostStorage(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("paired_host", Context.MODE_PRIVATE)
 
-    data class Entry(val host: String, val port: Int, val token: ByteArray, val macName: String) {
+    data class Entry(
+        val host: String,
+        val port: Int,
+        val token: ByteArray,
+        val macName: String,
+        val controlPort: Int = (port + 1).coerceAtMost(65535),
+    ) {
         override fun equals(other: Any?): Boolean {
             if (other !is Entry) return false
-            return host == other.host && port == other.port && macName == other.macName &&
+            return host == other.host &&
+                port == other.port &&
+                controlPort == other.controlPort &&
+                macName == other.macName &&
                 token.contentEquals(other.token)
         }
 
         override fun hashCode(): Int =
-            ((host.hashCode() * 31 + port) * 31 + macName.hashCode()) * 31 + token.contentHashCode()
+            ((((host.hashCode() * 31 + port) * 31 + controlPort) * 31 + macName.hashCode()) * 31) +
+                token.contentHashCode()
     }
 
     fun save(entry: Entry) {
+        require(entry.port in 1..65535) { "invalid video port" }
+        require(entry.controlPort in 1..65535) { "invalid control port" }
         val encrypted = encrypt(entry.token)
         prefs.edit()
             .putString("host", entry.host)
             .putInt("port", entry.port)
+            .putInt("control_port", entry.controlPort)
             .putString("token_ciphertext_b64", encode(encrypted.ciphertext))
             .putString("token_iv_b64", encode(encrypted.iv))
             .putString("mac_name", entry.macName)
@@ -42,9 +55,20 @@ class PairedHostStorage(context: Context) {
     fun load(): Entry? {
         val host = prefs.getString("host", null) ?: return null
         val port = prefs.getInt("port", -1).takeIf { it in 1..65535 } ?: return null
+        val storedControlPort = prefs.getInt("control_port", -1)
+        val controlPort =
+            if (storedControlPort in 1..65535) {
+                storedControlPort
+            } else {
+                (port + 1).takeIf { it <= 65535 } ?: return null
+            }
         val macName = prefs.getString("mac_name", null) ?: "Mac"
-        val token = loadEncryptedToken() ?: loadLegacyToken()?.also { migrate(host, port, it, macName) }
-        return token?.takeIf { it.size == TOKEN_SIZE }?.let { Entry(host, port, it, macName) }
+        val token =
+            loadEncryptedToken()
+                ?: loadLegacyToken()?.also { migrate(host, port, controlPort, it, macName) }
+        return token?.takeIf { it.size == TOKEN_SIZE }?.let {
+            Entry(host, port, it, macName, controlPort)
+        }
     }
 
     fun clear() {
@@ -77,9 +101,15 @@ class PairedHostStorage(context: Context) {
             }
         }?.takeIf { it.size == TOKEN_SIZE }
 
-    private fun migrate(host: String, port: Int, token: ByteArray, macName: String) {
+    private fun migrate(
+        host: String,
+        port: Int,
+        controlPort: Int,
+        token: ByteArray,
+        macName: String,
+    ) {
         try {
-            save(Entry(host, port, token, macName))
+            save(Entry(host, port, token, macName, controlPort))
         } catch (_: Exception) {
             // Keep the legacy value if Keystore initialization is temporarily
             // unavailable; the next load can retry the migration.
