@@ -215,13 +215,6 @@ class VideoEncoder {
         }
 
         let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
-
-        // Use system uptime clock — MUST match DispatchTime.now().uptimeNanoseconds.
-        // Allocate only for frames that actually enter VideoToolbox.
-        let captureNanos = DispatchTime.now().uptimeNanoseconds
-        let refconValue = UnsafeMutableRawPointer.allocate(byteCount: 8, alignment: 8)
-        refconValue.storeBytes(of: captureNanos, as: UInt64.self)
-
         let frameProperties: CFDictionary? = shouldForceKeyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             : nil
@@ -232,7 +225,7 @@ class VideoEncoder {
             presentationTimeStamp: presentationTimeStamp,
             duration: duration,
             frameProperties: frameProperties,
-            sourceFrameRefcon: refconValue,
+            sourceFrameRefcon: nil,
             infoFlagsOut: nil
         )
     }
@@ -247,27 +240,44 @@ class VideoEncoder {
 
 // Static start code to avoid repeated allocations
 private let nalStartCode: [UInt8] = [0, 0, 0, 1]
+private let plausibleFrameAgeNs: UInt64 = 60_000_000_000
 
-private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, _, sampleBuffer) in
+/// VideoToolbox preserves the submitted presentation timestamp on the encoded
+/// sample. Most SideScreen capture paths use the host-time clock; when they do,
+/// reuse that PTS for frame-age profiling instead of heap-allocating an 8-byte
+/// sourceFrameRefcon on every frame. If a source ever uses another timebase,
+/// fail closed to current uptime so transport metadata remains well formed.
+private func frameTimestampNanoseconds(_ sampleBuffer: CMSampleBuffer) -> UInt64 {
+    let now = DispatchTime.now().uptimeNanoseconds
+    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    guard pts.flags.contains(.valid),
+          !pts.flags.contains(.indefinite),
+          !pts.flags.contains(.positiveInfinity),
+          !pts.flags.contains(.negativeInfinity),
+          pts.timescale > 0 else {
+        return now
+    }
+
+    let converted = CMTimeConvertScale(
+        pts,
+        timescale: 1_000_000_000,
+        method: .default
+    )
+    guard converted.value >= 0 else { return now }
+    let ptsNs = UInt64(converted.value)
+    guard ptsNs <= now, now - ptsNs <= plausibleFrameAgeNs else { return now }
+    return ptsNs
+}
+
+private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, _, status, _, sampleBuffer) in
     guard status == noErr,
           let sampleBuffer = sampleBuffer,
           let refcon = outputCallbackRefCon else {
-        if let sourceFrameRefCon {
-            sourceFrameRefCon.deallocate()
-        }
         return
     }
 
     let encoder = Unmanaged<VideoEncoder>.fromOpaque(refcon).takeUnretainedValue()
-
-    // Get timestamp for frame age tracking
-    let timestamp: UInt64
-    if let refcon = sourceFrameRefCon {
-        timestamp = refcon.load(as: UInt64.self)
-        refcon.deallocate()
-    } else {
-        timestamp = DispatchTime.now().uptimeNanoseconds
-    }
+    let timestamp = frameTimestampNanoseconds(sampleBuffer)
 
     // Extract encoded data
     guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
