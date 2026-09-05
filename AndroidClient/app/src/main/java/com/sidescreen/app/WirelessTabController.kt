@@ -145,18 +145,37 @@ class WirelessTabController(
     }
 
     fun onScanResult(url: String) {
-        val parsed = PairingURL.parse(url) ?: return
+        val parsed =
+            PairingURL.parse(url) ?: run {
+                views.repairTitle.text = "⚠ Invalid pairing QR"
+                views.repairMessage.text =
+                    "That code is not a valid SideScreen pairing QR. Open Wireless mode on the Mac and scan its current QR."
+                transition(State.REPAIR_NEEDED)
+                return
+            }
+
         invalidateRecovery(rearm = true)
-        val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
-        storage.save(
+        val entry =
             PairedHostStorage.Entry(
                 host = parsed.host,
                 port = parsed.port,
                 token = parsed.token,
                 macName = parsed.macName,
                 controlPortOverride = parsed.controlPortOverride,
-            ),
-        )
+            )
+        try {
+            storage.save(entry)
+        } catch (e: Exception) {
+            android.util.Log.e("WirelessTabController", "Couldn't persist pairing", e)
+            views.repairTitle.text = "⚠ Couldn't save pairing"
+            views.repairMessage.text =
+                "Android couldn't store the SideScreen pairing credential securely. Try scanning again. " +
+                    "If this keeps happening, restart the tablet before re-pairing."
+            transition(State.REPAIR_NEEDED)
+            return
+        }
+
+        val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
     }
