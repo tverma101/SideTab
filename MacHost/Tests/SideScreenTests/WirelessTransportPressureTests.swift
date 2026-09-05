@@ -90,6 +90,28 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 3))
     }
 
+    func testForcedCaptureAdmissionIsGenerationFenced() {
+        let oldGeneration = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: oldGeneration)
+        let oldMarker = WirelessTransportPressure.noteForcedCapturePending()
+        XCTAssertEqual(oldGeneration, oldMarker)
+        XCTAssertTrue(WirelessTransportPressure.forcedCapturePending)
+
+        let newGeneration = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: newGeneration)
+        let newMarker = WirelessTransportPressure.noteForcedCapturePending()
+        XCTAssertEqual(newGeneration, newMarker)
+        XCTAssertTrue(WirelessTransportPressure.forcedCapturePending)
+
+        // A delayed encode from the retired transport cannot consume the new
+        // session's recovery admission.
+        WirelessTransportPressure.clearForcedCapturePending(generation: oldGeneration)
+        XCTAssertTrue(WirelessTransportPressure.forcedCapturePending)
+
+        WirelessTransportPressure.clearForcedCapturePending(generation: newGeneration)
+        XCTAssertFalse(WirelessTransportPressure.forcedCapturePending)
+    }
+
     func testUsbIgnoresBothSubmissionAndSendBufferPressure() {
         let generation = WirelessTransportPressure.reset(wireless: false)
         WirelessTransportPressure.setReady(generation: generation)
@@ -102,6 +124,8 @@ final class WirelessTransportPressureTests: XCTestCase {
             frameBytes: 1_000_000,
             nowNs: 100
         )
+        XCTAssertNil(WirelessTransportPressure.noteForcedCapturePending())
+        XCTAssertFalse(WirelessTransportPressure.forcedCapturePending)
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: 101))
     }
 
@@ -126,6 +150,7 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertEqual(newGeneration, snapshot.generation)
         XCTAssertEqual(1, snapshot.sendsInFlight)
         XCTAssertNil(snapshot.availableSendBuffer)
+        XCTAssertFalse(snapshot.forcedCapturePending)
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: 101))
     }
 }
