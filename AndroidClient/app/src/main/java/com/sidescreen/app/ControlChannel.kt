@@ -40,7 +40,7 @@ class ControlChannel(
 
     var onLatencyMeasured: ((Double) -> Unit)? = null
 
-    /** Server→client brightness command: 0..255, apply to the real panel. */
+    /** Server→client brightness command: 0..255, apply to the REAL panel. */
     var onBrightnessCommand: ((Int) -> Unit)? = null
 
     private var socket: Socket? = null
@@ -124,8 +124,6 @@ class ControlChannel(
                     DiagLog.log("CC", "Control pong timeout — reconnecting")
                     markTcpInactive(active.socket)
                 } else if (active == null || active.generation != probe.connectionGeneration) {
-                    // A stale probe from a retired socket must never kill the
-                    // replacement control connection.
                     outstandingPing = null
                 }
             }
@@ -159,7 +157,6 @@ class ControlChannel(
             s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
             val controlOutput = DataOutputStream(s.getOutputStream())
             writeAuthenticationPreamble(controlOutput)
-            // Idle is legitimate. Half-open detection is ping-driven above.
             s.soTimeout = 0
 
             val installedGeneration =
@@ -225,12 +222,12 @@ class ControlChannel(
                 val type = input.readByte().toInt()
                 val arrival = System.nanoTime()
                 when (type) {
-                    5 -> { // Pong: [clientTs 8][serverSendTs 8]
+                    5 -> {
                         val buf = ByteArray(16)
                         input.readFully(buf)
                         val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                         val clientTs = bb.long
-                        bb.long // Server timestamp; RTT uses echoed client timestamp.
+                        bb.long
                         val probe = outstandingPing
                         if (probe?.connectionGeneration == generation && probe.sentAtNs == clientTs) {
                             outstandingPing = null
@@ -250,7 +247,7 @@ class ControlChannel(
                         onLatencyMeasured?.invoke(rtt)
                     }
 
-                    11 -> { // Bright: [value 1] 0..255 — real panel backlight
+                    11 -> {
                         val value = input.readByte().toInt() and 0xFF
                         DiagLog.log("CC", "BRIGHT command value=$value")
                         onBrightnessCommand?.invoke(value)
@@ -271,29 +268,30 @@ class ControlChannel(
         }
     }
 
-    /** Set the token used for subsequent control-channel connections. */
     fun setAuthToken(token: ByteArray?) {
         controlAuthToken = token?.clone()
     }
 
-    /** Bind subsequent control sockets to the same Android Network as video. */
     fun setNetwork(network: Network?) {
         boundNetwork = network
     }
 
     /**
      * Fence queued input against StreamClient's current recovered video
-     * transport. Synchronizing with sendLock makes the generation transition
-     * atomic relative to an actual control write.
+     * transport. Cleanup and install can race on different threads; generations
+     * therefore advance only. A late cleanup from generation N must never move
+     * the persistent control channel backward after generation N+1 is live.
      */
     fun setSessionGeneration(generation: Long) {
         synchronized(sendLock) {
-            sessionGeneration = generation
+            if (generation > sessionGeneration) {
+                sessionGeneration = generation
+            }
         }
     }
 
     private fun writeAuthenticationPreamble(out: DataOutputStream) {
-        val token = controlAuthToken ?: return // Loopback USB tunnel is already local.
+        val token = controlAuthToken ?: return
         require(token.size == 32) { "Control auth token must be 32 bytes" }
         synchronized(sendLock) {
             out.write(authPreamble)
@@ -326,7 +324,6 @@ class ControlChannel(
             tcpActive && socket === expectedSocket && connectionGeneration == expectedGeneration
         }
 
-    /** Tell the server we understand BRIGHT (type 11). Old servers log-only. */
     private fun declareBrightnessSupport() {
         val transport = activeTransport() ?: return
         synchronized(sendLock) {
@@ -342,7 +339,6 @@ class ControlChannel(
         }
     }
 
-    /** Returns false when the caller should use its in-band fallback. */
     fun sendPing(): Boolean {
         val transport = activeTransport() ?: return false
         val ts = System.nanoTime()
@@ -367,11 +363,6 @@ class ControlChannel(
         }
     }
 
-    /**
-     * Returns false when the caller should use its in-band fallback. When an
-     * expectedSessionGeneration is supplied and is stale, true means the
-     * obsolete operation was intentionally consumed/dropped.
-     */
     fun requestKeyframe(
         force: Boolean,
         expectedSessionGeneration: Long? = null,
@@ -392,7 +383,6 @@ class ControlChannel(
         }
     }
 
-    /** Send pointer input on the low-latency path, preserving event order. */
     fun sendTouch(
         x: Float,
         y: Float,
@@ -430,7 +420,6 @@ class ControlChannel(
         }
     }
 
-    /** Send one negotiated S Pen event without passing through touch gestures. */
     fun sendStylus(
         event: StylusInputEvent,
         expectedSessionGeneration: Long? = null,
