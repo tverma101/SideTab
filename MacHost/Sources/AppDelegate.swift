@@ -5,21 +5,10 @@ import ApplicationServices
 import os.log
 @preconcurrency import ScreenCaptureKit
 
-// Debug file logger - writes to /tmp/sidescreen.log
+// Debug logging stays callable from latency-sensitive capture/network/input
+// paths; all formatting and disk I/O are delegated to the bounded async sink.
 func debugLog(_ message: String) {
-    let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-    let line = "[\(timestamp)] \(message)\n"
-    print(message)
-    if let data = line.data(using: .utf8) {
-        let url = URL(fileURLWithPath: "/tmp/sidescreen.log")
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            handle.closeFile()
-        } else {
-            try? data.write(to: url)
-        }
-    }
+    AsyncDebugLogger.shared.log(message)
 }
 
 // MARK: - Gesture State Machine
