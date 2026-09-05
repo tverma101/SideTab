@@ -1,16 +1,16 @@
 import Foundation
-import SystemConfiguration
 
 enum StatusDetector {
     static func adbInstalled() -> Bool {
         return adbExecutablePath() != nil
     }
 
+    /// SideScreen wireless is a LAN service and does not require an Internet
+    /// route. Reuse the same interface/address resolver as pairing instead of
+    /// constructing a reachability probe to a public IP on every status tick.
+    /// This also reports local-only Wi-Fi/Ethernet correctly.
     static func wifiReachable() -> Bool {
-        guard let reach = SCNetworkReachabilityCreateWithName(nil, "1.1.1.1") else { return false }
-        var flags = SCNetworkReachabilityFlags()
-        guard SCNetworkReachabilityGetFlags(reach, &flags) else { return false }
-        return flags.contains(.reachable) && !flags.contains(.connectionRequired)
+        LANAddressResolver.primaryIPv4() != nil
     }
 
     /// Run `adb devices`, return list of device serials in `device` state.
