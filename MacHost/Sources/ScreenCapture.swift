@@ -352,6 +352,7 @@ class ScreenCapture {
         // a stable 90 beats a jittery 120 when the pipeline can't hold 120.
         let expFps = UserDefaults.standard.integer(forKey: "SideScreen_exp_fps")
         let fps = expFps > 0 ? expFps : refreshRate
+        let wirelessCapture = UserDefaults.standard.string(forKey: "SideScreen_connectionMode") == "wireless"
 
         streamOutput = StreamOutput()
 
@@ -390,7 +391,11 @@ class ScreenCapture {
             break // leave SCKit's default (current production behavior)
         }
         config.showsCursor = true
-        config.queueDepth = 4
+        // ScreenCaptureKit's minimum/default queue depth is three. Wireless
+        // prioritizes freshness and already has downstream pressure gating, so
+        // retaining a fourth full-resolution surface only adds memory/stale-work
+        // headroom. Keep the existing depth of four for the lower-jitter USB path.
+        config.queueDepth = wirelessCapture ? 3 : 4
         config.capturesAudio = false
         config.backgroundColor = .clear
         config.scalesToFit = false
@@ -399,7 +404,7 @@ class ScreenCapture {
         try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
 
         stream = scStream
-        debugLog("Stream configured: \(width)x\(height) @ \(fps)fps (with delegate)")
+        debugLog("Stream configured: \(width)x\(height) @ \(fps)fps queueDepth=\(config.queueDepth) (with delegate)")
     }
 
     // MARK: - Shared frame handler (used by both startStreaming and restartStream)
