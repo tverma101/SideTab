@@ -2,8 +2,16 @@ name: Android build and tests
 
 on:
   push:
+    paths:
+      - 'AndroidClient/**'
+      - 'VERSION'
+      - '.github/workflows/build-android.yml'
   pull_request:
     branches: [main]
+    paths:
+      - 'AndroidClient/**'
+      - 'VERSION'
+      - '.github/workflows/build-android.yml'
   workflow_dispatch:
 
 permissions:
