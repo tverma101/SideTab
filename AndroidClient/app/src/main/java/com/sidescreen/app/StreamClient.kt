@@ -1160,7 +1160,9 @@ class StreamClient(
         private const val VIDEO_PROBE_INTERVAL_NS = 3_000_000_000L
         private const val VIDEO_PROBE_TIMEOUT_NS = 6_000_000_000L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
-        private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
+        // Five-second wireless GOP on the Mac plus one second of scheduling/
+        // decode slack. Decoder reset/error paths request keyframes directly.
+        private const val KEYFRAME_STALE_INTERVAL_NS = 6_000_000_000L
         private const val COALESCED_INPUT_BURST = 2
         private const val TOUCH_ACTION_MOVE = 1
 
