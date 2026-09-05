@@ -12,9 +12,11 @@ final class WirelessTransportPressureTests: XCTestCase {
 
         WirelessTransportPressure.beginSend(generation: generation)
         XCTAssertTrue(WirelessTransportPressure.shouldPauseEncoding)
+        XCTAssertEqual(.pause, WirelessTransportPressure.captureAdmission)
 
         WirelessTransportPressure.completeSend(generation: generation)
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding)
+        XCTAssertEqual(.normal, WirelessTransportPressure.captureAdmission)
     }
 
     func testLowTcpHeadroomCreatesOnlyBoundedPause() {
@@ -30,7 +32,9 @@ final class WirelessTransportPressureTests: XCTestCase {
         )
 
         XCTAssertTrue(WirelessTransportPressure.shouldPauseEncoding(at: now + 1))
+        XCTAssertEqual(.pause, WirelessTransportPressure.captureAdmission(at: now + 1))
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 20_000_000))
+        XCTAssertEqual(.normal, WirelessTransportPressure.captureAdmission(at: now + 20_000_000))
     }
 
     func testFrameThatWouldConsumeTcpReservePausesNextEncode() {
@@ -39,9 +43,7 @@ final class WirelessTransportPressureTests: XCTestCase {
         let now: UInt64 = 1_500_000_000
 
         // There is technically room for this 64 KiB frame now, but sending it
-        // would leave only 16 KiB. The encoder should stop before producing the
-        // next dependent frame instead of discovering the near-full socket one
-        // frame too late.
+        // would leave only 16 KiB. Stop before encoding another dependent frame.
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
             availableBytes: 80 * 1024,
@@ -51,6 +53,24 @@ final class WirelessTransportPressureTests: XCTestCase {
 
         XCTAssertTrue(WirelessTransportPressure.shouldPauseEncoding(at: now + 1))
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 20_000_000))
+    }
+
+    func testReserveTracksCurrentFrameSizeNotOnlyFixedFloor() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        let now: UInt64 = 1_650_000_000
+
+        // 120 KiB available can hold the current 64 KiB frame, but leaves only
+        // 56 KiB. The old fixed 32 KiB reserve would admit more work here; the
+        // new policy preserves room for roughly one comparable next frame.
+        WirelessTransportPressure.observeSendBuffer(
+            generation: generation,
+            availableBytes: 120 * 1024,
+            frameBytes: 64 * 1024,
+            nowNs: now
+        )
+
+        XCTAssertTrue(WirelessTransportPressure.shouldPauseEncoding(at: now + 1))
     }
 
     func testHealthyProjectedHeadroomDoesNotPause() {
@@ -95,21 +115,32 @@ final class WirelessTransportPressureTests: XCTestCase {
         WirelessTransportPressure.setReady(generation: oldGeneration)
         let oldMarker = WirelessTransportPressure.noteForcedCapturePending()
         XCTAssertEqual(oldGeneration, oldMarker)
-        XCTAssertTrue(WirelessTransportPressure.forcedCapturePending)
+        XCTAssertEqual(.forced, WirelessTransportPressure.captureAdmission)
 
         let newGeneration = WirelessTransportPressure.reset(wireless: true)
         WirelessTransportPressure.setReady(generation: newGeneration)
         let newMarker = WirelessTransportPressure.noteForcedCapturePending()
         XCTAssertEqual(newGeneration, newMarker)
-        XCTAssertTrue(WirelessTransportPressure.forcedCapturePending)
+        XCTAssertEqual(.forced, WirelessTransportPressure.captureAdmission)
 
         // A delayed encode from the retired transport cannot consume the new
         // session's recovery admission.
         WirelessTransportPressure.clearForcedCapturePending(generation: oldGeneration)
-        XCTAssertTrue(WirelessTransportPressure.forcedCapturePending)
+        XCTAssertEqual(.forced, WirelessTransportPressure.captureAdmission)
 
         WirelessTransportPressure.clearForcedCapturePending(generation: newGeneration)
-        XCTAssertFalse(WirelessTransportPressure.forcedCapturePending)
+        XCTAssertEqual(.normal, WirelessTransportPressure.captureAdmission)
+    }
+
+    func testForcedAdmissionOverridesActivePressure() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        WirelessTransportPressure.beginSend(generation: generation)
+        WirelessTransportPressure.beginSend(generation: generation)
+        XCTAssertEqual(.pause, WirelessTransportPressure.captureAdmission)
+
+        XCTAssertEqual(generation, WirelessTransportPressure.noteForcedCapturePending())
+        XCTAssertEqual(.forced, WirelessTransportPressure.captureAdmission)
     }
 
     func testUsbIgnoresBothSubmissionAndSendBufferPressure() {
@@ -125,7 +156,7 @@ final class WirelessTransportPressureTests: XCTestCase {
             nowNs: 100
         )
         XCTAssertNil(WirelessTransportPressure.noteForcedCapturePending())
-        XCTAssertFalse(WirelessTransportPressure.forcedCapturePending)
+        XCTAssertEqual(.normal, WirelessTransportPressure.captureAdmission(at: 101))
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: 101))
     }
 
