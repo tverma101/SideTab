@@ -121,8 +121,34 @@ class VideoDecoder(
         }
     }
 
-    private fun setupDecoder() {
+    /** Every MediaCodec instance is a fresh decoder generation. */
+    private fun resetDecoderGenerationState() {
+        availableInputBuffers.clear()
         frameTimingWindow.reset()
+        frameCount = 0L
+        droppedFrames = 0L
+        staleOutputDrops = 0L
+        lastStatsTime = System.currentTimeMillis()
+        inputFrameCount = 0L
+        outputFrameCount = 0L
+        queuedInputCount = 0L
+        stallReported = false
+        imageUnavailableSignalled = false
+        needsKeyframe = true
+        // A fresh decoder must be allowed to request its initial IDR
+        // immediately even if the previous generation requested one moments ago.
+        lastKeyframeRequestNs = 0L
+        inputBufferWaitCount = 0L
+        inputBufferWaitSumNs = 0L
+        inputBufferWaitMaxNs = 0L
+        inputBufferWaitTimeouts = 0L
+        latencySumNs = 0L
+        latencySamples = 0
+        latencyMaxNs = 0L
+    }
+
+    private fun setupDecoder() {
+        resetDecoderGenerationState()
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
 
@@ -649,16 +675,27 @@ class VideoDecoder(
     fun release() {
         isRunning = false
         frameTimingWindow.reset()
+        availableInputBuffers.clear()
+
+        // stop() can throw when MediaCodec is already in an error state. Keep
+        // release/thread teardown independent so a failed stop cannot leak the
+        // codec or its callback looper across a reconnect/surface recreation.
+        val codec = decoder
+        decoder = null
         try {
-            availableInputBuffers.clear()
-            decoder?.stop()
-            decoder?.release()
-            decoder = null
-            decoderThread?.quitSafely()
-            decoderThread = null
-            decoderHandler = null
-        } catch (_: Exception) {
+            codec?.stop()
+        } catch (e: Exception) {
+            diagLog("Decoder stop failed during release: ${e.message}")
         }
+        try {
+            codec?.release()
+        } catch (e: Exception) {
+            diagLog("Decoder release failed: ${e.message}")
+        }
+
+        decoderThread?.quitSafely()
+        decoderThread = null
+        decoderHandler = null
     }
 
     companion object {
