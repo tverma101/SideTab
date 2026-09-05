@@ -149,19 +149,21 @@ class VideoDecoder(
 
     private fun setupDecoder() {
         resetDecoderGenerationState()
-        decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
-        decoderHandler = Handler(decoderThread!!.looper)
 
-        // Find a decoder that supports our resolution (prefer HW, fallback to SW)
+        // Construct MediaCodec before starting the callback thread. Codec
+        // creation can fail on unsupported/broken vendor implementations; in
+        // that case there is no HandlerThread to leak.
         val decoderName = findBestDecoder(currentWidth, currentHeight)
         diagLog("setupDecoder: ${currentWidth}x$currentHeight, decoder=$decoderName")
-
         val codec =
             if (decoderName != null) {
                 MediaCodec.createByCodecName(decoderName)
             } else {
                 MediaCodec.createDecoderByType(mime)
             }
+
+        decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
+        decoderHandler = Handler(decoderThread!!.looper)
 
         val callback =
             object : MediaCodec.Callback() {
@@ -284,11 +286,28 @@ class VideoDecoder(
             }
         }
 
-        codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
-        needsKeyframe = true
-        isRunning = true
-        codec.start()
-        decoder = codec
+        try {
+            codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+            codec.start()
+            decoder = codec
+            isRunning = true
+        } catch (e: Exception) {
+            // Startup is transactional: never expose a half-started decoder as
+            // running, and never leak its vendor resources/callback looper.
+            isRunning = false
+            decoder = null
+            try {
+                codec.release()
+            } catch (releaseError: Exception) {
+                diagLog("Decoder release after startup failure also failed: ${releaseError.message}")
+            }
+            decoderThread?.quitSafely()
+            decoderThread = null
+            decoderHandler = null
+            diagLog("Decoder start failed: ${e.message}")
+            throw e
+        }
+
         diagLog(
             "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
                 "surface=$surface, valid=${surface.isValid}",
