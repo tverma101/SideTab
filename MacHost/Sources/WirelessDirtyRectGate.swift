@@ -39,23 +39,19 @@ enum WirelessDirtyRectGate {
         wireless: Bool,
         frameHasChanges: Bool?,
         mutatesCapturedPixels: Bool,
-        transportPressured: Bool = WirelessTransportPressure.shouldPauseEncoding,
-        forcedCapturePending: Bool = WirelessTransportPressure.forcedCapturePending
+        captureAdmission: WirelessTransportPressure.CaptureAdmission = WirelessTransportPressure.captureAdmission
     ) -> Bool {
         guard wireless else { return false }
 
-        // Startup/recovery IDRs must cut through congestion and must also be
-        // allowed on a visually static desktop. VideoEncoder clears this marker
-        // only for the transport generation that requested it.
-        if forcedCapturePending {
+        // One atomic transport snapshot decides whether this exact captured
+        // frame is routine, pressure-gated, or the recovery frame that must pass.
+        switch captureAdmission {
+        case .forced:
             return false
-        }
-
-        // This call site runs before synthetic pattern/dither/HDR processing and
-        // before the encode queue. Dropping here saves the expensive work that
-        // VideoEncoder's later pressure check used to discover too late.
-        if transportPressured {
+        case .pause:
             return true
+        case .normal:
+            break
         }
 
         guard !mutatesCapturedPixels else { return false }
