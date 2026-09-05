@@ -1,0 +1,45 @@
+name: macOS build and tests
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Swift unit tests
+        working-directory: MacHost
+        run: swift test
+
+      - name: Build release arm64
+        working-directory: MacHost
+        run: swift build -c release --arch arm64
+
+      - name: Build release x86_64
+        working-directory: MacHost
+        run: swift build -c release --arch x86_64
+
+      - name: Assemble universal binary
+        working-directory: MacHost
+        run: |
+          mkdir -p .build/release-universal
+          lipo -create \
+            .build/arm64-apple-macosx/release/SideScreen \
+            .build/x86_64-apple-macosx/release/SideScreen \
+            -output .build/release-universal/SideScreen
+          lipo -archs .build/release-universal/SideScreen | grep -q arm64
+          lipo -archs .build/release-universal/SideScreen | grep -q x86_64
