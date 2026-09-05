@@ -202,18 +202,26 @@ class VideoEncoder {
     func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
         guard let session = compressionSession else { return }
 
-        let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
-
-        // Use system uptime clock — MUST match DispatchTime.now().uptimeNanoseconds
-        let captureNanos = DispatchTime.now().uptimeNanoseconds
-        let refconValue = UnsafeMutableRawPointer.allocate(byteCount: 8, alignment: 8)
-        refconValue.storeBytes(of: captureNanos, as: UInt64.self)
-
+        // Consume the force request first: recovery/startup keyframes must cut
+        // through congestion. Routine captures, however, can be skipped safely
+        // BEFORE VideoToolbox sees them when the wireless sender is backed up.
         let shouldForceKeyframe = stateLock.withLock { state -> Bool in
             guard state.pendingForceKeyframe else { return false }
             state.pendingForceKeyframe = false
             return true
         }
+        if !shouldForceKeyframe && WirelessTransportPressure.shouldPauseEncoding {
+            return
+        }
+
+        let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
+
+        // Use system uptime clock — MUST match DispatchTime.now().uptimeNanoseconds.
+        // Allocate only for frames that actually enter VideoToolbox.
+        let captureNanos = DispatchTime.now().uptimeNanoseconds
+        let refconValue = UnsafeMutableRawPointer.allocate(byteCount: 8, alignment: 8)
+        refconValue.storeBytes(of: captureNanos, as: UInt64.self)
+
         let frameProperties: CFDictionary? = shouldForceKeyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             : nil
@@ -244,6 +252,9 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
     guard status == noErr,
           let sampleBuffer = sampleBuffer,
           let refcon = outputCallbackRefCon else {
+        if let sourceFrameRefCon {
+            sourceFrameRefCon.deallocate()
+        }
         return
     }
 
