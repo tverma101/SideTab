@@ -493,6 +493,9 @@ class VideoDecoder(
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
             submitted = true
+            if (isKeyframe) {
+                needsKeyframe = false
+            }
             queuedInputCount++
             if (queuedInputCount == STALL_DETECT_INPUT_FRAMES && outputFrameCount == 0L && !stallReported) {
                 stallReported = true
@@ -504,9 +507,6 @@ class VideoDecoder(
                 needsKeyframe = true
                 requestKeyframe("decoder stalled", force = true)
                 onDecoderStalled?.invoke()
-            }
-            if (isKeyframe) {
-                needsKeyframe = false
             }
         } catch (e: Exception) {
             // onInputBufferAvailable transfers ownership of this index to us.
