@@ -157,6 +157,7 @@ class StreamingServer {
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
+            params.serviceClass = .interactiveVideo
 
             // Optimize TCP for low-latency streaming
             if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
@@ -203,6 +204,7 @@ class StreamingServer {
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
+            params.serviceClass = .responsiveData
             if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
                 tcpOptions.noDelay = true
             }
@@ -1273,6 +1275,14 @@ class StreamingServer {
             isKeyframe: isKeyframe,
             usesMetadata: frameUsesMetadata
         )
+        if pressureGeneration != 0,
+           let tcpMetadata = connection.metadata(definition: NWProtocolTCP.definition) as? NWProtocolTCP.Metadata {
+            WirelessTransportPressure.observeSendBuffer(
+                generation: pressureGeneration,
+                availableBytes: tcpMetadata.availableSendBuffer,
+                frameBytes: data.count
+            )
+        }
         frameSendsInFlight += 1
         if pressureGeneration != 0 {
             WirelessTransportPressure.beginSend(generation: pressureGeneration)
