@@ -297,6 +297,13 @@ If Side Screen is useful to you, consider supporting development:
 
 ---
 
+## Privacy
+
+Side Screen does not request or collect device location. See [PRIVACY.md](PRIVACY.md)
+for the exact permissions and data-flow boundary.
+
+---
+
 ## License
 
 [MIT License](LICENSE) — free for personal and commercial use.
