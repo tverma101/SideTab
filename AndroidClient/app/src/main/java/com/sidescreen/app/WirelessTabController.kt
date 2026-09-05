@@ -192,6 +192,10 @@ class WirelessTabController(
 
             is StreamClient.WirelessConnectError.TokenRejected -> {
                 invalidateRecovery(rearm = false)
+                // The Mac has cryptographically told us this credential is no
+                // longer valid. Keeping it would make a later tab refresh look
+                // "paired" again and invite another doomed reconnect.
+                storage.clear()
                 views.repairTitle.text = "⚠ Re-pair required"
                 views.repairMessage.text =
                     if (cached != null) {
