@@ -19,12 +19,18 @@ enum WirelessTransportPressure {
         var pauseUntilNs: UInt64 = 0
         var lastAvailableSendBuffer: UInt32?
         var forcedCapturePending = false
+        var largeSendOutstanding = false
     }
 
     private static let lock = NSLock()
     private static var state = State()
     private static let highWatermark = 2
     private static let minimumHeadroomBytes = 32 * 1024
+    // A 256 KiB frame is already ~23 ms of payload at the wireless encoder's
+    // 90 Mbps hard burst ceiling and occupies most of Android's requested
+    // 384 KiB receive window. Do not immediately manufacture another routine
+    // dependent frame behind it; wait for the outstanding send set to drain.
+    private static let largeSendBytes = 256 * 1024
     private static let sendBufferPauseNs: UInt64 = 20_000_000
 
     /// Start a new video transport generation and return its pressure token.
@@ -39,6 +45,7 @@ enum WirelessTransportPressure {
         state.pauseUntilNs = 0
         state.lastAvailableSendBuffer = nil
         state.forcedCapturePending = false
+        state.largeSendOutstanding = false
         return state.generation
     }
 
@@ -61,6 +68,12 @@ enum WirelessTransportPressure {
         defer { lock.unlock() }
         guard state.generation == generation else { return }
         state.sendsInFlight = max(0, state.sendsInFlight - 1)
+        // observeSendBuffer runs immediately before beginSend. Once every send
+        // that was outstanding at/after a large frame has completed, the large
+        // payload can no longer be sitting in our local Network.framework queue.
+        if state.sendsInFlight == 0 {
+            state.largeSendOutstanding = false
+        }
     }
 
     /// Mark that a recovery/startup IDR must be admitted even when routine
@@ -95,7 +108,9 @@ enum WirelessTransportPressure {
         defer { lock.unlock() }
         guard state.wireless, state.ready else { return .normal }
         if state.forcedCapturePending { return .forced }
-        if state.sendsInFlight >= highWatermark || nowNs < state.pauseUntilNs {
+        if state.sendsInFlight >= highWatermark ||
+            state.largeSendOutstanding ||
+            nowNs < state.pauseUntilNs {
             return .pause
         }
         return .normal
@@ -109,9 +124,10 @@ enum WirelessTransportPressure {
     /// a 32 KiB floor), rather than a fixed tiny reserve that becomes ineffective
     /// at the 30–60 Mbps wireless quality tiers.
     ///
-    /// The pause is short and bounded, so a probe frame always gets another
-    /// chance to sample current socket headroom. Forced recovery keyframes still
-    /// bypass this gate in VideoEncoder.
+    /// A single unusually large frame also creates pressure until all currently
+    /// outstanding video sends drain. This specifically prevents a large IDR or
+    /// motion spike from being followed immediately by another routine encode
+    /// merely because frame-count pressure has not reached two yet.
     static func observeSendBuffer(
         generation: UInt64,
         availableBytes: UInt32,
@@ -129,6 +145,10 @@ enum WirelessTransportPressure {
         let reserve = max(UInt64(minimumHeadroomBytes), frame)
         let lowHeadroom = available < frame || residual < reserve
 
+        if frameBytes >= largeSendBytes {
+            state.largeSendOutstanding = true
+        }
+
         if lowHeadroom {
             let deadline = nowNs &+ sendBufferPauseNs
             if deadline > state.pauseUntilNs {
@@ -137,7 +157,7 @@ enum WirelessTransportPressure {
         } else {
             // Fresh evidence that this frame still leaves room for another
             // similarly-sized frame should release an older buffer-pressure hold
-            // immediately. Local sends-in-flight pressure remains independent.
+            // immediately. Send-count and large-payload pressure remain separate.
             state.pauseUntilNs = 0
         }
     }
@@ -152,6 +172,7 @@ enum WirelessTransportPressure {
         state.pauseUntilNs = 0
         state.lastAvailableSendBuffer = nil
         state.forcedCapturePending = false
+        state.largeSendOutstanding = false
         state.wireless = false
     }
 
@@ -167,7 +188,9 @@ enum WirelessTransportPressure {
         lock.lock()
         defer { lock.unlock() }
         guard state.wireless, state.ready else { return false }
-        return state.sendsInFlight >= highWatermark || nowNs < state.pauseUntilNs
+        return state.sendsInFlight >= highWatermark ||
+            state.largeSendOutstanding ||
+            nowNs < state.pauseUntilNs
     }
 
     // Test visibility without exposing mutable state to production callers.
@@ -178,7 +201,8 @@ enum WirelessTransportPressure {
         sendsInFlight: Int,
         pauseUntilNs: UInt64,
         availableSendBuffer: UInt32?,
-        forcedCapturePending: Bool
+        forcedCapturePending: Bool,
+        largeSendOutstanding: Bool
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -189,7 +213,8 @@ enum WirelessTransportPressure {
             state.sendsInFlight,
             state.pauseUntilNs,
             state.lastAvailableSendBuffer,
-            state.forcedCapturePending
+            state.forcedCapturePending,
+            state.largeSendOutstanding
         )
     }
 }
