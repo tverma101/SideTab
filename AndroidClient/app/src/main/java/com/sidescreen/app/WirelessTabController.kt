@@ -147,7 +147,7 @@ class WirelessTabController(
                 port = parsed.port,
                 token = parsed.token,
                 macName = parsed.macName,
-                controlPort = parsed.controlPort,
+                controlPortOverride = parsed.controlPortOverride,
             ),
         )
         discoveryRecoveryArmed = true
