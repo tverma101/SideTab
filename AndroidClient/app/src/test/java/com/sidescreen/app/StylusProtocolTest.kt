@@ -13,30 +13,29 @@ class StylusProtocolTest {
         val bytes =
             StylusProtocol.encode(
                 StylusInputEvent(
-                    x = 0.25f,
-                    y = 0.75f,
+                    x = 0.5f,
+                    y = 1.0f,
                     action = StylusProtocol.ACTION_MOVE,
                     toolType = 2,
-                    pressure = 0.6f,
-                    tilt = 0.4f,
-                    orientation = -0.2f,
-                    buttonState = 64,
+                    pressure = 0.25f,
+                    tilt = -0.5f,
+                    orientation = 1.5f,
+                    buttonState = 0x12345678,
                 ),
             )
 
-        assertEquals(StylusProtocol.EVENT_SIZE, bytes.size)
-        assertEquals(StylusProtocol.STYLUS_EVENT.toByte(), bytes[0])
-        assertEquals(StylusProtocol.ACTION_MOVE.toByte(), bytes[1])
-        assertEquals(2.toByte(), bytes[2])
-
-        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        buffer.position(4)
-        assertEquals(0.25f, buffer.float, 0.0001f)
-        assertEquals(0.75f, buffer.float, 0.0001f)
-        assertEquals(0.6f, buffer.float, 0.0001f)
-        assertEquals(0.4f, buffer.float, 0.0001f)
-        assertEquals(-0.2f, buffer.float, 0.0001f)
-        assertEquals(64, buffer.int)
+        assertArrayEquals(
+            byteArrayOf(
+                0x0e, 0x01, 0x02, 0x00,
+                0x00, 0x00, 0x00, 0x3f,
+                0x00, 0x00, 0x80.toByte(), 0x3f,
+                0x00, 0x00, 0x80.toByte(), 0x3e,
+                0x00, 0x00, 0x00, 0xbf.toByte(),
+                0x00, 0x00, 0xc0.toByte(), 0x3f,
+                0x78, 0x56, 0x34, 0x12,
+            ),
+            bytes,
+        )
     }
 
     @Test
