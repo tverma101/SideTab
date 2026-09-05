@@ -57,6 +57,9 @@ class ControlChannel(
     @Volatile
     private var sessionGeneration = 0L
 
+    @Volatile
+    private var connectionThread: Thread? = null
+
     private data class ActiveTransport(
         val socket: Socket,
         val output: DataOutputStream,
@@ -86,52 +89,79 @@ class ControlChannel(
         get() = tcpActive
 
     fun connect() {
-        synchronized(connectLock) {
-            if (running) return
-            running = true
-        }
-        Thread({ connectionLoop() }, "ControlConnection")
-            .apply {
-                isDaemon = true
-                priority = Thread.MAX_PRIORITY
-            }.start()
+        val thread =
+            synchronized(connectLock) {
+                if (running) return
+                running = true
+                Thread({ connectionLoop() }, "ControlConnection")
+                    .apply {
+                        isDaemon = true
+                        priority = Thread.MAX_PRIORITY
+                        connectionThread = this
+                    }
+            }
+        thread.start()
     }
 
     private fun connectionLoop() {
         var retryDelayMs = INITIAL_RETRY_MS
-        while (running) {
-            if (!tcpActive) {
-                if (tryTcp()) {
-                    retryDelayMs = INITIAL_RETRY_MS
+        try {
+            while (running) {
+                if (!tcpActive) {
+                    if (tryTcp()) {
+                        retryDelayMs = INITIAL_RETRY_MS
+                        continue
+                    }
+                    if (!sleepInterruptibly(retryDelayMs)) {
+                        // A route/socket event is actionable new information;
+                        // retry immediately instead of finishing an obsolete
+                        // exponential-backoff sleep.
+                        retryDelayMs = INITIAL_RETRY_MS
+                        continue
+                    }
+                    retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_RETRY_MS)
                     continue
                 }
-                sleepInterruptibly(retryDelayMs)
-                retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_RETRY_MS)
-                continue
-            }
 
-            // MainActivity already calls sendPing once per second. This slower
-            // safety poll is only a backstop for a ping whose caller disappears
-            // before the next tick; 4 wakeups/sec bought no useful latency.
-            val probe = outstandingPing
-            if (probe != null && System.nanoTime() - probe.sentAtNs > PONG_TIMEOUT_NS) {
-                val active = activeTransport()
-                if (active != null && active.generation == probe.connectionGeneration) {
-                    DiagLog.log("CC", "Control pong timeout — reconnecting")
-                    markTcpInactive(active.socket)
-                } else if (active == null || active.generation != probe.connectionGeneration) {
-                    outstandingPing = null
+                // MainActivity already calls sendPing once per second. This slower
+                // safety poll is only a backstop for a ping whose caller disappears
+                // before the next tick; 4 wakeups/sec bought no useful latency.
+                val probe = outstandingPing
+                if (probe != null && System.nanoTime() - probe.sentAtNs > PONG_TIMEOUT_NS) {
+                    val active = activeTransport()
+                    if (active != null && active.generation == probe.connectionGeneration) {
+                        DiagLog.log("CC", "Control pong timeout — reconnecting")
+                        markTcpInactive(active.socket)
+                    } else if (active == null || active.generation != probe.connectionGeneration) {
+                        outstandingPing = null
+                    }
+                }
+                sleepInterruptibly(HEALTH_POLL_MS)
+            }
+        } finally {
+            synchronized(connectLock) {
+                if (connectionThread === Thread.currentThread()) {
+                    connectionThread = null
                 }
             }
-            sleepInterruptibly(HEALTH_POLL_MS)
         }
     }
 
-    private fun sleepInterruptibly(delayMs: Long) {
+    /** False means an external event woke the loop before the delay elapsed. */
+    private fun sleepInterruptibly(delayMs: Long): Boolean =
         try {
             Thread.sleep(delayMs)
+            true
         } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
+            // Thread.sleep clears the interrupted flag. Do not restore it here:
+            // this interrupt is our intentional wake mechanism, not cancellation.
+            false
+        }
+
+    private fun wakeConnectionLoop() {
+        val thread = connectionThread
+        if (thread != null && thread !== Thread.currentThread()) {
+            thread.interrupt()
         }
     }
 
@@ -289,6 +319,9 @@ class ControlChannel(
             DiagLog.log("CC", "Android network changed $previous -> $network — rebinding control")
             markTcpInactive(activeSocket)
         }
+        // If the channel is between attempts, it may be sleeping in a 5s
+        // backoff. A new Android Network makes that wait obsolete.
+        wakeConnectionLoop()
     }
 
     /** Generations advance only; late cleanup cannot move control backward. */
@@ -463,37 +496,47 @@ class ControlChannel(
     }
 
     private fun markTcpInactive(expectedSocket: Socket) {
-        synchronized(connectLock) {
-            if (socket !== expectedSocket) return
-            connectionGeneration += 1
-            tcpActive = false
-            output = null
-            socket = null
-            outstandingPing = null
-            try {
-                expectedSocket.close()
-            } catch (_: Exception) {
+        val shouldWake =
+            synchronized(connectLock) {
+                if (socket !== expectedSocket) return
+                connectionGeneration += 1
+                tcpActive = false
+                output = null
+                socket = null
+                outstandingPing = null
+                try {
+                    expectedSocket.close()
+                } catch (_: Exception) {
+                }
+                if (running) {
+                    DiagLog.log("CC", "Control channel inactive — reconnecting; in-band fallback active")
+                    true
+                } else {
+                    false
+                }
             }
-            if (running) {
-                DiagLog.log("CC", "Control channel inactive — reconnecting; in-band fallback active")
-            }
-        }
+        if (shouldWake) wakeConnectionLoop()
     }
 
     fun disconnect() {
-        synchronized(connectLock) {
-            running = false
-            connecting = false
-            connectionGeneration += 1
-            tcpActive = false
-            output = null
-            outstandingPing = null
-            val activeSocket = socket
-            socket = null
-            try {
-                activeSocket?.close()
-            } catch (_: Exception) {
+        val thread =
+            synchronized(connectLock) {
+                running = false
+                connecting = false
+                connectionGeneration += 1
+                tcpActive = false
+                output = null
+                outstandingPing = null
+                val activeSocket = socket
+                socket = null
+                try {
+                    activeSocket?.close()
+                } catch (_: Exception) {
+                }
+                connectionThread
             }
+        if (thread != null && thread !== Thread.currentThread()) {
+            thread.interrupt()
         }
     }
 
