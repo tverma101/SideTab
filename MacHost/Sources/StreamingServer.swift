@@ -365,7 +365,9 @@ class StreamingServer {
 
     /// Promote an authenticated connection, replacing the prior client only now.
     private func installControlConnection(_ newConnection: NWConnection, initialBuffer: Data) {
-        controlConnection?.cancel()
+        // Publish the replacement first. A terminal callback from the old
+        // connection is then guaranteed to fail the identity guard below.
+        let oldConnection = controlConnection
         controlInputBuffer = initialBuffer  // fresh storage — never keep poisoned inline slices
         controlAuthenticated = true
         controlTouchCount = 0
@@ -373,6 +375,8 @@ class StreamingServer {
         maxControlTouchGapMs = 0
         clientSupportsBrightness = false
         controlConnection = newConnection
+        oldConnection?.cancel()
+
         let wasAlreadyReady = newConnection.state == .ready
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self, let newConnection else { return }
@@ -610,20 +614,23 @@ class StreamingServer {
         alreadyStarted: Bool = false,
         alreadyAuthenticated: Bool = false,
     ) {
-        // Clean up old connection properly
-        if let oldConnection = connection, oldConnection !== newConnection {
-            isReceiving = false
-            oldConnection.cancel()
-        }
-
+        // Publish the replacement before cancelling the prior client. The old
+        // connection's .cancelled/.failed callback then cannot pass the
+        // identity guard and tear down the promoted connection.
+        let oldConnection = connection
+        connection = newConnection
         connectionReady = false
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
         clientSupportsStylus = false
         clientDecodeLimits = nil
         inputBuffer.removeAll(keepingCapacity: true)
-        connection = newConnection
         resetFrameTransport(newConnection)
+
+        if let oldConnection, oldConnection !== newConnection {
+            isReceiving = false
+            oldConnection.cancel()
+        }
 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self = self else { return }
