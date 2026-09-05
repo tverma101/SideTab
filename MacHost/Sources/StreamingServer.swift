@@ -69,6 +69,12 @@ private extension NWEndpoint {
 }
 
 class StreamingServer {
+    private struct QueuedVideoFrame {
+        let data: Data
+        let timestamp: UInt64
+        let isKeyframe: Bool
+    }
+
     private let port: UInt16
     private var listener: NWListener?
     private var connection: NWConnection?
@@ -114,6 +120,20 @@ class StreamingServer {
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
     private let networkQueue = DispatchQueue(label: "networkQueue", qos: .userInteractive)
+
+    // Frame transport state is confined to frameQueue. Network.framework can
+    // buffer independently from the encoder, so the capture queue's two-frame
+    // encode limit is not sufficient backpressure for TCP delivery.
+    private var frameSendGeneration: UInt64 = 0
+    private var frameSendConnection: NWConnection?
+    private var frameTransportReady = false
+    private var frameWaitingForSync = true
+    private var frameUsesMetadata = false
+    private var frameSendsInFlight = 0
+    private var deferredFrame: QueuedVideoFrame?
+    private static let maxFrameSendsInFlight = 2
+    private static let maxDeferredFrameAgeNs: UInt64 = 250_000_000
+
     private var bytesSent: UInt64 = 0
     private var frameCount: UInt64 = 0
     private var droppedFrames: UInt64 = 0
@@ -126,7 +146,6 @@ class StreamingServer {
     private var isReceiving = false
     private var isStopped = false
     private var connectionReady = false
-    private var waitingForSyncFrame = false
     private var clientSupportsFrameMetadata = false
     private var clientIsAvcOnly = false
     private var clientSupportsStylus = false
@@ -136,7 +155,7 @@ class StreamingServer {
 
     init(port: UInt16, controlPort: UInt16? = nil) {
         self.port = port
-        self.controlPort = controlPort ?? port + 1
+        self.controlPort = controlPort ?? ControlPortResolver.effective(videoPort: port)
     }
 
     func start() {
@@ -602,10 +621,9 @@ class StreamingServer {
         clientIsAvcOnly = false
         clientSupportsStylus = false
         clientDecodeLimits = nil
-        waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
-        droppedFrames = 0
+        resetFrameTransport(newConnection)
 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self = self else { return }
@@ -641,6 +659,45 @@ class StreamingServer {
             // state handler installed above, like a fresh connection.
         } else {
             newConnection.start(queue: networkQueue)
+        }
+    }
+
+    private func resetFrameTransport(_ newConnection: NWConnection) {
+        frameQueue.sync {
+            frameSendGeneration &+= 1
+            frameSendConnection = newConnection
+            frameTransportReady = false
+            frameWaitingForSync = true
+            frameUsesMetadata = false
+            frameSendsInFlight = 0
+            deferredFrame = nil
+            droppedFrames = 0
+            bytesSent = 0
+            frameCount = 0
+            totalFrameAgeNs = 0
+            profiledFrameCount = 0
+            lastStatsTime = DispatchTime.now()
+        }
+    }
+
+    private func markFrameTransportReady(_ expected: NWConnection) {
+        frameQueue.sync {
+            guard frameSendConnection === expected else { return }
+            frameUsesMetadata = clientSupportsFrameMetadata
+            frameTransportReady = true
+        }
+    }
+
+    private func retireFrameTransport(_ expected: NWConnection?) {
+        frameQueue.sync {
+            if let expected, frameSendConnection !== expected { return }
+            frameSendGeneration &+= 1
+            frameSendConnection = nil
+            frameTransportReady = false
+            frameWaitingForSync = true
+            frameUsesMetadata = false
+            frameSendsInFlight = 0
+            deferredFrame = nil
         }
     }
 
@@ -733,8 +790,10 @@ class StreamingServer {
     /// pipeline stops pushing frames into a corpse (the dropped-frame plateau
     /// after "Connection reset by peer"), and report the disconnect once.
     private func markDisconnected() {
+        let disconnectedConnection = connection
         connectionReady = false
         isReceiving = false
+        retireFrameTransport(disconnectedConnection)
         connection = nil
         inputBuffer.removeAll(keepingCapacity: true)
         onClientDisconnected?()
@@ -801,6 +860,7 @@ class StreamingServer {
         debugLog("Client connected - sending display config first")
         sendDisplaySize()
         connectionReady = true
+        markFrameTransportReady(conn)
         debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), codec=\(codec))")
         onClientConnected?()
     }
@@ -1175,40 +1235,117 @@ class StreamingServer {
     }
 
     func sendFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool = false) {
-        guard let connection = connection, !isStopped, connectionReady else { return }
-
-        // With short-GOP encoding, a fresh client must start on a keyframe —
-        // sending P-frames before the first IDR would feed garbage to its decoder.
-        if waitingForSyncFrame {
-            guard isKeyframe else {
-                droppedFrames += 1
-                return
-            }
-            waitingForSyncFrame = false
-            debugLog("First keyframe sent to new client")
-        }
-
-        // No frame-age dropping or backpressure — send everything immediately.
-        // The encode queue depth limit (2 pending) in ScreenCapture handles flow control.
+        let frame = QueuedVideoFrame(data: data, timestamp: timestamp, isKeyframe: isKeyframe)
         frameQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            let packet = self.makeFramePacket(data, timestamp: timestamp, isKeyframe: isKeyframe)
-
-            connection.send(content: packet, completion: .contentProcessed { error in
-                if error != nil {
-                    self.droppedFrames += 1
-                }
-            })
-
-            // Track frame age at send time for pipeline profiling
-            let sendAge = DispatchTime.now().uptimeNanoseconds - timestamp
-            self.updateStats(bytes: data.count, frameAgeNs: sendAge)
+            self?.enqueueFrame(frame)
         }
     }
 
-    private func makeFramePacket(_ data: Data, timestamp: UInt64, isKeyframe: Bool) -> Data {
-        if clientSupportsFrameMetadata {
+    private func enqueueFrame(_ frame: QueuedVideoFrame) {
+        guard !isStopped,
+              frameTransportReady,
+              let connection = frameSendConnection else { return }
+
+        if frameWaitingForSync {
+            guard frame.isKeyframe else {
+                droppedFrames += 1
+                return
+            }
+            frameWaitingForSync = false
+            debugLog("First keyframe accepted for new client")
+        }
+
+        let now = DispatchTime.now().uptimeNanoseconds
+        if !frame.isKeyframe,
+           now >= frame.timestamp,
+           now - frame.timestamp > Self.maxDeferredFrameAgeNs {
+            droppedFrames += 1
+            debugLog("Dropping stale encoded frame age=\((now - frame.timestamp) / 1_000_000)ms")
+            return
+        }
+
+        if frameSendsInFlight >= Self.maxFrameSendsInFlight {
+            if let queued = deferredFrame {
+                // Never replace a waiting keyframe with a newer P-frame. A new
+                // keyframe may replace anything because it is self-contained.
+                if queued.isKeyframe && !frame.isKeyframe {
+                    droppedFrames += 1
+                    return
+                }
+                droppedFrames += 1
+            }
+            deferredFrame = frame
+            return
+        }
+
+        startFrameSend(frame, on: connection, generation: frameSendGeneration)
+    }
+
+    private func startFrameSend(
+        _ frame: QueuedVideoFrame,
+        on connection: NWConnection,
+        generation: UInt64,
+    ) {
+        guard frameTransportReady,
+              frameSendGeneration == generation,
+              frameSendConnection === connection else { return }
+
+        let now = DispatchTime.now().uptimeNanoseconds
+        if !frame.isKeyframe,
+           now >= frame.timestamp,
+           now - frame.timestamp > Self.maxDeferredFrameAgeNs {
+            droppedFrames += 1
+            if let next = deferredFrame {
+                deferredFrame = nil
+                enqueueFrame(next)
+            }
+            return
+        }
+
+        let packet = makeFramePacket(
+            frame.data,
+            timestamp: frame.timestamp,
+            isKeyframe: frame.isKeyframe,
+            usesMetadata: frameUsesMetadata
+        )
+        frameSendsInFlight += 1
+
+        connection.send(content: packet, completion: .contentProcessed { [weak self, weak connection] error in
+            guard let self, let connection else { return }
+            self.frameQueue.async {
+                guard self.frameSendGeneration == generation,
+                      self.frameSendConnection === connection else {
+                    return
+                }
+
+                self.frameSendsInFlight = max(0, self.frameSendsInFlight - 1)
+                if let error {
+                    self.droppedFrames += 1
+                    self.deferredFrame = nil
+                    self.frameTransportReady = false
+                    debugLog("Video send failed: \(error) — cancelling current connection")
+                    connection.cancel()
+                    return
+                }
+
+                if let next = self.deferredFrame {
+                    self.deferredFrame = nil
+                    self.enqueueFrame(next)
+                }
+            }
+        })
+
+        let sendAge = now >= frame.timestamp ? now - frame.timestamp : 0
+        updateStats(bytes: frame.data.count, frameAgeNs: sendAge)
+    }
+
+    private func makeFramePacket(
+        _ data: Data,
+        timestamp: UInt64,
+        isKeyframe: Bool,
+        usesMetadata: Bool
+    ) -> Data {
+        if usesMetadata {
             var packet = Data(capacity: data.count + 14)
             packet.append(WireMessage.videoFrameWithMetadata)
             appendFrameSize(data.count, to: &packet)
@@ -1271,6 +1408,7 @@ class StreamingServer {
     func stop() {
         isStopped = true
         isReceiving = false
+        retireFrameTransport(connection)
 
         // Wait for pending operations before cancelling
         frameQueue.sync {}
