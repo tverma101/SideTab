@@ -206,7 +206,13 @@ class StreamingServer {
 
     private func handleControlConnection(_ newConnection: NWConnection) {
         debugLog("Control connection incoming")
-        let requiresAuth = expectedAuthToken != nil && !newConnection.endpoint.isLoopback
+        let isLoopback = newConnection.endpoint.isLoopback
+        if !isLoopback && expectedAuthToken == nil {
+            debugLog("Rejecting non-loopback control candidate: wireless mode not active")
+            newConnection.cancel()
+            return
+        }
+        let requiresAuth = !isLoopback
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self, let newConnection else { return }
             switch state {
