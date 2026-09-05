@@ -2,20 +2,31 @@ package com.sidescreen.app
 
 import android.content.Context
 import android.util.Log
+import java.io.BufferedWriter
 import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
+import java.util.ArrayDeque
 import java.util.concurrent.Executors
 
 /**
  * Shared diagnostic file logger for debugging on devices that suppress logcat.
- * Writes to app-private files directory. Log file is capped at 1MB to prevent unbounded growth.
+ * File I/O is asynchronous and batched so a reconnect/decoder-log burst does
+ * not translate into one open/seek/write/close cycle per message.
  */
 object DiagLog {
     private const val TAG = "DiagLog"
     private const val LOG_FILE = "diag.log"
     private const val MAX_LOG_SIZE = 1_048_576L // 1MB
+    private const val MAX_PENDING_LINES = 1024
+    private const val MAX_BATCH_LINES = 256
 
     @Volatile
     private var logFile: File? = null
+
+    private val queueLock = Any()
+    private val pendingLines = ArrayDeque<String>()
+    private var drainScheduled = false
 
     private val logExecutor =
         Executors.newSingleThreadExecutor { runnable ->
@@ -34,18 +45,60 @@ object DiagLog {
         msg: String,
     ) {
         Log.d(tag, msg)
-        val f = logFile ?: return
-        logExecutor.execute {
-            try {
-                // Rotate if too large
-                if (f.exists() && f.length() > MAX_LOG_SIZE) {
-                    val backup = File(f.parent, "diag.log.old")
-                    backup.delete()
-                    f.renameTo(backup)
+        if (logFile == null) return
+
+        val line = "[${System.currentTimeMillis()}] $tag: $msg\n"
+        val shouldSchedule =
+            synchronized(queueLock) {
+                // Diagnostics must never become an unbounded producer queue.
+                // Preserve the newest context during a pathological burst.
+                while (pendingLines.size >= MAX_PENDING_LINES) {
+                    pendingLines.removeFirst()
                 }
-                f.appendText("[${System.currentTimeMillis()}] $tag: $msg\n")
+                pendingLines.addLast(line)
+                if (drainScheduled) {
+                    false
+                } else {
+                    drainScheduled = true
+                    true
+                }
+            }
+        if (shouldSchedule) {
+            logExecutor.execute(::drainLoop)
+        }
+    }
+
+    private fun drainLoop() {
+        while (true) {
+            val batch =
+                synchronized(queueLock) {
+                    if (pendingLines.isEmpty()) {
+                        drainScheduled = false
+                        return
+                    }
+                    val count = minOf(MAX_BATCH_LINES, pendingLines.size)
+                    ArrayList<String>(count).also { lines ->
+                        repeat(count) { lines.add(pendingLines.removeFirst()) }
+                    }
+                }
+
+            val file = logFile ?: continue
+            try {
+                rotateIfNeeded(file)
+                BufferedWriter(OutputStreamWriter(FileOutputStream(file, true), Charsets.UTF_8)).use { writer ->
+                    for (line in batch) writer.write(line)
+                    writer.flush()
+                }
             } catch (_: Exception) {
+                // Diagnostics are best-effort and must never affect streaming.
             }
         }
+    }
+
+    private fun rotateIfNeeded(file: File) {
+        if (!file.exists() || file.length() <= MAX_LOG_SIZE) return
+        val backup = File(file.parentFile, "diag.log.old")
+        backup.delete()
+        file.renameTo(backup)
     }
 }
