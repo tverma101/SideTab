@@ -439,7 +439,6 @@ class StreamingServer {
                 return
             }
             if let data = data, !data.isEmpty {
-                debugLog("Control receive \(data.count)B")
                 self.controlInputBuffer.append(data)
                 self.processControlBuffer(connection: connection)
             }
@@ -1268,8 +1267,8 @@ class StreamingServer {
 
         let generation = frameSendGeneration
         let pressureGeneration = framePressureGeneration
-        let packet = makeFramePacket(
-            data,
+        let header = makeFrameHeader(
+            size: data.count,
             timestamp: timestamp,
             isKeyframe: isKeyframe,
             usesMetadata: frameUsesMetadata
@@ -1279,60 +1278,81 @@ class StreamingServer {
             WirelessTransportPressure.beginSend(generation: pressureGeneration)
         }
 
-        connection.send(content: packet, completion: .contentProcessed { [weak self, weak connection] error in
-            guard let self, let connection else { return }
-
-            // Pressure completion is generation-fenced independently, so an old
-            // NWConnection callback can never reduce the replacement's count.
-            if pressureGeneration != 0 {
-                WirelessTransportPressure.completeSend(generation: pressureGeneration)
-            }
-
-            self.frameQueue.async {
-                guard self.frameSendGeneration == generation,
-                      self.frameSendConnection === connection else {
-                    return
+        // Avoid copying the entire encoded frame merely to prepend a 5/14-byte
+        // protocol header. Network.framework keeps content in one logical
+        // defaultMessage context: the header is incomplete and the existing
+        // encoder Data completes it. batch() lets the stack coalesce both send
+        // submissions while preserving the exact TCP byte stream.
+        connection.batch {
+            connection.send(
+                content: header,
+                contentContext: .defaultMessage,
+                isComplete: false,
+                completion: .contentProcessed { [weak connection] error in
+                    if let error {
+                        debugLog("Video header send failed: \(error) — cancelling current connection")
+                        connection?.cancel()
+                    }
                 }
+            )
+            connection.send(
+                content: data,
+                contentContext: .defaultMessage,
+                isComplete: true,
+                completion: .contentProcessed { [weak self, weak connection] error in
+                    guard let self, let connection else { return }
 
-                self.frameSendsInFlight = max(0, self.frameSendsInFlight - 1)
-                if let error {
-                    self.droppedFrames += 1
-                    self.frameTransportReady = false
-                    debugLog("Video send failed: \(error) — cancelling current connection")
-                    connection.cancel()
+                    // Pressure completion is generation-fenced independently,
+                    // so an old callback can never reduce the replacement count.
+                    if pressureGeneration != 0 {
+                        WirelessTransportPressure.completeSend(generation: pressureGeneration)
+                    }
+
+                    self.frameQueue.async {
+                        guard self.frameSendGeneration == generation,
+                              self.frameSendConnection === connection else {
+                            return
+                        }
+
+                        self.frameSendsInFlight = max(0, self.frameSendsInFlight - 1)
+                        if let error {
+                            self.droppedFrames += 1
+                            self.frameTransportReady = false
+                            debugLog("Video payload send failed: \(error) — cancelling current connection")
+                            connection.cancel()
+                        }
+                    }
                 }
-            }
-        })
+            )
+        }
 
         let now = DispatchTime.now().uptimeNanoseconds
         let sendAge = now >= timestamp ? now - timestamp : 0
         updateStats(bytes: data.count, frameAgeNs: sendAge)
     }
 
-    private func makeFramePacket(
-        _ data: Data,
+    private func makeFrameHeader(
+        size: Int,
         timestamp: UInt64,
         isKeyframe: Bool,
         usesMetadata: Bool
     ) -> Data {
         if usesMetadata {
-            var packet = Data(capacity: data.count + 14)
-            packet.append(WireMessage.videoFrameWithMetadata)
-            appendFrameSize(data.count, to: &packet)
-            packet.append(isKeyframe ? 1 : 0)
+            var header = Data(capacity: 14)
+            header.append(WireMessage.videoFrameWithMetadata)
+            appendFrameSize(size, to: &header)
+            header.append(isKeyframe ? 1 : 0)
             var captureTimestamp = timestamp.bigEndian
-            withUnsafeBytes(of: &captureTimestamp) { packet.append(contentsOf: $0) }
-            packet.append(data)
-            return packet
+            withUnsafeBytes(of: &captureTimestamp) { header.append(contentsOf: $0) }
+            return header
         }
 
-        // Keep legacy frame type 0 for clients that do not advertise
-        // metadata support; remove after legacy clients age out.
-        var packet = Data(capacity: data.count + 5)
-        packet.append(WireMessage.legacyVideoFrame)
-        appendFrameSize(data.count, to: &packet)
-        packet.append(data)
-        return packet
+        // Keep legacy frame type 0 for clients that do not advertise metadata
+        // support; remove after legacy clients age out.
+        var header = Data(capacity: 5)
+        header.append(WireMessage.legacyVideoFrame)
+        appendFrameSize(size, to: &header)
+        return header
     }
 
     private func appendFrameSize(_ size: Int, to packet: inout Data) {
