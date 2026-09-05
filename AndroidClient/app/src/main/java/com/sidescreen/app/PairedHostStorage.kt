@@ -21,53 +21,68 @@ class PairedHostStorage(context: Context) {
         val port: Int,
         val token: ByteArray,
         val macName: String,
-        val controlPort: Int = (port + 1).coerceAtMost(65535),
+        /** null means derive the dedicated control endpoint as videoPort + 1. */
+        val controlPortOverride: Int? = null,
     ) {
+        fun effectiveControlPort(): Int? =
+            controlPortOverride ?: (port + 1).takeIf { it <= 65535 }
+
         override fun equals(other: Any?): Boolean {
             if (other !is Entry) return false
             return host == other.host &&
                 port == other.port &&
-                controlPort == other.controlPort &&
+                controlPortOverride == other.controlPortOverride &&
                 macName == other.macName &&
                 token.contentEquals(other.token)
         }
 
         override fun hashCode(): Int =
-            ((((host.hashCode() * 31 + port) * 31 + controlPort) * 31 + macName.hashCode()) * 31) +
+            ((((host.hashCode() * 31 + port) * 31 + (controlPortOverride ?: 0)) * 31 + macName.hashCode()) * 31) +
                 token.contentHashCode()
     }
 
     fun save(entry: Entry) {
         require(entry.port in 1..65535) { "invalid video port" }
-        require(entry.controlPort in 1..65535) { "invalid control port" }
+        require(entry.effectiveControlPort() != null) { "invalid derived control port" }
+        entry.controlPortOverride?.let {
+            require(it in 1..65535) { "invalid control port override" }
+        }
+
         val encrypted = encrypt(entry.token)
-        prefs.edit()
-            .putString("host", entry.host)
-            .putInt("port", entry.port)
-            .putInt("control_port", entry.controlPort)
-            .putString("token_ciphertext_b64", encode(encrypted.ciphertext))
-            .putString("token_iv_b64", encode(encrypted.iv))
-            .putString("mac_name", entry.macName)
-            .remove("token_b64")
-            .apply()
+        val editor =
+            prefs.edit()
+                .putString("host", entry.host)
+                .putInt("port", entry.port)
+                .putString("token_ciphertext_b64", encode(encrypted.ciphertext))
+                .putString("token_iv_b64", encode(encrypted.iv))
+                .putString("mac_name", entry.macName)
+                .remove("token_b64")
+        if (entry.controlPortOverride != null) {
+            editor.putInt("control_port_override", entry.controlPortOverride)
+        } else {
+            editor.remove("control_port_override")
+        }
+        // Remove the short-lived absolute-port key from the stabilization
+        // branch if a build containing it was ever installed.
+        editor.remove("control_port")
+        editor.apply()
     }
 
     fun load(): Entry? {
         val host = prefs.getString("host", null) ?: return null
         val port = prefs.getInt("port", -1).takeIf { it in 1..65535 } ?: return null
-        val storedControlPort = prefs.getInt("control_port", -1)
-        val controlPort =
-            if (storedControlPort in 1..65535) {
-                storedControlPort
-            } else {
-                (port + 1).takeIf { it <= 65535 } ?: return null
-            }
+        val storedControlOverride = prefs.getInt("control_port_override", -1)
+        val controlPortOverride = storedControlOverride.takeIf { it in 1..65535 }
+        if (controlPortOverride == null && port == 65535) return null
+
         val macName = prefs.getString("mac_name", null) ?: "Mac"
         val token =
             loadEncryptedToken()
-                ?: loadLegacyToken()?.also { migrate(host, port, controlPort, it, macName) }
+                ?: loadLegacyToken()?.also {
+                    migrate(host, port, controlPortOverride, it, macName)
+                }
         return token?.takeIf { it.size == TOKEN_SIZE }?.let {
-            Entry(host, port, it, macName, controlPort)
+            Entry(host, port, it, macName, controlPortOverride)
         }
     }
 
@@ -104,12 +119,12 @@ class PairedHostStorage(context: Context) {
     private fun migrate(
         host: String,
         port: Int,
-        controlPort: Int,
+        controlPortOverride: Int?,
         token: ByteArray,
         macName: String,
     ) {
         try {
-            save(Entry(host, port, token, macName, controlPort))
+            save(Entry(host, port, token, macName, controlPortOverride))
         } catch (_: Exception) {
             // Keep the legacy value if Keystore initialization is temporarily
             // unavailable; the next load can retry the migration.
