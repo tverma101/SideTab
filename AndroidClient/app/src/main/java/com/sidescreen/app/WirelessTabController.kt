@@ -7,11 +7,12 @@ import android.widget.Button
 import android.widget.TextView
 
 /**
- * Five-state UI machine for the Wireless tab on Android.
+ * Six-state UI machine for the Wireless tab on Android.
  *
  *   ① first-time → ② scanning (QRScannerActivity) → ③ connected
- *                                         ↘ ④ token mismatch / re-pair
- *   ⓹ permission denied permanently
+ *                                         ↘ ④ paired/idle
+ *                                         ↘ ⑤ repair needed
+ *   ⑥ permission denied permanently
  */
 class WirelessTabController(
     private val activity: Activity,
@@ -82,8 +83,14 @@ class WirelessTabController(
     }
 
     /**
-     * Called when the TCP stream goes down. If StreamClient exhausts its
-     * transparent retry window, this leaves a clean manual recovery surface.
+     * Called only for an involuntary terminal stream loss. MainActivity bumps
+     * its connection generation before an explicit user Disconnect, so that
+     * callback is fenced out before it reaches this controller.
+     *
+     * Try the token-bound Bonjour identity immediately. This is also the
+     * reliable handoff from StreamClient's direct-IP retry loop: MainActivity
+     * clears its dead client on the false status callback, so the later thrown
+     * NetworkUnreachable error is intentionally stale and may be ignored.
      */
     fun onStreamDisconnected() {
         android.util.Log.i(
@@ -95,9 +102,11 @@ class WirelessTabController(
                 transition(State.FIRST_TIME)
                 return
             }
-        views.idleMacName.text = entry.macName
-        views.idleMacIp.text = "${entry.host}:${entry.port}"
-        transition(State.PAIRED_IDLE)
+
+        if (tryDiscoveryRecovery(entry)) {
+            return
+        }
+        showNetworkRepair(entry)
     }
 
     private fun transition(next: State) {
