@@ -1,5 +1,6 @@
 package com.sidescreen.app
 
+import android.net.Network
 import android.os.Process
 import java.io.BufferedInputStream
 import java.io.DataInputStream
@@ -16,10 +17,12 @@ import java.nio.ByteOrder
  * TCP-only. Wireless control connections begin with the pairing token; the
  * loopback USB reverse-forward remains unauthenticated because it terminates
  * on the local device. The channel's own connection carries nothing but
- * pings/pongs, so a pong is never queued behind video frames (the in-band path's ~40-1000ms
- * spikes under load). The tunnel's TCP carriage stall was fixed by replacing
- * toybox nc (no TCP_NODELAY) with a NODELAY relay on the tablet side, so a
- * dedicated TCP control connection now rides at true tunnel latency.
+ * control/input traffic, so a pong or S Pen event is never queued behind video
+ * frames on the main stream.
+ *
+ * The channel is deliberately self-healing. A video session can survive a
+ * control-port restart, Wi-Fi roam, NAT/ARP hiccup, or half-open TCP socket;
+ * while control reconnects, callers transparently use the in-band fallback.
  *
  * Wire format (little-endian):
  *   client -> server: PING     = [type 4][clientTs 8]
@@ -33,24 +36,37 @@ class ControlChannel(
     private val host: String,
     private val port: Int,
     authToken: ByteArray? = null,
+    network: Network? = null,
 ) {
     private val authPreamble = byteArrayOf(0x53, 0x53, 0x57, 0x43) // "SSWC"
+
     @Volatile
-    private var controlAuthToken: ByteArray? = authToken
+    private var controlAuthToken: ByteArray? = authToken?.clone()
+
+    @Volatile
+    private var boundNetwork: Network? = network
 
     var onLatencyMeasured: ((Double) -> Unit)? = null
 
     /** Server→client brightness command: 0..255, apply to the REAL panel. */
     var onBrightnessCommand: ((Int) -> Unit)? = null
 
-    // TCP path
     private var socket: Socket? = null
     private var output: DataOutputStream? = null
+
     @Volatile
     private var tcpActive = false
 
+    /** Desired lifetime of the channel, not the state of the current socket. */
     @Volatile
     private var running = false
+
+    @Volatile
+    private var connecting = false
+
+    /** First ping for which no pong has arrived yet; zero means none outstanding. */
+    @Volatile
+    private var firstUnansweredPingAtNs = 0L
 
     private val sendLock = Any()
     private val connectLock = Any()
@@ -58,58 +74,121 @@ class ControlChannel(
     val isConnected: Boolean
         get() = tcpActive
 
-    /** Best-effort, one attempt per stream session; failures fall back to in-band messages. */
+    /**
+     * Start (or keep) the self-healing control channel. Idempotent.
+     * Connection failures never fail the video session; they retry with capped
+     * backoff while callers use the in-band fallback.
+     */
     fun connect() {
         synchronized(connectLock) {
             if (running) return
             running = true
         }
-        Thread({ tryTcp() }, "ControlConnection")
+        Thread({ connectionLoop() }, "ControlConnection")
             .apply {
                 isDaemon = true
                 priority = Thread.MAX_PRIORITY
             }.start()
     }
 
-    private fun tryTcp() {
-        synchronized(connectLock) {
-            if (!running || socket != null) return
-            val s = Socket()
-            try {
-                // Bounded connect: never let the control path hang the caller.
-                s.connect(InetSocketAddress(host, port), 2000)
-                s.tcpNoDelay = true
-                socket = s
-                val controlOutput = DataOutputStream(s.getOutputStream())
-                output = controlOutput
-                // Active from connect, NOT from the first pong: StreamClient
-                // only pings via control when isConnected, so waiting for a
-                // pong before declaring active deadlocks the first ping.
-                writeAuthenticationPreamble(controlOutput)
-                // An idle control channel is valid while the tablet is
-                // backgrounded or between pings. A short read timeout would
-                // permanently disable this channel after a few quiet seconds
-                // and make the next foreground ping fall back to stale
-                // in-band traffic. Socket close/disconnect and the next ping
-                // write still detect a dead peer.
-                s.soTimeout = 0
-                tcpActive = true
-                DiagLog.log("CC", "Control channel ACTIVE mode=tcp")
-                declareBrightnessSupport()
-                Thread({ tcpReadLoop(s) }, "ControlTcpThread")
-                    .apply { isDaemon = true }
-                    .start()
-            } catch (e: Exception) {
-                DiagLog.log("CC", "Control channel TCP connect failed: ${e.javaClass.simpleName}: ${e.message}")
-                socket = null
-                output = null
-                tcpActive = false
-                running = false
-                try {
-                    s.close()
-                } catch (_: Exception) {
+    private fun connectionLoop() {
+        var retryDelayMs = INITIAL_RETRY_MS
+        while (running) {
+            if (!tcpActive) {
+                if (tryTcp()) {
+                    retryDelayMs = INITIAL_RETRY_MS
+                    continue
+                }
+                sleepInterruptibly(retryDelayMs)
+                retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_RETRY_MS)
+                continue
+            }
+
+            // A quiet control channel is valid. Only declare it half-open when
+            // we actually sent a ping and failed to receive its pong for long
+            // enough; background/idle periods therefore never trip the timer.
+            val unansweredAt = firstUnansweredPingAtNs
+            if (unansweredAt != 0L && System.nanoTime() - unansweredAt > PONG_TIMEOUT_NS) {
+                val activeSocket = synchronized(connectLock) { socket }
+                if (activeSocket != null) {
+                    DiagLog.log("CC", "Control pong timeout — reconnecting")
+                    markTcpInactive(activeSocket)
                 }
             }
+            sleepInterruptibly(HEALTH_POLL_MS)
+        }
+    }
+
+    private fun sleepInterruptibly(delayMs: Long) {
+        try {
+            Thread.sleep(delayMs)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    /** One bounded connection attempt. Never holds connectLock across I/O. */
+    private fun tryTcp(): Boolean {
+        synchronized(connectLock) {
+            if (!running || tcpActive || socket != null || connecting) return tcpActive
+            connecting = true
+        }
+
+        val s = Socket()
+        return try {
+            boundNetwork?.let { network ->
+                network.bindSocket(s)
+                DiagLog.log("CC", "Control socket bound to Android network $network")
+            }
+            s.tcpNoDelay = true
+            s.keepAlive = true
+            s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+            val controlOutput = DataOutputStream(s.getOutputStream())
+            writeAuthenticationPreamble(controlOutput)
+            // Idle is legitimate. Half-open detection is ping-driven above.
+            s.soTimeout = 0
+
+            synchronized(connectLock) {
+                connecting = false
+                if (!running || socket != null) {
+                    try {
+                        s.close()
+                    } catch (_: Exception) {
+                    }
+                    return false
+                }
+                socket = s
+                output = controlOutput
+                tcpActive = true
+                firstUnansweredPingAtNs = 0L
+            }
+
+            DiagLog.log("CC", "Control channel ACTIVE mode=tcp")
+            declareBrightnessSupport()
+            Thread({ tcpReadLoop(s) }, "ControlTcpThread")
+                .apply {
+                    isDaemon = true
+                    priority = Thread.MAX_PRIORITY
+                }.start()
+            true
+        } catch (e: Exception) {
+            synchronized(connectLock) {
+                connecting = false
+                if (socket === s) {
+                    socket = null
+                    output = null
+                    tcpActive = false
+                }
+            }
+            DiagLog.log(
+                "CC",
+                "Control channel TCP connect failed: ${e.javaClass.simpleName}: ${e.message}",
+            )
+            try {
+                s.close()
+            } catch (_: Exception) {
+            }
+            false
         }
     }
 
@@ -130,6 +209,7 @@ class ControlChannel(
                         val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                         val clientTs = bb.long
                         bb.long // server send timestamp; RTT uses the echoed client timestamp.
+                        firstUnansweredPingAtNs = 0L
                         val rtt = (arrival - clientTs) / 1_000_000.0
                         val processedAt = System.nanoTime()
                         val appDelay = (processedAt - arrival) / 1_000_000.0
@@ -142,10 +222,6 @@ class ControlChannel(
                                 rtt - appDelay,
                             ),
                         )
-                        if (!tcpActive) {
-                            tcpActive = true
-                            DiagLog.log("CC", "Control channel ACTIVE mode=tcp")
-                        }
                         onLatencyMeasured?.invoke(rtt)
                     }
 
@@ -156,7 +232,7 @@ class ControlChannel(
                     }
 
                     else -> {
-                        DiagLog.log("CC", "Unknown control type $type — disconnecting")
+                        DiagLog.log("CC", "Unknown control type $type — reconnecting")
                         return
                     }
                 }
@@ -170,9 +246,14 @@ class ControlChannel(
         }
     }
 
-    /** Set the token used for the next control-channel connection. */
+    /** Set the token used for subsequent control-channel connections. */
     fun setAuthToken(token: ByteArray?) {
         controlAuthToken = token?.clone()
+    }
+
+    /** Bind subsequent control sockets to the same Android Network as video. */
+    fun setNetwork(network: Network?) {
+        boundNetwork = network
     }
 
     private fun writeAuthenticationPreamble(out: DataOutputStream) {
@@ -187,22 +268,24 @@ class ControlChannel(
 
     /** Tell the server we understand BRIGHT (type 11). Old servers log-only. */
     private fun declareBrightnessSupport() {
-        val out = output ?: return
+        val activeSocket = synchronized(connectLock) { socket } ?: return
+        val out = synchronized(connectLock) { output } ?: return
         synchronized(sendLock) {
             try {
                 out.write(byteArrayOf(3))
                 out.flush()
                 DiagLog.log("CC", "Declared brightness support")
             } catch (e: Exception) {
-                DiagLog.log("CC", "Brightness declaration failed: ${e.message}")
+                DiagLog.log("CC", "Brightness declaration failed: ${e.javaClass.simpleName}: ${e.message}")
+                markTcpInactive(activeSocket)
             }
         }
     }
 
     /** Returns false when the caller should use its in-band fallback. */
     fun sendPing(): Boolean {
-        val activeSocket = socket ?: return false
-        val out = output ?: return false
+        val activeSocket = synchronized(connectLock) { socket } ?: return false
+        val out = synchronized(connectLock) { output } ?: return false
         val ts = System.nanoTime()
         synchronized(sendLock) {
             return try {
@@ -211,6 +294,7 @@ class ControlChannel(
                 buffer.putLong(ts)
                 out.write(buffer.array())
                 out.flush()
+                if (firstUnansweredPingAtNs == 0L) firstUnansweredPingAtNs = ts
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control ping write failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -222,8 +306,8 @@ class ControlChannel(
 
     /** Returns false when the caller should use its in-band fallback. */
     fun requestKeyframe(force: Boolean): Boolean {
-        val activeSocket = socket ?: return false
-        val out = output ?: return false
+        val activeSocket = synchronized(connectLock) { socket } ?: return false
+        val out = synchronized(connectLock) { output } ?: return false
         synchronized(sendLock) {
             return try {
                 out.write(byteArrayOf(7.toByte(), if (force) 1 else 0))
@@ -246,8 +330,8 @@ class ControlChannel(
         x2: Float,
         y2: Float,
     ): Boolean {
-        val activeSocket = socket ?: return false
-        val out = output ?: return false
+        val activeSocket = synchronized(connectLock) { socket } ?: return false
+        val out = synchronized(connectLock) { output } ?: return false
         val count = pointerCount.coerceIn(1, 2)
         val buffer = ByteBuffer.allocate(6 + count * 8).order(ByteOrder.LITTLE_ENDIAN)
         buffer.put(2.toByte())
@@ -275,8 +359,8 @@ class ControlChannel(
 
     /** Send one negotiated S Pen event without passing through touch gestures. */
     fun sendStylus(event: StylusInputEvent): Boolean {
-        val activeSocket = socket ?: return false
-        val out = output ?: return false
+        val activeSocket = synchronized(connectLock) { socket } ?: return false
+        val out = synchronized(connectLock) { output } ?: return false
         val bytes = StylusProtocol.encode(event)
         synchronized(sendLock) {
             return try {
@@ -297,13 +381,13 @@ class ControlChannel(
             tcpActive = false
             output = null
             socket = null
+            firstUnansweredPingAtNs = 0L
             try {
                 expectedSocket.close()
             } catch (_: Exception) {
             }
             if (running) {
-                running = false
-                DiagLog.log("CC", "Control channel inactive — using in-band fallback until next Connect")
+                DiagLog.log("CC", "Control channel inactive — reconnecting; in-band fallback active")
             }
         }
     }
@@ -311,8 +395,10 @@ class ControlChannel(
     fun disconnect() {
         synchronized(connectLock) {
             running = false
+            connecting = false
             tcpActive = false
             output = null
+            firstUnansweredPingAtNs = 0L
             val activeSocket = socket
             socket = null
             try {
@@ -322,4 +408,11 @@ class ControlChannel(
         }
     }
 
+    private companion object {
+        const val CONNECT_TIMEOUT_MS = 2_000
+        const val INITIAL_RETRY_MS = 250L
+        const val MAX_RETRY_MS = 5_000L
+        const val HEALTH_POLL_MS = 250L
+        const val PONG_TIMEOUT_NS = 4_000_000_000L
+    }
 }
