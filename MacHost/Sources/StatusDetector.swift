@@ -14,7 +14,11 @@ enum StatusDetector {
     }
 
     /// Run `adb devices`, return list of device serials in `device` state.
+    /// Wireless mode never needs this subprocess; AppDelegate refreshes status
+    /// every two seconds, so avoiding it removes recurring process churn from
+    /// the capture/encode workload.
     static func usbDevices() -> [String] {
+        guard !wirelessModeActive else { return [] }
         guard let adbPath = adbExecutablePath() else { return [] }
         let task = Process()
         task.executableURL = URL(fileURLWithPath: adbPath)
@@ -38,8 +42,33 @@ enum StatusDetector {
     }
 
     /// Heuristic: parse `adb reverse --list` for `tcp:<port> tcp:<port>`.
+    /// The status refresh asks for video and control ports back-to-back; cache
+    /// the command output briefly so those two checks share one adb process.
     static func adbReverseConfigured(port: Int) -> Bool {
-        guard let adbPath = adbExecutablePath() else { return false }
+        guard !wirelessModeActive else { return false }
+        guard let output = reverseListOutput() else { return false }
+        return output.contains("tcp:\(port) tcp:\(port)")
+    }
+
+    private static var wirelessModeActive: Bool {
+        UserDefaults.standard.string(forKey: "SideScreen_connectionMode") == "wireless"
+    }
+
+    private static let cacheLock = NSLock()
+    private static var cachedReverseList = ""
+    private static var lastReverseListCheck: Date = .distantPast
+    private static let reverseListCacheSeconds: TimeInterval = 0.75
+
+    private static func reverseListOutput() -> String? {
+        cacheLock.lock()
+        if Date().timeIntervalSince(lastReverseListCheck) < reverseListCacheSeconds {
+            let cached = cachedReverseList
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+
+        guard let adbPath = adbExecutablePath() else { return nil }
         let task = Process()
         task.executableURL = URL(fileURLWithPath: adbPath)
         task.arguments = ["reverse", "--list"]
@@ -50,11 +79,16 @@ enum StatusDetector {
             try task.run()
             task.waitUntilExit()
         } catch {
-            return false
+            return nil
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
-        return output.contains("tcp:\(port) tcp:\(port)")
+
+        cacheLock.lock()
+        cachedReverseList = output
+        lastReverseListCheck = Date()
+        cacheLock.unlock()
+        return output
     }
 
     private static var cachedAdbPath: String?
