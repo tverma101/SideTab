@@ -69,12 +69,6 @@ private extension NWEndpoint {
 }
 
 class StreamingServer {
-    private struct QueuedVideoFrame {
-        let data: Data
-        let timestamp: UInt64
-        let isKeyframe: Bool
-    }
-
     private let port: UInt16
     private var listener: NWListener?
     private var connection: NWConnection?
@@ -121,18 +115,18 @@ class StreamingServer {
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
     private let networkQueue = DispatchQueue(label: "networkQueue", qos: .userInteractive)
 
-    // Frame transport state is confined to frameQueue. Network.framework can
-    // buffer independently from the encoder, so the capture queue's two-frame
-    // encode limit is not sufficient backpressure for TCP delivery.
+    // Encoded frames are never dropped after VideoToolbox emits them: ordinary
+    // H.264/HEVC P-frames may reference earlier P-frames. Instead, the pressure
+    // generation below feeds WirelessTransportPressure, and VideoEncoder skips
+    // future routine captures before they enter the codec when two sends remain
+    // outstanding. This preserves the reference chain and avoids wasted encode.
     private var frameSendGeneration: UInt64 = 0
+    private var framePressureGeneration: UInt64 = 0
     private var frameSendConnection: NWConnection?
     private var frameTransportReady = false
     private var frameWaitingForSync = true
     private var frameUsesMetadata = false
     private var frameSendsInFlight = 0
-    private var deferredFrame: QueuedVideoFrame?
-    private static let maxFrameSendsInFlight = 2
-    private static let maxDeferredFrameAgeNs: UInt64 = 250_000_000
 
     private var bytesSent: UInt64 = 0
     private var frameCount: UInt64 = 0
@@ -671,13 +665,16 @@ class StreamingServer {
 
     private func resetFrameTransport(_ newConnection: NWConnection) {
         frameQueue.sync {
+            if framePressureGeneration != 0 {
+                WirelessTransportPressure.retire(generation: framePressureGeneration)
+            }
             frameSendGeneration &+= 1
+            framePressureGeneration = WirelessTransportPressure.reset(wireless: !newConnection.endpoint.isLoopback)
             frameSendConnection = newConnection
             frameTransportReady = false
             frameWaitingForSync = true
             frameUsesMetadata = false
             frameSendsInFlight = 0
-            deferredFrame = nil
             droppedFrames = 0
             bytesSent = 0
             frameCount = 0
@@ -692,19 +689,24 @@ class StreamingServer {
             guard frameSendConnection === expected else { return }
             frameUsesMetadata = clientSupportsFrameMetadata
             frameTransportReady = true
+            WirelessTransportPressure.setReady(generation: framePressureGeneration)
         }
     }
 
     private func retireFrameTransport(_ expected: NWConnection?) {
         frameQueue.sync {
             if let expected, frameSendConnection !== expected { return }
+            let pressureGeneration = framePressureGeneration
             frameSendGeneration &+= 1
+            framePressureGeneration = 0
             frameSendConnection = nil
             frameTransportReady = false
             frameWaitingForSync = true
             frameUsesMetadata = false
             frameSendsInFlight = 0
-            deferredFrame = nil
+            if pressureGeneration != 0 {
+                WirelessTransportPressure.retire(generation: pressureGeneration)
+            }
         }
     }
 
@@ -1242,19 +1244,21 @@ class StreamingServer {
     }
 
     func sendFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool = false) {
-        let frame = QueuedVideoFrame(data: data, timestamp: timestamp, isKeyframe: isKeyframe)
         frameQueue.async { [weak self] in
-            self?.enqueueFrame(frame)
+            self?.sendEncodedFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }
     }
 
-    private func enqueueFrame(_ frame: QueuedVideoFrame) {
+    private func sendEncodedFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool) {
         guard !isStopped,
               frameTransportReady,
               let connection = frameSendConnection else { return }
 
+        // Before the first sync frame there is no decoder reference chain yet,
+        // so ignoring P-frames is safe. Once an IDR has been sent, every encoded
+        // frame is preserved in order until the connection succeeds or fails.
         if frameWaitingForSync {
-            guard frame.isKeyframe else {
+            guard isKeyframe else {
                 droppedFrames += 1
                 return
             }
@@ -1262,63 +1266,28 @@ class StreamingServer {
             debugLog("First keyframe accepted for new client")
         }
 
-        let now = DispatchTime.now().uptimeNanoseconds
-        if !frame.isKeyframe,
-           now >= frame.timestamp,
-           now - frame.timestamp > Self.maxDeferredFrameAgeNs {
-            droppedFrames += 1
-            debugLog("Dropping stale encoded frame age=\((now - frame.timestamp) / 1_000_000)ms")
-            return
-        }
-
-        if frameSendsInFlight >= Self.maxFrameSendsInFlight {
-            if let queued = deferredFrame {
-                // Never replace a waiting keyframe with a newer P-frame. A new
-                // keyframe may replace anything because it is self-contained.
-                if queued.isKeyframe && !frame.isKeyframe {
-                    droppedFrames += 1
-                    return
-                }
-                droppedFrames += 1
-            }
-            deferredFrame = frame
-            return
-        }
-
-        startFrameSend(frame, on: connection, generation: frameSendGeneration)
-    }
-
-    private func startFrameSend(
-        _ frame: QueuedVideoFrame,
-        on connection: NWConnection,
-        generation: UInt64,
-    ) {
-        guard frameTransportReady,
-              frameSendGeneration == generation,
-              frameSendConnection === connection else { return }
-
-        let now = DispatchTime.now().uptimeNanoseconds
-        if !frame.isKeyframe,
-           now >= frame.timestamp,
-           now - frame.timestamp > Self.maxDeferredFrameAgeNs {
-            droppedFrames += 1
-            if let next = deferredFrame {
-                deferredFrame = nil
-                enqueueFrame(next)
-            }
-            return
-        }
-
+        let generation = frameSendGeneration
+        let pressureGeneration = framePressureGeneration
         let packet = makeFramePacket(
-            frame.data,
-            timestamp: frame.timestamp,
-            isKeyframe: frame.isKeyframe,
+            data,
+            timestamp: timestamp,
+            isKeyframe: isKeyframe,
             usesMetadata: frameUsesMetadata
         )
         frameSendsInFlight += 1
+        if pressureGeneration != 0 {
+            WirelessTransportPressure.beginSend(generation: pressureGeneration)
+        }
 
         connection.send(content: packet, completion: .contentProcessed { [weak self, weak connection] error in
             guard let self, let connection else { return }
+
+            // Pressure completion is generation-fenced independently, so an old
+            // NWConnection callback can never reduce the replacement's count.
+            if pressureGeneration != 0 {
+                WirelessTransportPressure.completeSend(generation: pressureGeneration)
+            }
+
             self.frameQueue.async {
                 guard self.frameSendGeneration == generation,
                       self.frameSendConnection === connection else {
@@ -1328,22 +1297,16 @@ class StreamingServer {
                 self.frameSendsInFlight = max(0, self.frameSendsInFlight - 1)
                 if let error {
                     self.droppedFrames += 1
-                    self.deferredFrame = nil
                     self.frameTransportReady = false
                     debugLog("Video send failed: \(error) — cancelling current connection")
                     connection.cancel()
-                    return
-                }
-
-                if let next = self.deferredFrame {
-                    self.deferredFrame = nil
-                    self.enqueueFrame(next)
                 }
             }
         })
 
-        let sendAge = now >= frame.timestamp ? now - frame.timestamp : 0
-        updateStats(bytes: frame.data.count, frameAgeNs: sendAge)
+        let now = DispatchTime.now().uptimeNanoseconds
+        let sendAge = now >= timestamp ? now - timestamp : 0
+        updateStats(bytes: data.count, frameAgeNs: sendAge)
     }
 
     private func makeFramePacket(
@@ -1400,7 +1363,7 @@ class StreamingServer {
             // Log pipeline latency profile
             if profiledFrameCount > 0 {
                 let avgAgeMs = Double(totalFrameAgeNs) / Double(profiledFrameCount) / 1_000_000.0
-                debugLog("Pipeline: \(String(format: "%.1f", fps))fps, \(String(format: "%.1f", mbps))Mbps, avg frame age: \(String(format: "%.1f", avgAgeMs))ms, dropped: \(droppedFrames)")
+                debugLog("Pipeline: \(String(format: "%.1f", fps))fps, \(String(format: "%.1f", mbps))Mbps, avg frame age: \(String(format: "%.1f", avgAgeMs))ms, dropped: \(droppedFrames), sendInFlight: \(frameSendsInFlight)")
             }
 
             bytesSent = 0
