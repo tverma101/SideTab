@@ -250,22 +250,15 @@ private let plausibleFrameAgeNs: UInt64 = 60_000_000_000
 private func frameTimestampNanoseconds(_ sampleBuffer: CMSampleBuffer) -> UInt64 {
     let now = DispatchTime.now().uptimeNanoseconds
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-    guard pts.flags.contains(.valid),
-          !pts.flags.contains(.indefinite),
-          !pts.flags.contains(.positiveInfinity),
-          !pts.flags.contains(.negativeInfinity),
-          pts.timescale > 0 else {
-        return now
-    }
+    guard pts.isNumeric else { return now }
 
-    let converted = CMTimeConvertScale(
-        pts,
-        timescale: 1_000_000_000,
-        method: .default
-    )
-    guard converted.value >= 0 else { return now }
-    let ptsNs = UInt64(converted.value)
-    guard ptsNs <= now, now - ptsNs <= plausibleFrameAgeNs else { return now }
+    let seconds = pts.seconds
+    guard seconds.isFinite, seconds >= 0 else { return now }
+    let ptsNsDouble = seconds * 1_000_000_000.0
+    guard ptsNsDouble <= Double(now) else { return now }
+
+    let ptsNs = UInt64(ptsNsDouble.rounded())
+    guard now - ptsNs <= plausibleFrameAgeNs else { return now }
     return ptsNs
 }
 
