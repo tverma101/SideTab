@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -22,6 +23,35 @@ import java.nio.ByteOrder
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
+private fun resolveControlPort(
+    context: Context?,
+    videoHost: String,
+    videoPort: Int,
+    requestedControlHost: String,
+    requestedControlPort: Int,
+): Int {
+    val derivedControlPort = videoPort + 1
+
+    // Explicit constructor overrides (notably the E3/ADB path) always win.
+    if (requestedControlHost != videoHost || requestedControlPort != derivedControlPort) {
+        return requestedControlPort
+    }
+
+    // Wireless MainActivity intentionally keeps the simple StreamClient(host,
+    // port) call. Resolve an optional QR-persisted override here so old callers
+    // and the USB path do not need a second control-port plumbing surface.
+    val paired =
+        try {
+            context?.let { PairedHostStorage(it).load() }
+        } catch (_: Exception) {
+            null
+        }
+    if (paired != null && paired.host == videoHost && paired.port == videoPort) {
+        paired.effectiveControlPort()?.let { return it }
+    }
+    return requestedControlPort
+}
+
 class StreamClient(
     private val host: String,
     private val port: Int,
@@ -29,7 +59,25 @@ class StreamClient(
     controlHost: String = host,
     controlPort: Int = port + 1,
 ) {
+    private data class TransportSnapshot(
+        val generation: Long,
+        val socket: Socket,
+        val output: DataOutputStream,
+    )
+
+    private data class VideoProbe(
+        val generation: Long,
+        val sentAtNs: Long,
+    )
+
+    private val transportLock = Any()
     private var socket: Socket? = null
+    private var inputStream: DataInputStream? = null
+    private var outputStream: DataOutputStream? = null
+
+    /** Every installed/retired video TCP transport gets a different identity. */
+    @Volatile
+    private var transportGeneration = 0L
 
     @Volatile
     private var pendingSocket: Socket? = null
@@ -37,17 +85,17 @@ class StreamClient(
     @Volatile
     private var connectionAttemptCancelled = false
 
-    private var inputStream: DataInputStream? = null
-    private var outputStream: java.io.DataOutputStream? = null
-
     @Volatile
     private var isConnected = false
+
+    private val effectiveControlPort =
+        resolveControlPort(context, host, port, controlHost, controlPort)
 
     /**
      * Dedicated out-of-band control channel (ping/pong + keyframe/input).
      * It self-heals independently and falls back in-band while unavailable.
      */
-    private val controlChannel = ControlChannel(controlHost, controlPort)
+    private val controlChannel = ControlChannel(controlHost, effectiveControlPort)
 
     // Callback includes actual frame size (may differ from buffer.size due to pooling),
     // receive timestamp, and whether the frame can restart HEVC decoding.
@@ -63,15 +111,18 @@ class StreamClient(
     var onBrightness: ((Int) -> Unit)? = null
 
     /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
-    @Volatile var streamCodecIsHevc = true
+    @Volatile
+    var streamCodecIsHevc = true
         private set
 
     /** True once a MESSAGE_CODEC_SELECTED arrived — distinguishes new Macs from old. */
-    @Volatile var codecNegotiated = false
+    @Volatile
+    var codecNegotiated = false
         private set
 
     /** True only after the connected Mac explicitly accepts stylus events. */
-    @Volatile var stylusSupported = false
+    @Volatile
+    var stylusSupported = false
         private set
 
     private var bytesReceived = 0L
@@ -80,6 +131,7 @@ class StreamClient(
     private var frameCallbackAccumNs = 0L
     private var frameCallbackSamples = 0
     private var lastStatsTime = System.currentTimeMillis()
+
     private val keyframeRequestLock = Any()
     private var lastKeyframeRequestNs = 0L
     private var lastKeyframeReceivedNs = 0L
@@ -90,7 +142,7 @@ class StreamClient(
      * uncongested, and a half-open video read can otherwise block forever.
      */
     private val videoProbeLock = Any()
-    private var videoProbeOutstandingNs = 0L
+    private var videoProbeOutstanding: VideoProbe? = null
     private var lastVideoProbeSentNs = 0L
 
     // Buffer pooling to reduce GC pressure from per-frame allocations.
@@ -145,7 +197,6 @@ class StreamClient(
             connectionAttemptCancelled = false
             controlChannel.setAuthToken(null)
             controlChannel.setNetwork(null)
-            var announcedConnected = false
             try {
                 val s = Socket()
                 pendingSocket = s
@@ -157,18 +208,17 @@ class StreamClient(
                     s.close()
                     return@withContext
                 }
-                installConnectedSocket(s)
-                announcedConnected = true
-                diagLog("Connected to $host:$port")
+
+                val generation = installConnectedSocket(s)
+                diagLog("Connected to $host:$port control=$effectiveControlPort generation=$generation")
                 onConnectionStatus?.invoke(true)
                 connectControlChannel()
-                receiveData()
+                receiveData(generation)
             } catch (e: Exception) {
                 if (!connectionAttemptCancelled) {
                     Log.e(TAG, "❌ Connection error", e)
                 }
             } finally {
-                isConnected = false
                 cleanupTransport(stopControl = true)
                 shutdownTouchExecutor()
                 if (!connectionAttemptCancelled) {
@@ -192,7 +242,6 @@ class StreamClient(
      * not masquerade as retries. After one successful session, ordinary TCP or
      * Wi-Fi loss is retried on the same StreamClient with capped exponential
      * backoff. The input executor is intentionally kept alive across retries.
-     * Explicit Disconnect cancels the pending socket and exits immediately.
      */
     suspend fun connectWireless(
         token: ByteArray,
@@ -211,31 +260,29 @@ class StreamClient(
         try {
             while (!connectionAttemptCancelled) {
                 try {
-                    openWirelessTransport(token, deviceName)
+                    val generation = openWirelessTransport(token, deviceName)
                     if (connectionAttemptCancelled) break
 
                     val wasReconnect = everConnected
                     everConnected = true
                     reconnectAttempt = 0
-                    isConnected = true
                     diagLog(
                         if (wasReconnect) {
-                            "Wireless session recovered to $host:$port"
+                            "Wireless session recovered to $host:$port control=$effectiveControlPort generation=$generation"
                         } else {
-                            "Wireless connected to $host:$port"
+                            "Wireless connected to $host:$port control=$effectiveControlPort generation=$generation"
                         },
                     )
                     onConnectionStatus?.invoke(true)
                     connectControlChannel()
 
-                    // Returns only on EOF/unknown protocol or throws on I/O.
-                    receiveData()
+                    // Returns only on disconnect or throws on I/O/protocol loss.
+                    receiveData(generation)
                     if (!connectionAttemptCancelled) {
                         throw IOException("Wireless stream ended")
                     }
                 } catch (e: WirelessConnectError) {
                     cleanupTransport(stopControl = false)
-                    isConnected = false
                     if (!everConnected ||
                         e is WirelessConnectError.TokenRejected ||
                         e is WirelessConnectError.ProtocolError
@@ -245,7 +292,6 @@ class StreamClient(
                     terminalError = e
                 } catch (e: IOException) {
                     cleanupTransport(stopControl = false)
-                    isConnected = false
                     if (!everConnected) {
                         throw WirelessConnectError.NetworkUnreachable
                     }
@@ -267,7 +313,6 @@ class StreamClient(
                 delay(delayMs)
             }
         } finally {
-            isConnected = false
             cleanupTransport(stopControl = true)
             shutdownTouchExecutor()
         }
@@ -276,8 +321,7 @@ class StreamClient(
             return@withContext
         }
 
-        // The false status callback intentionally drives the controller's
-        // terminal-drop Bonjour recovery before this error reaches the caller.
+        // This callback intentionally drives terminal-drop Bonjour recovery.
         if (everConnected) {
             onConnectionStatus?.invoke(false)
         }
@@ -288,7 +332,7 @@ class StreamClient(
     private fun openWirelessTransport(
         token: ByteArray,
         deviceName: String,
-    ) {
+    ): Long {
         Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
         val connectingSocket = Socket()
         pendingSocket = connectingSocket
@@ -318,7 +362,7 @@ class StreamClient(
 
         if (connectionAttemptCancelled) {
             closePending(connectingSocket)
-            return
+            throw WirelessConnectError.NetworkUnreachable
         }
 
         connectingSocket.soTimeout = HANDSHAKE_TIMEOUT_MS
@@ -346,7 +390,7 @@ class StreamClient(
                 if (count <= 0) break
                 read += count
             }
-        } catch (e: SocketTimeoutException) {
+        } catch (_: SocketTimeoutException) {
             closePending(connectingSocket)
             throw WirelessConnectError.NetworkUnreachable
         } catch (_: IOException) {
@@ -356,7 +400,7 @@ class StreamClient(
 
         if (connectionAttemptCancelled) {
             closePending(connectingSocket)
-            return
+            throw WirelessConnectError.NetworkUnreachable
         }
         if (read != responseBuf.size) {
             closePending(connectingSocket)
@@ -369,8 +413,12 @@ class StreamClient(
         }
         Log.i(TAG, "connectWireless: handshake response status=$status")
 
-        when (status) {
+        return when (status) {
             AuthHandshake.ResponseStatus.OK -> {
+                if (connectionAttemptCancelled) {
+                    closePending(connectingSocket)
+                    throw WirelessConnectError.NetworkUnreachable
+                }
                 connectingSocket.soTimeout = 0
                 clearPendingSocket(connectingSocket)
                 installConnectedSocket(connectingSocket)
@@ -407,10 +455,24 @@ class StreamClient(
         }
     }
 
-    private fun installConnectedSocket(s: Socket) {
-        socket = s
-        inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
-        outputStream = java.io.DataOutputStream(s.getOutputStream())
+    /** Install one authenticated video transport and return its generation. */
+    private fun installConnectedSocket(s: Socket): Long {
+        val input = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
+        val output = DataOutputStream(s.getOutputStream())
+        val generation =
+            synchronized(transportLock) {
+                transportGeneration += 1
+                socket = s
+                inputStream = input
+                outputStream = output
+                isConnected = true
+                transportGeneration
+            }
+
+        // Atomically fence the persistent control socket against any input task
+        // queued for the prior video session.
+        controlChannel.setSessionGeneration(generation)
+
         streamCodecIsHevc = true
         codecNegotiated = false
         stylusSupported = false
@@ -424,12 +486,33 @@ class StreamClient(
         lastStatsTime = System.currentTimeMillis()
 
         // MUST precede type 8: type 8 can trigger the server's early protocol finish.
-        advertiseAvcOnlyIfNeeded()
-        advertiseDecoderLimits()
-        advertiseStylusSupport()
-        advertiseFrameMetadataSupport()
-        isConnected = true
+        advertiseAvcOnlyIfNeeded(output)
+        advertiseDecoderLimits(output)
+        advertiseStylusSupport(output)
+        advertiseFrameMetadataSupport(output)
+        return generation
     }
+
+    private fun currentTransport(): TransportSnapshot? =
+        synchronized(transportLock) {
+            if (!isConnected) return@synchronized null
+            val activeSocket = socket ?: return@synchronized null
+            val activeOutput = outputStream ?: return@synchronized null
+            TransportSnapshot(transportGeneration, activeSocket, activeOutput)
+        }
+
+    private fun isTransportCurrent(snapshot: TransportSnapshot): Boolean =
+        synchronized(transportLock) {
+            isConnected &&
+                transportGeneration == snapshot.generation &&
+                socket === snapshot.socket &&
+                outputStream === snapshot.output
+        }
+
+    private fun isTransportGenerationCurrent(generation: Long): Boolean =
+        synchronized(transportLock) {
+            isConnected && transportGeneration == generation
+        }
 
     private fun clearPendingSocket(expected: Socket) {
         if (pendingSocket === expected) pendingSocket = null
@@ -454,63 +537,59 @@ class StreamClient(
         controlChannel.connect()
     }
 
-    private fun advertiseFrameMetadataSupport() {
-        outputStream?.let { out ->
-            out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
-            out.flush()
-            diagLog("Advertised frame metadata support")
-        }
+    private fun advertiseFrameMetadataSupport(out: DataOutputStream) {
+        out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
+        out.flush()
+        diagLog("Advertised frame metadata support")
     }
 
-    private fun advertiseStylusSupport() {
-        outputStream?.let { out ->
-            out.writeByte(MESSAGE_CLIENT_SUPPORTS_STYLUS)
-            out.flush()
-            diagLog("Advertised S Pen stylus support")
-        }
+    private fun advertiseStylusSupport(out: DataOutputStream) {
+        out.writeByte(MESSAGE_CLIENT_SUPPORTS_STYLUS)
+        out.flush()
+        diagLog("Advertised S Pen stylus support")
     }
 
-    private fun advertiseAvcOnlyIfNeeded() {
+    private fun advertiseAvcOnlyIfNeeded(out: DataOutputStream) {
         if (CodecCapabilities.hasHevcDecoder) return
-        outputStream?.let { out ->
-            out.writeByte(MESSAGE_CLIENT_AVC_ONLY)
-            out.flush()
-            diagLog("Advertised AVC-only (no HEVC decoder on this device)")
-        }
+        out.writeByte(MESSAGE_CLIENT_AVC_ONLY)
+        out.flush()
+        diagLog("Advertised AVC-only (no HEVC decoder on this device)")
     }
 
-    private fun advertiseDecoderLimits() {
+    private fun advertiseDecoderLimits(out: DataOutputStream) {
         val (maxW, maxH) = CodecCapabilities.maxDecodeSize(CodecCapabilities.streamMime) ?: return
         val w = maxW.coerceAtMost(16383)
         val h = maxH.coerceAtMost(16383)
         if (w < 256 || h < 256) return
-        outputStream?.let { out ->
-            out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS)
-            // 7 data bits per byte with the high bit always set: an old Mac
-            // skips unknown types one byte at a time, so payload bytes must
-            // never collide with real message-type values.
-            out.writeByte(0x80 or ((w shr 7) and 0x7F))
-            out.writeByte(0x80 or (w and 0x7F))
-            out.writeByte(0x80 or ((h shr 7) and 0x7F))
-            out.writeByte(0x80 or (h and 0x7F))
-            out.flush()
-            diagLog("Advertised decoder limit ${w}x$h for ${CodecCapabilities.streamMime}")
-        }
+
+        out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS)
+        // 7 data bits per byte with the high bit always set: an old Mac skips
+        // unknown types one byte at a time, so payload bytes cannot collide
+        // with protocol message-type values.
+        out.writeByte(0x80 or ((w shr 7) and 0x7F))
+        out.writeByte(0x80 or (w and 0x7F))
+        out.writeByte(0x80 or ((h shr 7) and 0x7F))
+        out.writeByte(0x80 or (h and 0x7F))
+        out.flush()
+        diagLog("Advertised decoder limit ${w}x$h for ${CodecCapabilities.streamMime}")
     }
 
     /** Receive until disconnect/EOF. I/O failures bubble to the session owner. */
-    private suspend fun receiveData() =
+    private suspend fun receiveData(generation: Long) =
         withContext(Dispatchers.IO) {
-            val input = inputStream ?: throw IOException("Missing stream input")
+            val input =
+                synchronized(transportLock) {
+                    if (transportGeneration != generation) null else inputStream
+                } ?: throw IOException("Missing stream input")
 
-            while (isConnected && !connectionAttemptCancelled) {
+            while (isTransportGenerationCurrent(generation) && !connectionAttemptCancelled) {
                 val type = input.readByte()
 
                 when (type.toInt()) {
                     MESSAGE_VIDEO_FRAME -> receiveVideoFrame(input, hasMetadata = false)
                     MESSAGE_VIDEO_FRAME_WITH_METADATA -> receiveVideoFrame(input, hasMetadata = true)
 
-                    1 -> {
+                    MESSAGE_DISPLAY_CONFIG -> {
                         val width = input.readInt()
                         val height = input.readInt()
                         val transform = input.readInt()
@@ -522,24 +601,22 @@ class StreamClient(
                         onDisplaySize?.invoke(width, height, rotation, flipHorizontal, flipVertical)
                     }
 
-                    5 -> {
+                    MESSAGE_PONG -> {
                         val buf = ByteArray(8)
                         input.readFully(buf)
                         val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                         val rtt = (System.nanoTime() - sentTime) / 1_000_000.0
                         val matchedProbe =
                             synchronized(videoProbeLock) {
-                                if (videoProbeOutstandingNs == sentTime) {
-                                    videoProbeOutstandingNs = 0L
+                                val probe = videoProbeOutstanding
+                                if (probe?.generation == generation && probe.sentAtNs == sentTime) {
+                                    videoProbeOutstanding = null
                                     true
                                 } else {
                                     false
                                 }
                             }
                         diagLog(String.format("VIDEO PONG rtt=%.2fms matched=%s", rtt, matchedProbe))
-                        // When the dedicated channel is down this remains the
-                        // user's latency measurement fallback. Otherwise the
-                        // in-band pong is primarily a video-path watchdog.
                         if (!controlChannel.isConnected) {
                             onLatencyMeasured?.invoke(rtt)
                         }
@@ -559,9 +636,7 @@ class StreamClient(
                     }
 
                     else -> {
-                        throw IOException(
-                            "Unknown message type ${type.toInt()}; stream may be misaligned",
-                        )
+                        throw IOException("Unknown message type ${type.toInt()}; stream may be misaligned")
                     }
                 }
             }
@@ -575,50 +650,64 @@ class StreamClient(
         x2: Float = 0f,
         y2: Float = 0f,
     ) {
-        if (!isConnected || touchExecutor.isShutdown) return
+        if (touchExecutor.isShutdown) return
+        val transport = currentTransport() ?: return
 
         touchScope.launch {
-            if (controlChannel.sendTouch(x, y, action, pointerCount, x2, y2)) {
+            if (!isTransportCurrent(transport)) return@launch
+            if (
+                controlChannel.sendTouch(
+                    x,
+                    y,
+                    action,
+                    pointerCount,
+                    x2,
+                    y2,
+                    expectedSessionGeneration = transport.generation,
+                )
+            ) {
                 return@launch
             }
+            if (!isTransportCurrent(transport)) return@launch
+
             try {
-                socket?.getOutputStream()?.let { out ->
-                    val count = pointerCount.coerceIn(1, 2)
-                    val size = 6 + count * 8
-                    val buffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
-                    buffer.put(2.toByte())
-                    buffer.put(count.toByte())
-                    buffer.putFloat(x)
-                    buffer.putFloat(y)
-                    if (count == 2) {
-                        buffer.putFloat(x2)
-                        buffer.putFloat(y2)
-                    }
-                    buffer.putInt(action)
-                    out.write(buffer.array())
-                    out.flush()
+                val count = pointerCount.coerceIn(1, 2)
+                val size = 6 + count * 8
+                val buffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
+                buffer.put(MESSAGE_TOUCH.toByte())
+                buffer.put(count.toByte())
+                buffer.putFloat(x)
+                buffer.putFloat(y)
+                if (count == 2) {
+                    buffer.putFloat(x2)
+                    buffer.putFloat(y2)
                 }
+                buffer.putInt(action)
+                transport.output.write(buffer.array())
+                transport.output.flush()
             } catch (e: Exception) {
-                failVideoTransport("in-band touch write failed", e)
+                failVideoTransport(transport, "in-band touch write failed", e)
             }
         }
     }
 
     /** Send a direct S Pen event when the Mac host negotiated the extension. */
     fun sendStylus(event: StylusInputEvent) {
-        if (!isConnected || !stylusSupported || touchExecutor.isShutdown) return
+        if (!stylusSupported || touchExecutor.isShutdown) return
+        val transport = currentTransport() ?: return
 
         touchScope.launch {
-            if (controlChannel.sendStylus(event)) {
+            if (!isTransportCurrent(transport)) return@launch
+            if (controlChannel.sendStylus(event, expectedSessionGeneration = transport.generation)) {
                 return@launch
             }
+            if (!isTransportCurrent(transport)) return@launch
+
             try {
-                socket?.getOutputStream()?.let { out ->
-                    out.write(StylusProtocol.encode(event))
-                    out.flush()
-                }
+                transport.output.write(StylusProtocol.encode(event))
+                transport.output.flush()
             } catch (e: Exception) {
-                failVideoTransport("in-band stylus write failed", e)
+                failVideoTransport(transport, "in-band stylus write failed", e)
             }
         }
     }
@@ -629,7 +718,8 @@ class StreamClient(
         force: Boolean = false,
         reason: String = "client request",
     ) {
-        if (!isConnected || touchExecutor.isShutdown) return
+        if (touchExecutor.isShutdown) return
+        val transport = currentTransport() ?: return
         val now = System.nanoTime()
         val shouldSend =
             synchronized(keyframeRequestLock) {
@@ -648,16 +738,24 @@ class StreamClient(
         val flags = if (force) KEYFRAME_REQUEST_FLAG_FORCE else 0
         diagLog("Requesting keyframe: reason=$reason, force=$force")
         touchScope.launch {
-            if (controlChannel.requestKeyframe(force)) {
+            if (!isTransportCurrent(transport)) return@launch
+            if (
+                controlChannel.requestKeyframe(
+                    force,
+                    expectedSessionGeneration = transport.generation,
+                )
+            ) {
                 return@launch
             }
+            if (!isTransportCurrent(transport)) return@launch
+
             try {
-                outputStream?.let { out ->
-                    out.write(byteArrayOf(MESSAGE_KEYFRAME_REQUEST.toByte(), flags.toByte()))
-                    out.flush()
-                }
+                transport.output.write(
+                    byteArrayOf(MESSAGE_KEYFRAME_REQUEST.toByte(), flags.toByte()),
+                )
+                transport.output.flush()
             } catch (e: Exception) {
-                failVideoTransport("in-band keyframe request failed", e)
+                failVideoTransport(transport, "in-band keyframe request failed", e)
             }
         }
     }
@@ -665,72 +763,84 @@ class StreamClient(
     /**
      * Called once per second by MainActivity. Control RTT remains on the
      * dedicated socket, but every few seconds we also probe the video TCP path.
-     * An unanswered in-band probe means that ordered video traffic is frozen or
-     * catastrophically backlogged, so closing the socket lets wireless recovery
-     * create a clean session instead of hanging indefinitely.
      */
     fun sendPing() {
-        if (!isConnected || touchExecutor.isShutdown) return
-
+        if (touchExecutor.isShutdown) return
+        val transport = currentTransport() ?: return
         val now = System.nanoTime()
-        val outstanding = synchronized(videoProbeLock) { videoProbeOutstandingNs }
-        if (outstanding != 0L && now - outstanding > VIDEO_PROBE_TIMEOUT_NS) {
-            failVideoTransport("video-path ping timed out", null)
-            return
+
+        val outstanding = synchronized(videoProbeLock) { videoProbeOutstanding }
+        if (outstanding != null && now - outstanding.sentAtNs > VIDEO_PROBE_TIMEOUT_NS) {
+            if (outstanding.generation == transport.generation) {
+                failVideoTransport(transport, "video-path ping timed out", null)
+                return
+            }
+            synchronized(videoProbeLock) {
+                if (videoProbeOutstanding === outstanding) videoProbeOutstanding = null
+            }
         }
 
         val controlSent = controlChannel.sendPing()
         val shouldProbeVideo =
             synchronized(videoProbeLock) {
-                videoProbeOutstandingNs == 0L &&
+                videoProbeOutstanding == null &&
                     (!controlSent || now - lastVideoProbeSentNs >= VIDEO_PROBE_INTERVAL_NS)
             }
         if (!shouldProbeVideo) return
 
         val queuedAt = now
         touchScope.launch {
+            if (!isTransportCurrent(transport)) return@launch
             val writeTime = System.nanoTime()
             synchronized(videoProbeLock) {
-                // A prior queued probe may have won while this task waited.
-                if (videoProbeOutstandingNs != 0L) return@launch
-                videoProbeOutstandingNs = writeTime
+                if (videoProbeOutstanding != null) return@launch
+                videoProbeOutstanding = VideoProbe(transport.generation, writeTime)
                 lastVideoProbeSentNs = writeTime
             }
+
             try {
-                outputStream?.let { out ->
-                    val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
-                    diagLog(String.format("VIDEO PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6))
-                    buffer.put(4.toByte())
-                    buffer.putLong(writeTime)
-                    out.write(buffer.array())
-                    out.flush()
-                } ?: throw IOException("video output unavailable")
+                val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
+                diagLog(String.format("VIDEO PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6))
+                buffer.put(MESSAGE_PING.toByte())
+                buffer.putLong(writeTime)
+                transport.output.write(buffer.array())
+                transport.output.flush()
             } catch (e: Exception) {
                 synchronized(videoProbeLock) {
-                    if (videoProbeOutstandingNs == writeTime) videoProbeOutstandingNs = 0L
+                    val probe = videoProbeOutstanding
+                    if (probe?.generation == transport.generation && probe.sentAtNs == writeTime) {
+                        videoProbeOutstanding = null
+                    }
                 }
-                failVideoTransport("video-path ping write failed", e)
+                failVideoTransport(transport, "video-path ping write failed", e)
             }
         }
     }
 
-    /** Close the active video socket; receiveData owns the actual retry path. */
-    private fun failVideoTransport(reason: String, error: Exception?) {
-        val active = socket ?: return
+    /** Close only the matching active video socket; receiveData owns retries. */
+    private fun failVideoTransport(
+        transport: TransportSnapshot,
+        reason: String,
+        error: Exception?,
+    ) {
+        if (!isTransportCurrent(transport)) return
         if (error == null) {
             diagLog("Video transport unhealthy: $reason — forcing reconnect")
         } else {
-            diagLog("Video transport unhealthy: $reason (${error.javaClass.simpleName}: ${error.message}) — forcing reconnect")
+            diagLog(
+                "Video transport unhealthy: $reason " +
+                    "(${error.javaClass.simpleName}: ${error.message}) — forcing reconnect",
+            )
         }
         try {
-            active.close()
+            transport.socket.close()
         } catch (_: Exception) {
         }
     }
 
     private fun resetVideoProbeState() {
         synchronized(videoProbeLock) {
-            videoProbeOutstandingNs = 0L
+            videoProbeOutstanding = null
             lastVideoProbeSentNs = 0L
         }
     }
@@ -741,12 +851,10 @@ class StreamClient(
 
         val now = System.currentTimeMillis()
         val elapsed = now - lastStatsTime
-
         if (elapsed >= 1000) {
             val mbps = (bytesReceived * 8.0) / (elapsed / 1000.0) / 1_000_000
             val fps = (framesReceived * 1000.0) / elapsed
             onStats?.invoke(fps, mbps)
-
             bytesReceived = 0
             framesReceived = 0
             lastStatsTime = now
@@ -758,7 +866,6 @@ class StreamClient(
         hasMetadata: Boolean,
     ) {
         val frameSize = input.readInt()
-
         if (frameSize <= 0 || frameSize > MAX_FRAME_SIZE) {
             throw IOException("Invalid frame size: $frameSize")
         }
@@ -774,8 +881,6 @@ class StreamClient(
         try {
             input.readFully(frameData, 0, frameSize)
         } catch (e: IOException) {
-            // A partial frame never reaches the decoder, so return its pooled
-            // buffer here instead of leaking one on every reconnect.
             releaseBuffer(frameData)
             throw e
         }
@@ -794,7 +899,12 @@ class StreamClient(
             )
         }
         if (diagFrameCount % 60L == 0L) {
-            val avgCallbackMs = if (frameCallbackSamples > 0) frameCallbackAccumNs / 1e6 / frameCallbackSamples else 0.0
+            val avgCallbackMs =
+                if (frameCallbackSamples > 0) {
+                    frameCallbackAccumNs / 1e6 / frameCallbackSamples
+                } else {
+                    0.0
+                }
             diagLog(
                 "Frames received: $diagFrameCount, readLoop callback avg=" +
                     String.format("%.2fms", avgCallbackMs),
@@ -829,16 +939,13 @@ class StreamClient(
 
         val keyframeAgeNs = receiveTimestamp - lastKeyframeNs
         if (keyframeAgeNs > KEYFRAME_STALE_INTERVAL_NS) {
-            requestKeyframe(
-                reason = "last keyframe ${keyframeAgeNs / 1_000_000L}ms ago",
-            )
+            requestKeyframe(reason = "last keyframe ${keyframeAgeNs / 1_000_000L}ms ago")
         }
     }
 
     /** Explicit/user disconnect: cancel retries and tear down all resources. */
     fun disconnect() {
         connectionAttemptCancelled = true
-        isConnected = false
         try {
             pendingSocket?.close()
         } catch (_: Exception) {
@@ -851,30 +958,42 @@ class StreamClient(
 
     /** Close only transport state; optionally keep self-healing control alive. */
     private fun cleanupTransport(stopControl: Boolean) {
-        val out = outputStream
-        val input = inputStream
-        val activeSocket = socket
-        val pending = pendingSocket
-        outputStream = null
-        inputStream = null
-        socket = null
-        pendingSocket = null
+        val retired =
+            synchronized(transportLock) {
+                val state =
+                    arrayOf<Any?>(
+                        outputStream,
+                        inputStream,
+                        socket,
+                        pendingSocket,
+                    )
+                outputStream = null
+                inputStream = null
+                socket = null
+                pendingSocket = null
+                isConnected = false
+                transportGeneration += 1
+                state
+            }
+
+        // Generation transition is atomic relative to ControlChannel writes.
+        controlChannel.setSessionGeneration(transportGeneration)
         resetVideoProbeState()
 
         try {
-            out?.close()
+            (retired[0] as? DataOutputStream)?.close()
         } catch (_: Exception) {
         }
         try {
-            input?.close()
+            (retired[1] as? DataInputStream)?.close()
         } catch (_: Exception) {
         }
         try {
-            activeSocket?.close()
+            (retired[2] as? Socket)?.close()
         } catch (_: Exception) {
         }
         try {
-            pending?.close()
+            (retired[3] as? Socket)?.close()
         } catch (_: Exception) {
         }
         if (stopControl) {
@@ -911,7 +1030,12 @@ class StreamClient(
         private const val VIDEO_PROBE_TIMEOUT_NS = 6_000_000_000L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
+
         private const val MESSAGE_VIDEO_FRAME = 0
+        private const val MESSAGE_DISPLAY_CONFIG = 1
+        private const val MESSAGE_TOUCH = 2
+        private const val MESSAGE_PING = 4
+        private const val MESSAGE_PONG = 5
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
         private const val MESSAGE_KEYFRAME_REQUEST = 7
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
@@ -973,9 +1097,7 @@ class StreamClient(
                     } else {
                         (header and 0x1F) == 5
                     }
-                if (isSync) {
-                    return true
-                }
+                if (isSync) return true
 
                 i = nalStart + 2
             }
