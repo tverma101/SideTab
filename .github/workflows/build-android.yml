@@ -1,0 +1,41 @@
+name: Android build and tests
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: AndroidClient/**/*.gradle*
+
+      - name: Verify Gradle wrapper
+        run: test -x AndroidClient/gradlew
+
+      - name: Unit tests
+        working-directory: AndroidClient
+        run: ./gradlew --no-daemon testDebugUnitTest --stacktrace
+
+      - name: Build debug APK
+        working-directory: AndroidClient
+        run: ./gradlew --no-daemon assembleDebug --stacktrace
