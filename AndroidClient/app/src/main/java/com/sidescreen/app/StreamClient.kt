@@ -145,6 +145,9 @@ class StreamClient(
     private var lastKeyframeRequestNs = 0L
     private var lastKeyframeReceivedNs = 0L
 
+    @Volatile
+    private var lastVideoFrameReceivedNs = 0L
+
     private val videoProbeLock = Any()
     private var videoProbeOutstanding: VideoProbe? = null
     private var lastVideoProbeSentNs = 0L
@@ -504,6 +507,7 @@ class StreamClient(
         codecNegotiated = false
         stylusSupported = false
         lastKeyframeReceivedNs = 0L
+        lastVideoFrameReceivedNs = 0L
         synchronized(keyframeRequestLock) {
             lastKeyframeRequestNs = 0L
         }
@@ -843,10 +847,14 @@ class StreamClient(
         }
 
         val controlSent = controlChannel.sendPing()
+        val lastFrameNs = lastVideoFrameReceivedNs
+        val videoRecentlyActive =
+            lastFrameNs > 0L && now >= lastFrameNs && now - lastFrameNs < VIDEO_PROBE_INTERVAL_NS
         val shouldProbeVideo =
             synchronized(videoProbeLock) {
                 videoProbeOutstanding == null &&
-                    (!controlSent || now - lastVideoProbeSentNs >= VIDEO_PROBE_INTERVAL_NS)
+                    (!controlSent ||
+                        (!videoRecentlyActive && now - lastVideoProbeSentNs >= VIDEO_PROBE_INTERVAL_NS))
             }
         if (!shouldProbeVideo) return
 
@@ -949,7 +957,17 @@ class StreamClient(
         }
 
         val receiveTimestamp = System.nanoTime()
-        checkKeyframeFreshness(receiveTimestamp, isKeyframe)
+        val previousFrameReceivedNs = lastVideoFrameReceivedNs
+        lastVideoFrameReceivedNs = receiveTimestamp
+
+        // Receiving actual frame bytes is stronger liveness evidence than a
+        // separate video ping. Do not reconnect an actively delivering stream
+        // merely because its pong is queued behind video data.
+        synchronized(videoProbeLock) {
+            videoProbeOutstanding = null
+        }
+
+        checkKeyframeFreshness(receiveTimestamp, isKeyframe, previousFrameReceivedNs)
         diagFrameCount++
         if (diagFrameCount == 1L) {
             diagLog(
@@ -987,8 +1005,18 @@ class StreamClient(
     private fun checkKeyframeFreshness(
         receiveTimestamp: Long,
         isKeyframe: Boolean,
+        previousFrameReceivedNs: Long,
     ) {
         if (isKeyframe) {
+            lastKeyframeReceivedNs = receiveTimestamp
+            return
+        }
+
+        // A long frame-silent interval is expected when the Mac dirty-rect gate
+        // suppresses an unchanged desktop. TCP preserved the encoded reference
+        // chain; the first frame after that quiet period must not be mistaken for
+        // a lost-keyframe condition and trigger an unnecessary large IDR burst.
+        if (isLongVideoGap(previousFrameReceivedNs, receiveTimestamp)) {
             lastKeyframeReceivedNs = receiveTimestamp
             return
         }
@@ -1157,6 +1185,14 @@ class StreamClient(
             val shift = (attempt - 1).coerceIn(0, 20)
             return (WIRELESS_RECONNECT_INITIAL_MS shl shift).coerceAtMost(WIRELESS_RECONNECT_MAX_MS)
         }
+
+        internal fun isLongVideoGap(
+            previousFrameNs: Long,
+            currentFrameNs: Long,
+        ): Boolean =
+            previousFrameNs > 0L &&
+                currentFrameNs >= previousFrameNs &&
+                currentFrameNs - previousFrameNs > KEYFRAME_STALE_INTERVAL_NS
 
         internal fun isSyncFrame(
             data: ByteArray,
