@@ -30,12 +30,15 @@ class SideScreenDiscovery(context: Context) {
         }
         val expectedName = WirelessServiceIdentity.nameForToken(token)
         val finished = AtomicBoolean(false)
+        val resolving = AtomicBoolean(false)
         var discoveryStarted = false
 
         lateinit var discoveryListener: NsdManager.DiscoveryListener
+        lateinit var timeout: Runnable
 
         fun finish(endpoint: Endpoint?) {
             if (!finished.compareAndSet(false, true)) return
+            mainHandler.removeCallbacks(timeout)
             if (discoveryStarted) {
                 try {
                     manager.stopServiceDiscovery(discoveryListener)
@@ -73,16 +76,15 @@ class SideScreenDiscovery(context: Context) {
                 }
 
                 override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                    if (finished.get()) return
-                    if (serviceInfo.serviceName == expectedName) {
-                        Log.i(TAG, "NSD matched ${serviceInfo.serviceName}; resolving")
-                        try {
-                            @Suppress("DEPRECATION")
-                            manager.resolveService(serviceInfo, resolveListener)
-                        } catch (e: Exception) {
-                            Log.w(TAG, "NSD resolve launch failed: ${e.message}")
-                            finish(null)
-                        }
+                    if (finished.get() || serviceInfo.serviceName != expectedName) return
+                    if (!resolving.compareAndSet(false, true)) return
+                    Log.i(TAG, "NSD matched ${serviceInfo.serviceName}; resolving")
+                    try {
+                        @Suppress("DEPRECATION")
+                        manager.resolveService(serviceInfo, resolveListener)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "NSD resolve launch failed: ${e.message}")
+                        finish(null)
                     }
                 }
 
@@ -104,7 +106,8 @@ class SideScreenDiscovery(context: Context) {
                 }
             }
 
-        mainHandler.postDelayed({ finish(null) }, timeoutMs.coerceIn(500L, 10_000L))
+        timeout = Runnable { finish(null) }
+        mainHandler.postDelayed(timeout, timeoutMs.coerceIn(500L, 10_000L))
         try {
             manager.discoverServices(
                 WirelessServiceIdentity.SERVICE_TYPE,
