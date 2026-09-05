@@ -5,6 +5,12 @@ import Foundation
 /// send pressure and samples TCP send-buffer headroom; capture/VideoEncoder
 /// consult the gate before doing routine work. Forced keyframes bypass it.
 enum WirelessTransportPressure {
+    enum CaptureAdmission {
+        case normal
+        case pause
+        case forced
+    }
+
     private struct State {
         var generation: UInt64 = 0
         var wireless = false
@@ -77,19 +83,31 @@ enum WirelessTransportPressure {
         state.forcedCapturePending = false
     }
 
-    static var forcedCapturePending: Bool {
+    /// One coherent capture-time snapshot. This replaces separate pressure and
+    /// forced-keyframe reads, so a concurrent recovery request cannot produce a
+    /// contradictory decision for the same captured frame.
+    static var captureAdmission: CaptureAdmission {
+        captureAdmission(at: DispatchTime.now().uptimeNanoseconds)
+    }
+
+    static func captureAdmission(at nowNs: UInt64) -> CaptureAdmission {
         lock.lock()
         defer { lock.unlock() }
-        return state.wireless && state.ready && state.forcedCapturePending
+        guard state.wireless, state.ready else { return .normal }
+        if state.forcedCapturePending { return .forced }
+        if state.sendsInFlight >= highWatermark || nowNs < state.pauseUntilNs {
+            return .pause
+        }
+        return .normal
     }
 
     /// Sample real TCP sender headroom before submitting an encoded frame.
     ///
     /// `availableSendBuffer` describes capacity *before* this frame is handed to
-    /// Network.framework. Predict the residual headroom after the frame too; if
-    /// this send would leave less than a small reserve, pause future pre-encode
-    /// routine captures immediately instead of waiting for the next already-
-    /// encoded frame to discover that the TCP queue is nearly full.
+    /// Network.framework. Predict the residual headroom after the frame too.
+    /// Preserve enough room for roughly one more frame of comparable size (with
+    /// a 32 KiB floor), rather than a fixed tiny reserve that becomes ineffective
+    /// at the 30–60 Mbps wireless quality tiers.
     ///
     /// The pause is short and bounded, so a probe frame always gets another
     /// chance to sample current socket headroom. Forced recovery keyframes still
@@ -108,7 +126,8 @@ enum WirelessTransportPressure {
         let available = UInt64(availableBytes)
         let frame = UInt64(max(1, frameBytes))
         let residual = available > frame ? available - frame : 0
-        let lowHeadroom = available < frame || residual < UInt64(minimumHeadroomBytes)
+        let reserve = max(UInt64(minimumHeadroomBytes), frame)
+        let lowHeadroom = available < frame || residual < reserve
 
         if lowHeadroom {
             let deadline = nowNs &+ sendBufferPauseNs
@@ -116,9 +135,9 @@ enum WirelessTransportPressure {
                 state.pauseUntilNs = deadline
             }
         } else {
-            // Fresh evidence that this frame still leaves useful TCP headroom
-            // should release an older buffer-pressure hold immediately. Local
-            // sends-in-flight pressure is evaluated independently below.
+            // Fresh evidence that this frame still leaves room for another
+            // similarly-sized frame should release an older buffer-pressure hold
+            // immediately. Local sends-in-flight pressure remains independent.
             state.pauseUntilNs = 0
         }
     }
