@@ -55,6 +55,7 @@ class WirelessTabController(
 
     private var state: State = State.FIRST_TIME
     private val discovery = SideScreenDiscovery(activity.applicationContext)
+    private val recoveryFence = RecoveryAttemptFence()
     private var discoveryRecoveryArmed = true
     private var discoveryRecoveryInFlight = false
 
@@ -63,20 +64,22 @@ class WirelessTabController(
         views.rescanButton.setOnClickListener { triggerScan() }
         views.openSettingsButton.setOnClickListener { cameraPerm.openAppSettings() }
         views.forgetButton.setOnClickListener {
+            invalidateRecovery(rearm = true)
             storage.clear()
-            transition(State.FIRST_TIME)
+            show()
         }
         views.idleForgetButton.setOnClickListener {
+            invalidateRecovery(rearm = true)
             storage.clear()
-            transition(State.FIRST_TIME)
+            show()
         }
         views.reconnectButton.setOnClickListener {
+            invalidateRecovery(rearm = true)
             val entry =
                 storage.load() ?: run {
-                    transition(State.FIRST_TIME)
+                    show()
                     return@setOnClickListener
                 }
-            discoveryRecoveryArmed = true
             showConnecting("Reconnecting to ${entry.macName}", "${entry.host}:${entry.port}")
             attemptReconnect(entry)
         }
@@ -99,7 +102,8 @@ class WirelessTabController(
         )
         val entry =
             storage.load() ?: run {
-                transition(State.FIRST_TIME)
+                invalidateRecovery(rearm = true)
+                show()
                 return
             }
 
@@ -123,23 +127,26 @@ class WirelessTabController(
     /**
      * Called when the Wireless tab becomes visible. A cached pairing is shown
      * but not connected until the user asks, avoiding surprise connections
-     * merely from switching tabs.
+     * merely from switching tabs. Camera permission is needed only to create a
+     * new pairing; it must never hide an already-paired host.
      */
     fun show() {
+        val entry = storage.load()
         when {
-            cameraPerm.isPermanentlyDenied() -> transition(State.PERM_DENIED)
-            storage.load() == null -> transition(State.FIRST_TIME)
-            else -> {
-                val entry = storage.load()!!
+            entry != null -> {
                 views.idleMacName.text = entry.macName
                 views.idleMacIp.text = "${entry.host}:${entry.port}"
                 transition(State.PAIRED_IDLE)
             }
+
+            cameraPerm.isPermanentlyDenied() -> transition(State.PERM_DENIED)
+            else -> transition(State.FIRST_TIME)
         }
     }
 
     fun onScanResult(url: String) {
         val parsed = PairingURL.parse(url) ?: return
+        invalidateRecovery(rearm = true)
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
         storage.save(
             PairedHostStorage.Entry(
@@ -150,7 +157,6 @@ class WirelessTabController(
                 controlPortOverride = parsed.controlPortOverride,
             ),
         )
-        discoveryRecoveryArmed = true
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
     }
@@ -166,7 +172,7 @@ class WirelessTabController(
             }
 
             is StreamClient.WirelessConnectError.TokenRejected -> {
-                discoveryRecoveryArmed = false
+                invalidateRecovery(rearm = false)
                 views.repairTitle.text = "⚠ Re-pair required"
                 views.repairMessage.text =
                     if (cached != null) {
@@ -179,7 +185,7 @@ class WirelessTabController(
             }
 
             is StreamClient.WirelessConnectError.ProtocolError -> {
-                discoveryRecoveryArmed = false
+                invalidateRecovery(rearm = false)
                 views.repairTitle.text = "⚠ Connection error"
                 views.repairMessage.text = "Couldn't complete the secure handshake with the Mac. Scan the QR again."
                 transition(State.REPAIR_NEEDED)
@@ -190,20 +196,38 @@ class WirelessTabController(
     /**
      * One bounded Bonjour recovery attempt per connection action. This repairs
      * stale DHCP addresses without creating a discovery/reconnect loop.
+     *
+     * The recovery token and pairing-token snapshot are both checked when NSD
+     * completes. Forgetting the host, scanning another QR, or beginning a newer
+     * reconnect therefore makes an older callback unable to restore stale
+     * storage or launch an obsolete connection.
      */
     private fun tryDiscoveryRecovery(entry: PairedHostStorage.Entry): Boolean {
         if (!discoveryRecoveryArmed || discoveryRecoveryInFlight) return false
         discoveryRecoveryArmed = false
         discoveryRecoveryInFlight = true
+        val attempt = recoveryFence.begin()
+        val expectedToken = entry.token.copyOf()
         showConnecting("Finding ${entry.macName}…", "Checking the local network")
-        discovery.resolve(entry.token) { endpoint ->
-            discoveryRecoveryInFlight = false
-            if (endpoint == null) {
-                showNetworkRepair(storage.load() ?: entry)
+        discovery.resolve(expectedToken) { endpoint ->
+            if (!recoveryFence.isCurrent(attempt)) {
+                android.util.Log.i("WirelessTabController", "Ignoring stale discovery callback")
                 return@resolve
             }
 
-            val updated = entry.copy(host = endpoint.host, port = endpoint.port)
+            discoveryRecoveryInFlight = false
+            val current = storage.load()
+            if (current == null || !current.token.contentEquals(expectedToken)) {
+                android.util.Log.i("WirelessTabController", "Ignoring discovery result for superseded pairing")
+                return@resolve
+            }
+
+            if (endpoint == null) {
+                showNetworkRepair(current)
+                return@resolve
+            }
+
+            val updated = current.copy(host = endpoint.host, port = endpoint.port)
             try {
                 storage.save(updated)
             } catch (e: Exception) {
@@ -214,6 +238,12 @@ class WirelessTabController(
             onConnectRequested(updated.host, updated.port, updated.token, deviceName, updated.macName)
         }
         return true
+    }
+
+    private fun invalidateRecovery(rearm: Boolean) {
+        recoveryFence.invalidate()
+        discoveryRecoveryInFlight = false
+        discoveryRecoveryArmed = rearm
     }
 
     private fun showNetworkRepair(cached: PairedHostStorage.Entry?) {
@@ -244,8 +274,7 @@ class WirelessTabController(
         macName: String,
         ip: String,
     ) {
-        discoveryRecoveryArmed = true
-        discoveryRecoveryInFlight = false
+        invalidateRecovery(rearm = true)
         views.connectedMacName.text = macName
         views.connectedMacIp.text = ip
         transition(State.CONNECTED)
@@ -255,7 +284,7 @@ class WirelessTabController(
         if (granted) {
             launchScanner()
         } else if (cameraPerm.isPermanentlyDenied()) {
-            transition(State.PERM_DENIED)
+            show()
         }
     }
 
