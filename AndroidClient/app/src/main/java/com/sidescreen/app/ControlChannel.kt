@@ -209,7 +209,9 @@ class ControlChannel(
                         val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                         val clientTs = bb.long
                         bb.long // server send timestamp; RTT uses the echoed client timestamp.
-                        firstUnansweredPingAtNs = 0L
+                        if (firstUnansweredPingAtNs == clientTs) {
+                            firstUnansweredPingAtNs = 0L
+                        }
                         val rtt = (arrival - clientTs) / 1_000_000.0
                         val processedAt = System.nanoTime()
                         val appDelay = (processedAt - arrival) / 1_000_000.0
@@ -292,9 +294,12 @@ class ControlChannel(
                 val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
                 buffer.put(4.toByte())
                 buffer.putLong(ts)
+                // Mark the oldest unanswered ping before the bytes become
+                // visible on the wire. A loopback/LAN-fast pong can otherwise
+                // race the post-flush assignment and leave a stale timeout.
+                if (firstUnansweredPingAtNs == 0L) firstUnansweredPingAtNs = ts
                 out.write(buffer.array())
                 out.flush()
-                if (firstUnansweredPingAtNs == 0L) firstUnansweredPingAtNs = ts
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control ping write failed: ${e.javaClass.simpleName}: ${e.message}")
