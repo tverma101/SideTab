@@ -56,6 +56,7 @@ class WirelessTabController(
     private var state: State = State.FIRST_TIME
     private val discovery = SideScreenDiscovery(activity.applicationContext)
     private val recoveryFence = RecoveryAttemptFence()
+    private var discoveryHandle: SideScreenDiscovery.Handle? = null
     private var discoveryRecoveryArmed = true
     private var discoveryRecoveryInFlight = false
 
@@ -223,7 +224,9 @@ class WirelessTabController(
      * The recovery token and pairing-token snapshot are both checked when NSD
      * completes. Forgetting the host, scanning another QR, or beginning a newer
      * reconnect therefore makes an older callback unable to restore stale
-     * storage or launch an obsolete connection.
+     * storage or launch an obsolete connection. The owned discovery handle is
+     * cancelled as well, so obsolete NsdManager work cannot contend with the
+     * replacement lookup.
      */
     private fun tryDiscoveryRecovery(entry: PairedHostStorage.Entry): Boolean {
         if (!discoveryRecoveryArmed || discoveryRecoveryInFlight) return false
@@ -232,39 +235,43 @@ class WirelessTabController(
         val attempt = recoveryFence.begin()
         val expectedToken = entry.token.copyOf()
         showConnecting("Finding ${entry.macName}…", "Checking the local network")
-        discovery.resolve(expectedToken) { endpoint ->
-            if (!recoveryFence.isCurrent(attempt)) {
-                android.util.Log.i("WirelessTabController", "Ignoring stale discovery callback")
-                return@resolve
-            }
+        discoveryHandle =
+            discovery.resolve(expectedToken) { endpoint ->
+                if (!recoveryFence.isCurrent(attempt)) {
+                    android.util.Log.i("WirelessTabController", "Ignoring stale discovery callback")
+                    return@resolve
+                }
 
-            discoveryRecoveryInFlight = false
-            val current = storage.load()
-            if (current == null || !current.token.contentEquals(expectedToken)) {
-                android.util.Log.i("WirelessTabController", "Ignoring discovery result for superseded pairing")
-                return@resolve
-            }
+                discoveryHandle = null
+                discoveryRecoveryInFlight = false
+                val current = storage.load()
+                if (current == null || !current.token.contentEquals(expectedToken)) {
+                    android.util.Log.i("WirelessTabController", "Ignoring discovery result for superseded pairing")
+                    return@resolve
+                }
 
-            if (endpoint == null) {
-                showNetworkRepair(current)
-                return@resolve
-            }
+                if (endpoint == null) {
+                    showNetworkRepair(current)
+                    return@resolve
+                }
 
-            val updated = current.copy(host = endpoint.host, port = endpoint.port)
-            try {
-                storage.save(updated)
-            } catch (e: Exception) {
-                android.util.Log.w("WirelessTabController", "Couldn't persist recovered endpoint", e)
+                val updated = current.copy(host = endpoint.host, port = endpoint.port)
+                try {
+                    storage.save(updated)
+                } catch (e: Exception) {
+                    android.util.Log.w("WirelessTabController", "Couldn't persist recovered endpoint", e)
+                }
+                val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+                showConnecting("Reconnecting to ${updated.macName}", "${updated.host}:${updated.port}")
+                onConnectRequested(updated.host, updated.port, updated.token, deviceName, updated.macName)
             }
-            val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
-            showConnecting("Reconnecting to ${updated.macName}", "${updated.host}:${updated.port}")
-            onConnectRequested(updated.host, updated.port, updated.token, deviceName, updated.macName)
-        }
         return true
     }
 
     private fun invalidateRecovery(rearm: Boolean) {
         recoveryFence.invalidate()
+        discoveryHandle?.cancel()
+        discoveryHandle = null
         discoveryRecoveryInFlight = false
         discoveryRecoveryArmed = rearm
     }
