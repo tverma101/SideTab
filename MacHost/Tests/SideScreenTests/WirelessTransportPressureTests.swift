@@ -33,6 +33,41 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 20_000_000))
     }
 
+    func testFrameThatWouldConsumeTcpReservePausesNextEncode() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        let now: UInt64 = 1_500_000_000
+
+        // There is technically room for this 64 KiB frame now, but sending it
+        // would leave only 16 KiB. The encoder should stop before producing the
+        // next dependent frame instead of discovering the near-full socket one
+        // frame too late.
+        WirelessTransportPressure.observeSendBuffer(
+            generation: generation,
+            availableBytes: 80 * 1024,
+            frameBytes: 64 * 1024,
+            nowNs: now
+        )
+
+        XCTAssertTrue(WirelessTransportPressure.shouldPauseEncoding(at: now + 1))
+        XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 20_000_000))
+    }
+
+    func testHealthyProjectedHeadroomDoesNotPause() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        let now: UInt64 = 1_750_000_000
+
+        WirelessTransportPressure.observeSendBuffer(
+            generation: generation,
+            availableBytes: 256 * 1024,
+            frameBytes: 64 * 1024,
+            nowNs: now
+        )
+
+        XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 1))
+    }
+
     func testHealthyTcpHeadroomReleasesOlderBufferPauseImmediately() {
         let generation = WirelessTransportPressure.reset(wireless: true)
         WirelessTransportPressure.setReady(generation: generation)
