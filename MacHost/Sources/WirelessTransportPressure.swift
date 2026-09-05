@@ -5,7 +5,7 @@ import Foundation
 /// send pressure and samples TCP send-buffer headroom; capture/VideoEncoder
 /// consult the gate before doing routine work. Forced keyframes bypass it.
 enum WirelessTransportPressure {
-    enum CaptureAdmission {
+    enum CaptureAdmission: Equatable {
         case normal
         case pause
         case forced
