@@ -19,6 +19,30 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertEqual(.normal, WirelessTransportPressure.captureAdmission)
     }
 
+    func testSingleLargeSendPausesUntilOutstandingSetDrains() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        let now: UInt64 = 500_000_000
+
+        // Socket headroom is healthy, so the only pressure source is the frame
+        // itself. A 300 KiB IDR/motion burst should not be followed immediately
+        // by another routine encode while that large send is outstanding.
+        WirelessTransportPressure.observeSendBuffer(
+            generation: generation,
+            availableBytes: 1_024 * 1024,
+            frameBytes: 300 * 1024,
+            nowNs: now
+        )
+        WirelessTransportPressure.beginSend(generation: generation)
+
+        XCTAssertEqual(.pause, WirelessTransportPressure.captureAdmission(at: now + 1))
+        XCTAssertTrue(WirelessTransportPressure.snapshotForTest().largeSendOutstanding)
+
+        WirelessTransportPressure.completeSend(generation: generation)
+        XCTAssertEqual(.normal, WirelessTransportPressure.captureAdmission(at: now + 2))
+        XCTAssertFalse(WirelessTransportPressure.snapshotForTest().largeSendOutstanding)
+    }
+
     func testLowTcpHeadroomCreatesOnlyBoundedPause() {
         let generation = WirelessTransportPressure.reset(wireless: true)
         WirelessTransportPressure.setReady(generation: generation)
@@ -182,6 +206,7 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertEqual(1, snapshot.sendsInFlight)
         XCTAssertNil(snapshot.availableSendBuffer)
         XCTAssertFalse(snapshot.forcedCapturePending)
+        XCTAssertFalse(snapshot.largeSendOutstanding)
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: 101))
     }
 }
