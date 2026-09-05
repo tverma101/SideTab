@@ -53,6 +53,9 @@ class WirelessTabController(
     enum class State { FIRST_TIME, CONNECTING, CONNECTED, PAIRED_IDLE, REPAIR_NEEDED, PERM_DENIED }
 
     private var state: State = State.FIRST_TIME
+    private val discovery = SideScreenDiscovery(activity.applicationContext)
+    private var discoveryRecoveryArmed = true
+    private var discoveryRecoveryInFlight = false
 
     fun bind() {
         views.scanButton.setOnClickListener { triggerScan() }
@@ -72,14 +75,15 @@ class WirelessTabController(
                     transition(State.FIRST_TIME)
                     return@setOnClickListener
                 }
+            discoveryRecoveryArmed = true
             showConnecting("Reconnecting to ${entry.macName}", "${entry.host}:${entry.port}")
             attemptReconnect(entry)
         }
     }
 
     /**
-     * Called when the TCP stream goes down (user tapped Disconnect, network drop, etc).
-     * Move the UI to a clean "paired but idle" state showing the Mac info + Reconnect button.
+     * Called when the TCP stream goes down. If StreamClient exhausts its
+     * transparent retry window, this leaves a clean manual recovery surface.
      */
     fun onStreamDisconnected() {
         android.util.Log.i(
@@ -108,12 +112,9 @@ class WirelessTabController(
     }
 
     /**
-     * Called when the Wireless tab becomes visible. Decides initial state based on
-     * cached host + camera permission state.
-     *
-     * No auto-connect: even when a cached pairing exists, the user must press
-     * the Reconnect button to actually start a connection. Auto-connect was
-     * confusing because it could run silently while the user toggled tabs.
+     * Called when the Wireless tab becomes visible. A cached pairing is shown
+     * but not connected until the user asks, avoiding surprise connections
+     * merely from switching tabs.
      */
     fun show() {
         when {
@@ -132,6 +133,7 @@ class WirelessTabController(
         val parsed = PairingURL.parse(url) ?: return
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
         storage.save(PairedHostStorage.Entry(parsed.host, parsed.port, parsed.token, parsed.macName))
+        discoveryRecoveryArmed = true
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
     }
@@ -140,19 +142,14 @@ class WirelessTabController(
         val cached = storage.load()
         when (error) {
             is StreamClient.WirelessConnectError.NetworkUnreachable -> {
-                views.repairTitle.text = "⚠ Couldn't reach Mac"
-                views.repairMessage.text =
-                    if (cached != null) {
-                        "No response from ${cached.macName} at ${cached.host}:${cached.port}.\n\n" +
-                            "The Mac may have switched WiFi networks, changed its port, or is not " +
-                            "running. Open SideScreen on the Mac and scan the new QR to re-pair."
-                    } else {
-                        "No response from your Mac. Make sure both devices are on the same WiFi " +
-                            "and the Mac app is running, then scan the QR again."
-                    }
-                transition(State.REPAIR_NEEDED)
+                if (cached != null && tryDiscoveryRecovery(cached)) {
+                    return
+                }
+                showNetworkRepair(cached)
             }
+
             is StreamClient.WirelessConnectError.TokenRejected -> {
+                discoveryRecoveryArmed = false
                 views.repairTitle.text = "⚠ Re-pair required"
                 views.repairMessage.text =
                     if (cached != null) {
@@ -163,12 +160,58 @@ class WirelessTabController(
                     }
                 transition(State.REPAIR_NEEDED)
             }
+
             is StreamClient.WirelessConnectError.ProtocolError -> {
+                discoveryRecoveryArmed = false
                 views.repairTitle.text = "⚠ Connection error"
                 views.repairMessage.text = "Couldn't complete the secure handshake with the Mac. Scan the QR again."
                 transition(State.REPAIR_NEEDED)
             }
         }
+    }
+
+    /**
+     * One bounded Bonjour recovery attempt per connection action. This repairs
+     * stale DHCP addresses without creating a discovery/reconnect loop.
+     */
+    private fun tryDiscoveryRecovery(entry: PairedHostStorage.Entry): Boolean {
+        if (!discoveryRecoveryArmed || discoveryRecoveryInFlight) return false
+        discoveryRecoveryArmed = false
+        discoveryRecoveryInFlight = true
+        showConnecting("Finding ${entry.macName}…", "Checking the local network")
+        discovery.resolve(entry.token) { endpoint ->
+            discoveryRecoveryInFlight = false
+            if (endpoint == null) {
+                showNetworkRepair(storage.load() ?: entry)
+                return@resolve
+            }
+
+            val updated = entry.copy(host = endpoint.host, port = endpoint.port)
+            try {
+                storage.save(updated)
+            } catch (e: Exception) {
+                android.util.Log.w("WirelessTabController", "Couldn't persist recovered endpoint", e)
+            }
+            val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+            showConnecting("Reconnecting to ${updated.macName}", "${updated.host}:${updated.port}")
+            onConnectRequested(updated.host, updated.port, updated.token, deviceName, updated.macName)
+        }
+        return true
+    }
+
+    private fun showNetworkRepair(cached: PairedHostStorage.Entry?) {
+        views.repairTitle.text = "⚠ Couldn't reach Mac"
+        views.repairMessage.text =
+            if (cached != null) {
+                "No response from ${cached.macName} at ${cached.host}:${cached.port}.\n\n" +
+                    "SideScreen also searched the local network for the paired Mac but couldn't " +
+                    "resolve a working endpoint. Make sure the Mac app is running on the same WiFi, " +
+                    "then scan its QR again if needed."
+            } else {
+                "No response from your Mac. Make sure both devices are on the same WiFi " +
+                    "and the Mac app is running, then scan the QR again."
+            }
+        transition(State.REPAIR_NEEDED)
     }
 
     private fun showConnecting(
@@ -184,6 +227,8 @@ class WirelessTabController(
         macName: String,
         ip: String,
     ) {
+        discoveryRecoveryArmed = true
+        discoveryRecoveryInFlight = false
         views.connectedMacName.text = macName
         views.connectedMacIp.text = ip
         transition(State.CONNECTED)
@@ -191,12 +236,10 @@ class WirelessTabController(
 
     fun onCameraPermissionResult(granted: Boolean) {
         if (granted) {
-            // Re-evaluate; user just granted, jump straight into scanner.
             launchScanner()
         } else if (cameraPerm.isPermanentlyDenied()) {
             transition(State.PERM_DENIED)
         }
-        // else: stay in current state; user can tap Scan again to re-prompt.
     }
 
     private fun triggerScan() {
