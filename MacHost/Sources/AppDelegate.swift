@@ -49,8 +49,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     let pairedDeviceStore = PairedDeviceStore()
     /// Name of the wireless device currently streaming (nil when no wireless client is active).
-    /// Used to roll its `lastConnected` timestamp forward every status refresh tick so the UI
-    /// shows "just now" while connected and freezes at the disconnect moment afterward.
+    /// Used to snapshot the disconnect time and identify the live paired-device row.
     private var currentWirelessDevice: String?
     private var cancellables = Set<AnyCancellable>()
     private var statusRefreshTimer: Timer?
@@ -136,19 +135,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Keep the inline permission state current after the user returns from
         // System Settings, without generating another native prompt.
         settings.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
-        settings.adbInstalled = StatusDetector.adbInstalled()
-        settings.wifiConnected = StatusDetector.wifiReachable()
-        settings.listeningAddress = LANAddressResolver.primaryIPv4()
 
-        // While a wireless client is actively streaming, keep its lastConnected
-        // rolling forward so the UI shows "just now". On disconnect, the
-        // onClientDisconnected handler clears currentWirelessDevice — from that
-        // point lastConnected stays frozen at the disconnect moment, so the
-        // "X minutes ago" label counts up correctly.
-        if let name = currentWirelessDevice {
-            pairedDeviceStore.upsert(name: name, lastConnected: Date())
+        // LANAddressResolver already does the interface walk needed by both
+        // wireless status fields. Resolve once instead of running getifaddrs()
+        // twice every two seconds.
+        let lanAddress = LANAddressResolver.primaryIPv4()
+        settings.wifiConnected = lanAddress != nil
+        settings.listeningAddress = lanAddress
+
+        // Wireless streaming never needs ADB. Avoid spawning the detached USB
+        // checklist task (and avoid PATH/which work in adbInstalled) on every
+        // wireless status tick. The paired-device UI already renders a live
+        // device as "Connected"; its final lastConnected timestamp is persisted
+        // by the disconnect handler, so there is no reason to rewrite JSON /
+        // UserDefaults every two seconds while a session is active.
+        guard settings.connectionMode == .usb else {
+            settings.adbInstalled = false
+            settings.usbDeviceConnected = false
+            settings.adbReverseConfigured = false
+            return
         }
 
+        settings.adbInstalled = StatusDetector.adbInstalled()
         let port = Int(settings.port)
         let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
         let controlPort = controlOverride > 0 ? controlOverride : port + 1
@@ -665,9 +673,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.releaseStylusIfNeeded()
                 Task { @MainActor in
                     self.settings.clientConnected = false
-                    // Final lastConnected snapshot at the disconnect moment, then
-                    // freeze (currentWirelessDevice = nil stops the rolling update
-                    // in refreshStatusIndicators).
+                    // Final lastConnected snapshot at the disconnect moment.
                     if let name = self.currentWirelessDevice {
                         self.pairedDeviceStore.upsert(name: name, lastConnected: Date())
                         self.currentWirelessDevice = nil
