@@ -4,7 +4,13 @@ import android.net.Uri
 import android.util.Base64
 
 object PairingURL {
-    data class Parsed(val host: String, val port: Int, val token: ByteArray, val macName: String)
+    data class Parsed(
+        val host: String,
+        val port: Int,
+        val token: ByteArray,
+        val macName: String,
+        val controlPort: Int,
+    )
 
     fun parse(url: String): Parsed? {
         val uri =
@@ -25,6 +31,17 @@ object PairingURL {
             }
         if (token.size != 32) return null
         val name = uri.getQueryParameter("name") ?: "Mac"
-        return Parsed(host, port, token, name)
+
+        // New hosts include c=<controlPort> when the dedicated control socket
+        // is not videoPort+1. Legacy QR payloads keep their original behavior.
+        val explicitControl = uri.getQueryParameter("c")
+        val controlPort =
+            if (explicitControl != null) {
+                explicitControl.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+            } else {
+                (port + 1).takeIf { it <= 65535 } ?: return null
+            }
+
+        return Parsed(host, port, token, name, controlPort)
     }
 }
