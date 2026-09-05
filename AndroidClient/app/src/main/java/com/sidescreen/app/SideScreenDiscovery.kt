@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Bounded Bonjour lookup used only as a reconnect fallback when the QR's
@@ -31,9 +32,11 @@ class SideScreenDiscovery(context: Context) {
         val expectedName = WirelessServiceIdentity.nameForToken(token)
         val finished = AtomicBoolean(false)
         val resolving = AtomicBoolean(false)
+        val resolveAttempts = AtomicInteger(0)
         var discoveryStarted = false
 
         lateinit var discoveryListener: NsdManager.DiscoveryListener
+        lateinit var resolveListener: NsdManager.ResolveListener
         lateinit var timeout: Runnable
 
         fun finish(endpoint: Endpoint?) {
@@ -48,19 +51,48 @@ class SideScreenDiscovery(context: Context) {
             mainHandler.post { callback(endpoint) }
         }
 
-        val resolveListener =
+        fun launchResolve(serviceInfo: NsdServiceInfo) {
+            if (finished.get() || resolveAttempts.get() >= MAX_RESOLVE_ATTEMPTS) return
+            if (!resolving.compareAndSet(false, true)) return
+            val attempt = resolveAttempts.incrementAndGet()
+            Log.i(TAG, "NSD resolving ${serviceInfo.serviceName} (attempt $attempt/$MAX_RESOLVE_ATTEMPTS)")
+            try {
+                @Suppress("DEPRECATION")
+                manager.resolveService(serviceInfo, resolveListener)
+            } catch (e: Exception) {
+                resolving.set(false)
+                Log.w(TAG, "NSD resolve launch failed on attempt $attempt: ${e.message}")
+                if (attempt < MAX_RESOLVE_ATTEMPTS && !finished.get()) {
+                    mainHandler.postDelayed({ launchResolve(serviceInfo) }, RESOLVE_RETRY_DELAY_MS)
+                }
+            }
+        }
+
+        resolveListener =
             object : NsdManager.ResolveListener {
                 override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                    Log.w(TAG, "NSD resolve failed for ${serviceInfo.serviceName}: $errorCode")
-                    finish(null)
+                    resolving.set(false)
+                    val attempt = resolveAttempts.get()
+                    Log.w(TAG, "NSD resolve failed for ${serviceInfo.serviceName} on attempt $attempt: $errorCode")
+                    if (attempt < MAX_RESOLVE_ATTEMPTS && !finished.get()) {
+                        mainHandler.postDelayed({ launchResolve(serviceInfo) }, RESOLVE_RETRY_DELAY_MS)
+                    }
+                    // Do not finish early after the final resolver failure.
+                    // Discovery remains active until its bounded timeout, so a
+                    // fresh service announcement still has a chance to arrive.
                 }
 
                 @Suppress("DEPRECATION")
                 override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                    resolving.set(false)
                     val host = serviceInfo.host?.hostAddress
                     val port = serviceInfo.port
                     if (host.isNullOrBlank() || port !in 1..65535) {
-                        finish(null)
+                        val attempt = resolveAttempts.get()
+                        Log.w(TAG, "NSD resolved an unusable endpoint on attempt $attempt")
+                        if (attempt < MAX_RESOLVE_ATTEMPTS && !finished.get()) {
+                            mainHandler.postDelayed({ launchResolve(serviceInfo) }, RESOLVE_RETRY_DELAY_MS)
+                        }
                     } else {
                         Log.i(TAG, "NSD recovered SideScreen endpoint $host:$port")
                         finish(Endpoint(host, port))
@@ -77,15 +109,7 @@ class SideScreenDiscovery(context: Context) {
 
                 override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                     if (finished.get() || serviceInfo.serviceName != expectedName) return
-                    if (!resolving.compareAndSet(false, true)) return
-                    Log.i(TAG, "NSD matched ${serviceInfo.serviceName}; resolving")
-                    try {
-                        @Suppress("DEPRECATION")
-                        manager.resolveService(serviceInfo, resolveListener)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "NSD resolve launch failed: ${e.message}")
-                        finish(null)
-                    }
+                    launchResolve(serviceInfo)
                 }
 
                 override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
@@ -123,5 +147,7 @@ class SideScreenDiscovery(context: Context) {
     private companion object {
         const val TAG = "SideScreenDiscovery"
         const val DEFAULT_TIMEOUT_MS = 3_000L
+        const val MAX_RESOLVE_ATTEMPTS = 3
+        const val RESOLVE_RETRY_DELAY_MS = 150L
     }
 }
