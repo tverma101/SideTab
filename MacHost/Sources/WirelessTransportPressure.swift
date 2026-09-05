@@ -2,8 +2,8 @@ import Foundation
 
 /// Crosses the Network.framework -> VideoToolbox boundary without dropping
 /// already-encoded reference frames. StreamingServer records shallow local
-/// send pressure and samples TCP send-buffer headroom; VideoEncoder consults
-/// the gate before submitting routine captures. Forced keyframes bypass it.
+/// send pressure and samples TCP send-buffer headroom; capture/VideoEncoder
+/// consult the gate before doing routine work. Forced keyframes bypass it.
 enum WirelessTransportPressure {
     private struct State {
         var generation: UInt64 = 0
@@ -12,6 +12,7 @@ enum WirelessTransportPressure {
         var sendsInFlight = 0
         var pauseUntilNs: UInt64 = 0
         var lastAvailableSendBuffer: UInt32?
+        var forcedCapturePending = false
     }
 
     private static let lock = NSLock()
@@ -31,6 +32,7 @@ enum WirelessTransportPressure {
         state.sendsInFlight = 0
         state.pauseUntilNs = 0
         state.lastAvailableSendBuffer = nil
+        state.forcedCapturePending = false
         return state.generation
     }
 
@@ -53,6 +55,32 @@ enum WirelessTransportPressure {
         defer { lock.unlock() }
         guard state.generation == generation else { return }
         state.sendsInFlight = max(0, state.sendsInFlight - 1)
+    }
+
+    /// Mark that a recovery/startup IDR must be admitted even when routine
+    /// wireless capture is currently pressure-gated. The returned generation
+    /// lets VideoEncoder clear only the marker it created; a late encode from an
+    /// older transport can never clear a newer session's recovery admission.
+    @discardableResult
+    static func noteForcedCapturePending() -> UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard state.wireless else { return nil }
+        state.forcedCapturePending = true
+        return state.generation
+    }
+
+    static func clearForcedCapturePending(generation: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard state.generation == generation else { return }
+        state.forcedCapturePending = false
+    }
+
+    static var forcedCapturePending: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return state.wireless && state.ready && state.forcedCapturePending
     }
 
     /// Sample real TCP sender headroom before submitting an encoded frame.
@@ -104,6 +132,7 @@ enum WirelessTransportPressure {
         state.sendsInFlight = 0
         state.pauseUntilNs = 0
         state.lastAvailableSendBuffer = nil
+        state.forcedCapturePending = false
         state.wireless = false
     }
 
@@ -129,7 +158,8 @@ enum WirelessTransportPressure {
         ready: Bool,
         sendsInFlight: Int,
         pauseUntilNs: UInt64,
-        availableSendBuffer: UInt32?
+        availableSendBuffer: UInt32?,
+        forcedCapturePending: Bool
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -139,7 +169,8 @@ enum WirelessTransportPressure {
             state.ready,
             state.sendsInFlight,
             state.pauseUntilNs,
-            state.lastAvailableSendBuffer
+            state.lastAvailableSendBuffer,
+            state.forcedCapturePending
         )
     }
 }
