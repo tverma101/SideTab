@@ -72,7 +72,7 @@ class StreamClient(
     )
 
     private data class TouchWrite(
-        val transport: TransportSnapshot,
+        val generation: Long,
         val x: Float,
         val y: Float,
         val action: Int,
@@ -82,7 +82,7 @@ class StreamClient(
     )
 
     private data class StylusWrite(
-        val transport: TransportSnapshot,
+        val generation: Long,
         val event: StylusInputEvent,
     )
 
@@ -566,6 +566,21 @@ class StreamClient(
             TransportSnapshot(transportGeneration, activeSocket, activeOutput)
         }
 
+    /**
+     * Allocation-free producer-side liveness check for high-rate input. Zero is
+     * reserved as "no writable transport"; real generations start at one and
+     * only advance from there.
+     */
+    private fun currentTransportGeneration(): Long =
+        synchronized(transportLock) {
+            if (!isConnected || socket == null || outputStream == null) 0L else transportGeneration
+        }
+
+    private fun outputForGeneration(generation: Long): DataOutputStream? =
+        synchronized(transportLock) {
+            if (isConnected && transportGeneration == generation) outputStream else null
+        }
+
     private fun isTransportCurrent(snapshot: TransportSnapshot): Boolean =
         synchronized(transportLock) {
             isConnected &&
@@ -670,8 +685,9 @@ class StreamClient(
         y2: Float = 0f,
     ) {
         if (touchExecutor.isShutdown) return
-        val transport = currentTransport() ?: return
-        val write = TouchWrite(transport, x, y, action, pointerCount, x2, y2)
+        val generation = currentTransportGeneration()
+        if (generation == 0L) return
+        val write = TouchWrite(generation, x, y, action, pointerCount, x2, y2)
 
         if (action == TOUCH_ACTION_MOVE) {
             touchMoveCoalescer.offer(write)?.let { epoch ->
@@ -701,8 +717,7 @@ class StreamClient(
     }
 
     private fun sendTouchNow(write: TouchWrite) {
-        val transport = write.transport
-        if (!isTransportCurrent(transport)) return
+        if (!isTransportGenerationCurrent(write.generation)) return
         if (
             controlChannel.sendTouch(
                 write.x,
@@ -711,13 +726,13 @@ class StreamClient(
                 write.pointerCount,
                 write.x2,
                 write.y2,
-                expectedSessionGeneration = transport.generation,
+                expectedSessionGeneration = write.generation,
             )
         ) {
             return
         }
-        if (!isTransportCurrent(transport)) return
 
+        val output = outputForGeneration(write.generation) ?: return
         try {
             val count = write.pointerCount.coerceIn(1, 2)
             inBandTouchPacket[0] = MESSAGE_TOUCH.toByte()
@@ -731,16 +746,17 @@ class StreamClient(
                 offset += 8
             }
             putIntLE(inBandTouchPacket, offset, write.action)
-            transport.output.write(inBandTouchPacket, 0, 6 + count * 8)
+            output.write(inBandTouchPacket, 0, 6 + count * 8)
         } catch (e: Exception) {
-            failVideoTransport(transport, "in-band touch write failed", e)
+            failVideoTransport(write.generation, "in-band touch write failed", e)
         }
     }
 
     fun sendStylus(event: StylusInputEvent) {
         if (!stylusSupported || touchExecutor.isShutdown) return
-        val transport = currentTransport() ?: return
-        val write = StylusWrite(transport, event)
+        val generation = currentTransportGeneration()
+        if (generation == 0L) return
+        val write = StylusWrite(generation, event)
         val replaceable =
             event.action == StylusProtocol.ACTION_MOVE ||
                 event.action == StylusProtocol.ACTION_HOVER
@@ -770,18 +786,17 @@ class StreamClient(
     }
 
     private fun sendStylusNow(write: StylusWrite) {
-        val transport = write.transport
-        if (!isTransportCurrent(transport)) return
-        if (controlChannel.sendStylus(write.event, expectedSessionGeneration = transport.generation)) {
+        if (!isTransportGenerationCurrent(write.generation)) return
+        if (controlChannel.sendStylus(write.event, expectedSessionGeneration = write.generation)) {
             return
         }
-        if (!isTransportCurrent(transport)) return
 
+        val output = outputForGeneration(write.generation) ?: return
         try {
             val size = StylusProtocol.encodeInto(write.event, inBandStylusPacket)
-            transport.output.write(inBandStylusPacket, 0, size)
+            output.write(inBandStylusPacket, 0, size)
         } catch (e: Exception) {
-            failVideoTransport(transport, "in-band stylus write failed", e)
+            failVideoTransport(write.generation, "in-band stylus write failed", e)
         }
     }
 
@@ -891,6 +906,34 @@ class StreamClient(
         error: Exception?,
     ) {
         if (!isTransportCurrent(transport)) return
+        logVideoTransportFailure(reason, error)
+        try {
+            transport.socket.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Generation-only variant for allocation-free high-rate input fallback. */
+    private fun failVideoTransport(
+        generation: Long,
+        reason: String,
+        error: Exception?,
+    ) {
+        val activeSocket =
+            synchronized(transportLock) {
+                if (!isConnected || transportGeneration != generation) null else socket
+            } ?: return
+        logVideoTransportFailure(reason, error)
+        try {
+            activeSocket.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun logVideoTransportFailure(
+        reason: String,
+        error: Exception?,
+    ) {
         if (error == null) {
             diagLog("Video transport unhealthy: $reason — forcing reconnect")
         } else {
@@ -898,10 +941,6 @@ class StreamClient(
                 "Video transport unhealthy: $reason " +
                     "(${error.javaClass.simpleName}: ${error.message}) — forcing reconnect",
             )
-        }
-        try {
-            transport.socket.close()
-        } catch (_: Exception) {
         }
     }
 
