@@ -98,9 +98,7 @@ class VideoEncoder {
         // measured against 30/45 limits). Motion bursts then overloaded the
         // transport/tablet decoder (the 34-39fps collapse + drop cascades).
         // Production now uses bitrate-based VBR: AverageBitRate as the soft
-        // target, DataRateLimits as the 1-second hard cap at 1.5x. The
-        // quality presets select the target; SideScreen_exp_bitrate (Mbps)
-        // overrides the target directly; the UI bitrate acts as a floor.
+        // target, DataRateLimits as the 1-second hard cap at 1.5x.
         let presetMbps: Int
         switch quality {
         case "ultralow": presetMbps = 6
@@ -113,17 +111,24 @@ class VideoEncoder {
         case "ultra": presetMbps = 60
         default: presetMbps = 20
         }
+
         let expBitrate = UserDefaults.standard.object(forKey: "SideScreen_exp_bitrate") as? Int
-        // The UI bitrate (Mbps) can raise the preset target, but only within
-        // the range the settings UI actually offers (100-2000 Mbps). Stored
-        // values above that are legacy Kbps-scale junk (e.g. the paused
-        // campaign's 8000) that must not turn the target into 8 Gbps.
-        // gamingBoost pins the bounded ultralow profile — its 1000Mbps
-        // effectiveBitrate is ignored (it predates bounded rate control).
-        let uiFloor = (bitrateMbps >= 100 && bitrateMbps <= 2000) ? bitrateMbps : 0
-        let targetMbps = expBitrate ?? (gamingBoost ? presetMbps : max(presetMbps, uiFloor))
+        let connectionMode = UserDefaults.standard.string(forKey: "SideScreen_connectionMode") ?? "usb"
+        let isWireless = connectionMode == "wireless"
+
+        // The historic UI bitrate control was designed for the USB path and
+        // defaults to 1000 Mbps. Feeding that value into Wi-Fi defeats the
+        // bounded 6..60 Mbps quality ladder and can ask VideoToolbox for a
+        // gigabit stream before TCP/backpressure has any chance to help.
+        // Wireless therefore follows the quality preset exactly. USB keeps the
+        // old explicit floor for users who deliberately want very high cable
+        // bitrate. SideScreen_exp_bitrate remains an intentional override for
+        // experiments on either transport.
+        let uiFloor = (!isWireless && bitrateMbps >= 100 && bitrateMbps <= 2000) ? bitrateMbps : 0
+        let targetMbps = expBitrate ?? ((gamingBoost || isWireless) ? presetMbps : max(presetMbps, uiFloor))
         let avgBps = targetMbps * 1_000_000
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: avgBps as CFNumber)
+
         // Hard cap: bytes over a 1s window at 1.5x target — the guarantee
         // that keeps per-frame size (and thus decoder+transport load) bounded
         // during complex motion. This is the property pair VideoToolbox
@@ -132,7 +137,7 @@ class VideoEncoder {
         let capBytes = Int(Double(targetMbps) * 1.5 * 1_000_000.0 / 8.0)
         let dataRateLimits = [capBytes, 1] as CFArray
         let limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits)
-        debugLog("Rate control: avg=\(targetMbps)Mbps cap=\(Int(Double(targetMbps) * 1.5))Mbps/1s (DataRateLimits status=\(limitStatus))")
+        debugLog("Rate control: path=\(isWireless ? "wireless" : "usb") avg=\(targetMbps)Mbps cap=\(Int(Double(targetMbps) * 1.5))Mbps/1s (DataRateLimits status=\(limitStatus))")
 
         // Frame rate settings
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
