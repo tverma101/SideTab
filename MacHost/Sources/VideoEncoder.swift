@@ -142,18 +142,16 @@ class VideoEncoder {
         // Frame rate settings
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
 
-        // IPP with a 1-second GOP, matching the deployed client's stale-
-        // keyframe contract (KEYFRAME_STALE_INTERVAL_NS = 1.5s in
-        // StreamClient.kt): natural IDRs at 1s mean the client NEVER needs to
-        // request one mid-stream, so the rate-control window is fully owned
-        // by the encoder. (GOP > 1.5s was tried 2026-08-16: the client fired
-        // stale-keyframe requests every ~1.5s regardless, desynchronizing
-        // forced IDRs from the encoder's budget. GOP between 1s and 1.5s
-        // behaves the same on static screens, where encoded-frame counting
-        // stalls.) The old unbounded-IDR-burst concern is now contained by
-        // the DataRateLimits hard cap above. SideScreen_exp_gop overrides.
+        // TCP preserves reference frames, reconnect/startup forces an IDR, and
+        // Android explicitly requests one when its decoder is reset or loses
+        // input. Wireless therefore uses a longer periodic safety GOP to avoid
+        // paying a large full-frame refresh every second during continuous
+        // motion. USB keeps the existing one-second cadence. The Android
+        // stale-keyframe watchdog sits just beyond the five-second wireless GOP.
+        // SideScreen_exp_gop remains an explicit frame-count override.
         let expGop = UserDefaults.standard.object(forKey: "SideScreen_exp_gop") as? Int
-        let gopFrames = expGop ?? frameRate
+        let defaultGopFrames = frameRate * (isWireless ? 5 : 1)
+        let gopFrames = expGop ?? defaultGopFrames
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: Double(gopFrames) / Double(frameRate) as CFNumber)
 
