@@ -9,7 +9,8 @@ object PairingURL {
         val port: Int,
         val token: ByteArray,
         val macName: String,
-        val controlPort: Int,
+        /** null means the control endpoint follows videoPort + 1. */
+        val controlPortOverride: Int?,
     )
 
     fun parse(url: String): Parsed? {
@@ -32,16 +33,16 @@ object PairingURL {
         if (token.size != 32) return null
         val name = uri.getQueryParameter("name") ?: "Mac"
 
-        // New hosts include c=<controlPort> when the dedicated control socket
-        // is not videoPort+1. Legacy QR payloads keep their original behavior.
-        val explicitControl = uri.getQueryParameter("c")
-        val controlPort =
-            if (explicitControl != null) {
-                explicitControl.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
-            } else {
-                (port + 1).takeIf { it <= 65535 } ?: return null
+        // New hosts include c=<controlPort> only when the dedicated control
+        // socket does not follow videoPort+1. Keeping the absence meaningful
+        // lets Bonjour update a changed video port without freezing the old
+        // derived control endpoint in storage.
+        val controlPortOverride =
+            uri.getQueryParameter("c")?.let { raw ->
+                raw.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
             }
+        if (controlPortOverride == null && port == 65535) return null
 
-        return Parsed(host, port, token, name, controlPort)
+        return Parsed(host, port, token, name, controlPortOverride)
     }
 }
