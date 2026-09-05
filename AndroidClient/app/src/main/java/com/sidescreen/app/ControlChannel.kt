@@ -445,10 +445,18 @@ class ControlChannel(
         y2: Float,
         expectedSessionGeneration: Long? = null,
     ): Boolean {
-        val transport = activeTransport() ?: return false
         synchronized(sendLock) {
+            var activeSocket: Socket? = null
+            var activeOutput: DataOutputStream? = null
+            synchronized(connectLock) {
+                if (tcpActive) {
+                    activeSocket = socket
+                    activeOutput = output
+                }
+            }
+            val currentSocket = activeSocket ?: return false
+            val currentOutput = activeOutput ?: return false
             if (expectedSessionGeneration != null && sessionGeneration != expectedSessionGeneration) return true
-            if (!isTransportCurrent(transport)) return false
 
             val count = pointerCount.coerceIn(1, 2)
             touchPacketScratch[0] = MESSAGE_TOUCH.toByte()
@@ -465,11 +473,11 @@ class ControlChannel(
             val packetSize = 6 + count * 8
 
             return try {
-                transport.output.write(touchPacketScratch, 0, packetSize)
+                currentOutput.write(touchPacketScratch, 0, packetSize)
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control touch write failed: ${e.javaClass.simpleName}: ${e.message}")
-                markTcpInactive(transport.socket)
+                markTcpInactive(currentSocket)
                 false
             }
         }
@@ -479,17 +487,25 @@ class ControlChannel(
         event: StylusInputEvent,
         expectedSessionGeneration: Long? = null,
     ): Boolean {
-        val transport = activeTransport() ?: return false
         synchronized(sendLock) {
+            var activeSocket: Socket? = null
+            var activeOutput: DataOutputStream? = null
+            synchronized(connectLock) {
+                if (tcpActive) {
+                    activeSocket = socket
+                    activeOutput = output
+                }
+            }
+            val currentSocket = activeSocket ?: return false
+            val currentOutput = activeOutput ?: return false
             if (expectedSessionGeneration != null && sessionGeneration != expectedSessionGeneration) return true
-            if (!isTransportCurrent(transport)) return false
             return try {
                 val size = StylusProtocol.encodeInto(event, stylusPacketScratch)
-                transport.output.write(stylusPacketScratch, 0, size)
+                currentOutput.write(stylusPacketScratch, 0, size)
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control stylus write failed: ${e.javaClass.simpleName}: ${e.message}")
-                markTcpInactive(transport.socket)
+                markTcpInactive(currentSocket)
                 false
             }
         }
