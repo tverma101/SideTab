@@ -605,9 +605,6 @@ class ScreenCapture {
             if let last = lastTime {
                 let elapsed = Double(DispatchTime.now().uptimeNanoseconds - last.uptimeNanoseconds) / 1_000_000_000
                 stalled = elapsed > 5.0
-                if stalled {
-                    debugLog("Frame flow stalled — no frames for \(String(format: "%.1f", elapsed))s, triggering fallback")
-                }
             } else {
                 stalled = true
                 debugLog("Frame flow stalled — no frames ever received after 5s, triggering fallback")
@@ -617,17 +614,27 @@ class ScreenCapture {
                 let hasHadFrames = self.stateLock.withLock { $0.hasReceivedFirstFrame }
 
                 if hasHadFrames, let lastBuffer = self.lastPixelBuffer {
-                    // Screen is idle — SCStream is healthy but not delivering frames (macOS optimization).
-                    // Re-send the last captured frame as a keepalive so the tablet stays connected.
-                    let pts = CMTime(
-                        value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
-                        timescale: 1_000_000
-                    )
-                    self.encodeQueue?.async {
-                        self.encoder?.encode(pixelBuffer: lastBuffer, presentationTimeStamp: pts)
+                    let wireless = UserDefaults.standard.string(forKey: "SideScreen_connectionMode") == "wireless"
+                    if wireless {
+                        // Static ScreenCaptureKit periods are expected. Android
+                        // now probes the real video TCP socket whenever frame
+                        // delivery is quiet, so re-encoding cached pixels here
+                        // only burns encoder work/airtime and can create a large
+                        // periodic IDR after the multi-second PTS jump. Stop the
+                        // monitor: genuine SCStream failures still arrive via
+                        // StreamDelegate and trigger fallback independently.
+                        self.stopFrameMonitor()
+                    } else {
+                        // Preserve the legacy USB keepalive behavior.
+                        let pts = CMTime(
+                            value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
+                            timescale: 1_000_000
+                        )
+                        self.encodeQueue?.async {
+                            self.encoder?.encode(pixelBuffer: lastBuffer, presentationTimeStamp: pts)
+                        }
+                        self.stateLock.withLock { $0.lastFrameTime = DispatchTime.now() }
                     }
-                    self.stateLock.withLock { $0.lastFrameTime = DispatchTime.now() }
-                    // Keep monitoring — real errors are handled by the SCStream error delegate
                 } else {
                     self.stopFrameMonitor()
                     if !self.restartAttempted {
