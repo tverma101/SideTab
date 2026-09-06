@@ -11,6 +11,11 @@ enum WirelessTransportPressure {
         case forced
     }
 
+    struct EncodingState: Equatable {
+        let pause: Bool
+        let bitrateStepDown: Int
+    }
+
     private struct State {
         var generation: UInt64 = 0
         var wireless = false
@@ -20,6 +25,7 @@ enum WirelessTransportPressure {
         var lastAvailableSendBuffer: UInt32?
         var forcedCapturePending = false
         var largeSendOutstanding = false
+        var bitratePolicy = WirelessBitratePolicy()
 
         // Lightweight transport telemetry. Outstanding sends are intentionally
         // tiny (the pressure high-watermark is two), so a fixed pair avoids a
@@ -61,6 +67,7 @@ enum WirelessTransportPressure {
         state.lastAvailableSendBuffer = nil
         state.forcedCapturePending = false
         state.largeSendOutstanding = false
+        state.bitratePolicy.reset()
         resetTelemetryLocked()
         return state.generation
     }
@@ -128,6 +135,12 @@ enum WirelessTransportPressure {
 
         if state.wireless,
            state.completionSamples >= telemetryLogEveryCompletions {
+            let window = WirelessBitratePolicy.Window(
+                completionSamples: state.completionSamples,
+                capturePauseDecisions: state.capturePauseDecisions,
+                headroomMinBytes: state.headroomMinBytes
+            )
+            _ = state.bitratePolicy.observe(window)
             logLine = telemetryLineLocked()
             resetTelemetryCountersLocked()
         }
@@ -173,13 +186,30 @@ enum WirelessTransportPressure {
             state.captureForcedDecisions += 1
             return .forced
         }
-        if state.sendsInFlight >= highWatermark ||
-            state.largeSendOutstanding ||
-            nowNs < state.pauseUntilNs {
+        if pressureLocked(at: nowNs) {
             state.capturePauseDecisions += 1
             return .pause
         }
         return .normal
+    }
+
+    /// VideoEncoder reads both decisions from one lock acquisition. The bitrate
+    /// recommendation changes only at telemetry-window boundaries, so there is
+    /// no per-frame policy work here.
+    static var encodingState: EncodingState {
+        encodingState(at: DispatchTime.now().uptimeNanoseconds)
+    }
+
+    static func encodingState(at nowNs: UInt64) -> EncodingState {
+        lock.lock()
+        defer { lock.unlock() }
+        guard state.wireless, state.ready else {
+            return EncodingState(pause: false, bitrateStepDown: 0)
+        }
+        return EncodingState(
+            pause: pressureLocked(at: nowNs),
+            bitrateStepDown: state.bitratePolicy.stepDown
+        )
     }
 
     /// Sample real TCP sender headroom before submitting an encoded frame.
@@ -250,6 +280,7 @@ enum WirelessTransportPressure {
         state.forcedCapturePending = false
         state.largeSendOutstanding = false
         state.wireless = false
+        state.bitratePolicy.reset()
         resetTelemetryLocked()
     }
 
@@ -258,14 +289,15 @@ enum WirelessTransportPressure {
     /// encode work from outrunning either local Network.framework submission or
     /// the TCP sender buffer during a transient Wi-Fi slowdown.
     static var shouldPauseEncoding: Bool {
-        shouldPauseEncoding(at: DispatchTime.now().uptimeNanoseconds)
+        encodingState.pause
     }
 
     static func shouldPauseEncoding(at nowNs: UInt64) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard state.wireless, state.ready else { return false }
-        return state.sendsInFlight >= highWatermark ||
+        encodingState(at: nowNs).pause
+    }
+
+    private static func pressureLocked(at nowNs: UInt64) -> Bool {
+        state.sendsInFlight >= highWatermark ||
             state.largeSendOutstanding ||
             nowNs < state.pauseUntilNs
     }
@@ -282,13 +314,14 @@ enum WirelessTransportPressure {
 
         return String(
             format: "Wireless transport: sendComplete avg=%.2fms max=%.2fms, " +
-                "TCP headroom avg=%.0fKiB min=%.0fKiB, capturePauses=%d forced=%d",
+                "TCP headroom avg=%.0fKiB min=%.0fKiB, capturePauses=%d forced=%d rateStep=-%d",
             completionAverageMs,
             completionMaxMs,
             headroomAverageKiB,
             headroomMinKiB,
             state.capturePauseDecisions,
-            state.captureForcedDecisions
+            state.captureForcedDecisions,
+            state.bitratePolicy.stepDown
         )
     }
 
