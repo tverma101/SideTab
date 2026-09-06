@@ -37,6 +37,30 @@ final class AnnexBConverterTests: XCTestCase {
         )
     }
 
+    func testRawStorageRewriteMatchesDataPath() {
+        var data = lengthPrefixed([
+            [0x02, 0x01, 0x10],
+            [0x28, 0x01, 0x20, 0x21],
+        ])
+
+        let rewritten = data.withUnsafeMutableBytes { bytes -> Bool in
+            guard let base = bytes.baseAddress else { return false }
+            return AnnexBConverter.rewriteFourByteLengthPrefixes(
+                bytes: base,
+                count: bytes.count
+            )
+        }
+
+        XCTAssertTrue(rewritten)
+        XCTAssertEqual(
+            data,
+            Data([
+                0, 0, 0, 1, 0x02, 0x01, 0x10,
+                0, 0, 0, 1, 0x28, 0x01, 0x20, 0x21,
+            ])
+        )
+    }
+
     func testPayloadOffsetPreservesPrependedParameterSets() {
         let prefix = Data([0, 0, 0, 1, 0x40, 0x01, 0x0C])
         var data = prefix
