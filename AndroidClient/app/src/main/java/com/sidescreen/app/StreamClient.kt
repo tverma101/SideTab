@@ -466,7 +466,10 @@ class StreamClient(
                 }
                 connectingSocket.soTimeout = 0
                 clearPendingSocket(connectingSocket)
-                installConnectedSocket(connectingSocket)
+                installConnectedSocket(
+                    connectingSocket,
+                    inputBufferBytes = WIRELESS_STREAM_INPUT_BUFFER_BYTES,
+                )
             }
 
             AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
@@ -501,8 +504,19 @@ class StreamClient(
      * prevents the still-running ping/input loop from interleaving bytes with
      * codec/decoder/stylus negotiation during an internal reconnect.
      */
-    private fun installConnectedSocket(s: Socket): Long {
-        val input = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
+    private fun installConnectedSocket(
+        s: Socket,
+        inputBufferBytes: Int = DEFAULT_STREAM_INPUT_BUFFER_BYTES,
+    ): Long {
+        // BufferedInputStream bypasses its internal array for sufficiently large
+        // read(byte[]) requests. Wireless therefore uses Android's normal 8 KiB
+        // scale: protocol headers stay cheap while most encoded payload bytes go
+        // directly into StreamClient's reusable frame array instead of taking a
+        // 64 KiB user-space prefetch/copy detour. USB keeps the legacy depth.
+        val input =
+            DataInputStream(
+                java.io.BufferedInputStream(s.getInputStream(), inputBufferBytes),
+            )
         val output = DataOutputStream(s.getOutputStream())
         val generation =
             synchronized(transportLock) {
@@ -529,6 +543,7 @@ class StreamClient(
         framesReceived = 0L
         lastStatsTime = System.currentTimeMillis()
 
+        diagLog("Installed stream input buffer=${inputBufferBytes / 1024}KiB generation=$generation")
         advertiseCapabilities(output)
 
         synchronized(transportLock) {
@@ -1210,6 +1225,8 @@ class StreamClient(
         // 90 Mbps * 25 ms decoder wait ~= 281 KiB; 384 KiB leaves LAN/Burst
         // headroom while remaining far below multi-megabyte autotuned windows.
         private const val WIRELESS_RECEIVE_BUFFER_BYTES = 384 * 1024
+        private const val DEFAULT_STREAM_INPUT_BUFFER_BYTES = 64 * 1024
+        private const val WIRELESS_STREAM_INPUT_BUFFER_BYTES = 8 * 1024
         private const val CONNECT_TIMEOUT_MS = 5_000
         private const val RECONNECT_CONNECT_TIMEOUT_MS = 1_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
