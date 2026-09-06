@@ -246,7 +246,7 @@ class VideoEncoder {
     }
 }
 
-// Static start code to avoid repeated allocations
+// Static start code used only for keyframe parameter sets.
 private let nalStartCode: [UInt8] = [0, 0, 0, 1]
 private let plausibleFrameAgeNs: UInt64 = 60_000_000_000
 
@@ -280,31 +280,17 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
     let encoder = Unmanaged<VideoEncoder>.fromOpaque(refcon).takeUnretainedValue()
     let timestamp = frameTimestampNanoseconds(sampleBuffer)
 
-    // Extract encoded data
     guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+    let totalLength = CMBlockBufferGetDataLength(dataBuffer)
+    guard totalLength > 0 else { return }
 
-    var lengthAtOffset: Int = 0
-    var totalLength: Int = 0
-    var dataPointer: UnsafeMutablePointer<Int8>?
-
-    let statusCode = CMBlockBufferGetDataPointer(
-        dataBuffer,
-        atOffset: 0,
-        lengthAtOffsetOut: &lengthAtOffset,
-        totalLengthOut: &totalLength,
-        dataPointerOut: &dataPointer
-    )
-
-    guard statusCode == kCMBlockBufferNoErr,
-          let dataPointer = dataPointer else {
-        return
-    }
-
-    // Check if this is a keyframe
+    // Check if this is a keyframe.
     let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
     let isKeyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
 
-    // Pre-allocate estimated size to reduce reallocations
+    // Keyframes prepend their parameter sets. The encoded CMBlockBuffer payload
+    // itself is then copied exactly once into its final Data storage; unlike the
+    // old NAL loop, payload bytes are never appended/copy-walked per NAL.
     let estimatedSize = totalLength + (isKeyframe ? 256 : 0) + 32
     var frameData = Data(capacity: estimatedSize)
 
@@ -340,20 +326,28 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         }
     }
 
-    // Convert length-prefixed NAL units to Annex-B format (start codes)
-    var offset = 0
-    while offset < totalLength {
-        // Read 4-byte length
-        var nalLength: UInt32 = 0
-        memcpy(&nalLength, dataPointer.advanced(by: offset), 4)
-        nalLength = UInt32(bigEndian: nalLength)
-        offset += 4
+    let payloadOffset = frameData.count
+    frameData.count = payloadOffset + totalLength
+    let copyStatus: OSStatus = frameData.withUnsafeMutableBytes { bytes in
+        guard let baseAddress = bytes.baseAddress else { return -1 }
+        return CMBlockBufferCopyDataBytes(
+            dataBuffer,
+            atOffset: 0,
+            dataLength: totalLength,
+            destination: baseAddress.advanced(by: payloadOffset)
+        )
+    }
+    guard copyStatus == kCMBlockBufferNoErr else {
+        debugLog("Encoded CMBlockBuffer copy failed: \(copyStatus)")
+        return
+    }
 
-        // Add start code and NAL unit data
-        frameData.append(contentsOf: nalStartCode)
-        let nalPointer = UnsafeRawPointer(dataPointer.advanced(by: offset))
-        frameData.append(nalPointer.assumingMemoryBound(to: UInt8.self), count: Int(nalLength))
-        offset += Int(nalLength)
+    guard AnnexBConverter.rewriteFourByteLengthPrefixes(
+        in: &frameData,
+        payloadOffset: payloadOffset
+    ) else {
+        debugLog("Encoded frame contained malformed 4-byte NAL lengths — dropping frame")
+        return
     }
 
     encoder.onEncodedFrame?(frameData, timestamp, isKeyframe)
