@@ -289,10 +289,10 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
     let isKeyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
 
     // Keyframes prepend their parameter sets. The encoded CMBlockBuffer payload
-    // itself is then copied exactly once into its final Data storage; unlike the
-    // old NAL loop, payload bytes are never appended/copy-walked per NAL.
-    let estimatedSize = totalLength + (isKeyframe ? 256 : 0) + 32
-    var frameData = Data(capacity: estimatedSize)
+    // itself is then copied exactly once into uninitialized final Data storage;
+    // unlike the old NAL loop, payload bytes are never zero-filled or appended
+    // and copy-walked per NAL.
+    var parameterPrefix = Data(capacity: isKeyframe ? 256 : 0)
 
     if isKeyframe {
         if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) {
@@ -319,23 +319,38 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
                 }
 
                 if let pointer = parameterSetPointer {
-                    frameData.append(contentsOf: nalStartCode)
-                    frameData.append(pointer, count: parameterSetSize)
+                    parameterPrefix.append(contentsOf: nalStartCode)
+                    parameterPrefix.append(pointer, count: parameterSetSize)
                 }
             }
         }
     }
 
-    let payloadOffset = frameData.count
-    frameData.count = payloadOffset + totalLength
-    let copyStatus: OSStatus = frameData.withUnsafeMutableBytes { bytes in
-        guard let baseAddress = bytes.baseAddress else { return -1 }
-        return CMBlockBufferCopyDataBytes(
+    let payloadOffset = parameterPrefix.count
+    let finalSize = payloadOffset + totalLength
+    var copyStatus: OSStatus = kCMBlockBufferNoErr
+    var frameData = Data(unsafeUninitializedCapacity: finalSize) { bytes, initializedCount in
+        guard let destination = bytes.baseAddress else {
+            copyStatus = -1
+            initializedCount = 0
+            return
+        }
+
+        if payloadOffset > 0 {
+            parameterPrefix.withUnsafeBytes { prefixBytes in
+                if let source = prefixBytes.baseAddress {
+                    destination.copyMemory(from: source, byteCount: payloadOffset)
+                }
+            }
+        }
+
+        copyStatus = CMBlockBufferCopyDataBytes(
             dataBuffer,
             atOffset: 0,
             dataLength: totalLength,
-            destination: baseAddress.advanced(by: payloadOffset)
+            destination: destination.advanced(by: payloadOffset)
         )
+        initializedCount = copyStatus == kCMBlockBufferNoErr ? finalSize : 0
     }
     guard copyStatus == kCMBlockBufferNoErr else {
         debugLog("Encoded CMBlockBuffer copy failed: \(copyStatus)")
