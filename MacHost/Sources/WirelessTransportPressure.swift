@@ -20,6 +20,20 @@ enum WirelessTransportPressure {
         var lastAvailableSendBuffer: UInt32?
         var forcedCapturePending = false
         var largeSendOutstanding = false
+
+        // Lightweight transport telemetry. Outstanding sends are intentionally
+        // tiny (the pressure high-watermark is two), so a fixed pair avoids a
+        // per-frame Array append/remove allocation on the 60/90/120 Hz path.
+        var oldestSendStartedNs: UInt64 = 0
+        var newestSendStartedNs: UInt64 = 0
+        var completionSamples = 0
+        var completionTotalNs: UInt64 = 0
+        var completionMaxNs: UInt64 = 0
+        var headroomSamples = 0
+        var headroomTotalBytes: UInt64 = 0
+        var headroomMinBytes: UInt32?
+        var capturePauseDecisions = 0
+        var captureForcedDecisions = 0
     }
 
     private static let lock = NSLock()
@@ -32,6 +46,7 @@ enum WirelessTransportPressure {
     // dependent frame behind it; wait for the outstanding send set to drain.
     private static let largeSendBytes = 256 * 1024
     private static let sendBufferPauseNs: UInt64 = 20_000_000
+    private static let telemetryLogEveryCompletions = 120
 
     /// Start a new video transport generation and return its pressure token.
     @discardableResult
@@ -46,6 +61,7 @@ enum WirelessTransportPressure {
         state.lastAvailableSendBuffer = nil
         state.forcedCapturePending = false
         state.largeSendOutstanding = false
+        resetTelemetryLocked()
         return state.generation
     }
 
@@ -56,23 +72,69 @@ enum WirelessTransportPressure {
         state.ready = true
     }
 
-    static func beginSend(generation: UInt64) {
+    static func beginSend(
+        generation: UInt64,
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
         lock.lock()
         defer { lock.unlock() }
         guard state.generation == generation, state.ready else { return }
         state.sendsInFlight += 1
+
+        // Two timestamp slots are enough because normal capture is gated at two
+        // outstanding sends. Forced recovery may briefly exceed that count; in
+        // that rare case the newest timestamp still gives a useful lower-bound
+        // completion sample without allocating a queue.
+        if state.oldestSendStartedNs == 0 {
+            state.oldestSendStartedNs = nowNs
+        } else {
+            state.newestSendStartedNs = nowNs
+        }
     }
 
-    static func completeSend(generation: UInt64) {
+    static func completeSend(
+        generation: UInt64,
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        var logLine: String?
+
         lock.lock()
-        defer { lock.unlock() }
-        guard state.generation == generation else { return }
+        guard state.generation == generation else {
+            lock.unlock()
+            return
+        }
+
+        let startedNs = state.oldestSendStartedNs
+        if startedNs > 0, nowNs >= startedNs {
+            let elapsed = nowNs - startedNs
+            state.completionSamples += 1
+            state.completionTotalNs &+= elapsed
+            if elapsed > state.completionMaxNs {
+                state.completionMaxNs = elapsed
+            }
+        }
+
+        state.oldestSendStartedNs = state.newestSendStartedNs
+        state.newestSendStartedNs = 0
         state.sendsInFlight = max(0, state.sendsInFlight - 1)
         // observeSendBuffer runs immediately before beginSend. Once every send
         // that was outstanding at/after a large frame has completed, the large
         // payload can no longer be sitting in our local Network.framework queue.
         if state.sendsInFlight == 0 {
             state.largeSendOutstanding = false
+            state.oldestSendStartedNs = 0
+            state.newestSendStartedNs = 0
+        }
+
+        if state.wireless,
+           state.completionSamples >= telemetryLogEveryCompletions {
+            logLine = telemetryLineLocked()
+            resetTelemetryCountersLocked()
+        }
+        lock.unlock()
+
+        if let logLine {
+            debugLog(logLine)
         }
     }
 
@@ -107,10 +169,14 @@ enum WirelessTransportPressure {
         lock.lock()
         defer { lock.unlock() }
         guard state.wireless, state.ready else { return .normal }
-        if state.forcedCapturePending { return .forced }
+        if state.forcedCapturePending {
+            state.captureForcedDecisions += 1
+            return .forced
+        }
         if state.sendsInFlight >= highWatermark ||
             state.largeSendOutstanding ||
             nowNs < state.pauseUntilNs {
+            state.capturePauseDecisions += 1
             return .pause
         }
         return .normal
@@ -139,6 +205,16 @@ enum WirelessTransportPressure {
         guard state.generation == generation, state.wireless, state.ready else { return }
 
         state.lastAvailableSendBuffer = availableBytes
+        state.headroomSamples += 1
+        state.headroomTotalBytes &+= UInt64(availableBytes)
+        if let minimum = state.headroomMinBytes {
+            if availableBytes < minimum {
+                state.headroomMinBytes = availableBytes
+            }
+        } else {
+            state.headroomMinBytes = availableBytes
+        }
+
         let available = UInt64(availableBytes)
         let frame = UInt64(max(1, frameBytes))
         let residual = available > frame ? available - frame : 0
@@ -174,6 +250,7 @@ enum WirelessTransportPressure {
         state.forcedCapturePending = false
         state.largeSendOutstanding = false
         state.wireless = false
+        resetTelemetryLocked()
     }
 
     /// Routine captures are suppressed only before VideoToolbox sees them.
@@ -191,6 +268,45 @@ enum WirelessTransportPressure {
         return state.sendsInFlight >= highWatermark ||
             state.largeSendOutstanding ||
             nowNs < state.pauseUntilNs
+    }
+
+    private static func telemetryLineLocked() -> String {
+        let completionAverageMs = state.completionSamples > 0
+            ? Double(state.completionTotalNs) / Double(state.completionSamples) / 1_000_000.0
+            : 0.0
+        let completionMaxMs = Double(state.completionMaxNs) / 1_000_000.0
+        let headroomAverageKiB = state.headroomSamples > 0
+            ? Double(state.headroomTotalBytes) / Double(state.headroomSamples) / 1024.0
+            : 0.0
+        let headroomMinKiB = Double(state.headroomMinBytes ?? 0) / 1024.0
+
+        return String(
+            format: "Wireless transport: sendComplete avg=%.2fms max=%.2fms, " +
+                "TCP headroom avg=%.0fKiB min=%.0fKiB, capturePauses=%d forced=%d",
+            completionAverageMs,
+            completionMaxMs,
+            headroomAverageKiB,
+            headroomMinKiB,
+            state.capturePauseDecisions,
+            state.captureForcedDecisions
+        )
+    }
+
+    private static func resetTelemetryCountersLocked() {
+        state.completionSamples = 0
+        state.completionTotalNs = 0
+        state.completionMaxNs = 0
+        state.headroomSamples = 0
+        state.headroomTotalBytes = 0
+        state.headroomMinBytes = nil
+        state.capturePauseDecisions = 0
+        state.captureForcedDecisions = 0
+    }
+
+    private static func resetTelemetryLocked() {
+        state.oldestSendStartedNs = 0
+        state.newestSendStartedNs = 0
+        resetTelemetryCountersLocked()
     }
 
     // Test visibility without exposing mutable state to production callers.
@@ -215,6 +331,30 @@ enum WirelessTransportPressure {
             state.lastAvailableSendBuffer,
             state.forcedCapturePending,
             state.largeSendOutstanding
+        )
+    }
+
+    static func telemetrySnapshotForTest() -> (
+        completionSamples: Int,
+        completionTotalNs: UInt64,
+        completionMaxNs: UInt64,
+        headroomSamples: Int,
+        headroomTotalBytes: UInt64,
+        headroomMinBytes: UInt32?,
+        capturePauseDecisions: Int,
+        captureForcedDecisions: Int
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (
+            state.completionSamples,
+            state.completionTotalNs,
+            state.completionMaxNs,
+            state.headroomSamples,
+            state.headroomTotalBytes,
+            state.headroomMinBytes,
+            state.capturePauseDecisions,
+            state.captureForcedDecisions
         )
     }
 }
