@@ -24,9 +24,6 @@ final class WirelessTransportPressureTests: XCTestCase {
         WirelessTransportPressure.setReady(generation: generation)
         let now: UInt64 = 500_000_000
 
-        // Socket headroom is healthy, so the only pressure source is the frame
-        // itself. A 300 KiB IDR/motion burst should not be followed immediately
-        // by another routine encode while that large send is outstanding.
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
             availableBytes: 1_024 * 1024,
@@ -66,8 +63,6 @@ final class WirelessTransportPressureTests: XCTestCase {
         WirelessTransportPressure.setReady(generation: generation)
         let now: UInt64 = 1_500_000_000
 
-        // There is technically room for this 64 KiB frame now, but sending it
-        // would leave only 16 KiB. Stop before encoding another dependent frame.
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
             availableBytes: 80 * 1024,
@@ -84,9 +79,6 @@ final class WirelessTransportPressureTests: XCTestCase {
         WirelessTransportPressure.setReady(generation: generation)
         let now: UInt64 = 1_650_000_000
 
-        // 120 KiB available can hold the current 64 KiB frame, but leaves only
-        // 56 KiB. The old fixed 32 KiB reserve would admit more work here; the
-        // new policy preserves room for roughly one comparable next frame.
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
             availableBytes: 120 * 1024,
@@ -147,8 +139,6 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertEqual(newGeneration, newMarker)
         XCTAssertEqual(.forced, WirelessTransportPressure.captureAdmission)
 
-        // A delayed encode from the retired transport cannot consume the new
-        // session's recovery admission.
         WirelessTransportPressure.clearForcedCapturePending(generation: oldGeneration)
         XCTAssertEqual(.forced, WirelessTransportPressure.captureAdmission)
 
@@ -165,6 +155,73 @@ final class WirelessTransportPressureTests: XCTestCase {
 
         XCTAssertEqual(generation, WirelessTransportPressure.noteForcedCapturePending())
         XCTAssertEqual(.forced, WirelessTransportPressure.captureAdmission)
+    }
+
+    func testTelemetryTracksCompletionHeadroomAndAdmission() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+
+        WirelessTransportPressure.observeSendBuffer(
+            generation: generation,
+            availableBytes: 512 * 1024,
+            frameBytes: 64 * 1024,
+            nowNs: 1_000
+        )
+        WirelessTransportPressure.beginSend(generation: generation, nowNs: 2_000)
+        XCTAssertEqual(.normal, WirelessTransportPressure.captureAdmission(at: 2_001))
+        WirelessTransportPressure.completeSend(generation: generation, nowNs: 12_000)
+
+        let metrics = WirelessTransportPressure.telemetrySnapshotForTest()
+        XCTAssertEqual(1, metrics.completionSamples)
+        XCTAssertEqual(10_000, metrics.completionTotalNs)
+        XCTAssertEqual(10_000, metrics.completionMaxNs)
+        XCTAssertEqual(1, metrics.headroomSamples)
+        XCTAssertEqual(UInt64(512 * 1024), metrics.headroomTotalBytes)
+        XCTAssertEqual(UInt32(512 * 1024), metrics.headroomMinBytes)
+        XCTAssertEqual(0, metrics.capturePauseDecisions)
+        XCTAssertEqual(0, metrics.captureForcedDecisions)
+    }
+
+    func testTelemetryCountsPauseAndForcedAdmissions() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        WirelessTransportPressure.beginSend(generation: generation, nowNs: 100)
+        WirelessTransportPressure.beginSend(generation: generation, nowNs: 200)
+
+        XCTAssertEqual(.pause, WirelessTransportPressure.captureAdmission(at: 201))
+        XCTAssertEqual(generation, WirelessTransportPressure.noteForcedCapturePending())
+        XCTAssertEqual(.forced, WirelessTransportPressure.captureAdmission(at: 202))
+
+        let metrics = WirelessTransportPressure.telemetrySnapshotForTest()
+        XCTAssertEqual(1, metrics.capturePauseDecisions)
+        XCTAssertEqual(1, metrics.captureForcedDecisions)
+    }
+
+    func testReplacementGenerationResetsAndFencesTelemetry() {
+        let oldGeneration = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: oldGeneration)
+        WirelessTransportPressure.observeSendBuffer(
+            generation: oldGeneration,
+            availableBytes: 128 * 1024,
+            frameBytes: 32 * 1024,
+            nowNs: 100
+        )
+        WirelessTransportPressure.beginSend(generation: oldGeneration, nowNs: 200)
+
+        let newGeneration = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: newGeneration)
+        WirelessTransportPressure.completeSend(generation: oldGeneration, nowNs: 5_000)
+        WirelessTransportPressure.observeSendBuffer(
+            generation: oldGeneration,
+            availableBytes: 1,
+            frameBytes: 1,
+            nowNs: 5_001
+        )
+
+        let metrics = WirelessTransportPressure.telemetrySnapshotForTest()
+        XCTAssertEqual(0, metrics.completionSamples)
+        XCTAssertEqual(0, metrics.headroomSamples)
+        XCTAssertNil(metrics.headroomMinBytes)
     }
 
     func testUsbIgnoresBothSubmissionAndSendBufferPressure() {
