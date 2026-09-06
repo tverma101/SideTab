@@ -353,14 +353,19 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         return
     }
 
-    var frameData = Data(bytesNoCopy: storage, count: finalSize, deallocator: .free)
+    // Rewrite the length words while the frame still lives in raw malloc
+    // storage. Data adopts the already-finished bytes afterwards, so Foundation
+    // copy-on-write can never turn boundary mutation into another frame copy.
     guard AnnexBConverter.rewriteFourByteLengthPrefixes(
-        in: &frameData,
+        bytes: storage,
+        count: finalSize,
         payloadOffset: payloadOffset
     ) else {
+        free(storage)
         debugLog("Encoded frame contained malformed 4-byte NAL lengths — dropping frame")
         return
     }
 
+    let frameData = Data(bytesNoCopy: storage, count: finalSize, deallocator: .free)
     encoder.onEncodedFrame?(frameData, timestamp, isKeyframe)
 }
