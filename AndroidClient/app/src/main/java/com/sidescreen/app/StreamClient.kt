@@ -134,6 +134,11 @@ class StreamClient(
     var stylusSupported = false
         private set
 
+    /** True while this client owns a wireless video transport. */
+    @Volatile
+    var isWirelessSession = false
+        private set
+
     private var bytesReceived = 0L
     private var framesReceived = 0L
     private var diagFrameCount = 0L
@@ -212,6 +217,7 @@ class StreamClient(
     /** USB/E3 connection. A dropped session remains terminal for this client. */
     suspend fun connect() =
         withContext(Dispatchers.IO) {
+            isWirelessSession = false
             connectionAttemptCancelled = false
             controlChannel.setAuthToken(null)
             controlChannel.setNetwork(null)
@@ -266,6 +272,7 @@ class StreamClient(
         if (token.size != PAIRING_TOKEN_SIZE) {
             throw WirelessConnectError.ProtocolError
         }
+        isWirelessSession = true
         connectionAttemptCancelled = false
         controlChannel.setAuthToken(token)
 
@@ -373,6 +380,12 @@ class StreamClient(
         try {
             connectingSocket.tcpNoDelay = true
             connectingSocket.keepAlive = true
+            runCatching {
+                connectingSocket.receiveBufferSize =
+                    WirelessTransportProfile.VIDEO_SOCKET_RECEIVE_BUFFER_BYTES
+            }.onFailure { error ->
+                Log.w(TAG, "connectWireless: receive buffer hint unavailable: ${error.message}")
+            }
             if (wifiNetwork != null) {
                 Log.i(TAG, "connectWireless: binding video/control to WiFi network $wifiNetwork")
                 wifiNetwork.bindSocket(connectingSocket)
@@ -488,7 +501,13 @@ class StreamClient(
      * codec/decoder/stylus negotiation during an internal reconnect.
      */
     private fun installConnectedSocket(s: Socket): Long {
-        val input = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
+        val inputBufferSize =
+            if (isWirelessSession) {
+                WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES
+            } else {
+                65536
+            }
+        val input = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), inputBufferSize))
         val output = DataOutputStream(s.getOutputStream())
         val generation =
             synchronized(transportLock) {

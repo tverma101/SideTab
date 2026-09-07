@@ -55,7 +55,7 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 ### USB-C or Wireless
 
-Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — the Mac app sets up adb-reverse forwarding for video on port `54321` and control on `54322`. **Wireless** lets you scan a QR code from the Mac; the tablet remembers the pairing and you can tap **Reconnect** on later launches (5 GHz strongly recommended). The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
+Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — the Mac app sets up adb-reverse forwarding for video on port `54321` and control on `54322`. **Wireless** lets you scan a QR code from the Mac; the tablet remembers the pairing and you can tap **Reconnect** on later launches (5 GHz strongly recommended). Wireless sessions use a bounded 60 FPS profile: up to 40 Mbps average, a 60 Mbps one-second peak ceiling, and freshness-aware backpressure between capture, TCP, decoding, and presentation. The auth token is generated locally and stays on your Mac; reset it any time to revoke access. See [the wireless 60 FPS path](docs/wireless-60fps.md) for the implementation contract and validation boundary.
 
 ### Virtual Display
 
@@ -188,6 +188,8 @@ than one Android device is connected.
 
 Wireless mode requires both devices to be on the same WiFi network. **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. The pairing token authenticates the wireless stream but does not currently provide end-to-end encryption, so use a trusted network. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
 
+Wireless defaults to the native Android `SurfaceView` presentation path. VSR/CfL enhancement remains opt-in, so disabling it keeps the tablet on the lowest-overhead hardware decode path.
+
 USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wireless adds 10–50 ms depending on WiFi quality.
 
 ### Headless mode (new in 0.11.0 — no Mac interaction)
@@ -203,7 +205,7 @@ First-time setup still needs a screen once to grant Screen Recording permission;
 | Setting | Options | Default |
 |---------|---------|---------|
 | Resolution | 720p to 8K, 30+ presets + custom | 1920x1200 |
-| Frame Rate | 30, 60, 90, 120 FPS | 60 |
+| Frame Rate | USB: 30, 60, 90, 120 FPS; Wireless: bounded at 60 FPS | 60 |
 | Bitrate | Host-bounded quality ladder | Host preset |
 | Quality | Ultra Low, Low, Medium, High | Ultra Low |
 | HiDPI (Retina) | On/Off | Off |

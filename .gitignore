@@ -50,8 +50,9 @@ dist/
 .env.local
 *.pem
 
-# Docs (local design docs)
-docs/
+# Docs (local design docs; explicitly publish the wireless runtime contract)
+docs/*
+!docs/wireless-60fps.md
 
 # Temporary
 tmp/
@@ -61,3 +62,6 @@ temp/
 
 # Local ktlint binary (CI downloads its own)
 AndroidClient/ktlint
+
+# Local device-install recovery backups
+backups/apk/

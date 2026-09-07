@@ -17,8 +17,9 @@ class VideoEncoder {
     private var quality: String = "medium"
     private var gamingBoost: Bool = false
     private var frameRate: Int = 60
+    private let maxBitrateMbps: Int?
     private let stateLock = OSAllocatedUnfairLock(initialState: EncoderState())
-    init(width: Int, height: Int, codec: StreamCodec = .hevc, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60) {
+    init(width: Int, height: Int, codec: StreamCodec = .hevc, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60, maxBitrateMbps: Int? = nil) {
         self.width = width
         self.height = height
         self.codec = codec
@@ -30,6 +31,7 @@ class VideoEncoder {
         self.quality = gamingBoost ? "ultralow" : quality
         self.gamingBoost = gamingBoost
         self.frameRate = frameRate
+        self.maxBitrateMbps = maxBitrateMbps.map { max(1, $0) }
         setupCompressionSession()
     }
 
@@ -120,12 +122,17 @@ class VideoEncoder {
         // defaults to 1000 Mbps. Feeding that value into Wi-Fi defeats the
         // bounded 6..60 Mbps quality ladder and can ask VideoToolbox for a
         // gigabit stream before TCP/backpressure has any chance to help.
-        // Wireless therefore follows the quality preset exactly. USB keeps the
-        // old explicit floor for users who deliberately want very high cable
-        // bitrate. SideScreen_exp_bitrate remains an intentional override for
-        // experiments on either transport.
+        // Wireless follows the quality preset, then applies its session cap.
+        // USB keeps the old explicit floor for users who deliberately want
+        // very high cable bitrate. The wireless session cap also bounds an
+        // experimental bitrate override so a debug knob cannot defeat the
+        // production LAN safety contract.
         let uiFloor = (!isWireless && bitrateMbps >= 100 && bitrateMbps <= 2000) ? bitrateMbps : 0
-        let targetMbps = expBitrate ?? ((gamingBoost || isWireless) ? presetMbps : max(presetMbps, uiFloor))
+        let uncappedTargetMbps = expBitrate ?? ((gamingBoost || isWireless) ? presetMbps : max(presetMbps, uiFloor))
+        let sessionBitrateCapMbps = isWireless
+            ? WirelessFreshnessPolicy.averageBitrateMbps
+            : maxBitrateMbps
+        let targetMbps = sessionBitrateCapMbps.map { min(uncappedTargetMbps, $0) } ?? uncappedTargetMbps
         let avgBps = targetMbps * 1_000_000
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: avgBps as CFNumber)
 
@@ -134,10 +141,15 @@ class VideoEncoder {
         // during complex motion. This is the property pair VideoToolbox
         // documents for live streaming; it only works because Quality is
         // never set on this session.
-        let capBytes = Int(Double(targetMbps) * 1.5 * 1_000_000.0 / 8.0)
+        let requestedPeakMbps = Int(Double(targetMbps) * 1.5)
+        let peakCeilingMbps = isWireless
+            ? WirelessFreshnessPolicy.peakBitrateMbps
+            : sessionBitrateCapMbps.map { Int(Double($0) * 1.5) } ?? Int.max
+        let peakMbps = min(requestedPeakMbps, peakCeilingMbps)
+        let capBytes = Int(Double(peakMbps) * 1_000_000.0 / 8.0)
         let dataRateLimits = [capBytes, 1] as CFArray
         let limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits)
-        debugLog("Rate control: path=\(isWireless ? "wireless" : "usb") avg=\(targetMbps)Mbps cap=\(Int(Double(targetMbps) * 1.5))Mbps/1s (DataRateLimits status=\(limitStatus))")
+        debugLog("Rate control: path=\(isWireless ? "wireless" : "usb") avg=\(targetMbps)Mbps cap=\(peakMbps)Mbps/1s (DataRateLimits status=\(limitStatus))")
 
         // Frame rate settings
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)

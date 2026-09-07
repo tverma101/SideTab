@@ -1252,7 +1252,18 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             val useBufferOutput = cflRenderer != null
-            videoDecoder = VideoDecoder(decoderSurface, displayObj, displayWidth, displayHeight, mime, bufferOutput = useBufferOutput)
+            val wirelessSession = streamClient?.isWirelessSession == true
+            videoDecoder = VideoDecoder(
+                decoderSurface,
+                displayObj,
+                displayWidth,
+                displayHeight,
+                mime,
+                bufferOutput = useBufferOutput,
+                wireless = wirelessSession,
+                targetFrameRate =
+                    if (wirelessSession) WirelessFreshnessPolicy.TARGET_FRAME_RATE else null,
+            )
             if (useBufferOutput) {
                 cflRenderer?.let { renderer ->
                     videoDecoder?.onDecodedImage = { img, done -> renderer.submitImage(img, done) }

@@ -570,13 +570,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
+            let sessionMode = settings.connectionMode
+            let sessionFrameRate = WirelessSessionProfile.frameRate(
+                for: sessionMode,
+                requested: settings.effectiveRefreshRate
+            )
+            let sessionBitrateCap = WirelessSessionProfile.bitrateCap(for: sessionMode)
+            debugLog(
+                "Session profile: mode=\(sessionMode.rawValue) " +
+                    "frameRate=\(sessionFrameRate)" +
+                    (sessionBitrateCap.map { " bitrateCap=\($0)Mbps" } ?? "")
+            )
+
             // Create virtual display and run ADB setup in parallel
             virtualDisplayManager = VirtualDisplayManager()
             let size = settings.resolutionSize
             try virtualDisplayManager?.createDisplay(
                 width: size.width,
                 height: size.height,
-                refreshRate: settings.refreshRate,
+                refreshRate: sessionFrameRate,
                 hiDPI: settings.hiDPI,
                 name: "SideScreen"
             )
@@ -623,7 +635,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.settings.captureMethod = method
                 }
             }
-            try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            try await screenCapture?.setupForVirtualDisplay(
+                displayID,
+                refreshRate: sessionFrameRate,
+                frameRateCap: sessionMode == .wireless ? WirelessFreshnessPolicy.targetFrameRate : nil
+            )
 
             // Setup server. Control channel (out-of-band ping/pong + keyframe
             // requests) runs on its own port: settings.port + 1, overridable
@@ -741,7 +757,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 bitrateMbps: settings.effectiveBitrate,
                 quality: settings.effectiveQuality,
                 gamingBoost: settings.gamingBoost,
-                frameRate: settings.effectiveRefreshRate
+                frameRate: sessionFrameRate,
+                bitrateCapMbps: sessionBitrateCap,
+                frameRateCap: sessionMode == .wireless ? WirelessFreshnessPolicy.targetFrameRate : nil
             )
 
             await MainActor.run {

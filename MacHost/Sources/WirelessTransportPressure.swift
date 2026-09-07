@@ -10,15 +10,13 @@ enum WirelessTransportPressure {
         var wireless = false
         var ready = false
         var sendsInFlight = 0
+        var bytesInFlight = 0
         var pauseUntilNs: UInt64 = 0
         var lastAvailableSendBuffer: UInt32?
     }
 
     private static let lock = NSLock()
     private static var state = State()
-    private static let highWatermark = 2
-    private static let minimumHeadroomBytes = 32 * 1024
-    private static let sendBufferPauseNs: UInt64 = 20_000_000
 
     /// Start a new video transport generation and return its pressure token.
     @discardableResult
@@ -29,6 +27,7 @@ enum WirelessTransportPressure {
         state.wireless = wireless
         state.ready = false
         state.sendsInFlight = 0
+        state.bytesInFlight = 0
         state.pauseUntilNs = 0
         state.lastAvailableSendBuffer = nil
         return state.generation
@@ -41,18 +40,20 @@ enum WirelessTransportPressure {
         state.ready = true
     }
 
-    static func beginSend(generation: UInt64) {
+    static func beginSend(generation: UInt64, bytes: Int = 0) {
         lock.lock()
         defer { lock.unlock() }
         guard state.generation == generation, state.ready else { return }
         state.sendsInFlight += 1
+        state.bytesInFlight += max(0, bytes)
     }
 
-    static func completeSend(generation: UInt64) {
+    static func completeSend(generation: UInt64, bytes: Int = 0) {
         lock.lock()
         defer { lock.unlock() }
         guard state.generation == generation else { return }
         state.sendsInFlight = max(0, state.sendsInFlight - 1)
+        state.bytesInFlight = max(0, state.bytesInFlight - max(0, bytes))
     }
 
     /// Sample real TCP sender headroom before submitting an encoded frame.
@@ -72,9 +73,9 @@ enum WirelessTransportPressure {
         guard state.generation == generation, state.wireless, state.ready else { return }
 
         state.lastAvailableSendBuffer = availableBytes
-        let required = UInt64(max(minimumHeadroomBytes, max(1, frameBytes)))
+        let required = UInt64(max(WirelessFreshnessPolicy.minimumSendBufferHeadroomBytes, max(1, frameBytes)))
         if UInt64(availableBytes) < required {
-            let deadline = nowNs &+ sendBufferPauseNs
+            let deadline = nowNs &+ WirelessFreshnessPolicy.sendBufferPauseNs
             if deadline > state.pauseUntilNs {
                 state.pauseUntilNs = deadline
             }
@@ -93,6 +94,7 @@ enum WirelessTransportPressure {
         state.generation &+= 1
         state.ready = false
         state.sendsInFlight = 0
+        state.bytesInFlight = 0
         state.pauseUntilNs = 0
         state.lastAvailableSendBuffer = nil
         state.wireless = false
@@ -110,7 +112,9 @@ enum WirelessTransportPressure {
         lock.lock()
         defer { lock.unlock() }
         guard state.wireless, state.ready else { return false }
-        return state.sendsInFlight >= highWatermark || nowNs < state.pauseUntilNs
+        return state.sendsInFlight >= WirelessFreshnessPolicy.maxSenderInFlightFrames ||
+            state.bytesInFlight >= WirelessFreshnessPolicy.maxSenderInFlightBytes ||
+            nowNs < state.pauseUntilNs
     }
 
     // Test visibility without exposing mutable state to production callers.
@@ -119,6 +123,7 @@ enum WirelessTransportPressure {
         wireless: Bool,
         ready: Bool,
         sendsInFlight: Int,
+        bytesInFlight: Int,
         pauseUntilNs: UInt64,
         availableSendBuffer: UInt32?
     ) {
@@ -129,6 +134,7 @@ enum WirelessTransportPressure {
             state.wireless,
             state.ready,
             state.sendsInFlight,
+            state.bytesInFlight,
             state.pauseUntilNs,
             state.lastAvailableSendBuffer
         )

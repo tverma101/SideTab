@@ -27,6 +27,10 @@ class VideoDecoder(
      *  output on this SoC (ImageReader surfaces deliver opaque UBWC buffers
      *  whose plane access is a fatal JNI abort). */
     private val bufferOutput: Boolean = false,
+    /** Wireless sessions use a tighter stale-output gate and a fixed 60 Hz
+     *  operating-rate target. USB preserves the panel's reported refresh rate. */
+    private val wireless: Boolean = false,
+    private val targetFrameRate: Int? = null,
 ) {
     private var decoder: MediaCodec? = null
     private var decoderThread: HandlerThread? = null
@@ -61,7 +65,8 @@ class VideoDecoder(
 
     private val frameTimes = ArrayDeque<Long>(120)
 
-    private val displayRefreshRate = display?.refreshRate ?: 60f
+    private val displayRefreshRate =
+        (targetFrameRate?.toFloat() ?: display?.refreshRate ?: 60f).coerceAtLeast(30f)
 
     private var currentWidth = initialWidth
     private var currentHeight = initialHeight
@@ -264,7 +269,7 @@ class VideoDecoder(
         decoder = codec
         diagLog(
             "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
-                "surface=$surface, valid=${surface.isValid}",
+                "wireless=$wireless, surface=$surface, valid=${surface.isValid}",
         )
     }
 
@@ -505,8 +510,39 @@ class VideoDecoder(
     ) {
         try {
             outputFrameCount++
-            if (outputFrameCount == 1L) {
+            val isFirstOutput = outputFrameCount == 1L
+            if (isFirstOutput) {
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
+            }
+
+            // Decoder PTS is the Android receive timestamp encoded when the
+            // frame entered MediaCodec. Releasing an old output without
+            // rendering it keeps the codec reference chain intact while
+            // preventing Wi-Fi jitter from becoming visible input lag.
+            val nowNs = System.nanoTime()
+            val latencyNs = nowNs - info.presentationTimeUs * 1000L
+            val hasValidLatency = latencyNs in 0..MAX_REASONABLE_LATENCY_NS
+            val shouldRender =
+                if (wireless && hasValidLatency) {
+                    WirelessFreshnessPolicy.shouldRender(latencyNs, isFirstOutput)
+                } else {
+                    isFirstOutput ||
+                        !hasValidLatency ||
+                        latencyNs <= MAX_RENDER_LATENCY_NS
+                }
+
+            if (!shouldRender) {
+                droppedFrames++
+                staleOutputDrops++
+                if (staleOutputDrops <= 3L || staleOutputDrops % 60L == 0L) {
+                    diagLog(
+                        "Dropping stale output frame: latency=${"%.1f".format(latencyNs / 1_000_000.0)}ms, " +
+                            "wireless=$wireless, staleDrops=$staleOutputDrops",
+                    )
+                }
+                codec.releaseOutputBuffer(index, false)
+                updateStats()
+                return
             }
 
             // ByteBuffer mode (CfL): hand the plane-accessible Image to the
@@ -544,9 +580,6 @@ class VideoDecoder(
             // Decoder latency: time from queueInputBuffer (where we encoded
             // System.nanoTime()/1000 as PTS) to now. Captures how long the
             // frame spent inside the codec's input/reorder/output queues.
-            val nowNs = System.nanoTime()
-            val latencyNs = nowNs - info.presentationTimeUs * 1000L
-            val hasValidLatency = latencyNs in 0..MAX_REASONABLE_LATENCY_NS
             if (hasValidLatency) {
                 latencySumNs += latencyNs
                 latencySamples++
@@ -579,25 +612,6 @@ class VideoDecoder(
                 inputBufferWaitSumNs = 0
                 inputBufferWaitMaxNs = 0
                 inputBufferWaitTimeouts = 0
-            }
-
-            val shouldRender =
-                outputFrameCount == 1L ||
-                    !hasValidLatency ||
-                    latencyNs <= MAX_RENDER_LATENCY_NS
-
-            if (!shouldRender) {
-                droppedFrames++
-                staleOutputDrops++
-                if (staleOutputDrops <= 3L || staleOutputDrops % 60L == 0L) {
-                    diagLog(
-                        "Dropping stale output frame: latency=${"%.1f".format(latencyNs / 1_000_000.0)}ms, " +
-                            "staleDrops=$staleOutputDrops",
-                    )
-                }
-                codec.releaseOutputBuffer(index, false)
-                updateStats()
-                return
             }
 
             codec.releaseOutputBuffer(index, true)

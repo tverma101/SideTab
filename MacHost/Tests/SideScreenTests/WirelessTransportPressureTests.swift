@@ -17,6 +17,27 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding)
     }
 
+    func testWirelessBackpressuresWhenEncodedBytesReachBudget() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+
+        WirelessTransportPressure.beginSend(
+            generation: generation,
+            bytes: WirelessFreshnessPolicy.maxSenderInFlightBytes
+        )
+
+        let snapshot = WirelessTransportPressure.snapshotForTest()
+        XCTAssertEqual(WirelessFreshnessPolicy.maxSenderInFlightBytes, snapshot.bytesInFlight)
+        XCTAssertTrue(WirelessTransportPressure.shouldPauseEncoding)
+
+        WirelessTransportPressure.completeSend(
+            generation: generation,
+            bytes: WirelessFreshnessPolicy.maxSenderInFlightBytes
+        )
+        XCTAssertEqual(0, WirelessTransportPressure.snapshotForTest().bytesInFlight)
+        XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding)
+    }
+
     func testLowTcpHeadroomCreatesOnlyBoundedPause() {
         let generation = WirelessTransportPressure.reset(wireless: true)
         WirelessTransportPressure.setReady(generation: generation)
@@ -90,7 +111,23 @@ final class WirelessTransportPressureTests: XCTestCase {
         let snapshot = WirelessTransportPressure.snapshotForTest()
         XCTAssertEqual(newGeneration, snapshot.generation)
         XCTAssertEqual(1, snapshot.sendsInFlight)
+        XCTAssertEqual(0, snapshot.bytesInFlight)
         XCTAssertNil(snapshot.availableSendBuffer)
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: 101))
+    }
+
+    func testRetireClearsInFlightBytesAndInvalidatesGeneration() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        WirelessTransportPressure.beginSend(generation: generation, bytes: 128 * 1024)
+
+        WirelessTransportPressure.retire(generation: generation)
+
+        let snapshot = WirelessTransportPressure.snapshotForTest()
+        XCTAssertNotEqual(generation, snapshot.generation)
+        XCTAssertFalse(snapshot.wireless)
+        XCTAssertEqual(0, snapshot.sendsInFlight)
+        XCTAssertEqual(0, snapshot.bytesInFlight)
+        XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding)
     }
 }

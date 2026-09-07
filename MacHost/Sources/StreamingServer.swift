@@ -1285,7 +1285,7 @@ class StreamingServer {
         }
         frameSendsInFlight += 1
         if pressureGeneration != 0 {
-            WirelessTransportPressure.beginSend(generation: pressureGeneration)
+            WirelessTransportPressure.beginSend(generation: pressureGeneration, bytes: data.count)
         }
 
         // Avoid copying the entire encoded frame merely to prepend a 5/14-byte
@@ -1315,7 +1315,7 @@ class StreamingServer {
                     // Pressure completion is generation-fenced independently,
                     // so an old callback can never reduce the replacement count.
                     if pressureGeneration != 0 {
-                        WirelessTransportPressure.completeSend(generation: pressureGeneration)
+                        WirelessTransportPressure.completeSend(generation: pressureGeneration, bytes: data.count)
                     }
 
                     self.frameQueue.async {
