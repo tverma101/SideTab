@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Wired SDR colors: the normal macOS 8-bit capture now uses video-range `420v`, matching the Android hardware decoder's limited-range conversion instead of expanding contrast from full-range `420f`. The legacy `SideScreen_exp_pixelFormat=8bit` full-range value remains available only as an explicit A/B control.
 
+### Performance
+- macOS USB status probes now run off the main actor, overlapping ADB repairs are suppressed, and the capture callback latches session flags instead of reading connection preferences on every frame.
+
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming

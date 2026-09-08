@@ -76,6 +76,21 @@ class ScreenCapture {
     private var currentFrameRate: Int = 60
     private var currentBitrateCapMbps: Int?
 
+    /// Preferences are read once per capture session instead of from the
+    /// ScreenCaptureKit callback for every frame. These values change only
+    /// when a stream is restarted, which keeps the 60/120-FPS path free of
+    /// synchronized UserDefaults lookups.
+    private struct FramePipelineFlags {
+        let wireless: Bool
+        let mutatesCapturedPixels: Bool
+        let skipsIdenticalFrames: Bool
+    }
+    private var pipelineFlags = FramePipelineFlags(
+        wireless: false,
+        mutatesCapturedPixels: false,
+        skipsIdenticalFrames: false
+    )
+
     // Encoding pipeline state (captured by frame handler closure)
     private var encodeQueue: DispatchQueue?
     private var pendingEncodes: Int32 = 0
@@ -419,6 +434,7 @@ class ScreenCapture {
         encodeQueue = queue
         pendingEncodes = 0
         lastPixelBuffer = nil
+        let sessionFlags = pipelineFlags
 
         streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
             guard let self = self else { return }
@@ -460,12 +476,10 @@ class ScreenCapture {
             // and presentation. Missing/unrecognized metadata encodes normally.
             // Synthetic pattern/dither experiments mutate pixels after capture,
             // so they deliberately bypass this gate.
-            let wireless = UserDefaults.standard.string(forKey: "SideScreen_connectionMode") == "wireless"
-            let mutatesCapturedPixels = PatternInjector.isActive() || DitherPass.enabled
             if WirelessDirtyRectGate.shouldSkip(
-                wireless: wireless,
+                wireless: sessionFlags.wireless,
                 frameHasChanges: WirelessDirtyRectGate.frameHasChanges(sampleBuffer),
-                mutatesCapturedPixels: mutatesCapturedPixels
+                mutatesCapturedPixels: sessionFlags.mutatesCapturedPixels
             ) {
                 return
             }
@@ -494,7 +508,7 @@ class ScreenCapture {
                 // pixel-identical frames (SideScreen_exp_skipFrames=1).
                 // lastFrameTime was already updated at handler top, so the
                 // early return cannot false-trigger the stall monitor.
-                if FrameSkipper.enabled {
+                if sessionFlags.skipsIdenticalFrames {
                     let decision = FrameSkipper.decide(imageBuffer)
                     if decision.skip {
                         return  // identical content — skip encode+send
@@ -543,6 +557,11 @@ class ScreenCapture {
         // Save parameters for potential restart
         currentServer = server
         self.frameRateCap = frameRateCap
+        pipelineFlags = FramePipelineFlags(
+            wireless: frameRateCap != nil,
+            mutatesCapturedPixels: PatternInjector.isActive() || DitherPass.enabled,
+            skipsIdenticalFrames: FrameSkipper.enabled
+        )
         currentBitrateCapMbps = bitrateCapMbps
         // EXP-FORK: SideScreen_exp_fps cap applies to the encoder too (rate
         // control must expect the same cadence the capture actually delivers).
@@ -635,8 +654,7 @@ class ScreenCapture {
                 let hasHadFrames = self.stateLock.withLock { $0.hasReceivedFirstFrame }
 
                 if hasHadFrames, let lastBuffer = self.lastPixelBuffer {
-                    let wireless = UserDefaults.standard.string(forKey: "SideScreen_connectionMode") == "wireless"
-                    if wireless {
+                    if self.pipelineFlags.wireless {
                         // Static ScreenCaptureKit periods are expected. Android
                         // now probes the real video TCP socket whenever frame
                         // delivery is quiet, so re-encoding cached pixels here

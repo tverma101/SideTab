@@ -93,10 +93,16 @@ enum StatusDetector {
 
     private static var cachedAdbPath: String?
     private static var lastAdbCacheCheck: Date = .distantPast
+    private static let adbPathCacheLock = NSLock()
 
     private static func adbExecutablePath() -> String? {
         // Re-resolve every 5 s so install/uninstall is reflected.
-        if let cached = cachedAdbPath, Date().timeIntervalSince(lastAdbCacheCheck) < 5.0 {
+        let now = Date()
+        adbPathCacheLock.lock()
+        let cached = cachedAdbPath
+        let lastCheck = lastAdbCacheCheck
+        adbPathCacheLock.unlock()
+        if let cached, now.timeIntervalSince(lastCheck) < 5.0 {
             return cached
         }
         let candidatePaths = [
@@ -105,8 +111,10 @@ enum StatusDetector {
             "\(NSHomeDirectory())/Library/Android/sdk/platform-tools/adb"
         ]
         for path in candidatePaths where FileManager.default.isExecutableFile(atPath: path) {
+            adbPathCacheLock.lock()
             cachedAdbPath = path
-            lastAdbCacheCheck = Date()
+            lastAdbCacheCheck = now
+            adbPathCacheLock.unlock()
             return path
         }
         // Fallback: ask `which adb` (covers PATH-installed setups).
@@ -123,15 +131,19 @@ enum StatusDetector {
             if let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !out.isEmpty,
                FileManager.default.isExecutableFile(atPath: out) {
+                adbPathCacheLock.lock()
                 cachedAdbPath = out
-                lastAdbCacheCheck = Date()
+                lastAdbCacheCheck = now
+                adbPathCacheLock.unlock()
                 return out
             }
         } catch {
             // ignore
         }
+        adbPathCacheLock.lock()
         cachedAdbPath = nil
-        lastAdbCacheCheck = Date()
+        lastAdbCacheCheck = now
+        adbPathCacheLock.unlock()
         return nil
     }
 }

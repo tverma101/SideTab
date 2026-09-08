@@ -53,6 +53,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentWirelessDevice: String?
     private var cancellables = Set<AnyCancellable>()
     private var statusRefreshTimer: Timer?
+    /// Prevent overlapping adb subprocess probes when a device or adb server
+    /// is slow to answer. The status UI is best-effort; it must never queue
+    /// work faster than the connection backend can finish it.
+    private var statusRefreshInFlight = false
+    /// A replug can leave adb reverse unavailable for several retry intervals.
+    /// Serialize the self-healing repair so status ticks cannot start a second
+    /// repair while the first one is still retrying.
+    private var adbReverseRepairInFlight = false
     /// Reentrancy latch for startServer() — a second Start (double-clicked menu
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
@@ -156,17 +164,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        settings.adbInstalled = StatusDetector.adbInstalled()
         let port = Int(settings.port)
         let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
         let controlPort = controlOverride > 0 ? controlOverride : port + 1
+
+        guard !statusRefreshInFlight else { return }
+        statusRefreshInFlight = true
+
         Task.detached { [weak self] in
+            // All adb/path/process work stays off the main actor. A stuck adb
+            // server must not make the settings window or touch path hitch.
+            let adbInstalled = StatusDetector.adbInstalled()
             let devices = StatusDetector.usbDevices()
             let reverseOK = StatusDetector.adbReverseConfigured(port: port)
                 && StatusDetector.adbReverseConfigured(port: controlPort)
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
-                
+                self.statusRefreshInFlight = false
+
+                // Ignore a stale USB probe that completed after a mode/port
+                // change. The next timer tick will probe the new state.
+                guard self.settings.connectionMode == .usb,
+                      Int(self.settings.port) == port else { return }
+
+                self.settings.adbInstalled = adbInstalled
                 let isConnected = !devices.isEmpty
 
                 self.settings.usbDeviceConnected = isConnected
@@ -182,9 +203,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     && isConnected
                     && self.settings.isRunning
                     && !reverseOK {
-                    debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse")
-                    Task { await self.setupADBReverse() }
+                    self.scheduleADBReverseRepair()
                 }
+            }
+        }
+    }
+
+    @MainActor
+    private func scheduleADBReverseRepair() {
+        guard !adbReverseRepairInFlight else { return }
+        adbReverseRepairInFlight = true
+        debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse")
+
+        Task { [weak self] in
+            guard let self = self else { return }
+            await self.setupADBReverse()
+            await MainActor.run {
+                self.adbReverseRepairInFlight = false
             }
         }
     }
