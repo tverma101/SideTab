@@ -5,21 +5,29 @@ import android.app.Application
 import android.os.Build
 import android.os.Bundle
 import android.view.Display
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import java.util.WeakHashMap
 
 /**
- * Window-level display policy for the interactive remote-desktop surface.
+ * Display policy for the interactive remote-desktop surface.
  *
  * SideScreen can deliver up to 120 FPS, but Android may start the activity on a
- * lower variable-refresh-rate mode. On Android 14+ tell the scheduler the true
- * 120-FPS intent directly. On older Android releases, where preferredRefreshRate
- * must be an advertised rate, pick the closest same-resolution panel mode.
+ * lower variable-refresh-rate mode. The window preference remains the fallback
+ * for old Android releases and the TextureView/mirrored path. On Android 11+
+ * the direct SurfaceView additionally calls Surface.setFrameRate(120), which is
+ * Android's preferred per-surface API and lets the compositor choose a panel
+ * mode compatible with the app's actual 120-FPS intent.
  *
  * This remains a preference, not a forced mode switch; thermal, power, user and
- * vendor policy may override it. We request it once at MainActivity startup
+ * vendor policy may override it. We install the hint once per surface lifetime
  * rather than tracking the host's adaptive 60/90/120 ladder, because frequent
  * refresh transitions can themselves drop frames.
  */
 class SideScreenApplication : Application(), Application.ActivityLifecycleCallbacks {
+    private val surfaceCallbacks = WeakHashMap<Activity, SurfaceHolder.Callback>()
+
     override fun onCreate() {
         super.onCreate()
         DiagLog.init(this)
@@ -79,6 +87,57 @@ class SideScreenApplication : Application(), Application.ActivityLifecycleCallba
         )
     }
 
+    /**
+     * Surface.setFrameRate is preferred to a window-only hint on Android 11+.
+     * SideScreen content is interactive/variable rather than fixed-cadence film,
+     * so DEFAULT compatibility allows Android to pick the best refresh mode.
+     */
+    private fun installSurfaceFrameRatePolicy(activity: MainActivity) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || surfaceCallbacks.containsKey(activity)) return
+        val surfaceView = activity.findViewById<SurfaceView>(R.id.surfaceView) ?: return
+        val holder = surfaceView.holder
+
+        fun apply(surface: Surface) {
+            if (!surface.isValid) return
+            try {
+                surface.setFrameRate(
+                    DisplayRefreshPolicy.STREAM_INTENT_HZ,
+                    Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                )
+                DiagLog.log(
+                    "DISPLAY",
+                    "Surface frame-rate intent=${DisplayRefreshPolicy.STREAM_INTENT_HZ}Hz applied",
+                )
+            } catch (e: Exception) {
+                // A vendor compositor may reject or ignore a frame-rate hint.
+                // Streaming must continue with the window/system-selected mode.
+                DiagLog.log("DISPLAY", "Surface frame-rate hint rejected: ${e.message}")
+            }
+        }
+
+        val callback =
+            object : SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: SurfaceHolder) {
+                    apply(holder.surface)
+                }
+
+                override fun surfaceChanged(
+                    holder: SurfaceHolder,
+                    format: Int,
+                    width: Int,
+                    height: Int,
+                ) {
+                    apply(holder.surface)
+                }
+
+                override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
+            }
+
+        holder.addCallback(callback)
+        surfaceCallbacks[activity] = callback
+        apply(holder.surface)
+    }
+
     @Suppress("DEPRECATION")
     private fun activityDisplay(activity: Activity): Display? =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -88,9 +147,20 @@ class SideScreenApplication : Application(), Application.ActivityLifecycleCallba
         }
 
     override fun onActivityStarted(activity: Activity) = Unit
-    override fun onActivityResumed(activity: Activity) = Unit
+
+    override fun onActivityResumed(activity: Activity) {
+        if (activity is MainActivity) {
+            installSurfaceFrameRatePolicy(activity)
+        }
+    }
+
     override fun onActivityPaused(activity: Activity) = Unit
     override fun onActivityStopped(activity: Activity) = Unit
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
-    override fun onActivityDestroyed(activity: Activity) = Unit
+
+    override fun onActivityDestroyed(activity: Activity) {
+        val callback = surfaceCallbacks.remove(activity) ?: return
+        val surfaceView = activity.findViewById<SurfaceView>(R.id.surfaceView) ?: return
+        surfaceView.holder.removeCallback(callback)
+    }
 }
