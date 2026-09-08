@@ -10,9 +10,9 @@ import Foundation
 ///      active -> motion target
 ///      0.15s clean -> up to 60 FPS
 ///      0.60s clean -> up to 30 FPS
-///      2.00s clean -> up to 15 FPS
+///      2.00s clean -> up to 1 FPS keepalive
 /// 2. USBAdaptiveLoadController can constrain *motion* 120 -> 90 -> 60 when
-///    Network.framework reports sustained sender pressure.
+///    sender or downstream recovery pressure is sustained.
 ///
 /// The first changed frame after an idle period always punches through
 /// immediately, even when the current motion ceiling is 60/90 FPS.
@@ -146,7 +146,7 @@ final class USBAdaptiveFramePacer {
         if frameHasChanges == true {
             state.lastChangedNs = nowNs
             // Waking an idle desktop is latency-sensitive. A changed frame must
-            // not wait behind the previous 15/30/60-FPS clean-frame deadline.
+            // not wait behind the previous 1/30/60-FPS clean-frame deadline.
             if wasIdleBeforeChange {
                 noteSent(nowNs: nowNs, changed: true, targetFPS: motionTargetFPS)
                 return Decision(skip: false, targetFPS: motionTargetFPS, phase: .active)
@@ -173,7 +173,10 @@ final class USBAdaptiveFramePacer {
             cleanCeiling = min(maxFPS, 30)
             phase = .idle
         default:
-            cleanCeiling = min(maxFPS, 15)
+            // ScreenCaptureKit explicitly says nothing changed. Keep a very low
+            // periodic frame for liveness/stats, but avoid waking VideoToolbox,
+            // USB/TCP, and MediaCodec 15 times a second for identical pixels.
+            cleanCeiling = 1
             phase = .deepIdle
         }
 
