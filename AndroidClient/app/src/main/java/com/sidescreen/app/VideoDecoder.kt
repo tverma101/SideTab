@@ -1,8 +1,10 @@
 package com.sidescreen.app
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
@@ -62,6 +64,11 @@ class VideoDecoder(
     private val frameTimes = ArrayDeque<Long>(120)
 
     private val displayRefreshRate = display?.refreshRate ?: 60f
+    // Provision the decoder for SideScreen's maximum interactive stream rate,
+    // not whatever variable-refresh mode the panel happened to be using while
+    // the decoder object was created. The configure path falls back cleanly if
+    // a codec/vendor does not accept this operating-rate hint.
+    private val decoderTargetRate = DisplayRefreshPolicy.STREAM_INTENT_HZ.toDouble()
 
     private var currentWidth = initialWidth
     private var currentHeight = initialHeight
@@ -125,7 +132,8 @@ class VideoDecoder(
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
 
-        // Find a decoder that supports our resolution (prefer HW, fallback to SW)
+        // Prefer a hardware decoder with real 120-FPS performance evidence at
+        // this resolution. Fall back to any size-capable hardware codec, then SW.
         val decoderName = findBestDecoder(currentWidth, currentHeight)
         diagLog("setupDecoder: ${currentWidth}x$currentHeight, decoder=$decoderName")
 
@@ -188,41 +196,52 @@ class VideoDecoder(
             }
         codec.setCallback(callback, decoderHandler)
 
-        val format =
-            MediaFormat.createVideoFormat(
-                mime,
-                currentWidth,
-                currentHeight,
-            )
-
         val targetSurface: Surface? = if (bufferOutput) null else surface
 
         var configured = false
 
-        // Attempt 1: Full low-latency config
+        // Attempt 1: full low-latency + 120-FPS operating-rate provisioning.
         try {
+            val format = MediaFormat.createVideoFormat(mime, currentWidth, currentHeight)
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
+            format.setInteger(MediaFormat.KEY_OPERATING_RATE, decoderTargetRate.toInt())
             format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             codec.configure(format, targetSurface, null, 0)
             configured = true
-            diagLog("Configured with full low-latency${if (bufferOutput) " (buffer output)" else ""}")
+            diagLog(
+                "Configured full low-latency @ ${decoderTargetRate.toInt()}fps" +
+                    if (bufferOutput) " (buffer output)" else "",
+            )
         } catch (e: Exception) {
             diagLog("Full low-latency config failed: ${e.message}")
             codec.reset()
             codec.setCallback(callback, decoderHandler)
         }
 
-        // Attempt 2: Without KEY_LOW_LATENCY
+        // Attempt 2: some decoders reject KEY_LOW_LATENCY but still accept an
+        // operating-rate hint. Preserve 120-FPS resource provisioning first.
         if (!configured) {
             try {
-                val basicFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
+                val rateFormat = MediaFormat.createVideoFormat(mime, currentWidth, currentHeight)
+                rateFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                rateFormat.setInteger(MediaFormat.KEY_OPERATING_RATE, decoderTargetRate.toInt())
+                rateFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                codec.configure(rateFormat, targetSurface, null, 0)
+                configured = true
+                diagLog("Configured without low-latency key @ ${decoderTargetRate.toInt()}fps")
+            } catch (e: Exception) {
+                diagLog("Operating-rate config failed: ${e.message}")
+                codec.reset()
+                codec.setCallback(callback, decoderHandler)
+            }
+        }
+
+        // Attempt 3: basic prioritized real-time-ish format without an explicit
+        // operating rate for vendor codecs that reject 120-Hz provisioning.
+        if (!configured) {
+            try {
+                val basicFormat = MediaFormat.createVideoFormat(mime, currentWidth, currentHeight)
                 basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
                 basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 codec.configure(basicFormat, targetSurface, null, 0)
@@ -235,20 +254,15 @@ class VideoDecoder(
             }
         }
 
-        // Attempt 3: Minimal config (just resolution)
+        // Attempt 4: minimal config (just resolution).
         if (!configured) {
             try {
-                val minimalFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
+                val minimalFormat = MediaFormat.createVideoFormat(mime, currentWidth, currentHeight)
                 codec.configure(minimalFormat, targetSurface, null, 0)
                 diagLog("Configured with minimal format")
             } catch (e: Exception) {
                 diagLog("All configure attempts failed: ${e.message}")
-                Log.e(TAG, "All configure attempts failed", e)
+                Log.e(TAG, "All configure attempts failed: ${e.message}", e)
                 codec.release()
                 decoderThread?.quitSafely()
                 decoderThread = null
@@ -263,15 +277,20 @@ class VideoDecoder(
         codec.start()
         decoder = codec
         diagLog(
-            "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
+            "Decoder started: ${currentWidth}x$currentHeight, " +
+                "display=${"%.1f".format(displayRefreshRate)}Hz target=${decoderTargetRate.toInt()}fps, " +
                 "surface=$surface, valid=${surface.isValid}",
         )
     }
 
     /**
      * Find the best decoder for [mime] at the given resolution.
-     * Prefers hardware decoders, falls back to software if HW can't handle the resolution.
-     * Returns codec name to use with MediaCodec.createByCodecName(), or null for default.
+     *
+     * Android 10+ exposes authoritative hardware/software classification and
+     * manufacturer performance points. `areSizeAndRateSupported()` alone is a
+     * codec-standard envelope, not a real-time performance guarantee, so use
+     * performance points / achievable-rate measurements as stronger ranking
+     * evidence when the vendor publishes them.
      */
     private fun findBestDecoder(
         width: Int,
@@ -279,11 +298,21 @@ class VideoDecoder(
     ): String? {
         try {
             val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
-            val targetRate = displayRefreshRate.toDouble().coerceAtLeast(30.0)
-            var hwRateDecoder: String? = null
-            var hwSizeDecoder: String? = null
-            var swRateDecoder: String? = null
-            var swSizeDecoder: String? = null
+            val targetRate = decoderTargetRate
+            val requiredPoint =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaCodecInfo.VideoCapabilities.PerformancePoint(
+                        width,
+                        height,
+                        targetRate.toInt(),
+                    )
+                } else {
+                    null
+                }
+
+            var bestName: String? = null
+            var bestScore = Int.MIN_VALUE
+            var bestEvidence = ""
 
             for (info in codecList.codecInfos) {
                 if (info.isEncoder) continue
@@ -295,51 +324,94 @@ class VideoDecoder(
                     }
 
                 val videoCaps = caps.videoCapabilities ?: continue
-                val isHardware =
-                    !info.name.startsWith("c2.android.") &&
-                        !info.name.startsWith("OMX.google.")
                 val supported = videoCaps.isSizeSupported(width, height)
-                val rateSupported =
-                    supported &&
-                        try {
-                            videoCaps.areSizeAndRateSupported(width, height, targetRate)
-                        } catch (_: Exception) {
-                            false
-                        }
+                if (!supported) continue
 
+                val isHardware =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        info.isHardwareAccelerated
+                    } else {
+                        // Android 8/9 have no authoritative classification API.
+                        !info.name.startsWith("c2.android.") &&
+                            !info.name.startsWith("OMX.google.")
+                    }
+                val isVendor =
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && info.isVendor
+                val isAlias =
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && info.isAlias
+                val lowLatency =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+                    } else {
+                        false
+                    }
+
+                val standardRateSupported =
+                    try {
+                        videoCaps.areSizeAndRateSupported(width, height, targetRate)
+                    } catch (_: Exception) {
+                        false
+                    }
+
+                val performanceGuaranteed: Boolean? =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && requiredPoint != null && isHardware) {
+                        val points = videoCaps.supportedPerformancePoints
+                        if (points == null) {
+                            null
+                        } else {
+                            points.any { it.covers(requiredPoint) }
+                        }
+                    } else {
+                        null
+                    }
+
+                val achievableUpper: Double? =
+                    try {
+                        videoCaps.getAchievableFrameRatesFor(width, height)?.upper
+                    } catch (_: Exception) {
+                        null
+                    }
+                val achievableTarget = achievableUpper?.let { it >= targetRate }
+
+                // Hardware remains the dominant preference because software-only
+                // codecs make no rendering-performance guarantee. Within hardware,
+                // prefer real manufacturer performance evidence for 120 FPS.
+                var score = if (isHardware) 1_000 else 0
+                if (performanceGuaranteed == true) score += 400
+                if (achievableTarget == true) score += 250
+                if (standardRateSupported) score += 100
+                if (lowLatency) score += 80
+                if (isVendor) score += 20
+                if (isAlias) score -= 5
+
+                val perfText =
+                    when (performanceGuaranteed) {
+                        true -> "yes"
+                        false -> "no"
+                        null -> "unknown"
+                    }
+                val achievableText = achievableUpper?.let { "%.1f".format(it) } ?: "unknown"
                 diagLog(
-                    "$mime decoder '${info.name}': " +
-                        "width=${videoCaps.supportedWidths}, " +
-                        "height=${videoCaps.supportedHeights}, " +
-                        "hw=$isHardware, supports ${width}x$height=$supported, " +
-                        "supports @${"%.0f".format(targetRate)}fps=$rateSupported",
+                    "$mime decoder '${info.name}': hw=$isHardware vendor=$isVendor alias=$isAlias " +
+                        "size=${width}x$height standard@${targetRate.toInt()}=$standardRateSupported " +
+                        "perfPoint=$perfText achievableMax=$achievableText lowLatency=$lowLatency score=$score",
                 )
 
-                if (supported) {
-                    if (isHardware && rateSupported && hwRateDecoder == null) {
-                        hwRateDecoder = info.name
-                    } else if (isHardware && hwSizeDecoder == null) {
-                        hwSizeDecoder = info.name
-                    } else if (!isHardware && rateSupported && swRateDecoder == null) {
-                        swRateDecoder = info.name
-                    } else if (!isHardware && swSizeDecoder == null) {
-                        swSizeDecoder = info.name
-                    }
+                if (score > bestScore) {
+                    bestScore = score
+                    bestName = info.name
+                    bestEvidence =
+                        "score=$score hw=$isHardware perf=$perfText " +
+                            "achievable=$achievableText standard=$standardRateSupported lowLatency=$lowLatency"
                 }
             }
 
-            // Prefer hardware that advertises the target refresh rate, then any
-            // hardware decoder for the size, then software as a last resort.
-            val chosen = hwRateDecoder ?: hwSizeDecoder ?: swRateDecoder ?: swSizeDecoder
-            if (chosen != null) {
-                diagLog(
-                    "Selected decoder: $chosen " +
-                        "(rateSupported=${chosen == hwRateDecoder || chosen == swRateDecoder})",
-                )
+            if (bestName != null) {
+                diagLog("Selected decoder: $bestName ($bestEvidence)")
             } else {
                 diagLog("No decoder supports ${width}x$height — will use default")
             }
-            return chosen
+            return bestName
         } catch (e: Exception) {
             diagLog("Decoder search failed: ${e.message}")
         }
