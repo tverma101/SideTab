@@ -4,7 +4,7 @@ Branch/PR experiment for high-refresh wired SideScreen sessions.
 
 ## Goal
 
-Keep the capture source hot at up to 120 Hz for immediate interaction response, while adapting the expensive encode/send/decode cadence to actual content, sender pressure, downstream recovery behavior, and the Android decoder's published capabilities.
+Keep the capture source hot at up to 120 Hz for immediate interaction response, while adapting the expensive encode/send/decode cadence to actual content, host encode pressure, sender pressure, downstream recovery behavior, and the Android decoder's published capabilities.
 
 ## Static-content policy
 
@@ -31,13 +31,27 @@ Primary pressure evidence:
 
 1. Network.framework sends overlapping before `.contentProcessed`.
 2. `.contentProcessed` taking multiple target-frame intervals.
-3. Repeated decoder recovery/keyframe pulses from the client-facing recovery path.
+3. Capture timestamp -> VideoToolbox output callback age staying over several target-frame intervals.
+4. Repeated decoder recovery/keyframe pulses from the client-facing recovery path.
 
 Corroborating evidence:
 
 - TCP send-buffer headroom becoming critically small (<32 KiB).
 
 A large encoded frame being larger than the currently available TCP send buffer is **not** treated as congestion. Network.framework can consume a larger application send asynchronously; completion/backlog is the stronger signal.
+
+### Host encode-age feedback
+
+VideoToolbox output callbacks can complete asynchronously. SideScreen already preserves the capture host-time timestamp into the encoded sample, so the encoder callback can measure how old the frame is when compression finishes without allocating per-frame timing objects.
+
+- at 120 FPS: pressure threshold is 25 ms (the floor is larger than three 8.33 ms frame periods only by rounding)
+- at 90 FPS: threshold is about 33.3 ms
+- at 60 FPS: threshold is 50 ms
+- encode age is mild pressure; two over-budget encoded frames are required before a downshift
+- invalid/non-host-time timestamps fail open because the existing timestamp helper substitutes the current uptime, producing near-zero age
+- the forced-IDR grace window suppresses encode-age pressure from a large recovery keyframe
+
+This catches the case where ScreenCaptureKit/VideoToolbox is slipping even though the USB/TCP sender and Android decoder still look healthy.
 
 ### Decoder-recovery burst feedback
 
@@ -53,11 +67,18 @@ The Android decoder's genuine input-buffer starvation path repeatedly force-requ
 
 This adds a downstream signal for the case where ADB/TCP itself is healthy but MediaCodec cannot sustain the supplied cadence.
 
+### Forced-IDR pressure grace
+
+A forced IDR is intentionally much larger than a routine P-frame. One normal startup/recovery IDR can therefore create short-lived send backlog, low send-buffer headroom, slow `.contentProcessed`, or elevated encode age even on a healthy 120-FPS path.
+
+Each explicit recovery pulse creates a 250 ms grace window in which transport and encode-age pressure are ignored. Repeated recovery pulses themselves are **not** ignored: a three-pulse recovery burst still steps down the FPS ladder. This separates “the recovery IDR was large” from “the steady-state path cannot sustain 120 FPS.”
+
 ### Hysteresis
 
 - 3+ sends in flight: severe pressure, one-step downshift (subject to 250 ms adjustment cooldown).
 - 2 sends in flight: mild pressure; two mild strikes required.
 - critically low TCP headroom: mild pressure only.
+- encode age above max(25 ms, three target-frame intervals): mild pressure; two strikes required.
 - 3 recovery pulses inside 1 s: severe downstream pressure.
 - healthy send completion can decay a mild strike.
 - 60 -> 90: requires 12 healthy completions and at least 2 s pressure-free.
@@ -133,7 +154,7 @@ If vendor performance measurements are absent, selection still falls back to siz
 
 ## Hardware-free validation
 
-Swift tests cover static ramp-down, one-FPS deep idle, forced recovery, recovery-burst feedback, fail-open behavior, 120/90/60 cadence, pressure hysteresis, recovery backoff, stale generations, mid-session maximum changes, adaptive GOP policy, and a longer marginal-path simulation.
+Swift tests cover static ramp-down, one-FPS deep idle, forced recovery, forced-IDR pressure grace, host encode-age pressure, recovery-burst feedback, fail-open behavior, 120/90/60 cadence, transport hysteresis, recovery backoff, stale generations, mid-session maximum changes, adaptive GOP policy, and a longer marginal-path simulation.
 
 Android JVM tests cover version-aware refresh-rate selection. CI also builds the macOS arm64/x86_64 release binaries and Android application, which verifies the Android Surface frame-rate and codec-capability API use against the configured min/compile SDKs.
 
