@@ -40,7 +40,18 @@ enum WirelessDirtyRectGate {
         frameHasChanges: Bool?,
         mutatesCapturedPixels: Bool
     ) -> Bool {
-        guard wireless, !mutatesCapturedPixels else { return false }
-        return frameHasChanges == false
+        if wireless {
+            guard !mutatesCapturedPixels else { return false }
+            return frameHasChanges == false
+        }
+
+        // USB keeps ScreenCaptureKit running at the configured high refresh
+        // rate, but suppresses redundant clean frames before VideoToolbox.
+        // This preserves instant 120-Hz motion wake-up while reducing idle
+        // encode/tunnel/decode work. Missing metadata fails open in the pacer.
+        return USBAdaptiveFramePacer.shared.shouldSkip(
+            frameHasChanges: frameHasChanges,
+            mutatesCapturedPixels: mutatesCapturedPixels
+        )
     }
 }
