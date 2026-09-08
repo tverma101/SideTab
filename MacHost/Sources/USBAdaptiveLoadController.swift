@@ -20,6 +20,11 @@ import Foundation
 /// (the Android client throttles forced requests to 200 ms). Three pulses inside
 /// one second are therefore treated as strong downstream decoder pressure.
 ///
+/// Explicit recovery also creates an unusually large IDR. A short grace window
+/// ignores transport-only pressure caused by that IDR itself, preventing a normal
+/// startup/recovery burst from teaching the controller that 120 FPS is unstable.
+/// Recovery-burst pressure is never suppressed by this grace window.
+///
 /// The policy is intentionally asymmetric: congestion falls back quickly,
 /// while recovery is slower and requires healthy completions. That hysteresis
 /// prevents a marginal 120-Hz path from bouncing 120 <-> 90 every few frames.
@@ -51,6 +56,7 @@ final class USBAdaptiveLoadController {
         let rampPenalty: Int
         let lastPressureNs: UInt64
         let recoveryPulseCount: Int
+        let transportGraceUntilNs: UInt64
     }
 
     static let shared = USBAdaptiveLoadController()
@@ -69,6 +75,7 @@ final class USBAdaptiveLoadController {
         var hasAdjusted = false
         var recoveryPulseCount = 0
         var lastRecoveryPulseNs: UInt64 = 0
+        var transportGraceUntilNs: UInt64 = 0
     }
 
     private let lock = NSLock()
@@ -81,6 +88,7 @@ final class USBAdaptiveLoadController {
     private static let maxRampPenalty = 3
     private static let recoveryBurstWindowNs: UInt64 = 1_000_000_000
     private static let recoveryPulsesForDownshift = 3
+    private static let keyframeTransportGraceNs: UInt64 = 250_000_000
     /// Only near-exhaustion is meaningful. A large frame may legitimately be
     /// bigger than the whole TCP send buffer and Network.framework will drain it
     /// asynchronously; comparing headroom to frame size would false-trigger.
@@ -195,6 +203,14 @@ final class USBAdaptiveLoadController {
             return
         }
 
+        // A forced IDR is much larger than a routine P-frame. Ignore transport
+        // backlog caused by that intentional burst for a bounded interval. A
+        // repeated recovery burst still downshifts through .recoveryBurst below.
+        let graceDeadline = nowNs &+ Self.keyframeTransportGraceNs
+        if graceDeadline > state.transportGraceUntilNs {
+            state.transportGraceUntilNs = graceDeadline
+        }
+
         if state.lastRecoveryPulseNs == 0 ||
             Self.elapsed(from: state.lastRecoveryPulseNs, to: nowNs) > Self.recoveryBurstWindowNs {
             state.recoveryPulseCount = 1
@@ -277,7 +293,8 @@ final class USBAdaptiveLoadController {
             healthyCompletions: state.healthyCompletions,
             rampPenalty: state.rampPenalty,
             lastPressureNs: state.lastPressureNs,
-            recoveryPulseCount: state.recoveryPulseCount
+            recoveryPulseCount: state.recoveryPulseCount,
+            transportGraceUntilNs: state.transportGraceUntilNs
         )
     }
 
@@ -290,6 +307,13 @@ final class USBAdaptiveLoadController {
         lock.lock()
         defer { lock.unlock() }
         guard state.active, state.generation == generation else { return }
+
+        // A large forced IDR can transiently look like network congestion. Do
+        // not let that expected burst alter the motion tier. Decoder-recovery
+        // bursts are a separate signal and intentionally bypass this guard.
+        if kind != .recoveryBurst && nowNs < state.transportGraceUntilNs {
+            return
+        }
 
         state.lastPressureNs = nowNs
         state.healthyCompletions = 0
