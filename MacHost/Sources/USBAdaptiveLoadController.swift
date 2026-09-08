@@ -105,10 +105,23 @@ final class USBAdaptiveLoadController {
         lock.lock()
         defer { lock.unlock() }
 
-        guard state.active, state.maxFPS == requestedMax else {
-            return requestedMax
+        guard state.generation != 0 else { return requestedMax }
+
+        // Settings can change while the USB connection stays alive. Starting a
+        // fresh ladder at the newly requested ceiling is safer than carrying a
+        // 60/90 decision that was learned for a different source cadence.
+        if state.maxFPS != requestedMax {
+            let generation = state.generation
+            state = State(
+                generation: generation,
+                active: requestedMax > 60,
+                maxFPS: requestedMax,
+                targetFPS: requestedMax
+            )
+            debugLog("USB adaptive FPS: source ceiling changed -> \(requestedMax), controller reset")
         }
 
+        guard state.active else { return requestedMax }
         maybeRampUp(nowNs: nowNs)
         return state.targetFPS
     }
