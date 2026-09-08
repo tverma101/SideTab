@@ -160,6 +160,11 @@ cd SideScreen
 # Android
 (cd AndroidClient && ./gradlew assembleDebug)
 
+# Rebuild the current source and install on the connected tablet
+./scripts/install_android.sh
+# Explicitly install an existing APK without rebuilding
+./scripts/install_android.sh --skip-build
+
 # Preserve every local APK and the currently installed APK before installing
 ./scripts/backup_android_apks.sh
 ```

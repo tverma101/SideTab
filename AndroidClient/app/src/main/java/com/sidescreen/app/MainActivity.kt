@@ -63,7 +63,7 @@ class MainActivity : AppCompatActivity() {
     private val cameraPerm by lazy { CameraPermissionManager(this) }
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: PreferencesManager
-    private var videoDecoder: VideoDecoder? = null
+    @Volatile private var videoDecoder: VideoDecoder? = null
     private var sgsrRenderer: SgsrRenderer? = null
     private var cflRenderer: CflRenderer? = null
     @Volatile private var streamClient: StreamClient? = null
@@ -1322,6 +1322,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Deliver frames from the socket thread without losing the first sync frame
+     * to the UI-thread decoder startup race. The Mac stream can begin sending
+     * immediately after display config; if the decoder is still being created,
+     * release the bytes and ask for a throttled refresh so the next frame is an
+     * IDR instead of leaving the decoder waiting on a P-frame forever.
+     */
+    private fun deliverFrame(
+        client: StreamClient,
+        generation: Long,
+        frameData: ByteArray,
+        frameSize: Int,
+        timestamp: Long,
+        isKeyframe: Boolean,
+    ) {
+        if (!isCurrentConnection(client, generation)) {
+            client.releaseBuffer(frameData)
+            return
+        }
+
+        val decoder = videoDecoder?.takeIf { it.isReady }
+        if (decoder != null) {
+            decoder.decode(frameData, frameSize, timestamp, isKeyframe)
+            return
+        }
+
+        client.releaseBuffer(frameData)
+        if (displayWidth > 0 && displayHeight > 0) {
+            client.requestKeyframe(reason = "decoder not ready")
+        }
+        mainDiag("FRAME DROPPED: decoder not ready; requested refresh=$isKeyframe")
+    }
+
+    /**
      * Wire up the wireless client's callbacks with the same generation fence
      * used by the USB path. A wireless connect can be cancelled while its
      * handshake socket is still local to the IO coroutine, so every callback
@@ -1333,17 +1366,7 @@ class MainActivity : AppCompatActivity() {
         host: String,
     ) {
         client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-            if (isCurrentConnection(client, generation)) {
-                val dec = videoDecoder
-                if (dec != null) {
-                    dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                } else {
-                    client.releaseBuffer(frameData)
-                    mainDiag("FRAME DROPPED: videoDecoder is null!")
-                }
-            } else {
-                client.releaseBuffer(frameData)
-            }
+            deliverFrame(client, generation, frameData, frameSize, timestamp, isKeyframe)
         }
 
         videoDecoder?.onFrameDecoded = { buffer ->
@@ -1522,16 +1545,7 @@ class MainActivity : AppCompatActivity() {
                 log("Connecting to $host:$port...")
 
                 client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-                    if (isCurrentConnection(client, generation)) {
-                        val dec = videoDecoder
-                        if (dec != null) {
-                            dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                        } else {
-                            client.releaseBuffer(frameData)
-                        }
-                    } else {
-                        client.releaseBuffer(frameData)
-                    }
+                    deliverFrame(client, generation, frameData, frameSize, timestamp, isKeyframe)
                 }
 
                 // Wire up buffer release callback for buffer pooling

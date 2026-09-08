@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Android now treats a configured data-only USB/ADB cable as connected in the checklist, and the main activity is single-instance so returning from Home cannot leave a hidden streaming activity behind.
 - Manual Android Disconnect now restores the connection panel, orientation, controls, and idle checklist instead of leaving the streaming UI stuck after the socket closes.
 - Android pauses latency pings while backgrounded and keeps an idle dedicated control socket alive, preventing stale multi-second RTT samples and permanent in-band fallback after foregrounding.
+- The Android decoder now fences asynchronous input-buffer callbacks across codec recreation, and the first frame arriving during decoder startup requests a fresh sync frame instead of leaving the stream waiting on a P-frame.
+- `scripts/install_android.sh` rebuilds the debug APK before installing by default; use `--skip-build` only when intentionally installing an already-built artifact.
 
 ### Added
 - Samsung S Pen drawing support: stylus contact is detected separately from finger touch, starts a direct stroke immediately, forwards normalized pressure/tilt/orientation, and supports hover-cursor movement plus the S Pen secondary button. The negotiated protocol falls back to legacy touch for older Mac hosts.
@@ -31,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - macOS USB status probes now run off the main actor, overlapping ADB repairs are suppressed, and the capture callback latches session flags instead of reading connection preferences on every frame.
+- Android's steady-state decoder path keeps the 60-FPS callback handoff bounded without reusing input-buffer indices from a retired codec instance.
 
 ### Planned
 - mDNS auto-discovery for wireless mode

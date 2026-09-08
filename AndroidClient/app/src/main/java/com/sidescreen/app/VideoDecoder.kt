@@ -32,7 +32,7 @@ class VideoDecoder(
     private val wireless: Boolean = false,
     private val targetFrameRate: Int? = null,
 ) {
-    private var decoder: MediaCodec? = null
+    @Volatile private var decoder: MediaCodec? = null
     private var decoderThread: HandlerThread? = null
     private var decoderHandler: Handler? = null
 
@@ -75,6 +75,10 @@ class VideoDecoder(
 
     @Volatile private var needsKeyframe = true
 
+    /** True only after the codec has started and is published to frame callers. */
+    val isReady: Boolean
+        get() = isRunning && decoder != null
+
     private var lastKeyframeRequestNs = 0L
 
     var onFrameRendered: ((Long) -> Unit)? = null
@@ -106,8 +110,17 @@ class VideoDecoder(
     private var stallReported = false
     private var queuedInputCount = 0L
 
-    // Available input buffer indices — fed by onInputBufferAvailable callback
-    private val availableInputBuffers = LinkedBlockingQueue<Int>()
+    // The callback is asynchronous and can finish after release() starts. Keep
+    // the codec generation with every index so a recreated decoder can never
+    // consume a stale index from its predecessor.
+    private data class InputBufferRef(
+        val generation: Long,
+        val index: Int,
+    )
+
+    // Available input buffers — fed by onInputBufferAvailable callback.
+    private val availableInputBuffers = LinkedBlockingQueue<InputBufferRef>()
+    @Volatile private var decoderGeneration = 0L
 
     init {
         setupDecoder()
@@ -127,6 +140,8 @@ class VideoDecoder(
     }
 
     private fun setupDecoder() {
+        val generation = decoderGeneration + 1L
+        decoderGeneration = generation
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
 
@@ -147,7 +162,9 @@ class VideoDecoder(
                     codec: MediaCodec,
                     index: Int,
                 ) {
-                    availableInputBuffers.offer(index)
+                    if (decoderGeneration == generation && isRunning) {
+                        availableInputBuffers.offer(InputBufferRef(generation, index))
+                    }
                 }
 
                 override fun onOutputBufferAvailable(
@@ -399,16 +416,10 @@ class VideoDecoder(
 
         // Fast path is still non-blocking. Only wait when the callback hand-off
         // queue is momentarily empty, and never for longer than one 60-Hz frame.
-        var index = availableInputBuffers.poll()
+        val generation = decoderGeneration
+        val waitStartedNs = System.nanoTime()
+        var index = pollInputBuffer(generation)
         if (index == null) {
-            val waitStartedNs = System.nanoTime()
-            index =
-                try {
-                    availableInputBuffers.poll(INPUT_BUFFER_WAIT_MS, TimeUnit.MILLISECONDS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    null
-                }
             val waitedNs = System.nanoTime() - waitStartedNs
             inputBufferWaitCount++
             inputBufferWaitSumNs += waitedNs
@@ -433,6 +444,34 @@ class VideoDecoder(
         }
 
         queueFrame(codec, index, frameData, frameSize, frameTimestamp, isKeyframe)
+    }
+
+    /**
+     * Wait for an input buffer from this decoder generation only. Old
+     * MediaCodec callbacks may still enqueue after release(), so silently
+     * discard those references while preserving the bounded wait budget.
+     */
+    private fun pollInputBuffer(generation: Long): Int? {
+        val deadlineNs = System.nanoTime() + INPUT_BUFFER_WAIT_MS * 1_000_000L
+        while (isRunning && decoderGeneration == generation) {
+            val ref =
+                availableInputBuffers.poll()
+                    ?: run {
+                        val remainingNs = deadlineNs - System.nanoTime()
+                        if (remainingNs <= 0L) return null
+                        try {
+                            availableInputBuffers.poll(remainingNs, TimeUnit.NANOSECONDS)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return null
+                        }
+                    }
+                    ?: return null
+            if (ref.generation == generation && decoderGeneration == generation) {
+                return ref.index
+            }
+        }
+        return null
     }
 
     private fun queueFrame(
@@ -656,11 +695,13 @@ class VideoDecoder(
 
     fun release() {
         isRunning = false
+        decoderGeneration += 1L
         try {
             availableInputBuffers.clear()
-            decoder?.stop()
-            decoder?.release()
+            val codec = decoder
             decoder = null
+            codec?.stop()
+            codec?.release()
             decoderThread?.quitSafely()
             decoderThread = null
             decoderHandler = null
