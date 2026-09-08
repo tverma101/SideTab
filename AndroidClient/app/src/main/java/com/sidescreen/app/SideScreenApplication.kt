@@ -10,14 +10,14 @@ import android.view.Display
  * Window-level display policy for the interactive remote-desktop surface.
  *
  * SideScreen can deliver up to 120 FPS, but Android may start the activity on a
- * lower variable-refresh-rate mode. Ask WindowManager for the highest refresh
- * rate at or below 120 Hz that is actually advertised at the panel's current
- * physical resolution. This is a preference, not a forced mode switch, and the
- * OS may ignore it for thermal/power/user-policy reasons.
+ * lower variable-refresh-rate mode. On Android 14+ tell the scheduler the true
+ * 120-FPS intent directly. On older Android releases, where preferredRefreshRate
+ * must be an advertised rate, pick the closest same-resolution panel mode.
  *
- * We set the preference once when MainActivity is created rather than tracking
- * the host's adaptive 60/90/120 ladder. Android explicitly discourages frequent
- * frame-rate requests because the display transition itself can drop frames.
+ * This remains a preference, not a forced mode switch; thermal, power, user and
+ * vendor policy may override it. We request it once at MainActivity startup
+ * rather than tracking the host's adaptive 60/90/120 ladder, because frequent
+ * refresh transitions can themselves drop frames.
  */
 class SideScreenApplication : Application(), Application.ActivityLifecycleCallbacks {
     override fun onCreate() {
@@ -51,10 +51,14 @@ class SideScreenApplication : Application(), Application.ActivityLifecycleCallba
                 .toList()
 
         val preferred =
-            DisplayRefreshPolicy.choosePreferredRate(
-                sameResolutionRates = sameResolutionRates,
-                currentRate = current.refreshRate,
-            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                DisplayRefreshPolicy.modernPreferredRate()
+            } else {
+                DisplayRefreshPolicy.chooseLegacyPreferredRate(
+                    sameResolutionRates = sameResolutionRates,
+                    currentRate = current.refreshRate,
+                )
+            }
 
         val attrs = activity.window.attributes
         attrs.preferredRefreshRate = preferred
@@ -68,7 +72,8 @@ class SideScreenApplication : Application(), Application.ActivityLifecycleCallba
 
         DiagLog.log(
             "DISPLAY",
-            "Interactive display policy: current=${"%.2f".format(current.refreshRate)}Hz " +
+            "Interactive display policy: api=${Build.VERSION.SDK_INT} " +
+                "current=${"%.2f".format(current.refreshRate)}Hz " +
                 "preferred=${"%.2f".format(preferred)}Hz " +
                 "sameRes=${sameResolutionRates.joinToString(prefix = "[", postfix = "]") { "%.2f".format(it) }}",
         )
