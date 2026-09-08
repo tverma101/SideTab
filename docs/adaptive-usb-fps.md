@@ -4,7 +4,7 @@ Branch/PR experiment for high-refresh wired SideScreen sessions.
 
 ## Goal
 
-Keep the capture source hot at up to 120 Hz for immediate interaction response, while adapting the expensive encode/send/decode cadence to actual content, sender pressure, and downstream recovery behavior.
+Keep the capture source hot at up to 120 Hz for immediate interaction response, while adapting the expensive encode/send/decode cadence to actual content, sender pressure, downstream recovery behavior, and the Android decoder's published capabilities.
 
 ## Static-content policy
 
@@ -20,6 +20,8 @@ ScreenCaptureKit dirty-rect metadata is used before VideoToolbox:
 - forced keyframe/recovery request: bypass the gate
 
 No per-frame full-buffer hashing is required. The 1-FPS deep-idle keepalive avoids repeatedly waking VideoToolbox, USB/TCP, and MediaCodec for identical pixels while still providing periodic liveness/stats traffic. A dirty frame does not wait for that one-second deadline.
+
+The Android video-path liveness probe does not begin until a 3-second frame-silent interval, so a 1-FPS keepalive remains comfortably inside the existing liveness model.
 
 ## Motion-load policy
 
@@ -69,6 +71,17 @@ This adds a downstream signal for the case where ADB/TCP itself is healthy but M
 
 The pacer carries an ideal send deadline forward rather than checking only elapsed time since the last sent frame. This avoids quantizing an 11.1 ms target interval onto 8.33 ms source samples as ~60 FPS. Deterministic tests require 90 FPS to pass 9 of 12 120-Hz source frames.
 
+## Periodic keyframe policy
+
+A one-second USB keyframe-duration limit conflicts with 1-FPS deep idle: it can make nearly every idle keepalive an IDR. Explicit startup/recovery keyframes already cut through pacing immediately, so adaptive high-refresh USB now uses a five-second periodic safety GOP.
+
+- wireless: 5 s (existing behavior)
+- adaptive USB above 60 FPS: 5 s
+- legacy/non-adaptive USB at 30/60 FPS: 1 s (unchanged)
+- `SideScreen_exp_gop`: still overrides the periodic frame-count interval
+
+This is isolated in `EncoderGOPPolicy` with deterministic tests.
+
 ## Android display policy
 
 SideScreen expresses a 120-FPS display intent when MainActivity starts and requests minimal post-processing on Android 11+.
@@ -90,18 +103,38 @@ Examples covered by JVM tests:
 
 These are OS preferences; thermal, power, user, and device policy may override them.
 
+## Android decoder policy
+
+The decoder is provisioned for SideScreen's 120-FPS stream intent rather than the panel's refresh rate at the instant the decoder happens to be constructed. Configuration falls back in stages when a vendor codec rejects a hint:
+
+1. low latency + priority + 120-FPS operating rate
+2. priority + 120-FPS operating rate (without the low-latency key)
+3. basic prioritized config without an explicit operating rate
+4. minimal resolution-only config
+
+Decoder selection no longer relies only on codec-name prefixes on modern Android:
+
+- API 29+: use `MediaCodecInfo.isHardwareAccelerated`, `isVendor`, and `isAlias`
+- API 26-28: retain the old codec-name heuristic as a compatibility fallback
+- prefer hardware decoders with manufacturer performance points covering the actual stream width/height at 120 FPS
+- use manufacturer achievable-frame-rate measurements as additional ranking evidence when published
+- `areSizeAndRateSupported()` is only weaker standards/capability-envelope evidence, not treated as a real-time performance guarantee
+- Android 11+ low-latency feature support receives an additional ranking preference
+- hardware remains preferred over software because software-only codecs make no rendering-performance guarantee
+
+If vendor performance measurements are absent, selection still falls back to size/rate capability and hardware preference rather than rejecting the decoder.
+
 ## Intentionally not included yet
 
 - Dynamic SCStream reconfiguration. Capture stays at the configured maximum to avoid configuration-transition latency.
 - Treating every isolated keyframe request as decoder overload. Only a short recovery burst is used as pressure evidence because startup/reconnect/reset requests remain valid single events.
 - VideoToolbox `MaximumRealTimeFrameRate`. It is a good semantic match for variable-rate real-time input, but current platform availability is newer than SideScreen's macOS 13 deployment floor; keep `ExpectedFrameRate` for this branch until deployment/SDK behavior is proven.
 - Automatic resolution/bitrate adaptation. FPS is isolated first so a hardware trace can identify the actual bottleneck later.
-- Replacing Android's legacy codec-name hardware heuristic. Android 10+ exposes authoritative hardware/software flags and performance points; that deserves a separate decoder-selection patch after this smaller controller/display batch is green.
 
 ## Hardware-free validation
 
-Swift tests cover static ramp-down, one-FPS deep idle, forced recovery, recovery-burst feedback, fail-open behavior, 120/90/60 cadence, pressure hysteresis, recovery backoff, stale generations, mid-session maximum changes, and a longer marginal-path simulation.
+Swift tests cover static ramp-down, one-FPS deep idle, forced recovery, recovery-burst feedback, fail-open behavior, 120/90/60 cadence, pressure hysteresis, recovery backoff, stale generations, mid-session maximum changes, adaptive GOP policy, and a longer marginal-path simulation.
 
-Android JVM tests cover version-aware refresh-rate selection. CI also builds the macOS arm64/x86_64 release binaries and Android application, which verifies the Android Surface frame-rate API use against the configured min/compile SDKs.
+Android JVM tests cover version-aware refresh-rate selection. CI also builds the macOS arm64/x86_64 release binaries and Android application, which verifies the Android Surface frame-rate and codec-capability API use against the configured min/compile SDKs.
 
 Hardware validation is still required before merging to claim sustained real-device 120 FPS or to tune thresholds for a specific tablet/USB path.
