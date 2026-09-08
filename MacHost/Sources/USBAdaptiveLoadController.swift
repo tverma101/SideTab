@@ -2,11 +2,17 @@ import Foundation
 
 /// Motion-side adaptive FPS controller for high-refresh USB sessions.
 ///
-/// This controller reacts only to signals that can be observed without client
-/// instrumentation:
-///   - Network.framework sends piling up before `contentProcessed`
-///   - TCP send-buffer headroom falling below one encoded frame
+/// Primary pressure signals:
+///   - multiple Network.framework sends still outstanding before `contentProcessed`
 ///   - `contentProcessed` taking multiple target-frame intervals
+/// Corroborating signal:
+///   - TCP send-buffer headroom becoming critically small
+///
+/// Network.framework can accept a message larger than the currently available
+/// kernel send buffer, so frameBytes > availableSendBuffer is NOT by itself
+/// evidence of congestion. Apple recommends `contentProcessed` as the live-data
+/// pacing point; this controller therefore gives completion timing/backlog more
+/// weight than instantaneous send-buffer capacity.
 ///
 /// The policy is intentionally asymmetric: congestion falls back quickly,
 /// while recovery is slower and requires healthy completions. That hysteresis
@@ -63,7 +69,10 @@ final class USBAdaptiveLoadController {
     private static let healthyCompletionsForRamp = 12
     private static let mildStrikesForDownshift = 2
     private static let maxRampPenalty = 3
-    private static let minimumSendHeadroomBytes = 64 * 1024
+    /// Only near-exhaustion is meaningful. A large frame may legitimately be
+    /// bigger than the whole TCP send buffer and Network.framework will drain it
+    /// asynchronously; comparing headroom to frame size would false-trigger.
+    private static let criticallyLowSendHeadroomBytes = 32 * 1024
 
     @discardableResult
     func reset(generation: UInt64, maxFPS rawMaxFPS: Int) -> Int {
@@ -143,15 +152,16 @@ final class USBAdaptiveLoadController {
     func observeSendBuffer(
         generation: UInt64,
         availableBytes: UInt32,
-        frameBytes: Int,
+        frameBytes _: Int,
         nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
-        let required = max(Self.minimumSendHeadroomBytes, max(1, frameBytes))
-        guard Int(availableBytes) < required else { return }
+        guard Int(availableBytes) < Self.criticallyLowSendHeadroomBytes else { return }
+        // Headroom is corroboration, never a one-sample hard downshift. Healthy
+        // contentProcessed completions decay this strike again.
         recordPressure(
             generation: generation,
             kind: .sendBuffer,
-            severity: .severe,
+            severity: .mild,
             nowNs: nowNs
         )
     }
