@@ -55,14 +55,18 @@ The pacer carries an ideal send deadline forward rather than checking only elaps
 
 ## Android display policy
 
-The Android app requests the highest advertised same-resolution display refresh rate at or below 120 Hz when MainActivity starts and asks for minimal post-processing on Android 11+.
+SideScreen expresses a 120-FPS display intent when MainActivity starts and requests minimal post-processing on Android 11+.
 
-The policy uses an exact advertised rate for pre-Android-14 compatibility. Examples covered by JVM tests:
+- Android 14 / API 34 and newer: request 120 Hz directly. Android allows `preferredRefreshRate` to be an intended rate even when it is not an exact advertised panel mode, then chooses the compatible display refresh itself.
+- Android 13 / API 33 and older: `preferredRefreshRate` must be an advertised mode, so SideScreen chooses the same-resolution rate closest to 120 Hz. Equal-distance ties prefer the higher refresh rate so presentation is not unnecessarily capped below the stream rate.
+
+Examples covered by JVM tests:
 
 - 60/90/120/144 -> 120
-- 60/90/144 -> 90
-- 60/96/144 -> 96
-- no usable <=120 candidate -> preserve current mode
+- 60/90/144 -> 144
+- 60/96/144 -> 144 (96 and 144 are equally distant from 120; higher wins)
+- 60/90 -> 90
+- 59.94/119.88/144 -> 119.88
 
 This is only an OS preference; thermal, power, user, and device policy may override it.
 
@@ -77,6 +81,6 @@ This is only an OS preference; thermal, power, user, and device policy may overr
 
 Swift tests cover static ramp-down, forced recovery, fail-open behavior, 120/90/60 cadence, pressure hysteresis, recovery backoff, stale generations, mid-session maximum changes, and a longer marginal-path simulation.
 
-Android JVM tests cover refresh-rate selection. CI also builds the macOS arm64/x86_64 release binaries and Android application.
+Android JVM tests cover version-aware refresh-rate selection. CI also builds the macOS arm64/x86_64 release binaries and Android application.
 
 Hardware validation is still required before merging to claim sustained real-device 120 FPS or to tune thresholds for a specific tablet/USB path.
