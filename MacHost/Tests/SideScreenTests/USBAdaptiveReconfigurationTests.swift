@@ -6,12 +6,7 @@ final class USBAdaptiveReconfigurationTests: XCTestCase {
         let controller = USBAdaptiveLoadController()
         controller.reset(generation: 21, maxFPS: 120)
 
-        controller.observeSendBuffer(
-            generation: 21,
-            availableBytes: 1,
-            frameBytes: 100_000,
-            nowNs: 100_000_000
-        )
+        controller.observeSendsInFlight(generation: 21, count: 3, nowNs: 100_000_000)
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 100_000_000), 90)
 
         // User changes the stream setting while the same TCP/ADB connection is
