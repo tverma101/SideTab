@@ -5,6 +5,7 @@ import Foundation
 /// Primary pressure signals:
 ///   - multiple Network.framework sends still outstanding before `contentProcessed`
 ///   - `contentProcessed` taking multiple target-frame intervals
+///   - repeated decoder recovery/keyframe pulses in a short window
 /// Corroborating signal:
 ///   - TCP send-buffer headroom becoming critically small
 ///
@@ -13,6 +14,11 @@ import Foundation
 /// evidence of congestion. Apple recommends `contentProcessed` as the live-data
 /// pacing point; this controller therefore gives completion timing/backlog more
 /// weight than instantaneous send-buffer capacity.
+///
+/// A single recovery pulse is expected during startup, reconnect, or a decoder
+/// reset. MediaCodec starvation, however, produces repeated forced-IDR requests
+/// (the Android client throttles forced requests to 200 ms). Three pulses inside
+/// one second are therefore treated as strong downstream decoder pressure.
 ///
 /// The policy is intentionally asymmetric: congestion falls back quickly,
 /// while recovery is slower and requires healthy completions. That hysteresis
@@ -27,6 +33,7 @@ final class USBAdaptiveLoadController {
         case sendBacklog
         case sendBuffer
         case slowSend
+        case recoveryBurst
     }
 
     enum Severity {
@@ -43,6 +50,7 @@ final class USBAdaptiveLoadController {
         let healthyCompletions: Int
         let rampPenalty: Int
         let lastPressureNs: UInt64
+        let recoveryPulseCount: Int
     }
 
     static let shared = USBAdaptiveLoadController()
@@ -59,6 +67,8 @@ final class USBAdaptiveLoadController {
         var lastAdjustmentNs: UInt64 = 0
         var lastRampUpNs: UInt64 = 0
         var hasAdjusted = false
+        var recoveryPulseCount = 0
+        var lastRecoveryPulseNs: UInt64 = 0
     }
 
     private let lock = NSLock()
@@ -69,6 +79,8 @@ final class USBAdaptiveLoadController {
     private static let healthyCompletionsForRamp = 12
     private static let mildStrikesForDownshift = 2
     private static let maxRampPenalty = 3
+    private static let recoveryBurstWindowNs: UInt64 = 1_000_000_000
+    private static let recoveryPulsesForDownshift = 3
     /// Only near-exhaustion is meaningful. A large frame may legitimately be
     /// bigger than the whole TCP send buffer and Network.framework will drain it
     /// asynchronously; comparing headroom to frame size would false-trigger.
@@ -166,6 +178,51 @@ final class USBAdaptiveLoadController {
         )
     }
 
+    /// Observe a host keyframe/recovery pulse. One or two pulses can be normal
+    /// startup/reset traffic. Three pulses inside the burst window are a strong
+    /// signal that the client is repeatedly losing decoder continuity or input
+    /// buffers, so step down one motion tier. The burst counter resets after a
+    /// downshift so sustained trouble must provide fresh evidence for 90 -> 60.
+    func observeRecoveryPulse(
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        var generation: UInt64 = 0
+        var shouldDownshift = false
+
+        lock.lock()
+        guard state.active, state.generation != 0 else {
+            lock.unlock()
+            return
+        }
+
+        if state.lastRecoveryPulseNs == 0 ||
+            Self.elapsed(from: state.lastRecoveryPulseNs, to: nowNs) > Self.recoveryBurstWindowNs {
+            state.recoveryPulseCount = 1
+        } else {
+            state.recoveryPulseCount = min(
+                Self.recoveryPulsesForDownshift,
+                state.recoveryPulseCount + 1
+            )
+        }
+        state.lastRecoveryPulseNs = nowNs
+
+        if state.recoveryPulseCount >= Self.recoveryPulsesForDownshift {
+            generation = state.generation
+            state.recoveryPulseCount = 0
+            shouldDownshift = true
+        }
+        lock.unlock()
+
+        if shouldDownshift {
+            recordPressure(
+                generation: generation,
+                kind: .recoveryBurst,
+                severity: .severe,
+                nowNs: nowNs
+            )
+        }
+    }
+
     /// `durationNs` is beginSend -> Network.framework `contentProcessed`.
     /// Apple defines that completion as the point where the stack consumed the
     /// data, so a duration several target-frame intervals long means the
@@ -219,7 +276,8 @@ final class USBAdaptiveLoadController {
             mildPressureStrikes: state.mildPressureStrikes,
             healthyCompletions: state.healthyCompletions,
             rampPenalty: state.rampPenalty,
-            lastPressureNs: state.lastPressureNs
+            lastPressureNs: state.lastPressureNs,
+            recoveryPulseCount: state.recoveryPulseCount
         )
     }
 
