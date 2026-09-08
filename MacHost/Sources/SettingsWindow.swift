@@ -168,8 +168,6 @@ struct SettingsView: View {
                 .padding(.vertical, 10)
                 .background(.ultraThinMaterial)
 
-                ConnectionStatusStrip(settings: settings)
-
                 Rectangle()
                     .fill(Color.primary.opacity(0.06))
                     .frame(height: 1)
@@ -793,16 +791,14 @@ struct SettingsView: View {
 
                     HStack(spacing: 12) {
                         Button(action: {
-                            if settings.isRunning || settings.hasScreenRecordingPermission {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                                 settings.toggleServer()
-                            } else {
-                                settings.requestScreenRecordingPermission()
                             }
                         }) {
                             HStack(spacing: 6) {
                                 Image(systemName: settings.isRunning ? "stop.fill" : "play.fill")
                                     .font(.system(size: 12))
-                                Text(settings.isRunning ? "Stop" : (settings.hasScreenRecordingPermission ? "Start" : "Set Up"))
+                                Text(settings.isRunning ? "Stop" : "Start")
                                     .font(.system(size: 13, weight: .medium))
                             }
                             .frame(width: 90)
@@ -810,11 +806,7 @@ struct SettingsView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(settings.isRunning ? .red : .accentColor)
                         .controlSize(.large)
-                        .help(settings.isRunning
-                              ? "Stop streaming"
-                              : (settings.hasScreenRecordingPermission
-                                 ? "Start streaming"
-                                 : "Grant Screen Recording access before starting"))
+                        .disabled(!settings.hasScreenRecordingPermission)
 
                         if settings.isRunning {
                             HStack(spacing: 6) {
@@ -911,118 +903,6 @@ struct SettingsView: View {
 }
 
 // MARK: - Supporting Views
-
-/// A compact, pinned connection summary keeps the common path visible without
-/// turning the existing single-scroll settings window into a new dashboard.
-/// It deliberately derives from the authoritative runtime state so the copy
-/// explains the next useful action instead of merely repeating preferences.
-struct ConnectionStatusStrip: View {
-    @ObservedObject var settings: DisplaySettings
-
-    private var modeLabel: String {
-        settings.connectionMode == .usb ? "USB" : "Wireless"
-    }
-
-    private var statusTitle: String {
-        if !settings.hasScreenRecordingPermission {
-            return "Screen capture access needed"
-        }
-        if !settings.isRunning {
-            return "Ready to connect"
-        }
-        return settings.clientConnected ? "Connected" : "Waiting for tablet"
-    }
-
-    private var statusDetail: String {
-        if !settings.hasScreenRecordingPermission {
-            return "Allow access here, then start Side Screen."
-        }
-        if !settings.isRunning {
-            return "Start the server, then connect over \(modeLabel)."
-        }
-        if settings.clientConnected {
-            let device = settings.currentWirelessDevice ?? "tablet"
-            if settings.currentFPS > 0 {
-                return String(format: "%@ · %.0f FPS · %.1f Mbps", device, settings.currentFPS, settings.currentBitrate)
-            }
-            return "\(device) is streaming"
-        }
-        if settings.connectionMode == .usb {
-            if settings.usbDeviceConnected && !settings.adbReverseConfigured {
-                return "USB detected · preparing the bridge"
-            }
-            return "Connect and authorize your Android tablet over USB."
-        }
-        if let address = settings.listeningAddress {
-            return "Listening on \(address):\(settings.port) · scan the QR on Android."
-        }
-        return "Join the same network as the tablet, then scan the QR."
-    }
-
-    private var statusColor: Color {
-        if !settings.hasScreenRecordingPermission { return .orange }
-        if settings.clientConnected { return .green }
-        if settings.isRunning { return .orange }
-        return .secondary
-    }
-
-    private var actionTitle: String? {
-        if !settings.hasScreenRecordingPermission { return "Allow" }
-        if !settings.isRunning { return "Start" }
-        return nil
-    }
-
-    private func performPrimaryAction() {
-        if !settings.hasScreenRecordingPermission {
-            settings.requestScreenRecordingPermission()
-        } else {
-            settings.toggleServer()
-        }
-    }
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 7, height: 7)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(statusTitle)
-                    .font(.system(size: 11, weight: .semibold))
-                    .lineLimit(1)
-                Text(statusDetail)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 6)
-
-            if let actionTitle {
-                Button(actionTitle, action: performPrimaryAction)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            } else if settings.clientConnected {
-                Text(modeLabel)
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundColor(.secondary)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.ultraThinMaterial)
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(statusColor.opacity(0.2), lineWidth: 1)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .padding(.horizontal, 20)
-        .padding(.bottom, 8)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(statusTitle). \(statusDetail)")
-    }
-}
 
 struct StatusRow: View {
     let title: String
