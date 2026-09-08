@@ -277,6 +277,13 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
 
     let encoder = Unmanaged<VideoEncoder>.fromOpaque(refcon).takeUnretainedValue()
     let timestamp = frameTimestampNanoseconds(sampleBuffer)
+    let encodeCompletedNs = DispatchTime.now().uptimeNanoseconds
+    if encodeCompletedNs >= timestamp {
+        USBAdaptiveLoadController.shared.observeEncodedFrameAge(
+            ageNs: encodeCompletedNs - timestamp,
+            nowNs: encodeCompletedNs
+        )
+    }
 
     // Extract encoded data
     guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
