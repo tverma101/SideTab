@@ -43,6 +43,9 @@ enum FrameSkipper {
 
     /// Force the next frame through (call alongside encoder.requestKeyframe()).
     static func forceNextFrame() {
+        // The production USB adaptive pacer sits before the optional hash gate,
+        // so recovery/startup keyframes must bypass both layers.
+        USBAdaptiveFramePacer.shared.forceNextFrame()
         lock.lock(); defer { lock.unlock() }
         forceNext = true
     }
