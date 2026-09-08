@@ -24,7 +24,7 @@ final class USBAdaptiveFramePacerTests: XCTestCase {
         XCTAssertEqual(next, .init(skip: false, targetFPS: 120, phase: .active))
     }
 
-    func testCleanFramesRampDownFrom120To60To30To15() {
+    func testCleanFramesRampDownFrom120To60To30To1() {
         let pacer = USBAdaptiveFramePacer()
         _ = pacer.decide(
             frameHasChanges: true,
@@ -57,11 +57,11 @@ final class USBAdaptiveFramePacerTests: XCTestCase {
             maxFPS: 120,
             nowNs: 2_500 * ms
         )
-        XCTAssertEqual(deepIdle.targetFPS, 15)
+        XCTAssertEqual(deepIdle.targetFPS, 1)
         XCTAssertEqual(deepIdle.phase, .deepIdle)
     }
 
-    func testDeepIdleActuallySuppressesCleanFrames() {
+    func testDeepIdleActuallySuppressesCleanFramesForOneSecond() {
         let pacer = USBAdaptiveFramePacer()
         _ = pacer.decide(
             frameHasChanges: true,
@@ -77,25 +77,25 @@ final class USBAdaptiveFramePacerTests: XCTestCase {
             nowNs: 2_500 * ms
         )
         XCTAssertFalse(firstIdleSend.skip)
-        XCTAssertEqual(firstIdleSend.targetFPS, 15)
+        XCTAssertEqual(firstIdleSend.targetFPS, 1)
 
         let tooSoon = pacer.decide(
             frameHasChanges: false,
             mutatesCapturedPixels: false,
             maxFPS: 120,
-            nowNs: 2_520 * ms
+            nowNs: 3_499 * ms
         )
         XCTAssertTrue(tooSoon.skip)
-        XCTAssertEqual(tooSoon.targetFPS, 15)
+        XCTAssertEqual(tooSoon.targetFPS, 1)
 
         let due = pacer.decide(
             frameHasChanges: false,
             mutatesCapturedPixels: false,
             maxFPS: 120,
-            nowNs: 2_570 * ms
+            nowNs: 3_500 * ms
         )
         XCTAssertFalse(due.skip)
-        XCTAssertEqual(due.targetFPS, 15)
+        XCTAssertEqual(due.targetFPS, 1)
     }
 
     func testFirstChangedFrameAfterIdleWakesImmediatelyTo120() {
@@ -113,7 +113,7 @@ final class USBAdaptiveFramePacerTests: XCTestCase {
             nowNs: 2_500 * ms
         )
 
-        // Only 1 ms after the last 15-FPS idle send: motion must still punch
+        // Only 1 ms after the last 1-FPS idle send: motion must still punch
         // through immediately rather than waiting for the idle interval.
         let wake = pacer.decide(
             frameHasChanges: true,
