@@ -324,6 +324,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func requestScreenRecordingFromMenu() {
+        Task { @MainActor [weak self] in
+            await self?.requestScreenRecordingPermission()
+        }
+    }
+
     @objc private func selectUSBMode() {
         guard settings.connectionMode != .usb else { return }
         settings.connectionMode = .usb
@@ -1398,15 +1404,17 @@ extension AppDelegate: NSMenuDelegate {
         menu.addItem(.separator())
 
         // Start / Stop
+        let needsScreenCaptureAccess = !settings.isRunning && !settings.hasScreenRecordingPermission
         let toggle = NSMenuItem(
-            title: settings.isRunning ? "Stop Streaming" : "Start Streaming",
-            action: #selector(toggleServerFromMenu),
+            title: settings.isRunning
+                ? "Stop Streaming"
+                : (needsScreenCaptureAccess ? "Grant Screen Recording Access" : "Start Streaming"),
+            action: needsScreenCaptureAccess
+                ? #selector(requestScreenRecordingFromMenu)
+                : #selector(toggleServerFromMenu),
             keyEquivalent: "t"
         )
         toggle.target = self
-        // Mirror the settings-window Start button: starting needs the Screen
-        // Recording permission, stopping is always allowed.
-        toggle.isEnabled = settings.isRunning || settings.hasScreenRecordingPermission
         menu.addItem(toggle)
 
         // Connection mode (switching while running restarts the server, same
