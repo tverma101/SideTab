@@ -16,6 +16,11 @@ import Foundation
 /// pacing point; this controller therefore gives completion timing/backlog more
 /// weight than instantaneous send-buffer capacity.
 ///
+/// Host encode-age strikes are tracked separately from transport mild-pressure
+/// strikes. A fast network completion must not erase evidence that VideoToolbox
+/// itself is falling behind. Conversely, one slow encode followed by a healthy
+/// encode resets the encode-age streak so distant outliers do not accumulate.
+///
 /// A single recovery pulse is expected during startup, reconnect, or a decoder
 /// reset. MediaCodec starvation, however, produces repeated forced-IDR requests
 /// (the Android client throttles forced requests to 200 ms). Three pulses inside
@@ -54,6 +59,7 @@ final class USBAdaptiveLoadController {
         let maxFPS: Int
         let targetFPS: Int
         let mildPressureStrikes: Int
+        let encodeAgeStrikes: Int
         let healthyCompletions: Int
         let rampPenalty: Int
         let lastPressureNs: UInt64
@@ -69,6 +75,7 @@ final class USBAdaptiveLoadController {
         var maxFPS = 60
         var targetFPS = 60
         var mildPressureStrikes = 0
+        var encodeAgeStrikes = 0
         var healthyCompletions = 0
         var rampPenalty = 0
         var lastPressureNs: UInt64 = 0
@@ -87,6 +94,7 @@ final class USBAdaptiveLoadController {
     private static let postRampPenaltyWindowNs: UInt64 = 2_000_000_000
     private static let healthyCompletionsForRamp = 12
     private static let mildStrikesForDownshift = 2
+    private static let encodeAgeStrikesForDownshift = 2
     private static let maxRampPenalty = 3
     private static let recoveryBurstWindowNs: UInt64 = 1_000_000_000
     private static let recoveryPulsesForDownshift = 3
@@ -180,7 +188,7 @@ final class USBAdaptiveLoadController {
     ) {
         guard Int(availableBytes) < Self.criticallyLowSendHeadroomBytes else { return }
         // Headroom is corroboration, never a one-sample hard downshift. Healthy
-        // contentProcessed completions decay this strike again.
+        // contentProcessed completions decay this transport strike again.
         recordPressure(
             generation: generation,
             kind: .sendBuffer,
@@ -189,33 +197,60 @@ final class USBAdaptiveLoadController {
         )
     }
 
-    /// Feed capture -> VideoToolbox output age into the same hysteresis ladder.
+    /// Feed capture -> VideoToolbox output age into an independent strike streak.
     /// The callback can be asynchronous, so rising age is direct evidence that
     /// work is spending multiple frame periods inside the host capture/encode
-    /// pipeline even when TCP itself is draining normally. This signal is always
-    /// mild: two over-budget frames are required before a downshift.
+    /// pipeline even when TCP itself is draining normally. Two consecutive
+    /// over-budget encoded frames are required before a one-tier downshift.
     func observeEncodedFrameAge(
         ageNs: UInt64,
         nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
         var generation: UInt64 = 0
-        var thresholdNs: UInt64 = 0
+        var shouldDownshift = false
 
         lock.lock()
-        if state.active, state.generation != 0 {
+        guard state.active, state.generation != 0 else {
+            lock.unlock()
+            return
+        }
+
+        // Recovery IDRs are intentionally large; do not learn host overload from
+        // their encode age. Also clear the streak so pre-IDR evidence cannot join
+        // with a later unrelated sample after the grace window.
+        if nowNs < state.transportGraceUntilNs {
+            state.encodeAgeStrikes = 0
+            lock.unlock()
+            return
+        }
+
+        let intervalNs = Self.intervalNs(fps: state.targetFPS)
+        let thresholdNs = max(Self.minimumEncodeAgePressureNs, intervalNs &* 3)
+        guard ageNs > thresholdNs else {
+            state.encodeAgeStrikes = 0
+            lock.unlock()
+            return
+        }
+
+        state.encodeAgeStrikes = min(
+            Self.encodeAgeStrikesForDownshift,
+            state.encodeAgeStrikes + 1
+        )
+        if state.encodeAgeStrikes >= Self.encodeAgeStrikesForDownshift {
             generation = state.generation
-            let intervalNs = Self.intervalNs(fps: state.targetFPS)
-            thresholdNs = max(Self.minimumEncodeAgePressureNs, intervalNs &* 3)
+            state.encodeAgeStrikes = 0
+            shouldDownshift = true
         }
         lock.unlock()
 
-        guard generation != 0, ageNs > thresholdNs else { return }
-        recordPressure(
-            generation: generation,
-            kind: .encodeAge,
-            severity: .mild,
-            nowNs: nowNs
-        )
+        if shouldDownshift {
+            recordPressure(
+                generation: generation,
+                kind: .encodeAge,
+                severity: .severe,
+                nowNs: nowNs
+            )
+        }
     }
 
     /// Observe a host keyframe/recovery pulse. One or two pulses can be normal
@@ -242,6 +277,7 @@ final class USBAdaptiveLoadController {
         if graceDeadline > state.transportGraceUntilNs {
             state.transportGraceUntilNs = graceDeadline
         }
+        state.encodeAgeStrikes = 0
 
         if state.lastRecoveryPulseNs == 0 ||
             Self.elapsed(from: state.lastRecoveryPulseNs, to: nowNs) > Self.recoveryBurstWindowNs {
@@ -295,6 +331,8 @@ final class USBAdaptiveLoadController {
 
         if isHealthy {
             state.healthyCompletions = min(state.healthyCompletions + 1, 10_000)
+            // Network health only decays network-derived mild pressure. It must
+            // not erase a VideoToolbox encode-age streak.
             if state.mildPressureStrikes > 0 {
                 state.mildPressureStrikes -= 1
             }
@@ -322,6 +360,7 @@ final class USBAdaptiveLoadController {
             maxFPS: state.maxFPS,
             targetFPS: state.targetFPS,
             mildPressureStrikes: state.mildPressureStrikes,
+            encodeAgeStrikes: state.encodeAgeStrikes,
             healthyCompletions: state.healthyCompletions,
             rampPenalty: state.rampPenalty,
             lastPressureNs: state.lastPressureNs,
@@ -359,6 +398,7 @@ final class USBAdaptiveLoadController {
         switch severity {
         case .severe:
             state.mildPressureStrikes = 0
+            state.encodeAgeStrikes = 0
             stepDownIfAllowed(kind: kind, nowNs: nowNs)
         case .mild:
             state.mildPressureStrikes = min(
@@ -368,6 +408,7 @@ final class USBAdaptiveLoadController {
             if state.mildPressureStrikes >= Self.mildStrikesForDownshift {
                 if stepDownIfAllowed(kind: kind, nowNs: nowNs) {
                     state.mildPressureStrikes = 0
+                    state.encodeAgeStrikes = 0
                 }
             }
         }
@@ -389,6 +430,8 @@ final class USBAdaptiveLoadController {
         state.targetFPS = levels[index - 1]
         state.lastAdjustmentNs = nowNs
         state.hasAdjusted = true
+        state.mildPressureStrikes = 0
+        state.encodeAgeStrikes = 0
         debugLog("USB adaptive FPS: \(old) -> \(state.targetFPS) (pressure=\(kind.rawValue), penalty=\(state.rampPenalty))")
         return true
     }
@@ -427,6 +470,7 @@ final class USBAdaptiveLoadController {
         state.hasAdjusted = true
         state.healthyCompletions = 0
         state.mildPressureStrikes = 0
+        state.encodeAgeStrikes = 0
         debugLog("USB adaptive FPS: \(old) -> \(state.targetFPS) (healthy ramp, penalty=\(state.rampPenalty))")
     }
 
