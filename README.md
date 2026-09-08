@@ -151,8 +151,11 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 git clone https://github.com/tranvuongquocdat/SideScreen.git
 cd SideScreen
 
-# macOS
-cd MacHost && swift build -c release
+# macOS (universal signed app bundle; also removes stale local app snapshots)
+./scripts/build_mac.sh
+
+# Optional: install exactly one user-facing copy under ~/Applications
+./scripts/install_mac.sh --launch
 
 # Android
 (cd AndroidClient && ./gradlew assembleDebug)
@@ -167,6 +170,12 @@ release APK outputs, `installed-base.apk` when a connected ADB device has Side
 Screen installed, and `MANIFEST.txt` with version, signing-certificate, source
 revision, device, and SHA-256 details. Set `SIDESCREEN_ADB_SERIAL` when more
 than one Android device is connected.
+
+The macOS installer replaces the exact `~/Applications/SideScreen.app` target
+without creating `SideScreen.app.previous.*` copies. Successful macOS builds,
+runs, and installs also move any verified stale snapshots left by older
+installers to the macOS Trash. The Trash is not emptied automatically, and
+unrelated applications are never searched or changed.
 </details>
 
 ---

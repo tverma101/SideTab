@@ -1,5 +1,5 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 # Get absolute path to root directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -102,6 +102,9 @@ EOF
 echo "Code signing (stable local identity)..."
 "$SCRIPT_DIR/sign_mac_app.sh" "$APP_DIR"
 echo "  ✓ App signed"
+
+echo "Cleaning stale installed app snapshots..."
+"$SCRIPT_DIR/cleanup_old_app_copies.sh" --apply
 
 echo ""
 echo "Build successful!"

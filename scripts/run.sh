@@ -3,9 +3,15 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The path is resolved from this script's directory at runtime.
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/android_ports.sh"
 
 echo "🚀 Starting Side Screen..."
+
+# Keep the user-facing install directory free of snapshots left by older
+# installers. The helper is scoped to SideScreen.app.previous.* only.
+"$SCRIPT_DIR/cleanup_old_app_copies.sh" --apply
 
 # Kill any existing instance
 pkill -x SideScreen 2>/dev/null || true
@@ -14,7 +20,7 @@ sleep 0.3
 # Check if app bundle exists
 if [ -d "$ROOT_DIR/SideScreen.app" ]; then
     echo "  Opening SideScreen.app..."
-    open "$ROOT_DIR/SideScreen.app"
+    /usr/bin/open -n "$ROOT_DIR/SideScreen.app"
 elif [ -f "$ROOT_DIR/MacHost/.build/release/SideScreen" ]; then
     echo "  Running release binary..."
     "$ROOT_DIR/MacHost/.build/release/SideScreen" &
@@ -26,7 +32,7 @@ else
     "$SCRIPT_DIR/build_mac.sh"
     echo ""
     echo "  Opening SideScreen.app..."
-    open "$ROOT_DIR/SideScreen.app"
+    /usr/bin/open -n "$ROOT_DIR/SideScreen.app"
 fi
 
 echo ""
