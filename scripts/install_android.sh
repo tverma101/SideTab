@@ -5,6 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 APK_PATH="$ROOT_DIR/AndroidClient/app/build/outputs/apk/debug/app-debug.apk"
 source "$SCRIPT_DIR/android_ports.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/resolve_adb.sh"
+
+ADB_BIN="$(sidescreen_resolve_adb 2>/dev/null || true)"
+if [ -z "$ADB_BIN" ]; then
+    echo "❌ ADB not found"
+    echo "   Install Android Studio platform-tools or set SIDESCREEN_ADB"
+    exit 1
+fi
 
 SKIP_BUILD=0
 if [ "${1:-}" = "--skip-build" ]; then
@@ -19,11 +28,17 @@ echo "📱 Installing Android app..."
 
 # Confirm the target before spending time on a build. A normal install always
 # rebuilds so an old ignored APK can never masquerade as the current source.
-if ! adb devices | grep -q "device$"; then
+"$ADB_BIN" start-server >/dev/null
+ADB_DEVICES="$($ADB_BIN devices -l 2>&1 || true)"
+ADB_SERIAL="$(printf '%s\n' "$ADB_DEVICES" | awk '$2 == "device" { print $1; exit }')"
+if [ -z "$ADB_SERIAL" ]; then
     echo "❌ No Android device found via ADB"
-    echo "   Please connect your device via USB and enable USB debugging"
+    echo "   ADB: $ADB_BIN"
+    printf '%s\n' "$ADB_DEVICES" | sed 's/^/   /'
+    echo "   Unlock the tablet, select a data-capable USB mode, and accept the USB debugging prompt."
     exit 1
 fi
+echo "  ✓ Android device connected: $ADB_SERIAL"
 
 # Preserve the currently installed APK and every existing local APK output
 # before the fresh build can replace the ignored build artifact.
@@ -40,16 +55,16 @@ elif [ ! -f "$APK_PATH" ]; then
 fi
 
 # Install APK
-adb install -r "$APK_PATH"
+"$ADB_BIN" -s "$ADB_SERIAL" install -r "$APK_PATH"
 
 echo ""
 echo "✅ App installed successfully!"
 echo ""
 echo "📲 Setting up USB port forwarding..."
-adb reverse --remove tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
-adb reverse --remove tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
-adb reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
-adb reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
+"$ADB_BIN" -s "$ADB_SERIAL" reverse --remove tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
+"$ADB_BIN" -s "$ADB_SERIAL" reverse --remove tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
+"$ADB_BIN" -s "$ADB_SERIAL" reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
+"$ADB_BIN" -s "$ADB_SERIAL" reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
 
 echo "✅ Ports $ANDROID_USB_VIDEO_PORT (video) and $ANDROID_USB_CONTROL_PORT (control) forwarded"
 echo ""

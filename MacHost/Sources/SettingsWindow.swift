@@ -655,7 +655,7 @@ struct SettingsView: View {
                                     StatusRow(title: "ADB installed",
                                               status: settings.adbInstalled ? "Installed" : "Missing",
                                               color: settings.adbInstalled ? .green : .red,
-                                              hint: "USB mode tunnels the TCP stream through the cable using `adb reverse`. Requires the `adb` command on the Mac. Searched paths: Homebrew, /usr/local/bin, ~/Library/Android/sdk/platform-tools, and PATH (`which adb`).")
+                                              hint: "USB mode tunnels the TCP stream through the cable using `adb reverse`. The Android SDK platform-tools copy is preferred, then Homebrew, /usr/local/bin, and PATH.")
                                     if !settings.adbInstalled {
                                         Text("brew install android-platform-tools")
                                             .font(.system(size: 10, design: .monospaced))

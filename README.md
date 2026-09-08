@@ -113,7 +113,7 @@ Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a la
 |---|---|---|
 | **OS** | macOS 13 (Ventura)+ | Android 8.0 (API 26)+ |
 | **Hardware** | Apple Silicon or Intel | H.265 hardware decoder |
-| **USB mode** | USB-C port + `adb` (`brew install android-platform-tools`) | USB-C cable + USB Debugging enabled |
+| **USB mode** | USB-C port + `adb` (Android SDK platform-tools preferred; Homebrew is a fallback) | USB-C cable + USB Debugging enabled |
 | **Wireless mode** | Same WiFi network as the tablet (5 GHz recommended) | Camera (for QR scan) + Google Play Services (for ML Kit barcode) |
 
 ---
@@ -134,6 +134,8 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 
 > **⚠️ ADB Required**
 > The Mac app needs `adb` to communicate with your Android device. If the app doesn't show "Running" after launch, you likely need to install ADB:
+>
+> Side Screen uses the Android SDK's `platform-tools/adb` when it is installed, then falls back to Homebrew. This keeps the Mac app, APK installer, and `adb reverse` tunnel on one toolchain. Set `SIDESCREEN_ADB=/absolute/path/to/adb` when an alternate SDK must be used.
 >
 > 1. Install Homebrew (if you don't have it):
 >    ```bash
@@ -243,7 +245,7 @@ Then open the app again.
 <details>
 <summary><strong>"Connection refused" on Android</strong></summary>
 
-The Mac app sets up `adb reverse` automatically when streaming starts. If it still fails, make sure `adb` is installed (via Android SDK or Homebrew: `brew install android-platform-tools`) and your device has USB debugging enabled.
+The Mac app sets up `adb reverse` automatically when streaming starts. If it still fails, run `./scripts/setup-usb.sh` from the repo; it prints the selected ADB binary and the full device state (`device`, `unauthorized`, or `offline`). Make sure the tablet is unlocked, using a data-capable USB mode, and has accepted the USB debugging prompt. A charge-only cable will not enumerate as an ADB device.
 </details>
 
 <details>

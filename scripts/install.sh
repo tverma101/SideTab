@@ -5,7 +5,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/android_ports.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/resolve_adb.sh"
 cd "$ROOT_DIR"
+
+ADB_BIN="$(sidescreen_resolve_adb 2>/dev/null || true)"
+if [ -z "$ADB_BIN" ]; then
+    echo "❌ ADB not found"
+    exit 1
+fi
 
 echo "🚀 Installing Side Screen..."
 echo ""
@@ -34,7 +42,9 @@ fi
 
 # Check ADB connection first
 echo "📱 Checking ADB connection..."
-if ! adb devices | grep -q "device$"; then
+"$ADB_BIN" start-server >/dev/null
+ADB_SERIAL="$("$ADB_BIN" devices | awk '$2 == "device" { print $1; exit }')"
+if [ -z "$ADB_SERIAL" ]; then
     echo "❌ No Android device found via ADB"
     echo "   Please connect your device via USB and enable USB debugging"
     exit 1
@@ -58,23 +68,23 @@ echo ""
 
 # Install Android app
 echo "📱 Installing Android app..."
-"$SCRIPT_DIR/backup_android_apks.sh"
-adb install -r AndroidClient/app/build/outputs/apk/debug/app-debug.apk
+ADB="$ADB_BIN" SIDESCREEN_ADB_SERIAL="$ADB_SERIAL" "$SCRIPT_DIR/backup_android_apks.sh"
+"$ADB_BIN" -s "$ADB_SERIAL" install -r AndroidClient/app/build/outputs/apk/debug/app-debug.apk
 echo "  ✓ Android app installed"
 echo ""
 
 # Setup ADB reverse (with retry)
 echo "🔧 Setting up USB port forwarding..."
-adb reverse --remove tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
-adb reverse --remove tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
+"$ADB_BIN" -s "$ADB_SERIAL" reverse --remove tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
+"$ADB_BIN" -s "$ADB_SERIAL" reverse --remove tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
 sleep 0.5
-adb reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
-adb reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
+"$ADB_BIN" -s "$ADB_SERIAL" reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
+"$ADB_BIN" -s "$ADB_SERIAL" reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
 
 # Verify ADB reverse is active
 echo "🔍 Verifying port forwarding..."
-if adb reverse --list | grep -q "tcp:$ANDROID_USB_VIDEO_PORT" && \
-   adb reverse --list | grep -q "tcp:$ANDROID_USB_CONTROL_PORT"; then
+if "$ADB_BIN" -s "$ADB_SERIAL" reverse --list | grep -q "tcp:$ANDROID_USB_VIDEO_PORT" && \
+   "$ADB_BIN" -s "$ADB_SERIAL" reverse --list | grep -q "tcp:$ANDROID_USB_CONTROL_PORT"; then
     echo "  ✓ Ports $ANDROID_USB_VIDEO_PORT and $ANDROID_USB_CONTROL_PORT forwarded successfully"
 else
     echo "  ⚠️  Port forwarding setup but verification failed"

@@ -6,6 +6,11 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # The path is resolved from this script's directory at runtime.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/android_ports.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/resolve_adb.sh"
+
+ADB_BIN="$(sidescreen_resolve_adb 2>/dev/null || true)"
+ADB_SERIAL=""
 
 echo "🚀 Starting Side Screen..."
 
@@ -40,12 +45,15 @@ echo "✅ Mac app started!"
 echo ""
 
 # Setup USB if device connected
-if adb devices 2>/dev/null | grep -q "device$"; then
+if [ -n "$ADB_BIN" ]; then
+    ADB_SERIAL="$("$ADB_BIN" devices | awk '$2 == "device" { print $1; exit }')"
+fi
+if [ -n "${ADB_SERIAL:-}" ]; then
     echo "📱 Android device detected, setting up USB..."
-    adb reverse --remove tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
-    adb reverse --remove tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
-    adb reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
-    adb reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
+    "$ADB_BIN" -s "$ADB_SERIAL" reverse --remove tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
+    "$ADB_BIN" -s "$ADB_SERIAL" reverse --remove tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
+    "$ADB_BIN" -s "$ADB_SERIAL" reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT"
+    "$ADB_BIN" -s "$ADB_SERIAL" reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT"
     echo "  ✓ Video/control port forwarding ready"
 fi
 

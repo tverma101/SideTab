@@ -95,7 +95,11 @@ enum StatusDetector {
     private static var lastAdbCacheCheck: Date = .distantPast
     private static let adbPathCacheLock = NSLock()
 
-    private static func adbExecutablePath() -> String? {
+    /// Resolve the same preferred ADB binary used by the command-line install
+    /// helpers. Android Studio's SDK platform-tools win over an older
+    /// Homebrew copy so device discovery, install, and reverse forwarding all
+    /// share one ADB server/version.
+    static func adbExecutablePath() -> String? {
         // Re-resolve every 5 s so install/uninstall is reflected.
         let now = Date()
         adbPathCacheLock.lock()
@@ -105,10 +109,15 @@ enum StatusDetector {
         if let cached, now.timeIntervalSince(lastCheck) < 5.0 {
             return cached
         }
-        let candidatePaths = [
+        var candidatePaths: [String] = []
+        if let explicit = ProcessInfo.processInfo.environment["SIDESCREEN_ADB"],
+           !explicit.isEmpty {
+            candidatePaths.append(explicit)
+        }
+        candidatePaths += [
+            "\(NSHomeDirectory())/Library/Android/sdk/platform-tools/adb",
             "/opt/homebrew/bin/adb",
-            "/usr/local/bin/adb",
-            "\(NSHomeDirectory())/Library/Android/sdk/platform-tools/adb"
+            "/usr/local/bin/adb"
         ]
         for path in candidatePaths where FileManager.default.isExecutableFile(atPath: path) {
             adbPathCacheLock.lock()

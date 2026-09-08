@@ -7,6 +7,11 @@ PACKAGE_NAME="${SIDESCREEN_ANDROID_PACKAGE:-com.sidescreen.app}"
 BACKUP_ROOT="${SIDESCREEN_APK_BACKUP_DIR:-$ROOT_DIR/backups/apk}"
 APK_OUTPUT_ROOT="$ROOT_DIR/AndroidClient/app/build/outputs/apk"
 ADB_BIN="${ADB:-adb}"
+if [[ -z "${ADB:-}" ]]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/resolve_adb.sh"
+    ADB_BIN="$(sidescreen_resolve_adb 2>/dev/null || true)"
+fi
 SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 if [[ -z "$SDK_ROOT" && -d "$HOME/Library/Android/sdk" ]]; then
     SDK_ROOT="$HOME/Library/Android/sdk"
