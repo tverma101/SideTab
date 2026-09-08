@@ -23,6 +23,7 @@ final class USBAdaptiveRecoveryPulseTests: XCTestCase {
         controller.observeRecoveryPulse(nowNs: 350 * ms)
         controller.observeRecoveryPulse(nowNs: 600 * ms)
 
+        // Recovery-burst pressure bypasses the IDR transport grace window.
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 600 * ms), 90)
         XCTAssertEqual(controller.snapshotForTest().recoveryPulseCount, 0)
     }
@@ -56,6 +57,23 @@ final class USBAdaptiveRecoveryPulseTests: XCTestCase {
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 1_200 * ms), 60)
     }
 
+    func testSingleRecoveryPulseSuppressesItsOwnTransportBurst() {
+        let controller = USBAdaptiveLoadController()
+        controller.reset(generation: 36, maxFPS: 120)
+
+        controller.observeRecoveryPulse(nowNs: 100 * ms)
+        XCTAssertEqual(controller.snapshotForTest().transportGraceUntilNs, 350 * ms)
+
+        // A large forced IDR can briefly create several outstanding sends. That
+        // expected burst must not be mistaken for normal 120-FPS overload.
+        controller.observeSendsInFlight(generation: 36, count: 3, nowNs: 200 * ms)
+        XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 200 * ms), 120)
+
+        // Genuine transport pressure after the grace window still counts.
+        controller.observeSendsInFlight(generation: 36, count: 3, nowNs: 360 * ms)
+        XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 360 * ms), 90)
+    }
+
     func testRecoveryPulsesAreIgnoredAtSixtyFPS() {
         let controller = USBAdaptiveLoadController()
         controller.reset(generation: 35, maxFPS: 60)
@@ -66,5 +84,6 @@ final class USBAdaptiveRecoveryPulseTests: XCTestCase {
 
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 60, nowNs: 700 * ms), 60)
         XCTAssertEqual(controller.snapshotForTest().recoveryPulseCount, 0)
+        XCTAssertEqual(controller.snapshotForTest().transportGraceUntilNs, 0)
     }
 }
