@@ -6,6 +6,7 @@ import Foundation
 ///   - multiple Network.framework sends still outstanding before `contentProcessed`
 ///   - `contentProcessed` taking multiple target-frame intervals
 ///   - repeated decoder recovery/keyframe pulses in a short window
+///   - capture-to-encoder-output age staying over several target-frame periods
 /// Corroborating signal:
 ///   - TCP send-buffer headroom becoming critically small
 ///
@@ -21,9 +22,9 @@ import Foundation
 /// one second are therefore treated as strong downstream decoder pressure.
 ///
 /// Explicit recovery also creates an unusually large IDR. A short grace window
-/// ignores transport-only pressure caused by that IDR itself, preventing a normal
-/// startup/recovery burst from teaching the controller that 120 FPS is unstable.
-/// Recovery-burst pressure is never suppressed by this grace window.
+/// ignores transport/encode pressure caused by that IDR itself, preventing a
+/// normal startup/recovery burst from teaching the controller that 120 FPS is
+/// unstable. Recovery-burst pressure is never suppressed by this grace window.
 ///
 /// The policy is intentionally asymmetric: congestion falls back quickly,
 /// while recovery is slower and requires healthy completions. That hysteresis
@@ -38,6 +39,7 @@ final class USBAdaptiveLoadController {
         case sendBacklog
         case sendBuffer
         case slowSend
+        case encodeAge
         case recoveryBurst
     }
 
@@ -89,6 +91,7 @@ final class USBAdaptiveLoadController {
     private static let recoveryBurstWindowNs: UInt64 = 1_000_000_000
     private static let recoveryPulsesForDownshift = 3
     private static let keyframeTransportGraceNs: UInt64 = 250_000_000
+    private static let minimumEncodeAgePressureNs: UInt64 = 25_000_000
     /// Only near-exhaustion is meaningful. A large frame may legitimately be
     /// bigger than the whole TCP send buffer and Network.framework will drain it
     /// asynchronously; comparing headroom to frame size would false-trigger.
@@ -186,6 +189,35 @@ final class USBAdaptiveLoadController {
         )
     }
 
+    /// Feed capture -> VideoToolbox output age into the same hysteresis ladder.
+    /// The callback can be asynchronous, so rising age is direct evidence that
+    /// work is spending multiple frame periods inside the host capture/encode
+    /// pipeline even when TCP itself is draining normally. This signal is always
+    /// mild: two over-budget frames are required before a downshift.
+    func observeEncodedFrameAge(
+        ageNs: UInt64,
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        var generation: UInt64 = 0
+        var thresholdNs: UInt64 = 0
+
+        lock.lock()
+        if state.active, state.generation != 0 {
+            generation = state.generation
+            let intervalNs = Self.intervalNs(fps: state.targetFPS)
+            thresholdNs = max(Self.minimumEncodeAgePressureNs, intervalNs &* 3)
+        }
+        lock.unlock()
+
+        guard generation != 0, ageNs > thresholdNs else { return }
+        recordPressure(
+            generation: generation,
+            kind: .encodeAge,
+            severity: .mild,
+            nowNs: nowNs
+        )
+    }
+
     /// Observe a host keyframe/recovery pulse. One or two pulses can be normal
     /// startup/reset traffic. Three pulses inside the burst window are a strong
     /// signal that the client is repeatedly losing decoder continuity or input
@@ -204,8 +236,8 @@ final class USBAdaptiveLoadController {
         }
 
         // A forced IDR is much larger than a routine P-frame. Ignore transport
-        // backlog caused by that intentional burst for a bounded interval. A
-        // repeated recovery burst still downshifts through .recoveryBurst below.
+        // or encode-age pressure caused by that intentional burst for a bounded
+        // interval. A repeated recovery burst still downshifts below.
         let graceDeadline = nowNs &+ Self.keyframeTransportGraceNs
         if graceDeadline > state.transportGraceUntilNs {
             state.transportGraceUntilNs = graceDeadline
@@ -308,9 +340,9 @@ final class USBAdaptiveLoadController {
         defer { lock.unlock() }
         guard state.active, state.generation == generation else { return }
 
-        // A large forced IDR can transiently look like network congestion. Do
-        // not let that expected burst alter the motion tier. Decoder-recovery
-        // bursts are a separate signal and intentionally bypass this guard.
+        // A large forced IDR can transiently look like network or encode
+        // congestion. Do not let that expected burst alter the motion tier.
+        // Decoder-recovery bursts are a separate signal and bypass this guard.
         if kind != .recoveryBurst && nowNs < state.transportGraceUntilNs {
             return
         }
