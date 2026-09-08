@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Samsung S Pen drawing support: stylus contact is detected separately from finger touch, starts a direct stroke immediately, forwards normalized pressure/tilt/orientation, and supports hover-cursor movement plus the S Pen secondary button. The negotiated protocol falls back to legacy touch for older Mac hosts.
 
+### Fixed
+- Wired SDR colors: the normal macOS 8-bit capture now uses video-range `420v`, matching the Android hardware decoder's limited-range conversion instead of expanding contrast from full-range `420f`. The legacy `SideScreen_exp_pixelFormat=8bit` full-range value remains available only as an explicit A/B control.
+
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming

@@ -380,13 +380,15 @@ class ScreenCapture {
         config.width = width
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        // EXP-FORK knobs (absent = current production behavior):
-        //   SideScreen_exp_pixelFormat "10bit" -> 420YpCbCr10BiPlanarVideoRange (Main10 source)
-        //   SideScreen_exp_colorSpace   "displayP3" | "bt2020" -> explicit color space
-        let expPixelFormat = UserDefaults.standard.string(forKey: "SideScreen_exp_pixelFormat")
-        config.pixelFormat = expPixelFormat == "10bit"
-            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        // The normal 8-bit SDR path is video-range so the sender agrees with
+        // Android's hardware decoder conversion. `8bit` remains an explicit
+        // full-range A/B control; `10bit` remains the Main10 video-range path.
+        let capturePixelFormat = VideoColorProfile.configuredCapturePixelFormat()
+        config.pixelFormat = capturePixelFormat
+        debugLog("Stream color profile: \(VideoColorProfile.rangeName(capturePixelFormat))")
+
+        // EXP-FORK knob (absent = no explicit color-space override):
+        //   SideScreen_exp_colorSpace "displayP3" | "bt2020" | "srgb"
         switch UserDefaults.standard.string(forKey: "SideScreen_exp_colorSpace") {
         case "displayP3":
             config.colorSpaceName = "kCGColorSpaceDisplayP3" as CFString
@@ -864,7 +866,9 @@ class ScreenCapture {
 
         debugLog("CGDisplayStream fallback — display \(displayID) (\(width)x\(height))")
 
-        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        let fallbackPixelFormat = VideoColorProfile.fallbackCapturePixelFormat()
+        let pixelFormat = Int32(fallbackPixelFormat)
+        debugLog("CGDisplayStream color profile: \(VideoColorProfile.rangeName(fallbackPixelFormat))")
         let queue = DispatchQueue(label: "com.sidescreen.cgdisplaystream", qos: .userInteractive)
 
         // Without kCGDisplayStreamShowCursor the fallback stream never

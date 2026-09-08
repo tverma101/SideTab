@@ -199,7 +199,7 @@ Wireless mode requires both devices to be on the same WiFi network. **5 GHz is s
 
 Wireless defaults to the native Android `SurfaceView` presentation path. VSR/CfL enhancement remains opt-in, so disabling it keeps the tablet on the lowest-overhead hardware decode path.
 
-USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wireless adds 10–50 ms depending on WiFi quality.
+USB mode remains the lowest-latency option for drawing or fast-paced gaming. Its normal SDR capture uses video-range `420v` signaling to match the Android hardware decoder and prevent washed or contrast-shifted colors. Wireless adds 10–50 ms depending on WiFi quality. The old full-range `420f` path is retained only as an explicit diagnostic control (`defaults write com.sidescreen.app SideScreen_exp_pixelFormat -string 8bit`).
 
 ### Headless mode (new in 0.11.0 — no Mac interaction)
 
