@@ -50,14 +50,11 @@ class SideScreenApplication : Application(), Application.ActivityLifecycleCallba
                 .sorted()
                 .toList()
 
-        // Before Android 14, preferredRefreshRate is required to be one of the
-        // display's advertised rates. Pick an exact supported value instead of
-        // blindly requesting 120 on a 60/90/144-only panel.
         val preferred =
-            sameResolutionRates
-                .filter { it <= MAX_STREAM_REFRESH_HZ + RATE_EPSILON_HZ }
-                .maxOrNull()
-                ?: current.refreshRate
+            DisplayRefreshPolicy.choosePreferredRate(
+                sameResolutionRates = sameResolutionRates,
+                currentRate = current.refreshRate,
+            )
 
         val attrs = activity.window.attributes
         attrs.preferredRefreshRate = preferred
@@ -91,9 +88,4 @@ class SideScreenApplication : Application(), Application.ActivityLifecycleCallba
     override fun onActivityStopped(activity: Activity) = Unit
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
     override fun onActivityDestroyed(activity: Activity) = Unit
-
-    companion object {
-        private const val MAX_STREAM_REFRESH_HZ = 120f
-        private const val RATE_EPSILON_HZ = 0.5f
-    }
 }
