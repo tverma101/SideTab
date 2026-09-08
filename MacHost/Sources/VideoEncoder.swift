@@ -144,16 +144,24 @@ class VideoEncoder {
 
         // TCP preserves reference frames, reconnect/startup forces an IDR, and
         // Android explicitly requests one when its decoder is reset or loses
-        // input. Wireless therefore uses a longer periodic safety GOP to avoid
-        // paying a large full-frame refresh every second during continuous
-        // motion. USB keeps the existing one-second cadence. The Android
-        // stale-keyframe watchdog sits just beyond the five-second wireless GOP.
-        // SideScreen_exp_gop remains an explicit frame-count override.
+        // input. Wi-Fi already uses a five-second periodic safety GOP. Adaptive
+        // high-refresh USB now uses the same interval: at a 1-FPS clean-screen
+        // keepalive, a one-second keyframe-duration limit would otherwise turn
+        // essentially every idle frame into an IDR. Legacy 30/60-Hz USB keeps
+        // its existing one-second cadence. SideScreen_exp_gop still overrides
+        // the frame-count interval explicitly.
         let expGop = UserDefaults.standard.object(forKey: "SideScreen_exp_gop") as? Int
-        let defaultGopFrames = frameRate * (isWireless ? 5 : 1)
+        let adaptiveUSBEnabled = !isWireless && USBAdaptiveFramePacer.isEnabled(maxFPS: frameRate)
+        let safetyGopSeconds = EncoderGOPPolicy.safetySeconds(
+            isWireless: isWireless,
+            frameRate: frameRate,
+            adaptiveUSBEnabled: adaptiveUSBEnabled
+        )
+        let defaultGopFrames = frameRate * safetyGopSeconds
         let gopFrames = expGop ?? defaultGopFrames
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: Double(gopFrames) / Double(frameRate) as CFNumber)
+        debugLog("Safety GOP: \(gopFrames) frames / \(String(format: "%.1f", Double(gopFrames) / Double(frameRate)))s (adaptiveUSB=\(adaptiveUSBEnabled))")
 
         // Critical for low latency - NO frame reordering (no B-frames)
         let expBFrames = UserDefaults.standard.object(forKey: "SideScreen_exp_bframes") as? Bool ?? false
