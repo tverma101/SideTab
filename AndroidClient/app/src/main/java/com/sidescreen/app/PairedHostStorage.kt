@@ -87,9 +87,11 @@ class PairedHostStorage(context: Context) {
         val macName = prefs.getString("mac_name", null) ?: "Mac"
         val encryptedToken = loadEncryptedToken()
         if (encryptedToken != null) {
-            return@synchronized encryptedToken.takeIf { it.size == TOKEN_SIZE }?.let {
-                Entry(host, port, it, macName, controlPortOverride)
+            if (encryptedToken.size != TOKEN_SIZE) {
+                invalidateStoredPairing("encrypted credential has invalid length")
+                return@synchronized null
             }
+            return@synchronized Entry(host, port, encryptedToken, macName, controlPortOverride)
         }
 
         val legacyToken = loadLegacyToken()
@@ -132,8 +134,14 @@ class PairedHostStorage(context: Context) {
     }
 
     private fun loadEncryptedToken(): ByteArray? {
-        val ciphertext = prefs.getString("token_ciphertext_b64", null) ?: return null
-        val iv = prefs.getString("token_iv_b64", null) ?: return null
+        val ciphertext = prefs.getString("token_ciphertext_b64", null)
+        val iv = prefs.getString("token_iv_b64", null)
+        if (ciphertext == null && iv == null) return null
+        if (ciphertext == null || iv == null) {
+            invalidateStoredPairing("encrypted credential is incomplete")
+            return null
+        }
+
         return try {
             decrypt(decode(ciphertext), decode(iv))
         } catch (e: Exception) {
