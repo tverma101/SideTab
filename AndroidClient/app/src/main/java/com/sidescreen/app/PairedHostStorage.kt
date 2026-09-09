@@ -15,6 +15,9 @@ import javax.crypto.spec.GCMParameterSpec
 class PairedHostStorage(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("paired_host", Context.MODE_PRIVATE)
+    private val mutationLock = Any()
+    private val keyLock = Any()
+    private var mutationGeneration = 0L
 
     data class Entry(
         val host: String,
@@ -48,32 +51,54 @@ class PairedHostStorage(context: Context) {
             require(it in 1..65535) { "invalid control port override" }
         }
 
-        val encrypted = encrypt(entry.token)
-        val editor =
-            prefs.edit()
-                .putString("host", entry.host)
-                .putInt("port", entry.port)
-                .putString("token_ciphertext_b64", encode(encrypted.ciphertext))
-                .putString("token_iv_b64", encode(encrypted.iv))
-                .putString("mac_name", entry.macName)
-                .remove("token_b64")
-        if (entry.controlPortOverride != null) {
-            editor.putInt("control_port_override", entry.controlPortOverride)
-        } else {
-            editor.remove("control_port_override")
+        // Mark this save before doing KeyStore work. If Forget Pairing or a
+        // newer save happens while encryption is in flight, this operation is
+        // stale and must not be allowed to resurrect/overwrite a pairing.
+        val operationGeneration = synchronized(mutationLock) {
+            mutationGeneration += 1
+            mutationGeneration
         }
-        // Remove the short-lived absolute-port key from the stabilization
-        // branch if a build containing it was ever installed.
-        editor.remove("control_port")
-        editor.apply()
+
+        val encrypted =
+            try {
+                encrypt(entry.token)
+            } catch (e: Exception) {
+                DiagLog.log("PAIR", "Secure pairing persistence failed: ${e.javaClass.simpleName}")
+                return
+            }
+
+        synchronized(mutationLock) {
+            if (operationGeneration != mutationGeneration) {
+                DiagLog.log("PAIR", "Discarding superseded pairing persistence operation")
+                return@synchronized
+            }
+
+            val editor =
+                prefs.edit()
+                    .putString("host", entry.host)
+                    .putInt("port", entry.port)
+                    .putString("token_ciphertext_b64", encode(encrypted.ciphertext))
+                    .putString("token_iv_b64", encode(encrypted.iv))
+                    .putString("mac_name", entry.macName)
+                    .remove("token_b64")
+            if (entry.controlPortOverride != null) {
+                editor.putInt("control_port_override", entry.controlPortOverride)
+            } else {
+                editor.remove("control_port_override")
+            }
+            // Remove the short-lived absolute-port key from the stabilization
+            // branch if a build containing it was ever installed.
+            editor.remove("control_port")
+            editor.apply()
+        }
     }
 
-    fun load(): Entry? {
-        val host = prefs.getString("host", null) ?: return null
-        val port = prefs.getInt("port", -1).takeIf { it in 1..65535 } ?: return null
+    fun load(): Entry? = synchronized(mutationLock) {
+        val host = prefs.getString("host", null) ?: return@synchronized null
+        val port = prefs.getInt("port", -1).takeIf { it in 1..65535 } ?: return@synchronized null
         val storedControlOverride = prefs.getInt("control_port_override", -1)
         val controlPortOverride = storedControlOverride.takeIf { it in 1..65535 }
-        if (controlPortOverride == null && port == 65535) return null
+        if (controlPortOverride == null && port == 65535) return@synchronized null
 
         val macName = prefs.getString("mac_name", null) ?: "Mac"
         val token =
@@ -81,13 +106,29 @@ class PairedHostStorage(context: Context) {
                 ?: loadLegacyToken()?.also {
                     migrate(host, port, controlPortOverride, it, macName)
                 }
-        return token?.takeIf { it.size == TOKEN_SIZE }?.let {
+        token?.takeIf { it.size == TOKEN_SIZE }?.let {
             Entry(host, port, it, macName, controlPortOverride)
         }
     }
 
     fun clear() {
-        prefs.edit().clear().apply()
+        synchronized(mutationLock) {
+            // Invalidate saves already encrypting before removing anything.
+            // A stale save will fail its generation check after this returns.
+            mutationGeneration += 1
+
+            // Forget Pairing is a security-sensitive user action. Use a
+            // synchronous preference commit so an immediate process exit
+            // cannot leave the legacy plaintext token or ciphertext on disk.
+            if (!prefs.edit().clear().commit()) {
+                DiagLog.log("PAIR", "Pairing preference deletion did not commit")
+            }
+
+            // The ciphertext is not the only persistent artifact: remove the
+            // non-exportable AES key as well so the old credential cannot be
+            // recovered from a restored/stale preference file.
+            deleteKey()
+        }
     }
 
     private fun loadEncryptedToken(): ByteArray? {
@@ -147,10 +188,10 @@ class PairedHostStorage(context: Context) {
         return cipher.doFinal(ciphertext)
     }
 
-    private fun key(): SecretKey {
+    private fun key(): SecretKey = synchronized(keyLock) {
         val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        (store.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE).apply {
+        (store.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return@synchronized it }
+        KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE).apply {
             init(
                 KeyGenParameterSpec.Builder(
                     KEY_ALIAS,
@@ -162,6 +203,19 @@ class PairedHostStorage(context: Context) {
                     .build(),
             )
         }.generateKey()
+    }
+
+    private fun deleteKey() = synchronized(keyLock) {
+        try {
+            val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (store.containsAlias(KEY_ALIAS)) {
+                store.deleteEntry(KEY_ALIAS)
+            }
+        } catch (e: Exception) {
+            // Preferences are already durably cleared. Keep this observable so
+            // target-device validation can catch a KeyStore deletion failure.
+            DiagLog.log("PAIR", "Pairing key deletion failed: ${e.javaClass.simpleName}")
+        }
     }
 
     private fun encode(bytes: ByteArray): String =
