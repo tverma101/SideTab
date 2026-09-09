@@ -21,9 +21,11 @@ the user's persisted USB settings.
 - After the initial sync frame, encoded reference frames are kept in order;
   congestion suppresses work before VideoToolbox instead of dropping a P-frame
   from the codec reference chain.
-- The Android client binds video and the dedicated control channel to the same
-  Wi-Fi network when Android exposes a Wi-Fi `Network` handle. The video socket
-  has a bounded receive-buffer hint and a 256 KiB input buffer.
+- The Android client sends video and dedicated control traffic through the same
+  Wi-Fi `Network` when Android exposes a handle, preferring that network's
+  `SocketFactory` and retaining process-default plus legacy `bindSocket`
+  fallbacks for OEM compatibility. The video socket has a bounded
+  receive-buffer hint and a 256 KiB input buffer.
 - The Android decoder targets 60 Hz and drops decoded wireless output older than
   two 60 Hz intervals (33.33 ms), while releasing the codec buffer normally.
   This bounds visible staleness without breaking the H.265 reference chain.

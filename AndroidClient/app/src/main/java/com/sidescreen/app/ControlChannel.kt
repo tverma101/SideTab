@@ -7,6 +7,7 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import javax.net.SocketFactory
 
 /**
  * Out-of-band control channel: ping/pong RTT measurement + keyframe requests
@@ -172,73 +173,114 @@ class ControlChannel(
             connecting = true
         }
 
-        // Snapshot the Android Network used for this attempt. If a roam occurs
-        // while connect/auth is in flight, the completed socket is discarded
-        // rather than installing a route that was obsolete before promotion.
+        // Snapshot the Android Network used for this attempt. Android's
+        // per-network SocketFactory is the supported route; keep both the
+        // process-default and legacy bindSocket forms as OEM fallbacks so the
+        // control channel follows the same recovery path as video.
         val targetNetwork = boundNetwork
-        val s = Socket()
-        return try {
-            targetNetwork?.let { network ->
-                network.bindSocket(s)
-                DiagLog.log("CC", "Control socket bound to Android network $network")
+        val routes: List<Pair<String, () -> Socket>> = buildList {
+            if (targetNetwork != null) {
+                add("WiFi-factory" to { targetNetwork.socketFactory.createSocket() })
             }
-            s.tcpNoDelay = true
-            s.keepAlive = true
-            s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
-            val controlOutput = DataOutputStream(s.getOutputStream())
-            writeAuthenticationPreamble(controlOutput)
-            s.soTimeout = 0
+            add("default" to { SocketFactory.getDefault().createSocket() })
+            if (targetNetwork != null) {
+                add(
+                    "WiFi-bind" to {
+                        SocketFactory.getDefault().createSocket().also(targetNetwork::bindSocket)
+                    },
+                )
+            }
+        }
+        var lastError: Exception? = null
 
-            val installedGeneration =
-                synchronized(connectLock) {
-                    connecting = false
-                    if (!running || socket != null || boundNetwork != targetNetwork) {
-                        if (boundNetwork != targetNetwork) {
-                            DiagLog.log("CC", "Control connect finished on retired Android network — retrying")
+        for ((index, route) in routes.withIndex()) {
+            if (!running) break
+            var s: Socket? = null
+            try {
+                val candidate = route.second()
+                s = candidate
+                DiagLog.log("CC", "Control socket using ${route.first} route")
+                candidate.tcpNoDelay = true
+                candidate.keepAlive = true
+                candidate.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+                DiagLog.log(
+                    "CC",
+                    "Control socket connected on ${route.first} " +
+                        "from ${candidate.localAddress?.hostAddress}:${candidate.localPort}",
+                )
+                val controlOutput = DataOutputStream(candidate.getOutputStream())
+                writeAuthenticationPreamble(controlOutput)
+                candidate.soTimeout = 0
+
+                val installedGeneration =
+                    synchronized(connectLock) {
+                        connecting = false
+                        if (!running || this.socket != null || boundNetwork != targetNetwork) {
+                            if (boundNetwork != targetNetwork) {
+                                DiagLog.log("CC", "Control connect finished on retired Android network — retrying")
+                            }
+                            null
+                        } else {
+                            connectionGeneration += 1
+                            this.socket = candidate
+                            output = controlOutput
+                            tcpActive = true
+                            outstandingPing = null
+                            connectionGeneration
                         }
-                        try {
-                            s.close()
-                        } catch (_: Exception) {
-                        }
-                        return false
                     }
-                    connectionGeneration += 1
-                    socket = s
-                    output = controlOutput
-                    tcpActive = true
-                    outstandingPing = null
-                    connectionGeneration
+
+                if (installedGeneration == null) {
+                    try {
+                        candidate.close()
+                    } catch (_: Exception) {
+                    }
+                    return false
                 }
 
-            DiagLog.log("CC", "Control channel ACTIVE mode=tcp generation=$installedGeneration")
-            declareBrightnessSupport()
-            Thread({ tcpReadLoop(s, installedGeneration) }, "ControlTcpThread")
-                .apply {
-                    isDaemon = true
-                    priority = Thread.MAX_PRIORITY
-                }.start()
-            true
-        } catch (e: Exception) {
-            synchronized(connectLock) {
-                connecting = false
-                if (socket === s) {
-                    connectionGeneration += 1
-                    socket = null
-                    output = null
-                    tcpActive = false
-                    outstandingPing = null
+                DiagLog.log("CC", "Control channel ACTIVE mode=tcp generation=$installedGeneration")
+                declareBrightnessSupport()
+                Thread({ tcpReadLoop(candidate, installedGeneration) }, "ControlTcpThread")
+                    .apply {
+                        isDaemon = true
+                        priority = Thread.MAX_PRIORITY
+                    }.start()
+                return true
+            } catch (e: Exception) {
+                lastError = e
+                synchronized(connectLock) {
+                    if (this.socket === s) {
+                        connectionGeneration += 1
+                        this.socket = null
+                        output = null
+                        tcpActive = false
+                        outstandingPing = null
+                    }
                 }
+                try {
+                    s?.close()
+                } catch (_: Exception) {
+                }
+                DiagLog.log(
+                    "CC",
+                    "Control TCP ${route.first} route ${index + 1}/${routes.size} failed: " +
+                        "${e.javaClass.simpleName}: ${e.message}",
+                )
             }
+        }
+
+        synchronized(connectLock) {
+            connecting = false
+        }
+        val error = lastError
+        if (error != null) {
             DiagLog.log(
                 "CC",
-                "Control channel TCP connect failed: ${e.javaClass.simpleName}: ${e.message}",
+                "Control channel TCP connect failed: " +
+                    "${error.javaClass.simpleName}: ${error.message}",
             )
-            try {
-                s.close()
-            } catch (_: Exception) {
-            }
-            false
         }
+        return false
     }
 
     private fun tcpReadLoop(

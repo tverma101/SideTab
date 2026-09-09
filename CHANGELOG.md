@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Wired SDR colors: the normal macOS 8-bit capture now uses video-range `420v`, matching the Android hardware decoder's limited-range conversion instead of expanding contrast from full-range `420f`. The legacy `SideScreen_exp_pixelFormat=8bit` full-range value remains available only as an explicit A/B control.
+- Wireless recovery: a failed connection now keeps the cached or just-scanned pairing available, presents **Reconnect** as the primary repair action, and keeps QR scanning secondary unless the Mac rejects the pairing token. Manual Disconnect also returns to the paired-idle screen instead of leaving the wireless panel in its previous state; dedicated QR control-port overrides survive the in-session retry path.
+- Wireless transport now tries Android's per-network `SocketFactory` first, then the process-default route and legacy `bindSocket` fallback, preserving connectivity across OEM routing implementations.
 
 ### Performance
 - macOS USB status probes now run off the main actor, overlapping ADB repairs are suppressed, and the capture callback latches session flags instead of reading connection preferences on every frame.

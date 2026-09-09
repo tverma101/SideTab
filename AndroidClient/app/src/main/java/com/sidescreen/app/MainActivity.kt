@@ -14,6 +14,7 @@ import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
 import android.hardware.usb.UsbManager
 import android.media.MediaFormat
+import android.net.Network
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -205,6 +206,10 @@ class MainActivity : AppCompatActivity() {
                         disconnectButton = binding.wirelessDisconnectButton,
                         forgetButton = binding.wirelessForgetButton,
                         reconnectButton = binding.wirelessReconnectButton,
+                        repairReconnectButton = binding.wirelessRepairReconnectButton,
+                        privateLinkButton = binding.wirelessPrivateLinkButton,
+                        privateLinkStopButton = binding.wirelessPrivateLinkStopButton,
+                        privateLinkDetails = binding.wirelessPrivateLinkDetails,
                         idleForgetButton = binding.wirelessIdleForgetButton,
                         openSettingsButton = binding.wirelessOpenSettingsButton,
                         connectedMacName = binding.connectedMacName,
@@ -218,12 +223,19 @@ class MainActivity : AppCompatActivity() {
                     ),
                 storage = pairedHostStorage,
                 cameraPerm = cameraPerm,
-                onConnectRequested = { host, port, token, deviceName, _ ->
-                    connectWireless(host, port, token, deviceName)
+                onConnectRequested = { host, port, token, deviceName, _, controlPort, network ->
+                    connectWireless(host, port, token, deviceName, controlPort, network)
                 },
             )
         wirelessController.bind()
-        binding.wirelessDisconnectButton.setOnClickListener { disconnect() }
+        binding.wirelessDisconnectButton.setOnClickListener {
+            disconnect()
+            // The generation fence intentionally suppresses the stale client's
+            // disconnected callback. Update the wireless state explicitly so a
+            // user-initiated disconnect returns to the paired-idle screen with
+            // its Reconnect action visible.
+            wirelessController.onUserDisconnected()
+        }
         if (prefs.connectionMode == ConnectionMode.WIRELESS) {
             wirelessController.show()
         }
@@ -250,6 +262,9 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == WirelessTabController.REQ_CAMERA) {
             val granted = grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED
             wirelessController.onCameraPermissionResult(granted)
+        } else if (requestCode == PrivateLinkController.PERMISSION_REQUEST_CODE) {
+            val granted = grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED
+            wirelessController.onPrivateLinkPermissionResult(granted)
         }
     }
 
@@ -1478,6 +1493,8 @@ class MainActivity : AppCompatActivity() {
         port: Int,
         token: ByteArray,
         deviceName: String,
+        controlPort: Int? = null,
+        network: Network? = null,
     ) {
         val generation = activeConnectionGeneration + 1
         activeConnectionGeneration = generation
@@ -1485,14 +1502,20 @@ class MainActivity : AppCompatActivity() {
         streamClient = null
         isConnected = false
 
-        val client = StreamClient(host, port, applicationContext)
+        val client =
+            StreamClient(
+                host,
+                port,
+                applicationContext,
+                controlPort = controlPort ?: port + 1,
+            )
         streamClient = client
         setupStreamClientCallbacks(client, generation, host)
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
-                client.connectWireless(token, deviceName)
+                client.connectWireless(token, deviceName, preferredNetwork = network)
                 // NOTE: onConnectSuccess is fired from the onConnectionStatus(true)
                 // listener (above) right after handshake OK — not here. This line
                 // would otherwise run AFTER the receive loop exits, i.e. AFTER
@@ -2123,6 +2146,7 @@ class MainActivity : AppCompatActivity() {
             }
             vsrCmdReceiver = null
         }
+        wirelessController.close()
         super.onDestroy()
         stopChecklistUpdates()
         cleanup()

@@ -18,6 +18,7 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import javax.net.SocketFactory
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -268,6 +269,7 @@ class StreamClient(
     suspend fun connectWireless(
         token: ByteArray,
         deviceName: String,
+        preferredNetwork: Network? = null,
     ) = withContext(Dispatchers.IO) {
         if (token.size != PAIRING_TOKEN_SIZE) {
             throw WirelessConnectError.ProtocolError
@@ -294,6 +296,7 @@ class StreamClient(
                             deviceName,
                             connectTimeout,
                             handshakeTimeout,
+                            preferredNetwork,
                         )
                     if (connectionAttemptCancelled) break
 
@@ -365,43 +368,16 @@ class StreamClient(
         deviceName: String,
         connectTimeoutMs: Int,
         handshakeTimeoutMs: Int,
+        preferredNetwork: Network?,
     ): Long {
         Log.i(
             TAG,
             "connectWireless: trying $host:$port " +
                 "(device=$deviceName, connect=${connectTimeoutMs}ms, auth=${handshakeTimeoutMs}ms)",
         )
-        val connectingSocket = Socket()
-        pendingSocket = connectingSocket
-
-        val wifiNetwork = selectWifiNetwork()
+        val wifiNetwork = preferredNetwork ?: selectWifiNetwork()
         controlChannel.setNetwork(wifiNetwork)
-
-        try {
-            connectingSocket.tcpNoDelay = true
-            connectingSocket.keepAlive = true
-            runCatching {
-                connectingSocket.receiveBufferSize =
-                    WirelessTransportProfile.VIDEO_SOCKET_RECEIVE_BUFFER_BYTES
-            }.onFailure { error ->
-                Log.w(TAG, "connectWireless: receive buffer hint unavailable: ${error.message}")
-            }
-            if (wifiNetwork != null) {
-                Log.i(TAG, "connectWireless: binding video/control to WiFi network $wifiNetwork")
-                wifiNetwork.bindSocket(connectingSocket)
-            } else {
-                Log.w(TAG, "connectWireless: no WiFi Network handle found, using default routing")
-            }
-            connectingSocket.connect(InetSocketAddress(host, port), connectTimeoutMs)
-        } catch (e: SocketTimeoutException) {
-            closePending(connectingSocket)
-            Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port")
-            throw WirelessConnectError.NetworkUnreachable
-        } catch (e: IOException) {
-            closePending(connectingSocket)
-            Log.e(TAG, "connectWireless: TCP connect failed: ${e.javaClass.simpleName}: ${e.message}")
-            throw WirelessConnectError.NetworkUnreachable
-        }
+        val connectingSocket = connectWirelessSocket(wifiNetwork, connectTimeoutMs)
 
         if (connectionAttemptCancelled) {
             closePending(connectingSocket)
@@ -478,6 +454,76 @@ class StreamClient(
                 throw WirelessConnectError.ProtocolError
             }
         }
+    }
+
+    /**
+     * Use the Android per-network socket factory before the process-default
+     * route. Android documents the factory as the supported way to create a
+     * socket whose traffic is guaranteed to use that Network. Keep both the
+     * default route and the older bindSocket form as compatibility fallbacks
+     * for OEMs that expose a Network handle with incomplete factory support.
+     */
+    private fun connectWirelessSocket(
+        wifiNetwork: Network?,
+        connectTimeoutMs: Int,
+    ): Socket {
+        val routes: List<Pair<String, () -> Socket>> = buildList {
+            if (wifiNetwork != null) {
+                add("WiFi-factory" to { wifiNetwork.socketFactory.createSocket() })
+            }
+            add("default" to { SocketFactory.getDefault().createSocket() })
+            if (wifiNetwork != null) {
+                add(
+                    "WiFi-bind" to {
+                        SocketFactory.getDefault().createSocket().also(wifiNetwork::bindSocket)
+                    },
+                )
+            }
+        }
+        var lastError: IOException? = null
+
+        routes.forEachIndexed { index, route ->
+            if (connectionAttemptCancelled) {
+                throw WirelessConnectError.NetworkUnreachable
+            }
+            var candidate: Socket? = null
+            try {
+                val socket = route.second()
+                candidate = socket
+                pendingSocket = candidate
+                socket.tcpNoDelay = true
+                socket.keepAlive = true
+                runCatching {
+                    socket.receiveBufferSize =
+                        WirelessTransportProfile.VIDEO_SOCKET_RECEIVE_BUFFER_BYTES
+                }.onFailure { error ->
+                    Log.w(TAG, "connectWireless: receive buffer hint unavailable: ${error.message}")
+                }
+                Log.i(TAG, "connectWireless: trying video socket on ${route.first} route")
+                socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+                Log.i(
+                    TAG,
+                    "connectWireless: video socket connected on ${route.first} " +
+                        "from ${socket.localAddress?.hostAddress}:${socket.localPort}",
+                )
+                return socket
+            } catch (e: IOException) {
+                lastError = e
+                candidate?.let(::closePending)
+                Log.w(
+                    TAG,
+                    "connectWireless: TCP ${route.first} route ${index + 1}/${routes.size} failed: " +
+                        "${e.javaClass.simpleName}: ${e.message}",
+                )
+            }
+        }
+
+        if (lastError is SocketTimeoutException) {
+            Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port")
+        } else {
+            Log.e(TAG, "connectWireless: TCP connect failed to $host:$port", lastError)
+        }
+        throw WirelessConnectError.NetworkUnreachable
     }
 
     private fun selectWifiNetwork(): Network? {

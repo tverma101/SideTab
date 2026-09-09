@@ -272,7 +272,8 @@ The connection checklist checks tablet-local prerequisites while idle; it does n
 
 - Both devices must be on the same WiFi network (and same subnet — some mesh routers isolate "guest" devices)
 - Click **Start** on the Mac before scanning the QR — the listener only binds when the server is running
-- If the Mac changes WiFi or its LAN IP, scan a fresh QR (the cached one points to the old address)
+- If Android already has a pairing, tap **Reconnect** first. The repair screen keeps the saved pairing and makes **Scan QR instead** the secondary action; scan a fresh QR only if the Mac pairing token or address changed and reconnect/discovery cannot recover it
+- If both devices show addresses in the same subnet but Reconnect still times out, test device-to-device TCP reachability; campus or guest WiFi can isolate clients and block both TCP and Bonjour even when the addresses look local. Use a non-isolated SSID or disable client isolation on the access point.
 - macOS may prompt for **Local Network** permission on first wireless toggle — grant it; without it, LAN inbound is silently dropped
 </details>
 

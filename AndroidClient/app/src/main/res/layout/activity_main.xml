@@ -678,7 +678,7 @@
                         android:textSize="16sp"
                         app:cornerRadius="16dp"
                         app:backgroundTint="@color/ss_accent"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="@color/ss_on_accent"
                         android:layout_marginBottom="8dp" />
 
                     <com.google.android.material.button.MaterialButton
@@ -723,14 +723,60 @@
                         android:gravity="center"
                         android:layout_marginBottom="16dp" />
 
+                    <TextView
+                        android:id="@+id/wirelessPrivateLinkDetails"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text=""
+                        android:textColor="@color/ss_text_secondary"
+                        android:textSize="12sp"
+                        android:visibility="gone"
+                        android:gravity="center"
+                        android:padding="12dp"
+                        android:layout_marginBottom="8dp"
+                        android:background="@drawable/instruction_bg" />
+
                     <com.google.android.material.button.MaterialButton
-                        android:id="@+id/wirelessRescanButton"
+                        android:id="@+id/wirelessRepairReconnectButton"
                         android:layout_width="match_parent"
                         android:layout_height="56dp"
-                        android:text="Scan QR Code"
+                        android:text="Reconnect"
+                        android:textSize="16sp"
                         app:cornerRadius="16dp"
-                        app:backgroundTint="@color/ss_success"
-                        android:textColor="@color/ss_on_accent" />
+                        app:backgroundTint="@color/ss_accent"
+                        android:textColor="@color/ss_on_accent"
+                        android:visibility="gone"
+                        android:layout_marginBottom="8dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessPrivateLinkButton"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="USE PRIVATE LINK"
+                        android:textColor="@color/ss_text_secondary"
+                        app:strokeColor="@color/ss_outline"
+                        android:layout_marginBottom="8dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessPrivateLinkStopButton"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="STOP PRIVATE LINK"
+                        android:textColor="@color/ss_error_soft"
+                        app:strokeColor="@color/ss_error_container"
+                        android:visibility="gone"
+                        android:layout_marginBottom="8dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessRescanButton"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Scan QR Code"
+                        android:textColor="@color/ss_text_secondary"
+                        app:strokeColor="@color/ss_outline" />
                 </LinearLayout>
 
                 <!-- State 5: Permission denied permanently -->

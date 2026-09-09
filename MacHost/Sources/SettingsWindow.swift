@@ -677,7 +677,7 @@ struct SettingsView: View {
                                     StatusRow(title: "WiFi",
                                               status: settings.wifiConnected ? "Connected" : "Disconnected",
                                               color: settings.wifiConnected ? .green : .red,
-                                              hint: "Whether the Mac currently has a working internet route. Wireless mode requires the Mac to be on a WiFi (or Ethernet) network — the same network the tablet is on.")
+                                              hint: "Whether the Mac has an active local-network address. This does not prove that the access point allows peer-to-peer TCP or Bonjour; wireless mode still requires the tablet to reach the listening address.")
                                     StatusRow(title: "Listening on",
                                               status: settings.listeningAddress.map { "\($0):\(settings.port)" } ?? "—",
                                               color: settings.listeningAddress != nil ? .green : .secondary,
@@ -1390,6 +1390,10 @@ struct WirelessSection: View {
         .onChange(of: settings.port) { _ in refreshQR() }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { now in
             nowTick = now
+            // A Private Link can replace the current Wi-Fi address while this
+            // window remains open. Refresh the QR so pairing/recovery never
+            // keeps showing the isolated WLAN endpoint.
+            refreshQR()
             refreshPaired()
         }
         .alert("Reset Token?", isPresented: $showResetConfirm) {
