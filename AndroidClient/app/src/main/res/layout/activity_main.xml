@@ -175,8 +175,10 @@
             android:layout_width="24dp"
             android:layout_height="24dp"
             android:layout_gravity="center"
+            android:contentDescription="@null"
+            android:importantForAccessibility="no"
             android:src="@drawable/ic_settings"
-            android:tint="@color/ss_text_primary" />
+            app:tint="@color/ss_text_primary" />
     </androidx.cardview.widget.CardView>
 
     <!-- Modern Connection Panel -->
@@ -791,6 +793,8 @@
         android:id="@+id/logText"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:visibility="gone" />
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
