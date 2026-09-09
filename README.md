@@ -1,319 +1,187 @@
-<a id="readme-top"></a>
-
 <div align="center">
 
-<img src="resources/logo/sidescreen-icon.png" alt="Side Screen" width="128"/>
+<img src="resources/logo/sidescreen-icon.png" alt="Side Screen icon" width="112" />
 
-<h1>Side Screen</h1>
+# Side Screen
 
-<p><em>Turn your Android tablet into a second display for macOS — USB-C or wireless over WiFi</em></p>
+**Use an Android tablet as a second display for macOS over USB or Wi‑Fi.**
 
-<p>
-  <img src="https://img.shields.io/github/v/release/tranvuongquocdat/SideScreen?style=for-the-badge&label=version&color=blue" alt="Version">
-  <a href="https://github.com/tranvuongquocdat/SideScreen/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/tranvuongquocdat/SideScreen?style=for-the-badge&color=34C759" alt="License">
-  </a>
-  <a href="https://github.com/tranvuongquocdat/SideScreen/stargazers">
-    <img src="https://img.shields.io/github/stars/tranvuongquocdat/SideScreen?style=for-the-badge&color=FF9500" alt="Stars">
-  </a>
-  <a href="https://github.com/tranvuongquocdat/SideScreen/releases">
-    <img src="https://img.shields.io/github/downloads/tranvuongquocdat/SideScreen/total?style=for-the-badge&color=8E44AD&label=downloads" alt="Downloads">
-  </a>
+[![License](https://img.shields.io/github/license/tverma101/SideScreen?style=flat-square)](LICENSE)
+[![macOS 13+](https://img.shields.io/badge/macOS-13%2B-111111?style=flat-square&logo=apple)](MacHost/Package.swift)
+[![Android 8+](https://img.shields.io/badge/Android-8%2B-3DDC84?style=flat-square&logo=android&logoColor=white)](AndroidClient/app/build.gradle.kts)
+[![GitHub stars](https://img.shields.io/github/stars/tverma101/SideScreen?style=flat-square)](https://github.com/tverma101/SideScreen/stargazers)
+
+</div>
+
+<p align="center">
+  <img src="resources/screenshots/hero_screenshot.jpeg" alt="Side Screen running on macOS and Android" width="760" />
 </p>
 
-![Swift](https://img.shields.io/badge/Swift-FA7343?style=for-the-badge&logo=swift&logoColor=white)
-![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)
-![macOS](https://img.shields.io/badge/macOS_13+-000000?style=for-the-badge&logo=apple&logoColor=white)
-![Android](https://img.shields.io/badge/Android_8+-3DDC84?style=for-the-badge&logo=android&logoColor=white)
-![Universal Binary](https://img.shields.io/badge/Universal_Binary-Apple_Silicon_+_Intel-000000?style=for-the-badge&logo=apple&logoColor=white)
+## Project status
 
-</div>
+Side Screen is under active development. The repository version is **0.11.2**; `main` also contains unreleased fixes and performance work newer than that version.
 
----
+This fork currently does **not** publish binaries through GitHub Releases. Build from source when testing this repository so the Mac host and Android client come from the same code revision.
 
-<div align="center">
-  <img src="resources/screenshots/hero_screenshot.jpeg" alt="Side Screen — Mac + Android tablet as second display" width="800"/>
-</div>
+| Area | Current state |
+| --- | --- |
+| USB display | Primary validation path; video, touch, high refresh rates, and S Pen support are implemented |
+| Wireless display | Functional, but transport/security and reconnect work remain |
+| Display profile | Current fork uses a fixed 1400×876 logical HiDPI profile (2800×1752 physical) |
+| Refresh rate | 30 / 60 / 90 / 120 Hz are exposed; 60 Hz is the normal default |
+| macOS | macOS 13 Ventura or newer |
+| Android | API 26 / Android 8.0 or newer |
 
----
+See [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for the current production blockers, experiments, and issue map.
 
-## About
+> [!IMPORTANT]
+> Wireless video traffic is not yet end-to-end encrypted. Use wireless mode only on a trusted network until the Protocol V2 / TLS work is complete. USB remains local through the ADB reverse-forwarding path.
 
-Side Screen brings true second-display functionality to your Android tablet — over USB-C cable for the lowest latency, or wirelessly over WiFi after a one-time QR pair. Something macOS doesn't natively support either way.
+## What it does
 
-While Apple's Sidecar only works with iPads, millions of Android tablets sit unused as potential workstations. Side Screen bridges that gap with hardware-accelerated H.265 streaming, sub-16ms pipeline latency on USB, and full touch input — making your tablet feel like a real monitor, not a laggy mirror.
+- Creates a virtual display on macOS and captures it with ScreenCaptureKit.
+- Encodes the display with VideoToolbox and streams it to the Android client.
+- Uses Android MediaCodec for hardware-assisted decode where supported.
+- Supports USB through ADB reverse port forwarding and wireless connections on the local network.
+- Forwards touch input from the tablet to macOS.
+- Supports Samsung S Pen contact, pressure/tilt metadata, hover, and the secondary button on the negotiated stylus path.
+- Supports HEVC with H.264 fallback for clients that cannot decode HEVC.
+- Supports display rotation, mirroring, launch-at-login, and automatic host startup.
 
-Built entirely open-source, Side Screen is designed to be fast, lightweight, and seamlessly integrated.
-
-For full details, features, and documentation, please visit **[sidescreen.dev](https://sidescreen.dev)**
-
-<p align="right"><a href="#readme-top">↑ Back to top</a></p>
-
----
-
-## Features
-
-### USB-C or Wireless
-
-Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — the Mac app sets up adb-reverse forwarding for video on port `54321` and control on `54322`. **Wireless** lets you scan a QR code from the Mac; the tablet remembers the pairing and you can tap **Reconnect** on later launches (5 GHz strongly recommended). The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
-
-### Virtual Display
-
-Create a true virtual display on your Mac. Drag windows to your tablet like a real monitor — not mirroring, but extending.
-
-<div align="center">
-  <img src="resources/screenshots/feature_virtual_display.png" alt="Virtual Display in macOS Display Preferences" width="600"/>
-</div>
-
-### Ultra-Low Latency
-
-Hardware-accelerated H.265 encoding on Mac and decoding on Android. Async pipeline architecture delivers frames in under 30ms.
-
-<div align="center">
-  <img src="resources/screenshots/android_performance.png" alt="Low Latency Streaming with Stats Overlay" width="700"/>
-</div>
-
-### Touch Support
-
-Use your tablet's touchscreen to interact with macOS. Touch prediction compensates for network latency, making taps and drags feel natural.
-
-Samsung S Pen contact is handled as a direct drawing stroke rather than a touch scroll gesture. Current Mac/Android builds also forward pen pressure, hover movement, tilt/orientation metadata, and the S Pen secondary button. Pressure is delivered through macOS's tablet-style mouse event fields, so apps that read mouse/tablet pressure can vary brush width; this is not a kernel-level Wacom/Apple tablet driver.
-
-### HiDPI (Retina) Support
-
-Enable HiDPI mode to render at 2× resolution internally — text and icons are sharp at any logical resolution, just like a MacBook Retina display. Perfect for users with 2K/4K tablets who want a readable workspace without sacrificing sharpness.
-
-### Gaming Mode
-
-Enable Gaming Boost for the bounded ultra-low-latency encoder profile. The host pins this mode to its low-bitrate real-time profile; actual throughput depends on the selected display and device.
-
-### Customizable
-
-Configure resolution (up to 4K/8K), frame rate (30–120 FPS; 60 FPS is the current balanced default), bitrate and quality presets from the Mac app. The host applies a bounded encoder ladder rather than treating the UI bitrate as an unrestricted wire rate.
-
-<div align="center">
-  <img src="resources/screenshots/mac_settings_1.png" alt="macOS Settings — Display & FPS" height="500"/>
-  &nbsp;&nbsp;
-  <img src="resources/screenshots/mac_settings_2.png" alt="macOS Settings — Streaming & Status" height="500"/>
-  &nbsp;&nbsp;
-  <img src="resources/screenshots/android_settings.png" alt="Android — Connection Screen" height="500"/>
-</div>
-
-### Headless / portable Mac (new in 0.11.0)
-
-Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a laptop in clamshell — using the tablet as its only screen. Enable Launch at Login and Auto-start streaming, and the Mac boots straight into serving the tablet, with nothing to press on the Mac.
-
-<p align="right"><a href="#readme-top">↑ Back to top</a></p>
-
----
+Performance numbers are intentionally not advertised as fixed guarantees. End-to-end latency and sustained 120 Hz behavior depend on the Mac, Android decoder, panel mode, connection, content, and current branch. The repository tracks measurement work explicitly rather than presenting partial pipeline timestamps as glass-to-glass latency.
 
 ## Requirements
 
-| | macOS Host | Android Client |
-|---|---|---|
-| **OS** | macOS 13 (Ventura)+ | Android 8.0 (API 26)+ |
-| **Hardware** | Apple Silicon or Intel | H.265 hardware decoder |
-| **USB mode** | USB-C port + `adb` (`brew install android-platform-tools`) | USB-C cable + USB Debugging enabled |
-| **Wireless mode** | Same WiFi network as the tablet (5 GHz recommended) | Camera (for QR scan) + Google Play Services (for ML Kit barcode) |
+### macOS host
 
----
+- macOS 13 Ventura or newer
+- Swift 5.9+ / a compatible Xcode toolchain
+- Screen Recording permission
+- Accessibility permission for tablet-to-Mac input
+- ADB for USB mode
 
-## Installation
+### Android client
 
-Download the latest release from [**GitHub Releases**](https://github.com/tranvuongquocdat/SideScreen/releases):
+- Android 8.0 / API 26 or newer
+- USB debugging enabled for USB mode
+- Camera permission only when scanning a wireless pairing QR code
 
-- **macOS**: Download `.dmg`, open it, drag Side Screen to Applications
-- **Android**: Download `.apk`, install on your tablet (enable "Unknown sources" if needed). Port forwarding is handled automatically by the Mac app.
+## Build from source
 
-> **⚠️ macOS Gatekeeper**
-> If macOS says the app is "damaged", open Terminal and run:
-> ```bash
-> sudo xattr -cr /Applications/SideScreen.app
-> ```
-> Then open the app again. This is needed because the app is not notarized with an Apple Developer certificate.
-
-> **⚠️ ADB Required**
-> The Mac app needs `adb` to communicate with your Android device. If the app doesn't show "Running" after launch, you likely need to install ADB:
->
-> 1. Install Homebrew (if you don't have it):
->    ```bash
->    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
->    ```
-> 2. Install ADB:
->    ```bash
->    brew install --cask android-platform-tools
->    ```
-
-<details>
-<summary><strong>Build from source (for developers)</strong></summary>
+Clone this repository:
 
 ```bash
-git clone https://github.com/tranvuongquocdat/SideScreen.git
+git clone https://github.com/tverma101/SideScreen.git
 cd SideScreen
-
-# macOS
-cd MacHost && swift build -c release
-
-# Android
-(cd AndroidClient && ./gradlew assembleDebug)
-
-# Preserve every local APK and the currently installed APK before installing
-./scripts/backup_android_apks.sh
 ```
 
-The backup helper creates a non-overwriting snapshot under
-`backups/apk/<UTC-timestamp>/`. Each snapshot includes the available debug and
-release APK outputs, `installed-base.apk` when a connected ADB device has Side
-Screen installed, and `MANIFEST.txt` with version, signing-certificate, source
-revision, device, and SHA-256 details. Set `SIDESCREEN_ADB_SERIAL` when more
-than one Android device is connected.
-</details>
+### macOS
 
----
+The repository build script creates a universal app bundle and DMG:
 
-## Usage
-
-### USB mode (default — lowest latency)
-
-1. Connect tablet to Mac via **USB-C**
-2. Launch **Side Screen** on Mac (runs in menu bar — port forwarding is set up automatically)
-3. Open **Side Screen** on tablet → keep on the **USB** tab → tap **Connect**
-4. Done — drag windows to your new display
-
-### Wireless mode (new in 0.8.0 — no cable)
-
-1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
-2. Open **Side Screen** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
-3. The tablet remembers the Mac. On subsequent launches, open the Wireless tab and tap **Reconnect** — no rescan is needed unless the token or Mac address changed.
-
-Wireless mode requires both devices to be on the same WiFi network. **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. The pairing token authenticates the wireless stream but does not currently provide end-to-end encryption, so use a trusted network. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
-
-USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wireless adds 10–50 ms depending on WiFi quality.
-
-### Headless mode (new in 0.11.0 — no Mac interaction)
-
-In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
-
-First-time setup still needs a screen once to grant Screen Recording permission; after that the Mac runs fully headless. For wireless headless use, give the Mac a static IP or DHCP reservation, and consider enabling macOS Screen Sharing as a fallback way in.
-
----
-
-## Configuration
-
-| Setting | Options | Default |
-|---------|---------|---------|
-| Resolution | 720p to 8K, 30+ presets + custom | 1920x1200 |
-| Frame Rate | 30, 60, 90, 120 FPS | 60 |
-| Bitrate | Host-bounded quality ladder | Host preset |
-| Quality | Ultra Low, Low, Medium, High | Ultra Low |
-| HiDPI (Retina) | On/Off | Off |
-| Gaming Boost | On/Off (bounded low-latency profile) | Off |
-| Touch Input | On/Off | On |
-
----
-
-## Troubleshooting
-
-<details>
-<summary><strong>"SideScreen is damaged" on macOS</strong></summary>
-
-This happens because the app is not notarized by Apple. Run this command to fix it:
 ```bash
-sudo xattr -cr /Applications/SideScreen.app
+./scripts/build_mac.sh
+open SideScreen.app
 ```
-Then open the app again.
-</details>
 
-<details>
-<summary><strong>"Connection refused" on Android</strong></summary>
+On first launch, grant the requested **Screen Recording** and **Accessibility** permissions in System Settings.
 
-The Mac app sets up `adb reverse` automatically when streaming starts. If it still fails, make sure `adb` is installed (via Android SDK or Homebrew: `brew install android-platform-tools`) and your device has USB debugging enabled.
-</details>
+### Android
 
-<details>
-<summary><strong>Android keeps trying to reconnect</strong></summary>
+Build the debug APK:
 
-Current Android builds only connect after you tap **Connect** or **Reconnect**. They do not resume a saved session or retry a dropped connection by themselves. Reinstall the current APK if an older build is still running, then launch the app again.
+```bash
+./scripts/build_android.sh
+```
 
-The connection checklist checks tablet-local prerequisites while idle; it does not open a Mac socket until you explicitly connect.
-</details>
+The APK is written to:
 
-<details>
-<summary><strong>High latency or stuttering</strong></summary>
+```text
+AndroidClient/app/build/outputs/apk/debug/app-debug.apk
+```
 
-- Lower resolution or frame rate
-- Ensure H.265 hardware codec support on your device
-- For USB mode, use a high-quality USB-C cable (not charge-only)
-- For wireless mode, ensure both devices are on **5 GHz WiFi**, not 2.4 GHz; reduce refresh rate to 60 Hz if jitter persists
-</details>
+With an Android device connected through ADB, the repository installer can install the current debug build:
 
-<details>
-<summary><strong>Wireless: "Couldn't reach Mac" / connection times out</strong></summary>
+```bash
+./scripts/install_android.sh
+```
 
-- Both devices must be on the same WiFi network (and same subnet — some mesh routers isolate "guest" devices)
-- Click **Start** on the Mac before scanning the QR — the listener only binds when the server is running
-- If the Mac changes WiFi or its LAN IP, scan a fresh QR (the cached one points to the old address)
-- macOS may prompt for **Local Network** permission on first wireless toggle — grant it; without it, LAN inbound is silently dropped
-</details>
+Release APKs intentionally require explicit release-signing credentials and do not silently fall back to the debug key.
 
-<details>
-<summary><strong>Wireless: "Re-pair required" after restart / reinstall</strong></summary>
+## Connect
 
-The Mac's auth token resets when you click **Reset Token (forget all)** or reinstall the app. Tap **Scan QR Code** on the Android client and scan the new QR shown on the Mac.
-</details>
+### USB
 
-<details>
-<summary><strong>Virtual display not appearing</strong></summary>
+1. Enable **Developer options → USB debugging** on the Android tablet.
+2. Connect the tablet to the Mac with a data-capable USB cable.
+3. Accept the Android USB-debugging authorization prompt if shown.
+4. Start Side Screen on the Mac.
+5. Open Side Screen on Android and connect.
 
-Grant Screen Recording permission: **System Preferences → Privacy & Security → Screen Recording → Enable Side Screen**
-</details>
+The helper scripts use ADB reverse forwarding for the video and control ports.
 
----
+### Wireless
+
+1. Put the Mac and tablet on the same trusted local network.
+2. Select **Wireless** on the Mac host.
+3. Pair the Android client using the QR flow.
+4. Connect from the tablet.
+
+Wireless pairing credentials are protected at rest on Android, but the current video transport is still cleartext. Network encryption and stronger session binding are tracked as production work.
+
+## Current configuration
+
+The current `main` branch is intentionally tuned around a fixed tablet profile rather than the older upstream resolution picker:
+
+- Logical resolution: **1400 × 876**
+- HiDPI physical size: **2800 × 1752**
+- Refresh options: **30 / 60 / 90 / 120 Hz**
+- Default refresh: **60 Hz**
+- Default video port: **54321**
+- Control port: **54322**
+
+High refresh rates are available for testing, but they are not assumed to be sustainable on every Mac/tablet combination.
+
+## Development
+
+Useful entry points:
+
+```text
+MacHost/Sources/                  macOS host
+MacHost/Tests/                    Swift tests
+AndroidClient/app/src/main/       Android client
+AndroidClient/app/src/test/       JVM tests
+scripts/                          build, install, benchmark, and maintenance tools
+docs/                             architecture, validation, and experiment notes
+```
+
+Before opening a pull request, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Changes to capture, encode, transport, decode, rendering, lifecycle, or input paths should include deterministic tests where possible and real-device evidence when the behavior cannot be proven on hosted CI.
+
+## Known work
+
+The issue tracker contains both product blockers and research/measurement tasks. The highest-value unfinished areas are:
+
+- authenticated, encrypted Protocol V2 for wireless sessions;
+- macOS lock/sleep and Android wake/reconnect lifecycle handling;
+- Android runtime/session ownership cleanup;
+- trustworthy end-to-end latency and smoothness instrumentation;
+- WindowServer / 120 Hz cost attribution;
+- real-device validation of adaptive high-refresh behavior.
+
+A curated map with issue numbers and merge gates lives in [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
 
 ## Contributing
 
-Contributions are welcome!
+Bug reports should include the exact Mac model/macOS version, Android device/Android version, connection mode, app revision, reproduction steps, and relevant logs. For performance reports, include the configured resolution/refresh rate and whether the symptom is visible stutter, latency, decoder recovery, bandwidth, CPU/GPU load, or connection failure.
 
-- ⭐ **Star** this repo to help others discover it
-- 🐛 **Report bugs** via [Issues](https://github.com/tranvuongquocdat/SideScreen/issues)
-- 💡 **Suggest features** via [Issues](https://github.com/tranvuongquocdat/SideScreen/issues)
-- 🔧 **Submit PRs** — see [CONTRIBUTING.md](CONTRIBUTING.md)
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full workflow.
 
----
+## Privacy and security
 
-## Support
+See [`PRIVACY.md`](PRIVACY.md) for data-handling boundaries. Do not post pairing secrets, signing credentials, private network credentials, or other sensitive material in public issues or logs.
 
-If Side Screen is useful to you, consider supporting development:
+## License and attribution
 
-<div align="center">
+Side Screen is available under the [MIT License](LICENSE).
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/tranvuongqk)
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-EA4AAA?style=for-the-badge&logo=github-sponsors&logoColor=white)](https://github.com/sponsors/tranvuongquocdat)
-[![VietQR](https://img.shields.io/badge/Vietnam-VietQR-DA251D?style=for-the-badge&logoColor=white)](https://sidescreen.dev/donate.html)
-
-</div>
-
-🇻🇳 Vietnamese users — scan VietQR for a local bank transfer (no international fees) at [sidescreen.dev/donate](https://sidescreen.dev/donate.html).
-
----
-
-## Privacy
-
-Side Screen does not request or collect device location. See [PRIVACY.md](PRIVACY.md)
-for the exact permissions and data-flow boundary.
-
----
-
-## License
-
-[MIT License](LICENSE) — free for personal and commercial use.
-
----
-
-<div align="center">
-
-Made with ❤️ by **Tran Vuong Quoc Dat**
-
-[Report Bug](https://github.com/tranvuongquocdat/SideScreen/issues) · [Request Feature](https://github.com/tranvuongquocdat/SideScreen/issues) · [Discussions](https://github.com/tranvuongquocdat/SideScreen/discussions)
-
-</div>
+This repository is a maintained fork of the Side Screen project originally created by **Trần Vương Quốc Đạt**. Historical changelog entries and contributor credits are preserved so authorship remains clear. Fork-specific maintenance and development are tracked in this repository.
