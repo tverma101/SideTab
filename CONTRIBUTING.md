@@ -1,224 +1,216 @@
 # Contributing to Side Screen
 
-Thank you for your interest in contributing to Side Screen! This document provides guidelines and information for contributors.
+Thanks for helping improve Side Screen. This repository contains a macOS host, an Android client, protocol code, hardware-dependent display/codec paths, and a number of active experiments. The most useful contributions are small enough to review and explicit about what was actually tested.
 
-## Table of Contents
+Before starting substantial work, read [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) and check the existing issues and pull requests. Several older draft PRs target evaluation branches and may overlap code that is already on `main`.
 
-- [Code of Conduct](#code-of-conduct)
-- [Ways to Contribute](#ways-to-contribute)
-- [Development Setup](#development-setup)
-- [Coding Standards](#coding-standards)
-- [Pull Request Process](#pull-request-process)
-- [Issue Guidelines](#issue-guidelines)
+## Development requirements
 
----
+### macOS
 
-## Code of Conduct
+- macOS 13 Ventura or newer
+- Swift 5.9+ / a compatible Xcode toolchain
+- Screen Recording permission for runtime capture testing
+- Accessibility permission for tablet-to-Mac input testing
+- ADB for USB integration testing
 
-Please be respectful and constructive in all interactions. We're building something together, and a positive environment helps everyone contribute their best work.
+### Android
 
----
+- Android Studio or an equivalent Android SDK setup
+- Java 11+; JDK 17 is recommended for current Android tooling
+- Android SDK 34 for the current project configuration
+- A real Android device for codec, panel-refresh, stylus, USB, brightness, and lifecycle validation
 
-## Ways to Contribute
+The Android application currently targets API 34 and supports API 26+.
 
-### Report Bugs
-
-Found a bug? Please open an issue with:
-- Clear description of the problem
-- Steps to reproduce
-- Expected vs actual behavior
-- Your environment (macOS version, Android version, device model)
-
-### Suggest Features
-
-Have an idea? Open a feature request issue with:
-- Description of the feature
-- Use case / why it would be helpful
-- Any implementation ideas (optional)
-
-### Submit Code
-
-Ready to code? Great! See the development setup below.
-
-### Improve Documentation
-
-Documentation improvements are always welcome:
-- Fix typos
-- Clarify instructions
-- Add examples
-- Translate to other languages
-
-### Star the Repository
-
-The simplest way to help - star the repo to help others discover it!
-
----
-
-## Development Setup
-
-### Prerequisites
-
-**macOS Development:**
-- macOS 14 (Sonoma) or later
-- Xcode 15+ or Swift toolchain
-- Swift 5.9+
-
-**Android Development:**
-- Android Studio Hedgehog or later
-- JDK 17
-- Android SDK 34
-
-### Clone and Build
+## Clone and build
 
 ```bash
-# Clone the repository
-git clone https://github.com/tranvuongquocdat/SideScreen.git
+git clone https://github.com/tverma101/SideScreen.git
 cd SideScreen
+```
 
-# Build macOS app
+Build the macOS app bundle and DMG:
+
+```bash
+./scripts/build_mac.sh
+```
+
+Build the Android debug APK:
+
+```bash
+./scripts/build_android.sh
+```
+
+Run the platform test suites directly when working in a subsystem:
+
+```bash
 cd MacHost
-swift build
+swift test
 
-# Build Android app
 cd ../AndroidClient
-./gradlew assembleDebug
+./gradlew testDebugUnitTest
 ```
 
-### Project Structure
+Release Android builds require explicit signing credentials. Do not add debug-signing fallbacks, keystores, passwords, tokens, or other secrets to the repository.
 
-```
+## Repository layout
+
+```text
 SideScreen/
-├── MacHost/                 # macOS Swift application
-│   └── Sources/             # Swift source files
-├── AndroidClient/           # Android Kotlin application
-│   └── app/src/main/        # Kotlin source files
-├── scripts/                 # Build and install scripts
-├── resources/               # Assets (logos, screenshots)
-└── website/                 # Landing page
+├── MacHost/                 macOS Swift host
+│   ├── Sources/             application/runtime source
+│   └── Tests/               Swift tests
+├── AndroidClient/           Android Kotlin client
+│   └── app/src/             main, test, and Android test sources
+├── docs/                    architecture, validation, and experiment notes
+├── scripts/                 build, install, benchmark, and maintenance tools
+├── resources/               icons and screenshots
+└── website/                 project website source
 ```
 
----
+## Before changing code
 
-## Coding Standards
+1. Reproduce the problem on current `main` when possible.
+2. Search existing issues and PRs for the same subsystem.
+3. Separate a confirmed bug from a hypothesis about its cause.
+4. For performance work, establish a measurable baseline before changing the hot path.
+5. For protocol or lifecycle changes, write down the state/session invariant before implementation.
 
-### Swift (macOS)
+Do not revive an old experimental branch merely because its issue is still open. Compare it against current `main` first; preserve useful tests and acceptance criteria, not obsolete implementation.
 
-- Follow Swift API Design Guidelines
-- Use meaningful variable and function names
-- Add documentation comments for public APIs
-- Keep functions focused and small
+## Change scope
 
-```swift
-// Good
-func startStreaming() throws {
-    // Clear, focused implementation
-}
+Prefer focused pull requests. Avoid combining unrelated cleanup, protocol changes, renderer changes, and performance tuning in one diff.
 
-// Avoid
-func doStuff() {
-    // Vague naming, unclear purpose
-}
+Examples of good scopes:
+
+- one reproducible settings bug plus its regression test;
+- one Android ownership race plus concurrency coverage;
+- one protocol parser rule plus compatibility tests;
+- one documentation correction that removes a stale public claim;
+- one performance experiment with a defined before/after measurement.
+
+Large refactors should explain why the existing ownership boundary is insufficient and what new invariant the refactor establishes.
+
+## Coding guidelines
+
+### Swift
+
+- Follow Swift API naming conventions.
+- Prefer explicit ownership and lifecycle boundaries over hidden global state.
+- Keep hot capture/encode/input paths allocation-conscious.
+- Document private or unusual API assumptions next to the code that depends on them.
+- Keep platform availability consistent with the macOS 13 deployment floor unless the requirement is intentionally raised.
+
+### Kotlin
+
+- Follow Kotlin conventions and prefer immutable state where practical.
+- Keep network, decoder, UI, and session ownership clearly separated.
+- Do not perform blocking network, storage, or crypto work on the Android main thread.
+- Treat callbacks from an old connection/session generation as stale unless explicitly proven current.
+- Use Android capability APIs rather than codec-name/device-name guesses when the platform exposes reliable capability data.
+
+### General
+
+- Make failures observable and actionable.
+- Avoid silent fallbacks that change security, signing, resolution, refresh rate, or transport behavior.
+- Avoid unbounded queues and unbounded packet/frame allocations.
+- Keep comments focused on **why** a constraint exists.
+- Do not claim latency, FPS, power, or quality improvements without evidence measuring the relevant boundary.
+
+## Testing expectations
+
+Different changes need different proof. A green hosted build is useful, but it cannot validate every Side Screen behavior.
+
+### Usually suitable for deterministic tests
+
+- parsers and framing;
+- state machines;
+- generation/session fencing;
+- settings defaults and migrations;
+- pacing/controller policy;
+- math, timestamps, and bounded-allocation rules;
+- pure decoder-selection policy.
+
+### Requires real-device or real-Mac evidence
+
+- CGVirtualDisplay behavior;
+- ScreenCaptureKit runtime cadence;
+- VideoToolbox hardware behavior;
+- MediaCodec decoder throughput/recovery;
+- actual Android panel refresh selection;
+- USB/ADB interruption and reconnect;
+- brightness ownership;
+- lock/sleep/wake behavior;
+- stylus hardware behavior;
+- Wi‑Fi transport under real congestion.
+
+If a PR changes one of these areas, include the exact hardware/OS versions and the test scenario. Performance PRs should include before/after measurements and visible behavior, not only averages from an internal stage.
+
+## Pull requests
+
+Use a descriptive branch name such as:
+
+```text
+fix/reset-refresh-default
+fix/android-session-generation
+perf/wireless-send-pressure
+docs/repository-status
 ```
 
-### Kotlin (Android)
+Commit messages should describe the behavior changed, for example:
 
-- Follow Kotlin coding conventions
-- Use Kotlin idioms (null safety, extension functions)
-- Prefer immutability (`val` over `var`)
-- Use meaningful names
-
-```kotlin
-// Good
-private fun connectToHost(host: String, port: Int): Result<Connection>
-
-// Avoid
-private fun connect(h: String, p: Int): Any?
+```text
+fix(mac): keep reset refresh default at 60 Hz
 ```
 
-### General Guidelines
+A useful PR description includes:
 
-- Write self-documenting code
-- Add comments only when the "why" isn't obvious
-- Keep commits focused and atomic
-- Test your changes before submitting
+- the problem and reproduction;
+- the root cause, when established;
+- the behavioral change;
+- tests run;
+- hardware/runtime evidence where required;
+- compatibility or migration impact;
+- anything intentionally deferred.
 
----
+Do not present an untested hardware hypothesis as a completed fix. If target-device validation is still missing, keep the PR draft or state the validation boundary explicitly.
 
-## Pull Request Process
+## Bug reports
 
-### Before You Start
+Please include:
 
-1. Check existing issues/PRs to avoid duplicate work
-2. For major changes, open an issue first to discuss
-3. Fork the repository and create a feature branch
+- Side Screen version or commit SHA;
+- Mac model and macOS version;
+- Android device model and Android version;
+- USB or wireless mode;
+- configured refresh rate;
+- exact reproduction steps;
+- expected and actual behavior;
+- logs or screenshots when relevant.
 
-### Branch Naming
+For performance reports, identify the symptom precisely: visible stutter, touch latency, decoder recovery, bandwidth, CPU/GPU load, WindowServer load, dropped frames, or connection delay. Avoid reducing different symptoms to a single “lag” number.
 
-Use descriptive branch names:
-- `feature/wifi-support`
-- `fix/connection-timeout`
-- `docs/installation-guide`
+Do not post pairing secrets, signing credentials, private network credentials, or other sensitive information in public issues.
 
-### Commit Messages
+## Feature requests and experiments
 
-Write clear, descriptive commit messages:
+For a feature request, describe the user problem before the implementation idea. For experiments, state the question being tested and the result that would cause the approach to be rejected.
 
-```
-feat: add WiFi Direct connection support
+Examples:
 
-- Implement mDNS discovery for nearby devices
-- Add WiFi connection option in settings
-- Handle connection state transitions
+- “Does TCP head-of-line blocking dominate wireless p95 freshness after sender queues are bounded?”
+- “Does the 120 Hz virtual display itself raise WindowServer CPU while capture is disabled?”
 
-Closes #42
-```
+That makes experimental work useful even when the hypothesis is wrong.
 
-### Submitting
+## Documentation
 
-1. Ensure your code builds without errors
-2. Test your changes on real devices if possible
-3. Update documentation if needed
-4. Create a pull request with:
-   - Clear description of changes
-   - Link to related issue (if any)
-   - Screenshots for UI changes
+Documentation should describe the behavior in the current repository, not inherited behavior that is no longer exposed. Preserve original contributor attribution and historical release notes where appropriate, while making fork-specific status and limitations clear.
 
-### Review Process
+## Review standard
 
-- Maintainers will review your PR
-- Be responsive to feedback
-- Make requested changes promptly
-- Once approved, your PR will be merged
+A change is ready to merge when its scope is understandable, the relevant deterministic checks pass, required hardware behavior is verified, public documentation is accurate, and known limitations are stated rather than hidden.
 
----
-
-## Issue Guidelines
-
-### Bug Reports
-
-Include:
-- **Title**: Brief, descriptive summary
-- **Environment**: macOS version, Android version, device models
-- **Steps to reproduce**: Numbered steps to trigger the bug
-- **Expected behavior**: What should happen
-- **Actual behavior**: What actually happens
-- **Screenshots/logs**: If applicable
-
-### Feature Requests
-
-Include:
-- **Title**: Brief description of the feature
-- **Problem**: What problem does this solve?
-- **Solution**: Your proposed solution
-- **Alternatives**: Other solutions you considered
-- **Additional context**: Mockups, examples, etc.
-
----
-
-## Questions?
-
-If you have questions about contributing, feel free to:
-- Open a discussion on GitHub
-- Ask in an issue with the `question` label
-
-Thank you for contributing to Side Screen!
+Thank you for contributing.
