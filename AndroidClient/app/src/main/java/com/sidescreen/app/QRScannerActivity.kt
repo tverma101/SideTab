@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.util.Log
 import android.widget.Button
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
@@ -19,6 +20,7 @@ import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 
+@OptIn(markerClass = [ExperimentalGetImage::class])
 class QRScannerActivity : AppCompatActivity() {
     private val scanner by lazy {
         BarcodeScanning.getClient(
@@ -61,7 +63,6 @@ class QRScannerActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @ExperimentalGetImage
     private fun analyze(proxy: ImageProxy) {
         val mediaImage = proxy.image
         if (mediaImage == null || alreadyDelivered) {
