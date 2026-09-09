@@ -208,6 +208,8 @@ Wireless defaults to the native Android `SurfaceView` presentation path. VSR/CfL
 
 USB mode remains the lowest-latency option for drawing or fast-paced gaming. Its normal SDR capture uses video-range `420v` signaling to match the Android hardware decoder and prevent washed or contrast-shifted colors. Wireless adds 10–50 ms depending on WiFi quality. The old full-range `420f` path is retained only as an explicit diagnostic control (`defaults write com.sidescreen.app SideScreen_exp_pixelFormat -string 8bit`).
 
+The Mac menu-bar menu includes a compact **Tablet Brightness** slider. It controls the Android panel through the low-latency control channel, remembers the selected level while disconnected, and reapplies it when the tablet reconnects.
+
 ### Headless mode (new in 0.11.0 — no Mac interaction)
 
 In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).

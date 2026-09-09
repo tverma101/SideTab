@@ -43,6 +43,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var screenCapture: ScreenCapture?
     var virtualDisplayManager: VirtualDisplayManager?
     var brightnessMonitor: BrightnessMonitor?
+    var nativeBrightness: NativeBrightnessController?
     var idleSleepMonitor: IdleSleepMonitor?
     var settings = DisplaySettings()
     var settingsWindow: SettingsWindowController?
@@ -69,6 +70,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
+
+        nativeBrightness = NativeBrightnessController()
+        nativeBrightness?.onBrightness = { [weak self] level in
+            self?.streamingServer?.sendBrightness(level)
+        }
 
         // Create menu bar item
         setupMenuBar()
@@ -663,6 +669,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
+                // Re-apply the persisted menu-bar value after the Android
+                // client has joined; StreamingServer queues it until BRIGHT
+                // capability negotiation completes.
+                self.nativeBrightness?.pushCurrent()
                 Task { @MainActor in
                     self.settings.clientConnected = true
                 }
@@ -1420,6 +1430,16 @@ extension AppDelegate: NSMenuDelegate {
         let modeItem = NSMenuItem(title: "Connection Mode", action: nil, keyEquivalent: "")
         modeItem.submenu = modeMenu
         menu.addItem(modeItem)
+
+        let brightnessItem = NSMenuItem()
+        let brightnessView = BrightnessMenuItemView(
+            level: nativeBrightness?.level ?? UInt8(NativeBrightnessController.persistedLevel)
+        )
+        brightnessView.onChange = { [weak self] level in
+            self?.nativeBrightness?.setLevel(level)
+        }
+        brightnessItem.view = brightnessView
+        menu.addItem(brightnessItem)
 
         menu.addItem(.separator())
 

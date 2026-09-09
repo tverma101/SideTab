@@ -86,6 +86,10 @@ class StreamingServer {
     private var lastControlTouchNs: UInt64 = 0
     private var maxControlTouchGapMs = 0.0
     private var clientSupportsBrightness = false
+    /// Latest requested level. Queue it while the Android client is still
+    /// negotiating capabilities so a menu-bar change cannot be lost during
+    /// the short connection-startup race.
+    private var lastBrightness: UInt8?
     private let controlQueue = DispatchQueue(label: "controlQueue", qos: .userInteractive)
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
@@ -555,6 +559,9 @@ class StreamingServer {
                 controlInputBuffer = Data(controlInputBuffer.dropFirst())
                 clientSupportsBrightness = true
                 debugLog("Client supports brightness (BRIGHT armed)")
+                if let value = lastBrightness {
+                    sendBrightnessMessage(value, on: connection, path: "control")
+                }
 
             default:
                 debugLog("Unknown control type: \(msgType)")
@@ -568,12 +575,27 @@ class StreamingServer {
     /// disconnect on unknown message types, so never send unsolicited.
     /// No-op when the control connection is not ready. Call from any queue.
     func sendBrightness(_ value: UInt8) {
-        guard clientSupportsBrightness, let connection = controlConnection else { return }
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            self.lastBrightness = value
+            guard self.clientSupportsBrightness else {
+                debugLog("BRIGHT queued: \(value) (client capability not armed)")
+                return
+            }
+            guard let connection = self.controlConnection else {
+                debugLog("BRIGHT queued: \(value) (no control connection)")
+                return
+            }
+            self.sendBrightnessMessage(value, on: connection, path: "control")
+        }
+    }
+
+    private func sendBrightnessMessage(_ value: UInt8, on connection: NWConnection, path: String) {
         var msg = Data(capacity: 2)
         msg.append(WireMessage.bright)
         msg.append(value)
         connection.send(content: msg, completion: .contentProcessed { _ in })
-        debugLog("BRIGHT sent: \(value)")
+        debugLog("BRIGHT sent (\(path)): \(value)")
     }
 
     // Contender: a new connection that arrived while a live client is
