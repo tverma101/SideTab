@@ -31,6 +31,7 @@ android {
         targetSdk = 34
         versionCode = computedVersionCode
         versionName = appVersion
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -99,4 +100,8 @@ dependencies {
     implementation("com.google.mlkit:barcode-scanning:17.2.0")
 
     testImplementation("junit:junit:4.13.2")
+
+    androidTestImplementation("androidx.test:core:1.5.0")
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
+    androidTestImplementation("androidx.test:runner:1.5.2")
 }
