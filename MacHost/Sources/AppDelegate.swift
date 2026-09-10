@@ -46,6 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var nativeBrightness: NativeBrightnessController?
     var idleSleepMonitor: IdleSleepMonitor?
     var settings = DisplaySettings()
+    var runtime = DisplayRuntimeState()
     var settingsWindow: SettingsWindowController?
     var statusItem: NSStatusItem?
     let pairedDeviceStore = PairedDeviceStore()
@@ -127,7 +128,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     await self.startServer()
                 } else {
                     await self.checkPermissions()
-                    if self.settings.hasScreenRecordingPermission {
+                    if self.runtime.hasScreenRecordingPermission {
                         await self.startServer()
                     } else {
                         debugLog("Auto-start skipped: Screen Recording permission not granted")
@@ -148,14 +149,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshStatusIndicators() {
         // Keep the inline permission state current after the user returns from
         // System Settings, without generating another native prompt.
-        settings.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+        runtime.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
 
         // LANAddressResolver already does the interface walk needed by both
         // wireless status fields. Resolve once instead of running getifaddrs()
         // twice every two seconds.
         let lanAddress = LANAddressResolver.primaryIPv4()
-        settings.wifiConnected = lanAddress != nil
-        settings.listeningAddress = lanAddress
+        runtime.wifiConnected = lanAddress != nil
+        runtime.listeningAddress = lanAddress
 
         // Wireless streaming never needs ADB. Avoid spawning the detached USB
         // checklist task (and avoid PATH/which work in adbInstalled) on every
@@ -164,9 +165,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // by the disconnect handler, so there is no reason to rewrite JSON /
         // UserDefaults every two seconds while a session is active.
         guard settings.connectionMode == .usb else {
-            settings.adbInstalled = false
-            settings.usbDeviceConnected = false
-            settings.adbReverseConfigured = false
+            runtime.adbInstalled = false
+            runtime.usbDeviceConnected = false
+            runtime.adbReverseConfigured = false
             return
         }
 
@@ -193,11 +194,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard self.settings.connectionMode == .usb,
                       Int(self.settings.port) == port else { return }
 
-                self.settings.adbInstalled = adbInstalled
+                self.runtime.adbInstalled = adbInstalled
                 let isConnected = !devices.isEmpty
 
-                self.settings.usbDeviceConnected = isConnected
-                self.settings.adbReverseConfigured = reverseOK
+                self.runtime.usbDeviceConnected = isConnected
+                self.runtime.adbReverseConfigured = reverseOK
 
                 // Self-healing USB bridge (level-triggered, not edge-triggered):
                 // whenever we are in USB mode with the server running and a
@@ -207,7 +208,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // reconnects via its own connect button.
                 if self.settings.connectionMode == .usb
                     && isConnected
-                    && self.settings.isRunning
+                    && self.runtime.isRunning
                     && !reverseOK {
                     self.scheduleADBReverseRepair()
                 }
@@ -234,7 +235,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleConnectionModeChange(to mode: ConnectionMode) async {
         debugLog("Connection mode changed to: \(mode.rawValue)")
         // Disconnect any active client immediately (per spec §6 / fix #2).
-        let wasRunning = settings.isRunning
+        let wasRunning = runtime.isRunning
         if wasRunning {
             stopServer()
         }
@@ -259,7 +260,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.$gamingBoost
             .dropFirst() // Skip initial value
             .sink { [weak self] gamingBoost in
-                guard let self = self, self.settings.isRunning else { return }
+                guard let self = self, self.runtime.isRunning else { return }
                 print("🎮 Gaming Boost \(gamingBoost ? "ENABLED" : "DISABLED")")
                 self.screenCapture?.updateEncoderSettings(
                     bitrateMbps: self.settings.effectiveBitrate,
@@ -273,7 +274,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Publishers.CombineLatest(settings.$bitrate, settings.$quality)
             .dropFirst()
             .sink { [weak self] bitrate, quality in
-                guard let self = self, self.settings.isRunning, !self.settings.gamingBoost else { return }
+                guard let self = self, self.runtime.isRunning, !self.settings.gamingBoost else { return }
                 print("⚙️ Settings updated: \(bitrate)Mbps, \(quality)")
                 self.screenCapture?.updateEncoderSettings(
                     bitrateMbps: bitrate,
@@ -286,7 +287,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Publishers.CombineLatest3(settings.$rotation, settings.$flipHorizontal, settings.$flipVertical)
             .dropFirst()
             .sink { [weak self] rotation, flipHorizontal, flipVertical in
-                guard let self = self, self.settings.isRunning else { return }
+                guard let self = self, self.runtime.isRunning else { return }
                 print("🔄 Display transform changed: \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
                 self.streamingServer?.updateDisplayTransform(rotation: rotation, flipHorizontal: flipHorizontal, flipVertical: flipVertical)
             }
@@ -322,7 +323,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] resolution in
                 guard let self = self else { return }
                 Task { @MainActor in
-                    guard self.settings.isRunning else { return }
+                    guard self.runtime.isRunning else { return }
                     debugLog("Resolution changed to \(resolution) — restarting server to rebuild virtual display")
                     self.stopServer()
                     await self.startServer()
@@ -347,7 +348,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Dim the menu bar icon while the server is stopped — at-a-glance
         // state without opening the menu.
-        settings.$isRunning
+        runtime.$isRunning
             .receive(on: DispatchQueue.main)
             .sink { [weak self] running in
                 self?.statusItem?.button?.appearsDisabled = !running
@@ -356,7 +357,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleServerFromMenu() {
-        if settings.isRunning {
+        if runtime.isRunning {
             stopServer()
         } else {
             Task { [weak self] in
@@ -376,17 +377,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupSettingsWindow() {
-        settingsWindow = SettingsWindowController(settings: settings)
+        settingsWindow = SettingsWindowController(settings: settings, runtime: runtime)
 
         settings.onToggleServer = { [weak self] in
             guard let self else { return }
-            if self.settings.isRunning {
+            if self.runtime.isRunning {
                 self.stopServer()
             } else {
                 Task { [weak self] in
                     guard let self else { return }
                     await self.checkPermissions()
-                    if self.settings.hasScreenRecordingPermission {
+                    if self.runtime.hasScreenRecordingPermission {
                         await self.startServer()
                     } else {
                         await MainActor.run {
@@ -420,7 +421,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Check Screen Recording permission using CoreGraphics API
         let hasScreenCapture = CGPreflightScreenCaptureAccess()
         await MainActor.run {
-            settings.hasScreenRecordingPermission = hasScreenCapture
+            runtime.hasScreenRecordingPermission = hasScreenCapture
         }
         if hasScreenCapture {
             debugLog("Screen recording permission granted (CGPreflight)")
@@ -453,8 +454,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        settings.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
-        if !settings.hasScreenRecordingPermission {
+        runtime.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+        if !runtime.hasScreenRecordingPermission {
             showSettings()
         }
     }
@@ -462,7 +463,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func checkAccessibilityPermission() async {
         let trusted = AXIsProcessTrusted()
         await MainActor.run {
-            settings.hasAccessibilityPermission = trusted
+            runtime.hasAccessibilityPermission = trusted
         }
         if trusted {
             print("✅ Accessibility permission granted")
@@ -476,7 +477,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // This will show the system prompt to grant Accessibility permission
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
-        settings.hasAccessibilityPermission = trusted
+        runtime.hasAccessibilityPermission = trusted
 
         if !trusted {
             print("⚠️  User needs to grant Accessibility permission in System Settings")
@@ -547,7 +548,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startServer() async {
         let canStart = await MainActor.run { () -> Bool in
-            guard !isStartingServer, !settings.isRunning else { return false }
+            guard !isStartingServer, !runtime.isRunning else { return false }
             isStartingServer = true
             return true
         }
@@ -560,7 +561,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let hasScreenCapture = CGPreflightScreenCaptureAccess()
         await MainActor.run {
-            settings.hasScreenRecordingPermission = hasScreenCapture
+            runtime.hasScreenRecordingPermission = hasScreenCapture
         }
         debugLog("🚀 startServer() invoked. Screen Recording permission: \(hasScreenCapture)")
         guard hasScreenCapture else {
@@ -603,7 +604,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             await MainActor.run {
-                settings.displayCreated = true
+                runtime.displayCreated = true
             }
 
             // Run ADB setup (USB only) and display init wait in parallel.
@@ -634,7 +635,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 debugLog("Capture method: \(method)")
                 Task { @MainActor in
-                    self.settings.captureMethod = method
+                    self.runtime.captureMethod = method
                 }
             }
             try await screenCapture?.setupForVirtualDisplay(
@@ -656,7 +657,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self = self else { return }
                     Task { @MainActor in
                         self.currentWirelessDevice = deviceName
-                        self.settings.currentWirelessDevice = deviceName
+                        self.runtime.currentWirelessDevice = deviceName
                         self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
                     }
                 }
@@ -674,7 +675,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // capability negotiation completes.
                 self.nativeBrightness?.pushCurrent()
                 Task { @MainActor in
-                    self.settings.clientConnected = true
+                    self.runtime.clientConnected = true
                 }
             }
             // Runs synchronously on the server's network queue BEFORE the
@@ -694,12 +695,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 self.releaseStylusIfNeeded()
                 Task { @MainActor in
-                    self.settings.clientConnected = false
+                    self.runtime.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment.
                     if let name = self.currentWirelessDevice {
                         self.pairedDeviceStore.upsert(name: name, lastConnected: Date())
                         self.currentWirelessDevice = nil
-                        self.settings.currentWirelessDevice = nil
+                        self.runtime.currentWirelessDevice = nil
                     }
                 }
             }
@@ -714,8 +715,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.onStats = { [weak self] fps, mbps in
                 let captured = self
                 Task { @MainActor in
-                    captured?.settings.currentFPS = fps
-                    captured?.settings.currentBitrate = mbps
+                    captured?.runtime.currentFPS = fps
+                    captured?.runtime.currentBitrate = mbps
                 }
             }
 
@@ -742,7 +743,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let secs = UserDefaults.standard.integer(forKey: "SideScreen_exp_idleSleepSecs")
                 let grace = secs > 0 ? Double(secs) : 15.0
                 let monitor = IdleSleepMonitor(
-                    isClientConnected: { [weak self] in self?.settings.clientConnected ?? false },
+                    isClientConnected: { [weak self] in self?.runtime.clientConnected ?? false },
                     pause: { [weak self] in self?.screenCapture?.pauseForIdle() },
                     resume: { [weak self] in
                         self?.screenCapture?.resumeFromIdle()
@@ -769,7 +770,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
 
             await MainActor.run {
-                settings.isRunning = true
+                runtime.isRunning = true
             }
 
             print("✅ Server started on port \(settings.port)")
@@ -781,13 +782,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 || errorDescription.localizedCaseInsensitiveContains("declined")
                 || errorDescription.localizedCaseInsensitiveContains("not authorized")
             await MainActor.run {
-                settings.isRunning = false
-                settings.displayCreated = false
+                runtime.isRunning = false
+                runtime.displayCreated = false
 
                 if permissionDenied {
                     // TCC denial belongs in the existing inline permission card.
                     // Do not stack a blocking app alert over macOS's own prompt.
-                    settings.hasScreenRecordingPermission = false
+                    runtime.hasScreenRecordingPermission = false
                     showSettings()
                 } else {
                     let alert = NSAlert()
@@ -810,11 +811,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         streamingServer?.stop()
         virtualDisplayManager?.destroyDisplay()
 
-        settings.isRunning = false
-        settings.displayCreated = false
-        settings.clientConnected = false
-        settings.currentFPS = 0
-        settings.currentBitrate = 0
+        runtime.isRunning = false
+        runtime.displayCreated = false
+        runtime.clientConnected = false
+        runtime.currentFPS = 0
+        runtime.currentBitrate = 0
 
         print("⏹️ Server stopped")
     }
@@ -883,7 +884,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 accessibilityWarningShown = true
                 print("⚠️  Accessibility not granted - touch ignored")
                 Task { @MainActor in
-                    settings.hasAccessibilityPermission = false
+                    runtime.hasAccessibilityPermission = false
                 }
             }
             return
@@ -923,7 +924,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 accessibilityWarningShown = true
                 print("⚠️  Accessibility not granted - S Pen input ignored")
                 Task { @MainActor in
-                    settings.hasAccessibilityPermission = false
+                    runtime.hasAccessibilityPermission = false
                 }
             }
             return
@@ -1388,9 +1389,9 @@ extension AppDelegate: NSMenuDelegate {
 
         // Live status line (not clickable)
         let statusTitle: String
-        if settings.isRunning {
-            if settings.clientConnected {
-                let device = settings.currentWirelessDevice ?? "tablet"
+        if runtime.isRunning {
+            if runtime.clientConnected {
+                let device = runtime.currentWirelessDevice ?? "tablet"
                 statusTitle = "🟢 Connected — \(device)"
             } else {
                 statusTitle = "🟡 Waiting for tablet on port \(settings.port)"
@@ -1405,14 +1406,14 @@ extension AppDelegate: NSMenuDelegate {
 
         // Start / Stop
         let toggle = NSMenuItem(
-            title: settings.isRunning ? "Stop Streaming" : "Start Streaming",
+            title: runtime.isRunning ? "Stop Streaming" : "Start Streaming",
             action: #selector(toggleServerFromMenu),
             keyEquivalent: "t"
         )
         toggle.target = self
         // Mirror the settings-window Start button: starting needs the Screen
         // Recording permission, stopping is always allowed.
-        toggle.isEnabled = settings.isRunning || settings.hasScreenRecordingPermission
+        toggle.isEnabled = runtime.isRunning || runtime.hasScreenRecordingPermission
         menu.addItem(toggle)
 
         // Connection mode (switching while running restarts the server, same

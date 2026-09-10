@@ -244,3 +244,18 @@
 - `next`: use the published manifest SHA-256 values when selecting a known APK for future rollback
 - `learning_checkpoint`: `promoted`: APK recovery snapshots are published with their manifests when explicitly requested; `quarantined`: none; `skipped`: source rebuild, APK reinstall, and global memory update
 - `rollout_refs`: current Codex session
+
+## 2026-09-10 — Wired macOS CPU relayout fix
+
+- `scope`: live wired macOS host CPU diagnosis, settings-window observation graph, and the isolated SideScreen source worktree
+- `baseline`: canonical `/Users/tejas/Projects/SideScreen` on `codex/wireless-60fps-native` at `b4c6405`; implementation work was isolated in `/Users/tejas/Projects/SideScreen-wired-cpu-20260910` on `codex/wired-cpu-20260910`; the canonical checkout and the running installed app were preserved
+- `observed`: installed `/Users/tejas/Applications/SideScreen.app` version `0.11.2` was using approximately 101% CPU while wired listeners were active on `54321`/`54322`; a five-second sample placed the dominant work on the macOS main thread in repeated SwiftUI/AppKit layout and `SettingsView.body` rendering, while the stream logs remained healthy at approximately 70–79 FPS with zero drops
+- `changed`: added `MacHost/Sources/DisplayRuntimeState.swift`; moved runtime state out of `DisplaySettings`; split runtime-dependent status, performance, network, wireless, and footer content into observing child views in `MacHost/Sources/SettingsWindow.swift`; routed `AppDelegate` runtime updates through the new model; documented the behavior in `CHANGELOG.md`
+- `validation`: `swift test --package-path MacHost` passed 63 tests with 0 failures; arm64 and x86_64 release builds passed; the universal app passed `lipo -info` and deep strict code-signature verification; all shell scripts passed `bash -n`; source references contain no remaining `settings.<runtime-state>` accesses; `git diff --check` and the staged diff check passed; the delivery ZIP SHA-256 is `750874e6271e0d48824e6ba526d01188ef1ff7a61be8df3ab704cce4a4346b8a`
+- `evidence`: root-cause diagnosis is live-proven from the installed process sample; implementation, tests, release compilation, universal packaging, and signing are proven in the isolated source worktree; the new binary is not installed or live-tested yet, so reduced CPU and unchanged rendered quality remain to be verified after installation
+- `blocker`: none for source/test work; installed/live verification requires replacing and restarting the exact user-facing app, which was intentionally not performed in this turn
+- `cleanup`: no installed app, running process, tablet session, pairing data, source checkout, backup, or unrelated file was removed or changed; no GitHub, PR, workflow, or Actions state was mutated
+- `git`: local commit on isolated branch `codex/wired-cpu-20260910`; no push, merge, default-branch, PR, workflow, or Actions mutation
+- `next`: install/restart this exact build only with explicit installation scope; repeat `ps`/`sample` during wired streaming and verify FPS, bitrate, drops, and rendered quality
+- `learning_checkpoint`: `promoted`: high-frequency runtime metrics must not be published through the root settings configuration object; `quarantined`: post-install CPU/quality improvement until the rebuilt app is live; `skipped`: encoder/bitrate/resolution changes, blind copy-removal experiments, publication, and global memory update
+- `rollout_refs`: current Codex session
