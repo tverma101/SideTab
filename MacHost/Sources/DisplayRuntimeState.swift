@@ -19,7 +19,12 @@ final class DisplayRuntimeState: ObservableObject {
     @Published var wifiConnected = false
     @Published var listeningAddress: String?
     @Published var isRunning = false
+    @Published var captureMethod: String = "Initializing..."
+}
+
+/// High-frequency stream metrics have their own publisher so FPS/bitrate
+/// updates invalidate only the small Performance section.
+final class DisplayPerformanceState: ObservableObject {
     @Published var currentFPS: Double = 0
     @Published var currentBitrate: Double = 0
-    @Published var captureMethod: String = "Initializing..."
 }
