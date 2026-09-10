@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - macOS USB status probes now run off the main actor, overlapping ADB repairs are suppressed, and the capture callback latches session flags instead of reading connection preferences on every frame.
+- macOS live streaming metrics now use a separate runtime observation model, so once-per-second FPS/bitrate and connection updates refresh only their small status sections instead of relaying the entire settings form through SwiftUI/AppKit layout.
 - Android's steady-state decoder path keeps the 60-FPS callback handoff bounded without reusing input-buffer indices from a retired codec instance.
 - USB install diagnostics now preserve the fresh-build fast path and report the selected ADB binary plus the complete device state when the tablet is not ready, avoiding wasted APK builds and ambiguous connection failures.
 
