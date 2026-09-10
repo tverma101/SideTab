@@ -47,6 +47,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var idleSleepMonitor: IdleSleepMonitor?
     var settings = DisplaySettings()
     var runtime = DisplayRuntimeState()
+    var performance = DisplayPerformanceState()
     var settingsWindow: SettingsWindowController?
     var statusItem: NSStatusItem?
     let pairedDeviceStore = PairedDeviceStore()
@@ -377,7 +378,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupSettingsWindow() {
-        settingsWindow = SettingsWindowController(settings: settings, runtime: runtime)
+        settingsWindow = SettingsWindowController(settings: settings, runtime: runtime, performance: performance)
 
         settings.onToggleServer = { [weak self] in
             guard let self else { return }
@@ -715,8 +716,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.onStats = { [weak self] fps, mbps in
                 let captured = self
                 Task { @MainActor in
-                    captured?.runtime.currentFPS = fps
-                    captured?.runtime.currentBitrate = mbps
+                    captured?.performance.currentFPS = fps
+                    captured?.performance.currentBitrate = mbps
                 }
             }
 
@@ -814,8 +815,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         runtime.isRunning = false
         runtime.displayCreated = false
         runtime.clientConnected = false
-        runtime.currentFPS = 0
-        runtime.currentBitrate = 0
+        performance.currentFPS = 0
+        performance.currentBitrate = 0
 
         print("⏹️ Server stopped")
     }

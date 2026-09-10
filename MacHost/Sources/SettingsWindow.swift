@@ -76,6 +76,7 @@ struct SettingsView: View {
     /// Do not make this an `@ObservedObject` here: doing so relays every stream
     /// status/metric update through the entire settings view.
     let runtime: DisplayRuntimeState
+    let performance: DisplayPerformanceState
     @State private var showPermissionAlert = false
     @State private var showResetConfirmation = false
     @State private var headerHovered = false
@@ -600,7 +601,7 @@ struct SettingsView: View {
                         }
 
                         RuntimeStatusSection(settings: settings, runtime: runtime)
-                        PerformanceSection(runtime: runtime)
+                        PerformanceSection(runtime: runtime, performance: performance)
                     }
                     .padding(20)
                 }
@@ -816,6 +817,7 @@ private struct RuntimeStatusSection: View {
 
 private struct PerformanceSection: View {
     @ObservedObject var runtime: DisplayRuntimeState
+    @ObservedObject var performance: DisplayPerformanceState
 
     @ViewBuilder
     var body: some View {
@@ -826,7 +828,7 @@ private struct PerformanceSection: View {
                         Text("FPS")
                             .font(.system(size: 10))
                             .foregroundColor(.secondary)
-                        Text(String(format: "%.1f", runtime.currentFPS))
+                        Text(String(format: "%.1f", performance.currentFPS))
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.green)
                     }
@@ -835,7 +837,7 @@ private struct PerformanceSection: View {
                         Text("Bitrate")
                             .font(.system(size: 10))
                             .foregroundColor(.secondary)
-                        Text(String(format: "%.1f Mbps", runtime.currentBitrate))
+                        Text(String(format: "%.1f Mbps", performance.currentBitrate))
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.accentColor)
                     }
@@ -1211,7 +1213,9 @@ class DisplaySettings: ObservableObject {
 // MARK: - Window Controller
 
 class SettingsWindowController: NSWindowController, NSWindowDelegate {
-    convenience init(settings: DisplaySettings, runtime: DisplayRuntimeState) {
+    convenience init(settings: DisplaySettings,
+                     runtime: DisplayRuntimeState,
+                     performance: DisplayPerformanceState) {
         let window = ConstrainedWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 780),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -1224,7 +1228,11 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.backgroundColor = .windowBackgroundColor
         window.isMovableByWindowBackground = true
         window.center()
-        window.contentView = NSHostingView(rootView: SettingsView(settings: settings, runtime: runtime))
+        window.contentView = NSHostingView(rootView: SettingsView(
+            settings: settings,
+            runtime: runtime,
+            performance: performance
+        ))
         window.isReleasedWhenClosed = false
 
         self.init(window: window)
