@@ -70,6 +70,11 @@ private extension NWEndpoint {
 
 class StreamingServer {
     private let port: UInt16
+    /// Transport selection belongs to the server session, not to whichever
+    /// endpoint happens to arrive first. A USB reverse-forward is loopback at
+    /// Network.framework, while wireless is LAN; keeping this explicit also
+    /// prevents pressure policy from changing when a probe or contender joins.
+    private var transportMode: ConnectionMode = .usb
     private var listener: NWListener?
     private var connection: NWConnection?
 
@@ -156,12 +161,16 @@ class StreamingServer {
         self.controlPort = controlPort ?? ControlPortResolver.effective(videoPort: port)
     }
 
-    func start() {
+    func start(wireless: Bool = false) {
         isStopped = false
+        transportMode = wireless ? .wireless : .usb
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            params.serviceClass = .interactiveVideo
+            // Keep the proven interactive class for the USB reverse-forward.
+            // Wireless opts into the throughput-oriented class because its
+            // bounded freshness gates provide the latency control there.
+            params.serviceClass = wireless ? .bestEffort : .interactiveVideo
 
             // Optimize TCP for low-latency streaming
             if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
@@ -234,13 +243,19 @@ class StreamingServer {
 
     private func handleControlConnection(_ newConnection: NWConnection) {
         debugLog("Control connection incoming")
+        let mode = transportMode
         let isLoopback = newConnection.endpoint.isLoopback
-        if !isLoopback && expectedAuthToken == nil {
-            debugLog("Rejecting non-loopback control candidate: wireless mode not active")
+        if mode == .usb && !isLoopback {
+            debugLog("Rejecting LAN control candidate: USB mode is active")
             newConnection.cancel()
             return
         }
-        let requiresAuth = !isLoopback
+        if mode == .wireless && !isLoopback && expectedAuthToken == nil {
+            debugLog("Rejecting non-loopback control candidate: wireless auth is unavailable")
+            newConnection.cancel()
+            return
+        }
+        let requiresAuth = mode == .wireless && !isLoopback
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self, let newConnection else { return }
             switch state {
@@ -692,7 +707,7 @@ class StreamingServer {
                 WirelessTransportPressure.retire(generation: framePressureGeneration)
             }
             frameSendGeneration &+= 1
-            framePressureGeneration = WirelessTransportPressure.reset(wireless: !newConnection.endpoint.isLoopback)
+            framePressureGeneration = WirelessTransportPressure.reset(wireless: transportMode == .wireless)
             frameSendConnection = newConnection
             frameTransportReady = false
             frameWaitingForSync = true
@@ -739,7 +754,14 @@ class StreamingServer {
     private func armContender(_ newConnection: NWConnection) {
         clearContender(newConnection, cancelSocket: true)  // one contender at a time
         contender = newConnection
-        let isWireless = !newConnection.endpoint.isLoopback
+        let mode = transportMode
+        let isLoopback = newConnection.endpoint.isLoopback
+        guard mode == .wireless || isLoopback else {
+            debugLog("Rejecting LAN contender: USB mode is active")
+            clearContender(newConnection, cancelSocket: true)
+            return
+        }
+        let isWireless = mode == .wireless && !isLoopback
 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self = self else { return }
@@ -840,13 +862,19 @@ class StreamingServer {
             beginExistingProtocol(on: conn)
             return
         }
+        let mode = transportMode
+        if mode == .usb && !conn.endpoint.isLoopback {
+            debugLog("Rejecting LAN client: USB mode is active")
+            conn.cancel()
+            return
+        }
         if conn.endpoint.isLoopback {
-            debugLog("Client connected via loopback (USB) — skipping auth")
+            debugLog("Client connected via loopback (\(mode.rawValue)) — skipping auth")
             beginExistingProtocol(on: conn)
             return
         }
-        guard let expected = expectedAuthToken else {
-            debugLog("Rejecting non-loopback client: wireless mode not active")
+        guard mode == .wireless, let expected = expectedAuthToken else {
+            debugLog("Rejecting non-loopback client: wireless mode/auth is not active")
             conn.cancel()
             return
         }

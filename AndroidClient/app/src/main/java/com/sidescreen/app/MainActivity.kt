@@ -14,7 +14,6 @@ import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
 import android.hardware.usb.UsbManager
 import android.media.MediaFormat
-import android.net.Network
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -120,11 +119,12 @@ class MainActivity : AppCompatActivity() {
         DiagLog.init(applicationContext)
         prefs = PreferencesManager(this)
 
+        if (prefs.connectionMode == ConnectionMode.USB) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+
         // Allow rotation based on device sensor when not connected
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-
-        // Keep screen on
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         // Enable edge-to-edge display (draw behind system bars and cutout)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -169,7 +169,12 @@ class MainActivity : AppCompatActivity() {
             prefs.connectionMode = mode
             applyModeVisibility(mode)
             if (mode == ConnectionMode.WIRELESS) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                releasePerformanceMode()
                 wirelessController.show()
+            } else {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                enablePerformanceMode()
             }
         }
     }
@@ -207,9 +212,6 @@ class MainActivity : AppCompatActivity() {
                         forgetButton = binding.wirelessForgetButton,
                         reconnectButton = binding.wirelessReconnectButton,
                         repairReconnectButton = binding.wirelessRepairReconnectButton,
-                        privateLinkButton = binding.wirelessPrivateLinkButton,
-                        privateLinkStopButton = binding.wirelessPrivateLinkStopButton,
-                        privateLinkDetails = binding.wirelessPrivateLinkDetails,
                         idleForgetButton = binding.wirelessIdleForgetButton,
                         openSettingsButton = binding.wirelessOpenSettingsButton,
                         connectedMacName = binding.connectedMacName,
@@ -223,8 +225,8 @@ class MainActivity : AppCompatActivity() {
                     ),
                 storage = pairedHostStorage,
                 cameraPerm = cameraPerm,
-                onConnectRequested = { host, port, token, deviceName, _, controlPort, network ->
-                    connectWireless(host, port, token, deviceName, controlPort, network)
+                onConnectRequested = { host, port, token, deviceName, _, controlPort, alternateHosts ->
+                    connectWireless(host, port, token, deviceName, controlPort, alternateHosts)
                 },
             )
         wirelessController.bind()
@@ -262,39 +264,91 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == WirelessTabController.REQ_CAMERA) {
             val granted = grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED
             wirelessController.onCameraPermissionResult(granted)
-        } else if (requestCode == PrivateLinkController.PERMISSION_REQUEST_CODE) {
-            val granted = grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED
-            wirelessController.onPrivateLinkPermissionResult(granted)
+        }
+    }
+
+    /** Preserve the legacy USB keep-awake path; wireless stays display-driven. */
+    private fun enablePerformanceMode() {
+        if (prefs.connectionMode != ConnectionMode.USB) {
+            log("🎮 Performance mode: wireless display-driven policy")
+            return
+        }
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (wakeLock?.isHeld != true) {
+                wakeLock =
+                    powerManager.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK,
+                        "SideScreen::PerformanceMode",
+                    )
+                wakeLock?.acquire(30 * 60 * 1000L)
+            }
+            log("🎮 Performance mode ENABLED (USB legacy path)")
+        } catch (e: Exception) {
+            log("⚠️ Performance mode failed: ${e.message}")
+        }
+    }
+
+    private fun releasePerformanceMode() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) {
+        }
+        wakeLock = null
+    }
+
+    /** Keep the panel awake only for an active display session. */
+    private fun setDisplayKeepAwake(keepAwake: Boolean) {
+        if (keepAwake) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 
     /**
-     * Enable performance mode for streaming
-     * NOTE: setSustainedPerformanceMode is DISABLED - it causes thermal throttling
-     * which makes the entire device laggy. Normal power management is more efficient.
+     * Tell SurfaceFlinger the cadence of the source stream. On devices with a
+     * seamless 60-Hz mode this can avoid running a 120-Hz panel for a 60-FPS
+     * wireless stream; otherwise Android keeps the current mode and still
+     * uses the hint for frame pacing. This is only a scheduling hint and does
+     * not alter decoded pixels or frame rate.
      */
-    private fun enablePerformanceMode() {
-        try {
-            // REMOVED: setSustainedPerformanceMode(true)
-            // Sustained performance mode forces max CPU/GPU clocks which causes
-            // thermal throttling on extended use, making the device laggy.
-            // Let the SoC manage power efficiently instead.
+    private fun applyFrameRateHint() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
 
-            // Use PARTIAL_WAKE_LOCK with timeout to prevent battery drain
-            // Screen is already kept on via FLAG_KEEP_SCREEN_ON
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock =
-                powerManager.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "SideScreen::PerformanceMode",
-                )
-            // 30 minute timeout instead of infinite acquire
-            wakeLock?.acquire(30 * 60 * 1000L)
-
-            log("🎮 Performance mode ENABLED (balanced)")
-        } catch (e: Exception) {
-            log("⚠️ Performance mode failed: ${e.message}")
+        val wireless = streamClient?.isWirelessSession == true
+        val connected = isConnected && streamClient != null && wireless
+        if (!connected) {
+            currentSurfaceHolder?.surface?.takeIf { it.isValid }?.clearFrameRate()
+            currentTextureSurface?.takeIf { it.isValid }?.clearFrameRate()
+            return
         }
+
+        val requestedFps = WirelessFreshnessPolicy.TARGET_FRAME_RATE.toFloat()
+
+        val surfaces = listOfNotNull(
+            currentSurfaceHolder?.surface?.takeIf { it.isValid },
+            currentTextureSurface?.takeIf { it.isValid },
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            surfaces.forEach { surface ->
+                surface.setFrameRate(
+                requestedFps,
+                Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS,
+                )
+            }
+        } else {
+            surfaces.forEach { surface ->
+                surface.setFrameRate(
+                    requestedFps,
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                )
+            }
+        }
+        mainDiag("Frame-rate hint: ${"%.1f".format(requestedFps)}Hz, wireless=true")
     }
 
     /**
@@ -361,6 +415,7 @@ class MainActivity : AppCompatActivity() {
                     )
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
+                    applyFrameRateHint()
                     initializeDecoderForCurrentSurface()
                 }
 
@@ -387,6 +442,7 @@ class MainActivity : AppCompatActivity() {
                 ) {
                     mainDiag("textureAvailable: ${width}x$height")
                     currentTextureSurface = Surface(surface)
+                    applyFrameRateHint()
                     initializeDecoderForCurrentSurface()
                 }
 
@@ -1424,6 +1480,12 @@ class MainActivity : AppCompatActivity() {
                     if (connected) android.R.color.holo_green_light else android.R.color.holo_red_light,
                 )
                 if (connected) {
+                    setDisplayKeepAwake(true)
+                    if (client.isWirelessSession) {
+                        applyFrameRateHint()
+                    } else {
+                        enablePerformanceMode()
+                    }
                     startPingTimer()
                     stopChecklistUpdates()
                     enableFullscreenMode()
@@ -1434,9 +1496,12 @@ class MainActivity : AppCompatActivity() {
                     val entry = pairedHostStorage.load()
                     wirelessController.onConnectSuccess(
                         entry?.macName ?: "Mac",
-                        entry?.host ?: host,
+                        client.connectedHost ?: entry?.host ?: host,
                     )
                 } else {
+                    setDisplayKeepAwake(false)
+                    releasePerformanceMode()
+                    applyFrameRateHint()
                     streamClient = null
                     stopPingTimer()
                     disableFullscreenMode()
@@ -1467,6 +1532,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     if (isCurrentConnection(client, generation)) {
                         binding.resolutionText.text = "${width}x$height"
+                        applyFrameRateHint()
                         applyRotation(rotation, flipHorizontal, flipVertical)
                         applyDirectPixelMapping(width, height)
                         initializeDecoderForCurrentSurface()
@@ -1494,7 +1560,7 @@ class MainActivity : AppCompatActivity() {
         token: ByteArray,
         deviceName: String,
         controlPort: Int? = null,
-        network: Network? = null,
+        alternateHosts: List<String> = emptyList(),
     ) {
         val generation = activeConnectionGeneration + 1
         activeConnectionGeneration = generation
@@ -1508,6 +1574,7 @@ class MainActivity : AppCompatActivity() {
                 port,
                 applicationContext,
                 controlPort = controlPort ?: port + 1,
+                alternateHosts = alternateHosts,
             )
         streamClient = client
         setupStreamClientCallbacks(client, generation, host)
@@ -1515,7 +1582,7 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
-                client.connectWireless(token, deviceName, preferredNetwork = network)
+                client.connectWireless(token, deviceName)
                 // NOTE: onConnectSuccess is fired from the onConnectionStatus(true)
                 // listener (above) right after handshake OK — not here. This line
                 // would otherwise run AFTER the receive loop exits, i.e. AFTER
@@ -1628,6 +1695,12 @@ class MainActivity : AppCompatActivity() {
                         )
 
                         if (connected) {
+                            setDisplayKeepAwake(true)
+                            if (client.isWirelessSession) {
+                                applyFrameRateHint()
+                            } else {
+                                enablePerformanceMode()
+                            }
                             // Start periodic ping for latency measurement
                             startPingTimer()
 
@@ -1642,6 +1715,9 @@ class MainActivity : AppCompatActivity() {
                             restoreSettingsButtonPosition()
                             updateOverlayVisibility(prefs.showStatsOverlay)
                         } else {
+                            setDisplayKeepAwake(false)
+                            releasePerformanceMode()
+                            applyFrameRateHint()
                             streamClient = null
                             // Stop ping timer
                             stopPingTimer()
@@ -1748,6 +1824,9 @@ class MainActivity : AppCompatActivity() {
         streamClient?.disconnect()
         streamClient = null
         isConnected = false
+        setDisplayKeepAwake(false)
+        releasePerformanceMode()
+        applyFrameRateHint()
         macServerKnownAvailable = false
         activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
         regularTouchActive = false
@@ -1804,15 +1883,9 @@ class MainActivity : AppCompatActivity() {
             currentTextureSurface?.release()
             currentTextureSurface = null
 
-            // Release wake lock safely
-            try {
-                if (wakeLock?.isHeld == true) {
-                    wakeLock?.release()
-                }
-            } catch (e: Exception) {
-                // Ignore wake lock release errors
-            }
-            wakeLock = null
+            setDisplayKeepAwake(false)
+            releasePerformanceMode()
+            applyFrameRateHint()
             log("🎮 Performance mode DISABLED")
         } catch (e: Exception) {
             log("⚠️ Cleanup error: ${e.message}")

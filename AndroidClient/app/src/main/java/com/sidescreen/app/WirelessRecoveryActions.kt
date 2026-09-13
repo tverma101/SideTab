@@ -12,7 +12,7 @@ data class WirelessRecoveryActions(
 ) {
     companion object {
         const val SCAN_QR_LABEL = "Scan QR Code"
-        const val SCAN_QR_INSTEAD_LABEL = "Scan QR instead"
+        const val SCAN_QR_INSTEAD_LABEL = "Pair again (scan QR)"
 
         fun forState(
             hasPairing: Boolean,

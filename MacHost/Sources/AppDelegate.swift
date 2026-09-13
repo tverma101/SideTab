@@ -153,7 +153,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // LANAddressResolver already does the interface walk needed by both
         // wireless status fields. Resolve once instead of running getifaddrs()
         // twice every two seconds.
-        let lanAddress = LANAddressResolver.primaryIPv4()
+        let lanAddress = LANAddressResolver.primaryHost()
         settings.wifiConnected = lanAddress != nil
         settings.listeningAddress = lanAddress
 
@@ -170,6 +170,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Once the loopback stream is live, it is already proof that the
+        // selected USB reverse mapping works. Do not keep spawning adb while
+        // the latency-sensitive capture/send path is active. If the cable or
+        // reverse socket actually disappears, the Network.framework terminal
+        // callback clears clientConnected and the next tick resumes repair.
+        if settings.isRunning && settings.clientConnected {
+            settings.adbInstalled = true
+            settings.usbDeviceConnected = true
+            settings.adbReverseConfigured = true
+            return
+        }
+
         let port = Int(settings.port)
         let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
         let controlPort = controlOverride > 0 ? controlOverride : port + 1
@@ -182,8 +194,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // server must not make the settings window or touch path hitch.
             let adbInstalled = StatusDetector.adbInstalled()
             let devices = StatusDetector.usbDevices()
-            let reverseOK = StatusDetector.adbReverseConfigured(port: port)
-                && StatusDetector.adbReverseConfigured(port: controlPort)
+            let usbSerial = devices.first
+            let reverseOK = usbSerial.map { serial in
+                StatusDetector.adbReverseConfigured(serial: serial, port: port)
+                    && StatusDetector.adbReverseConfigured(serial: serial, port: controlPort)
+            } ?? false
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
                 self.statusRefreshInFlight = false
@@ -194,7 +209,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                       Int(self.settings.port) == port else { return }
 
                 self.settings.adbInstalled = adbInstalled
-                let isConnected = !devices.isEmpty
+                let isConnected = usbSerial != nil
 
                 self.settings.usbDeviceConnected = isConnected
                 self.settings.adbReverseConfigured = reverseOK
@@ -209,21 +224,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     && isConnected
                     && self.settings.isRunning
                     && !reverseOK {
-                    self.scheduleADBReverseRepair()
+                    self.scheduleADBReverseRepair(serial: usbSerial!)
                 }
             }
         }
     }
 
     @MainActor
-    private func scheduleADBReverseRepair() {
+    private func scheduleADBReverseRepair(serial: String) {
         guard !adbReverseRepairInFlight else { return }
         adbReverseRepairInFlight = true
-        debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse")
+        debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse for (serial)")
 
         Task { [weak self] in
             guard let self = self else { return }
-            await self.setupADBReverse()
+            await self.setupADBReverse(serial: serial)
             await MainActor.run {
                 self.adbReverseRepairInFlight = false
             }
@@ -484,13 +499,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Setup ADB reverse port forwarding for USB connection
-    func setupADBReverse() async {
+    func setupADBReverse(serial requestedSerial: String? = nil) async {
         let port = settings.port
         let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
         let controlPort = controlOverride > 0 ? UInt16(controlOverride) : port + 1
         let ports = [port, controlPort]
         print("🔌 Setting up ADB reverse for ports \(ports)...")
-        debugLog("🔌 setupADBReverse() invoked for ports \(ports)...")
+        debugLog(
+            "🔌 setupADBReverse() invoked for ports \(ports)" +
+                (requestedSerial.map { " on USB serial \($0)" } ?? "") + "..."
+        )
 
         await Task.detached(priority: .utility) {
             guard let finalAdbPath = StatusDetector.adbExecutablePath() else {
@@ -499,7 +517,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
+            let serial = requestedSerial ?? StatusDetector.usbDevices().first
+            guard let serial, !serial.isEmpty else {
+                print("⚠️  No physical USB ADB device found - skipping reverse setup")
+                return
+            }
+
             print("📱 Found ADB at: \(finalAdbPath)")
+            print("📱 Targeting USB device: \(serial)")
 
             // Configure both bulk video and the dedicated control channel.
             // Retry each mapping up to 3 times so USB cannot be left in a
@@ -509,7 +534,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 for attempt in 1...3 {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: finalAdbPath)
-                    process.arguments = ["reverse", "tcp:\(reversePort)", "tcp:\(reversePort)"]
+                    process.arguments = ["-s", serial, "reverse", "tcp:\(reversePort)", "tcp:\(reversePort)"]
 
                     let pipe = Pipe()
                     process.standardOutput = pipe
@@ -523,7 +548,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         let output = String(data: data, encoding: .utf8) ?? ""
 
                         if process.terminationStatus == 0 {
-                            print("✅ ADB reverse setup successful: tcp:\(reversePort) -> tcp:\(reversePort)")
+                            print("✅ ADB reverse setup successful for \(serial): tcp:\(reversePort) -> tcp:\(reversePort)")
                             configured = true
                             break
                         }
@@ -640,7 +665,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try await screenCapture?.setupForVirtualDisplay(
                 displayID,
                 refreshRate: sessionFrameRate,
-                frameRateCap: sessionMode == .wireless ? WirelessFreshnessPolicy.targetFrameRate : nil
+                frameRateCap: sessionMode == .wireless ? WirelessFreshnessPolicy.targetFrameRate : nil,
+                connectionMode: sessionMode
             )
 
             // Setup server. Control channel (out-of-band ping/pong + keyframe
@@ -668,6 +694,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.setDisplaySize(width: size.width, height: size.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
+                // If the no-client idle policy paused capture, resume it at the
+                // connection boundary instead of waiting for the next monitor
+                // tick. The cached replay/keyframe then has a live pipeline.
+                if sessionMode == .wireless {
+                    self.screenCapture?.resumeFromIdle()
+                }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
                 // Re-apply the persisted menu-bar value after the Android
                 // client has joined; StreamingServer queues it until BRIGHT
@@ -738,7 +770,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // the grace window, pause capture+encode (CPU -> ~0). Resume is
             // instant: onClientConnected forces a keyframe/replays the cached
             // frame, and resumeFromIdle restarts the SCStream underneath.
-            if UserDefaults.standard.bool(forKey: "SideScreen_exp_idleSleep") {
+            let idleSleepKey = "SideScreen_exp_idleSleep"
+            let idleSleepEnabled = UserDefaults.standard.object(forKey: idleSleepKey) == nil
+                || UserDefaults.standard.bool(forKey: idleSleepKey)
+            if sessionMode == .wireless && idleSleepEnabled {
                 let secs = UserDefaults.standard.integer(forKey: "SideScreen_exp_idleSleepSecs")
                 let grace = secs > 0 ? Double(secs) : 15.0
                 let monitor = IdleSleepMonitor(
@@ -752,12 +787,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 monitor.start()
                 idleSleepMonitor = monitor
-                debugLog("Idle-sleep monitor ENABLED (grace \(grace)s)")
+                debugLog("Idle-sleep monitor ENABLED (grace \(grace)s, default-on)")
+            } else if sessionMode == .wireless {
+                debugLog("Idle-sleep monitor disabled (SideScreen_exp_idleSleep=false)")
             } else {
-                debugLog("Idle-sleep monitor disabled (knob unset)")
+                debugLog("Idle-sleep monitor disabled for USB mode (legacy capture behavior)")
             }
 
-            streamingServer?.start()
+            streamingServer?.start(wireless: sessionMode == .wireless)
             screenCapture?.startStreaming(
                 to: streamingServer,
                 bitrateMbps: settings.effectiveBitrate,
@@ -765,7 +802,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 gamingBoost: settings.gamingBoost,
                 frameRate: sessionFrameRate,
                 bitrateCapMbps: sessionBitrateCap,
-                frameRateCap: sessionMode == .wireless ? WirelessFreshnessPolicy.targetFrameRate : nil
+                frameRateCap: sessionMode == .wireless ? WirelessFreshnessPolicy.targetFrameRate : nil,
+                connectionMode: sessionMode
             )
 
             await MainActor.run {
@@ -805,6 +843,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         virtualDisplayManager?.saveDisplayPosition()
 
         releaseStylusIfNeeded()
+
+        idleSleepMonitor?.stop()
+        idleSleepMonitor = nil
 
         screenCapture?.stopStreaming()
         streamingServer?.stop()

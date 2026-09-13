@@ -50,9 +50,16 @@ class StreamClient(
     private val host: String,
     private val port: Int,
     private val context: Context? = null,
-    controlHost: String = host,
+    private val controlHost: String = host,
     controlPort: Int = port + 1,
+    alternateHosts: List<String> = emptyList(),
 ) {
+    private val hostCandidates =
+        (listOf(host) + alternateHosts)
+            .map(String::trim)
+            .filter { it.isNotEmpty() }
+            .distinct()
+    private val controlHostFollowsVideo = controlHost == host
     private data class TransportSnapshot(
         val generation: Long,
         val socket: Socket,
@@ -140,6 +147,11 @@ class StreamClient(
     var isWirelessSession = false
         private set
 
+    /** Address that completed the most recent video handshake, if any. */
+    @Volatile
+    var connectedHost: String? = null
+        private set
+
     private var bytesReceived = 0L
     private var framesReceived = 0L
     private var diagFrameCount = 0L
@@ -177,7 +189,11 @@ class StreamClient(
 
     fun releaseBuffer(buffer: ByteArray) {
         synchronized(poolLock) {
-            if (bufferPool.size < 8) {
+            // A rare keyframe can be much larger than the steady-state frame.
+            // Do not retain several multi-megabyte arrays forever just because
+            // the pool saw one transient burst; normal frames still use the
+            // bounded pool without creating tablet memory pressure.
+            if ((!isWirelessSession || buffer.size <= MAX_POOLED_FRAME_BYTES) && bufferPool.size < 8) {
                 bufferPool.addLast(buffer)
             }
         }
@@ -219,9 +235,11 @@ class StreamClient(
     suspend fun connect() =
         withContext(Dispatchers.IO) {
             isWirelessSession = false
+            connectedHost = host
             connectionAttemptCancelled = false
             controlChannel.setAuthToken(null)
             controlChannel.setNetwork(null)
+            controlChannel.setHost(controlHost)
             try {
                 val s = Socket()
                 pendingSocket = s
@@ -275,6 +293,7 @@ class StreamClient(
             throw WirelessConnectError.ProtocolError
         }
         isWirelessSession = true
+        connectedHost = null
         connectionAttemptCancelled = false
         controlChannel.setAuthToken(token)
 
@@ -305,9 +324,9 @@ class StreamClient(
                     reconnectAttempt = 0
                     diagLog(
                         if (wasReconnect) {
-                            "Wireless session recovered to $host:$port control=$effectiveControlPort generation=$generation"
+                            "Wireless session recovered to ${connectedHost ?: host}:$port control=$effectiveControlPort generation=$generation"
                         } else {
-                            "Wireless connected to $host:$port control=$effectiveControlPort generation=$generation"
+                            "Wireless connected to ${connectedHost ?: host}:$port control=$effectiveControlPort generation=$generation"
                         },
                     )
                     onConnectionStatus?.invoke(true)
@@ -372,12 +391,46 @@ class StreamClient(
     ): Long {
         Log.i(
             TAG,
-            "connectWireless: trying $host:$port " +
+            "connectWireless: trying ${hostCandidates.joinToString()} port=$port " +
                 "(device=$deviceName, connect=${connectTimeoutMs}ms, auth=${handshakeTimeoutMs}ms)",
         )
         val wifiNetwork = preferredNetwork ?: selectWifiNetwork()
         controlChannel.setNetwork(wifiNetwork)
-        val connectingSocket = connectWirelessSocket(wifiNetwork, connectTimeoutMs)
+        var lastError: WirelessConnectError.NetworkUnreachable? = null
+        for ((index, targetHost) in hostCandidates.withIndex()) {
+            try {
+                val generation =
+                    openWirelessTransportOnHost(
+                        targetHost,
+                        token,
+                        deviceName,
+                        connectTimeoutMs,
+                        handshakeTimeoutMs,
+                        wifiNetwork,
+                    )
+                connectedHost = targetHost
+                if (controlHostFollowsVideo) {
+                    controlChannel.setHost(targetHost)
+                }
+                Log.i(TAG, "connectWireless: video handshake succeeded on host ${index + 1}/${hostCandidates.size} $targetHost")
+                return generation
+            } catch (e: WirelessConnectError.NetworkUnreachable) {
+                lastError = e
+                Log.w(TAG, "connectWireless: host ${index + 1}/${hostCandidates.size} $targetHost unreachable; trying next candidate")
+            }
+        }
+        throw lastError ?: WirelessConnectError.NetworkUnreachable
+    }
+
+    private fun openWirelessTransportOnHost(
+        targetHost: String,
+        token: ByteArray,
+        deviceName: String,
+        connectTimeoutMs: Int,
+        handshakeTimeoutMs: Int,
+        wifiNetwork: Network?,
+    ): Long {
+        val connectingSocket = connectWirelessSocket(targetHost, wifiNetwork, connectTimeoutMs)
 
         if (connectionAttemptCancelled) {
             closePending(connectingSocket)
@@ -464,6 +517,7 @@ class StreamClient(
      * for OEMs that expose a Network handle with incomplete factory support.
      */
     private fun connectWirelessSocket(
+        targetHost: String,
         wifiNetwork: Network?,
         connectTimeoutMs: Int,
     ): Socket {
@@ -500,7 +554,7 @@ class StreamClient(
                     Log.w(TAG, "connectWireless: receive buffer hint unavailable: ${error.message}")
                 }
                 Log.i(TAG, "connectWireless: trying video socket on ${route.first} route")
-                socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+                socket.connect(InetSocketAddress(targetHost, port), connectTimeoutMs)
                 Log.i(
                     TAG,
                     "connectWireless: video socket connected on ${route.first} " +
@@ -519,9 +573,9 @@ class StreamClient(
         }
 
         if (lastError is SocketTimeoutException) {
-            Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port")
+            Log.e(TAG, "connectWireless: TCP connect timeout to $targetHost:$port")
         } else {
-            Log.e(TAG, "connectWireless: TCP connect failed to $host:$port", lastError)
+            Log.e(TAG, "connectWireless: TCP connect failed to $targetHost:$port", lastError)
         }
         throw WirelessConnectError.NetworkUnreachable
     }
@@ -1246,6 +1300,7 @@ class StreamClient(
         private const val MESSAGE_SERVER_SUPPORTS_STYLUS = StylusProtocol.SERVER_SUPPORTS_STYLUS
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
+        private const val MAX_POOLED_FRAME_BYTES = 1 * 1024 * 1024
         private const val PAIRING_TOKEN_SIZE = 32
 
         internal fun reconnectDelayMs(attempt: Int): Long {

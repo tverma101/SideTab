@@ -44,6 +44,30 @@ sidescreen_resolve_adb() {
     command -v adb
 }
 
+# Return the first ready physical USB transport from `adb devices -l` input.
+# Wi-Fi transports are also reported as `device`, so `$2 == device` alone is
+# unsafe when Android wireless debugging is enabled at the same time.
+sidescreen_first_usb_serial() {
+    awk '
+        NR > 1 && $2 == "device" {
+            for (i = 3; i <= NF; i++) {
+                if ($i ~ /^usb:/) {
+                    print $1
+                    exit
+                }
+            }
+        }
+    '
+}
+
+# Resolve a physical USB device directly when a caller does not already have
+# the `adb devices -l` output available for diagnostics.
+sidescreen_resolve_usb_serial() {
+    local adb_bin="${1:-}"
+    [[ -n "$adb_bin" ]] || return 1
+    "$adb_bin" devices -l 2>/dev/null | sidescreen_first_usb_serial
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     sidescreen_resolve_adb
 fi

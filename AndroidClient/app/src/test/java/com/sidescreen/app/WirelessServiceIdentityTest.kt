@@ -12,6 +12,6 @@ class WirelessServiceIdentityTest {
 
     @Test
     fun serviceTypeUsesBonjourTcp() {
-        assertEquals("_sidescreen._tcp.", WirelessServiceIdentity.SERVICE_TYPE)
+        assertEquals("_sidescreen._tcp", WirelessServiceIdentity.SERVICE_TYPE)
     }
 }

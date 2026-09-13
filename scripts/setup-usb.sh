@@ -18,7 +18,7 @@ echo "🔧 Setting up USB port forwarding..."
 # Check ADB connection
 "$ADB_BIN" start-server >/dev/null
 ADB_DEVICES="$($ADB_BIN devices -l 2>&1 || true)"
-ADB_SERIAL="$(printf '%s\n' "$ADB_DEVICES" | awk '$2 == "device" { print $1; exit }')"
+ADB_SERIAL="$(printf '%s\n' "$ADB_DEVICES" | sidescreen_first_usb_serial)"
 if [ -z "$ADB_SERIAL" ]; then
     echo "❌ No Android device found via ADB"
     echo "   ADB: $ADB_BIN"

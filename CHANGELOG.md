@@ -34,14 +34,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wired SDR colors: the normal macOS 8-bit capture now uses video-range `420v`, matching the Android hardware decoder's limited-range conversion instead of expanding contrast from full-range `420f`. The legacy `SideScreen_exp_pixelFormat=8bit` full-range value remains available only as an explicit A/B control.
 - Wireless recovery: a failed connection now keeps the cached or just-scanned pairing available, presents **Reconnect** as the primary repair action, and keeps QR scanning secondary unless the Mac rejects the pairing token. Manual Disconnect also returns to the paired-idle screen instead of leaving the wireless panel in its previous state; dedicated QR control-port overrides survive the in-session retry path.
 - Wireless transport now tries Android's per-network `SocketFactory` first, then the process-default route and legacy `bindSocket` fallback, preserving connectivity across OEM routing implementations.
+- Wireless home-network recovery now carries multiple usable LAN addresses in QR/Bonjour data, including bracketed IPv6, and tries the same candidates for video and control. The unproven private-hotspot workaround was removed so recovery never changes the tablet's normal WiFi/Internet route.
 
 ### Performance
+- Wireless 60-FPS transport no longer waits for the TCP socket to have room for
+  an entire encoded frame before admitting the next frame. The sender now uses
+  a small headroom floor plus its existing bounded in-flight frame/byte budget,
+  preventing a healthy Wi-Fi connection from self-throttling every other frame.
+- The Mac wireless capture path now uses a dedicated ordered sample queue and a
+  four-frame ScreenCaptureKit queue, while Android limits video read-ahead to
+  64 KiB with a 256 KiB socket receive hint. These changes reduce stale buffering
+  without changing resolution, codec, bitrate, or color quality.
+- Wireless ScreenCaptureKit idle callbacks no longer re-encode a cached pixel
+  buffer; cached replay is reserved for an explicit reconnect keyframe. USB
+  retains the legacy cached-frame fallback. Zero-valued TCP headroom metadata is
+  treated as unavailable on routes where that sample is not reliable, while
+  the bounded in-flight frame/byte budget remains enforced for wireless.
+- Wireless Android no longer holds a partial CPU wake lock or keeps the panel
+  awake on the connection screen. During an active wireless stream it
+  advertises the source cadence to SurfaceFlinger, and the wireless receiver
+  bounds its frame pool so a rare large keyframe cannot retain multi-megabyte
+  buffers indefinitely. USB retains its legacy wake-lock path.
+- The Mac wireless video listener now uses Network.framework's
+  throughput-oriented `.bestEffort` class while retaining explicit bounded
+  in-flight/freshness pressure. USB remains on `.interactiveVideo`, and the
+  no-client capture idle monitor is enabled by default only for wireless
+  sessions, releasing the display-sleep assertion after its grace period.
 - macOS USB status probes now run off the main actor, overlapping ADB repairs are suppressed, and the capture callback latches session flags instead of reading connection preferences on every frame.
 - Android's steady-state decoder path keeps the 60-FPS callback handoff bounded without reusing input-buffer indices from a retired codec instance.
 - USB install diagnostics now preserve the fresh-build fast path and report the selected ADB binary plus the complete device state when the tablet is not ready, avoiding wasted APK builds and ambiguous connection failures.
 
 ### Planned
-- mDNS auto-discovery for wireless mode
 - Audio streaming
 - Multi-touch gestures
 

@@ -10,22 +10,22 @@ enum StatusDetector {
     /// constructing a reachability probe to a public IP on every status tick.
     /// This also reports local-only Wi-Fi/Ethernet correctly.
     static func wifiReachable() -> Bool {
-        LANAddressResolver.primaryIPv4() != nil
+        LANAddressResolver.primaryHost() != nil
     }
 
-    /// Run `adb devices`, return list of device serials in `device` state.
-    /// Wireless mode never needs this subprocess; AppDelegate refreshes status
-    /// every two seconds, so avoiding it removes recurring process churn from
-    /// the capture/encode workload.
+    /// Run `adb devices -l`, return physical USB serials in `device` state.
+    /// ADB exposes Wi-Fi transports in the same `device` state, so checking the
+    /// state alone is not sufficient when USB and wireless debugging are both
+    /// enabled for the same tablet.
     static func usbDevices() -> [String] {
         guard !wirelessModeActive else { return [] }
         guard let adbPath = adbExecutablePath() else { return [] }
         let task = Process()
         task.executableURL = URL(fileURLWithPath: adbPath)
-        task.arguments = ["devices"]
+        task.arguments = ["devices", "-l"]
         let pipe = Pipe()
         task.standardOutput = pipe
-        task.standardError = Pipe()
+        task.standardError = pipe
         do {
             try task.run()
             task.waitUntilExit()
@@ -34,20 +34,40 @@ enum StatusDetector {
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
-        return output.split(separator: "\n").compactMap { line in
-            let parts = line.split(separator: "\t").map(String.init)
-            guard parts.count == 2, parts[1] == "device" else { return nil }
-            return parts[0]
+        guard task.terminationStatus == 0 else { return [] }
+        return usbSerials(from: output)
+    }
+
+    /// Parse `adb devices -l` and keep only ready transports with a `usb:`
+    /// descriptor. Wi-Fi ADB serials such as `192.168.1.130:45809` are
+    /// intentionally excluded even though their state is also `device`.
+    static func usbSerials(from output: String) -> [String] {
+        output.split(whereSeparator: \.isNewline).compactMap { line in
+            let fields = line.split { $0 == " " || $0 == "\t" }
+            guard fields.count >= 3, fields[1] == "device" else { return nil }
+            guard fields.dropFirst(2).contains(where: { $0.hasPrefix("usb:") }) else {
+                return nil
+            }
+            return String(fields[0])
         }
     }
 
-    /// Heuristic: parse `adb reverse --list` for `tcp:<port> tcp:<port>`.
+    /// Parse `adb reverse --list` for `tcp:<port> tcp:<port>`.
+    static func reverseMappingConfigured(in output: String, port: Int) -> Bool {
+        let expected = "tcp:\(port)"
+        return output.split(whereSeparator: \.isNewline).contains { line in
+            let fields = line.split { $0 == " " || $0 == "\t" }
+            return fields.count >= 3 && fields[1] == expected && fields[2] == expected
+        }
+    }
+
+    /// Check a reverse mapping on one explicitly selected USB device.
     /// The status refresh asks for video and control ports back-to-back; cache
     /// the command output briefly so those two checks share one adb process.
-    static func adbReverseConfigured(port: Int) -> Bool {
+    static func adbReverseConfigured(serial: String, port: Int) -> Bool {
         guard !wirelessModeActive else { return false }
-        guard let output = reverseListOutput() else { return false }
-        return output.contains("tcp:\(port) tcp:\(port)")
+        guard let output = reverseListOutput(serial: serial) else { return false }
+        return reverseMappingConfigured(in: output, port: port)
     }
 
     private static var wirelessModeActive: Bool {
@@ -56,12 +76,14 @@ enum StatusDetector {
 
     private static let cacheLock = NSLock()
     private static var cachedReverseList = ""
+    private static var cachedReverseListSerial: String?
     private static var lastReverseListCheck: Date = .distantPast
     private static let reverseListCacheSeconds: TimeInterval = 0.75
 
-    private static func reverseListOutput() -> String? {
+    private static func reverseListOutput(serial: String) -> String? {
         cacheLock.lock()
-        if Date().timeIntervalSince(lastReverseListCheck) < reverseListCacheSeconds {
+        if cachedReverseListSerial == serial,
+           Date().timeIntervalSince(lastReverseListCheck) < reverseListCacheSeconds {
             let cached = cachedReverseList
             cacheLock.unlock()
             return cached
@@ -71,10 +93,10 @@ enum StatusDetector {
         guard let adbPath = adbExecutablePath() else { return nil }
         let task = Process()
         task.executableURL = URL(fileURLWithPath: adbPath)
-        task.arguments = ["reverse", "--list"]
+        task.arguments = ["-s", serial, "reverse", "--list"]
         let pipe = Pipe()
         task.standardOutput = pipe
-        task.standardError = Pipe()
+        task.standardError = pipe
         do {
             try task.run()
             task.waitUntilExit()
@@ -83,9 +105,11 @@ enum StatusDetector {
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
+        guard task.terminationStatus == 0 else { return nil }
 
         cacheLock.lock()
         cachedReverseList = output
+        cachedReverseListSerial = serial
         lastReverseListCheck = Date()
         cacheLock.unlock()
         return output

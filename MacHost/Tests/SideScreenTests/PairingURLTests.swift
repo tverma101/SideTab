@@ -71,4 +71,18 @@ final class PairingURLTests: XCTestCase {
         )
         XCTAssertFalse(url.contains("&c="))
     }
+
+    func testIPv6AuthorityAndAlternateHostsAreEncoded() {
+        UserDefaults.standard.removeObject(forKey: controlPortKey)
+        let url = PairingURL.build(
+            host: "2001:db8::1",
+            port: 54321,
+            token: Data(repeating: 4, count: 32),
+            name: "Mac",
+            alternateHosts: ["192.168.1.42", "2001:db8::1", "192.168.1.42"]
+        )
+        XCTAssertTrue(url.hasPrefix("sidescreen://[2001:db8::1]:54321?"))
+        XCTAssertTrue(url.contains("&h=192.168.1.42"))
+        XCTAssertFalse(url.contains("&h=2001:db8::1"))
+    }
 }

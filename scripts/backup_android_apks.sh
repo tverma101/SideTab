@@ -7,9 +7,9 @@ PACKAGE_NAME="${SIDESCREEN_ANDROID_PACKAGE:-com.sidescreen.app}"
 BACKUP_ROOT="${SIDESCREEN_APK_BACKUP_DIR:-$ROOT_DIR/backups/apk}"
 APK_OUTPUT_ROOT="$ROOT_DIR/AndroidClient/app/build/outputs/apk"
 ADB_BIN="${ADB:-adb}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/resolve_adb.sh"
 if [[ -z "${ADB:-}" ]]; then
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/resolve_adb.sh"
     ADB_BIN="$(sidescreen_resolve_adb 2>/dev/null || true)"
 fi
 SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -107,10 +107,10 @@ adb_device=''
 adb_serial="${SIDESCREEN_ADB_SERIAL:-${ANDROID_SERIAL:-}}"
 if command -v "$ADB_BIN" >/dev/null 2>&1; then
     if [[ -z "$adb_serial" ]]; then
-        ready_devices="$("$ADB_BIN" devices 2>/dev/null | awk 'NR > 1 && $2 == "device" {print $1}')"
+        ready_devices="$("$ADB_BIN" devices -l 2>/dev/null | sidescreen_first_usb_serial)"
         ready_count="$(printf '%s\n' "$ready_devices" | sed '/^$/d' | wc -l | tr -d ' ')"
         if [[ "$ready_count" -gt 1 ]]; then
-            echo "warning: multiple ADB devices found; backing up the first. Set SIDESCREEN_ADB_SERIAL to choose one." >&2
+            echo "warning: multiple USB ADB devices found; backing up the first. Set SIDESCREEN_ADB_SERIAL to choose one." >&2
         fi
         adb_serial="$(printf '%s\n' "$ready_devices" | sed '/^$/d' | head -n 1)"
     fi

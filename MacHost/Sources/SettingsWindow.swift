@@ -679,9 +679,9 @@ struct SettingsView: View {
                                               color: settings.wifiConnected ? .green : .red,
                                               hint: "Whether the Mac has an active local-network address. This does not prove that the access point allows peer-to-peer TCP or Bonjour; wireless mode still requires the tablet to reach the listening address.")
                                     StatusRow(title: "Listening on",
-                                              status: settings.listeningAddress.map { "\($0):\(settings.port)" } ?? "—",
+                                              status: settings.listeningAddress.map { LANAddressResolver.endpoint(host: $0, port: settings.port) } ?? "—",
                                               color: settings.listeningAddress != nil ? .green : .secondary,
-                                              hint: "The LAN address the tablet must reach. The QR code embeds this exact host:port — if it changes (e.g. you switch WiFi), re-scan the new QR on the tablet.")
+                                              hint: "The QR includes the preferred local address plus compatible fallbacks. If the Mac changes networks, refresh the QR before pairing a new tablet.")
                                 }
 
                                 if !settings.hasScreenRecordingPermission {
@@ -1313,7 +1313,7 @@ struct WirelessSection: View {
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
-                    Text(LANAddressResolver.primaryIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
+                    Text(LANAddressResolver.primaryHost().map { "Listening: \(LANAddressResolver.endpoint(host: $0, port: settings.port))" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
@@ -1390,9 +1390,8 @@ struct WirelessSection: View {
         .onChange(of: settings.port) { _ in refreshQR() }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { now in
             nowTick = now
-            // A Private Link can replace the current Wi-Fi address while this
-            // window remains open. Refresh the QR so pairing/recovery never
-            // keeps showing the isolated WLAN endpoint.
+            // Refresh the address list while the window remains open so a
+            // Wi-Fi roam updates both the preferred host and its fallbacks.
             refreshQR()
             refreshPaired()
         }
@@ -1411,9 +1410,16 @@ struct WirelessSection: View {
 
     private func refreshQR() {
         let token = WirelessAuth.loadOrCreate()
-        let host = LANAddressResolver.primaryIPv4() ?? "0.0.0.0"
+        let hosts = LANAddressResolver.preferredHosts()
+        let host = hosts.first ?? "0.0.0.0"
         let name = Host.current().localizedName ?? "Mac"
-        let url = PairingURL.build(host: host, port: settings.port, token: token, name: name)
+        let url = PairingURL.build(
+            host: host,
+            port: settings.port,
+            token: token,
+            name: name,
+            alternateHosts: Array(hosts.dropFirst()),
+        )
         qrImage = QRRenderer.render(url: url, size: 180)
     }
 

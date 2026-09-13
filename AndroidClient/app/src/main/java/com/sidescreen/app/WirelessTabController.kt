@@ -2,9 +2,6 @@ package com.sidescreen.app
 
 import android.app.Activity
 import android.content.Intent
-import android.net.Network
-import android.os.Handler
-import android.os.Looper
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
@@ -33,7 +30,7 @@ class WirelessTabController(
         deviceName: String,
         macName: String,
         controlPort: Int?,
-        network: Network?,
+        alternateHosts: List<String>,
     ) -> Unit,
 ) {
     data class Views(
@@ -49,9 +46,6 @@ class WirelessTabController(
         val forgetButton: Button,
         val reconnectButton: Button,
         val repairReconnectButton: Button,
-        val privateLinkButton: Button,
-        val privateLinkStopButton: Button,
-        val privateLinkDetails: TextView,
         val idleForgetButton: Button,
         val openSettingsButton: Button,
         val connectedMacName: TextView,
@@ -70,64 +64,11 @@ class WirelessTabController(
     private val discovery = SideScreenDiscovery(activity.applicationContext)
     private var discoveryRecoveryArmed = true
     private var discoveryRecoveryInFlight = false
-    private val privateLinkHandler = Handler(Looper.getMainLooper())
-    private var privateLinkResolveInFlight = false
-    private var privateLinkResolveDeadlineMs = 0L
     // Keep the last pairing in memory for the current app session. A secure
     // preference read can temporarily fail (for example while the Android
     // Keystore is recovering), but that must not turn a recoverable connection
     // error into a QR-only dead end.
     private var lastAttemptedEntry: PairedHostStorage.Entry? = null
-
-    private lateinit var privateLink: PrivateLinkController
-
-    init {
-        privateLink =
-            PrivateLinkController(
-            activity,
-            object : PrivateLinkController.Callbacks {
-                override fun onPermissionRequired(permissions: Array<String>) {
-                    views.privateLinkButton.isEnabled = true
-                    views.repairTitle.text = "Private Link permission needed"
-                    views.repairMessage.text =
-                        "Allow Nearby Wi-Fi access so Side Screen can create a private local link. This link has no Internet route."
-                    configureRepairActions(needsRePair = false, entry = storage.load() ?: lastAttemptedEntry)
-                    transition(State.REPAIR_NEEDED)
-                }
-
-                override fun onReady(details: PrivateLinkController.Details) {
-                    showPrivateLinkReady(details)
-                }
-
-                override fun onNetworkChanged(network: Network, tabletAddress: String?) {
-                    if (privateLink.isRunning) {
-                        val entry = storage.load() ?: lastAttemptedEntry
-                        if (entry != null) {
-                            schedulePrivateLinkResolve(entry, initialDelayMs = 250)
-                        }
-                    }
-                }
-
-                override fun onStopped() {
-                    cancelPrivateLinkResolve()
-                    views.privateLinkDetails.visibility = View.GONE
-                    views.privateLinkStopButton.visibility = View.GONE
-                    views.privateLinkButton.text = "USE PRIVATE LINK"
-                }
-
-                override fun onFailed(message: String) {
-                    cancelPrivateLinkResolve()
-                    views.privateLinkDetails.visibility = View.GONE
-                    views.privateLinkStopButton.visibility = View.GONE
-                    views.privateLinkButton.text = "USE PRIVATE LINK"
-                    views.repairTitle.text = "⚠ Private Link unavailable"
-                    views.repairMessage.text = message
-                    configureRepairActions(needsRePair = false, entry = storage.load() ?: lastAttemptedEntry)
-                    transition(State.REPAIR_NEEDED)
-                }
-                },
-            )
-    }
 
     fun bind() {
         views.scanButton.setOnClickListener { triggerScan() }
@@ -145,124 +86,6 @@ class WirelessTabController(
         }
         views.reconnectButton.setOnClickListener { startManualReconnect() }
         views.repairReconnectButton.setOnClickListener { startManualReconnect() }
-        views.privateLinkButton.setOnClickListener {
-            if (privateLink.isRunning) {
-                startPrivateLinkDiscovery()
-            } else {
-                startPrivateLink()
-            }
-        }
-        views.privateLinkStopButton.setOnClickListener {
-            privateLink.stop()
-            showNetworkRepair(storage.load() ?: lastAttemptedEntry)
-        }
-    }
-
-    private fun startPrivateLink() {
-        views.repairTitle.text = "Starting Private Link…"
-        views.repairMessage.text = "Creating a private Wi-Fi network on this tablet."
-        views.privateLinkButton.isEnabled = false
-        transition(State.REPAIR_NEEDED)
-        privateLink.start(PrivateLinkController.PERMISSION_REQUEST_CODE)
-    }
-
-    private fun startPrivateLinkDiscovery() {
-        val entry = storage.load() ?: lastAttemptedEntry
-        if (entry == null) {
-            views.repairTitle.text = "Pair once to use Private Link"
-            views.repairMessage.text =
-                "Join the Mac to the displayed Private Link, then scan the Side Screen QR once. Future reconnects will use the private link automatically."
-            configureRepairActions(needsRePair = true, entry = null)
-            transition(State.REPAIR_NEEDED)
-            return
-        }
-        schedulePrivateLinkResolve(entry, initialDelayMs = 50)
-    }
-
-    private fun showPrivateLinkReady(details: PrivateLinkController.Details) {
-        views.privateLinkButton.isEnabled = true
-        views.privateLinkButton.text = "FIND MAC ON PRIVATE LINK"
-        views.privateLinkStopButton.visibility = View.VISIBLE
-        views.privateLinkDetails.visibility = View.VISIBLE
-        views.privateLinkDetails.text =
-            buildString {
-                append("Wi-Fi name: ${details.ssid}\n")
-                append("Password: ${details.passphrase ?: "none"}\n\n")
-                append("On the Mac, join this Wi-Fi network. Keep SideScreen open here; the paired Mac will be found automatically.")
-            }
-        views.repairTitle.text = "Private Link ready"
-        views.repairMessage.text =
-            "This bypasses the current Wi-Fi's device isolation. It is local-only and does not provide Internet access."
-        configureRepairActions(needsRePair = false, entry = storage.load() ?: lastAttemptedEntry)
-        transition(State.REPAIR_NEEDED)
-        (storage.load() ?: lastAttemptedEntry)?.let { schedulePrivateLinkResolve(it) }
-    }
-
-    private fun schedulePrivateLinkResolve(
-        entry: PairedHostStorage.Entry,
-        initialDelayMs: Long = 2_000L,
-    ) {
-        if (!privateLink.isRunning) return
-        if (privateLinkResolveDeadlineMs == 0L) {
-            privateLinkResolveDeadlineMs = System.currentTimeMillis() + PRIVATE_LINK_DISCOVERY_WINDOW_MS
-        }
-        privateLinkHandler.removeCallbacksAndMessages(PRIVATE_LINK_DISCOVERY_TOKEN)
-        privateLinkHandler.postDelayed(
-            { resolvePrivateLink(entry) },
-            PRIVATE_LINK_DISCOVERY_TOKEN,
-            initialDelayMs,
-        )
-    }
-
-    private fun resolvePrivateLink(entry: PairedHostStorage.Entry) {
-        if (!privateLink.isRunning || privateLinkResolveInFlight) return
-        if (privateLinkResolveDeadlineMs != 0L && System.currentTimeMillis() > privateLinkResolveDeadlineMs) {
-            privateLinkResolveDeadlineMs = 0L
-            views.repairMessage.text =
-                "Private Link is ready, but the Mac has not appeared yet. Join the Mac to the displayed Wi-Fi, then tap FIND MAC ON PRIVATE LINK."
-            return
-        }
-        val network = privateLink.network
-        if (network == null) {
-            schedulePrivateLinkResolve(entry)
-            return
-        }
-        privateLinkResolveInFlight = true
-        views.repairMessage.text = "Looking for ${entry.macName} on the private link…"
-        discovery.resolve(entry.token, timeoutMs = PRIVATE_LINK_DISCOVERY_TIMEOUT_MS, network = network) { endpoint ->
-            privateLinkResolveInFlight = false
-            if (!privateLink.isRunning) return@resolve
-            if (endpoint == null) {
-                schedulePrivateLinkResolve(entry, initialDelayMs = PRIVATE_LINK_DISCOVERY_RETRY_MS)
-                return@resolve
-            }
-
-            privateLinkResolveDeadlineMs = 0L
-            privateLinkHandler.removeCallbacksAndMessages(PRIVATE_LINK_DISCOVERY_TOKEN)
-            val updated = entry.copy(host = endpoint.host, port = endpoint.port)
-            lastAttemptedEntry = copyEntry(updated)
-            try {
-                storage.save(updated)
-            } catch (e: Exception) {
-                android.util.Log.w("WirelessTabController", "Couldn't persist Private Link endpoint", e)
-            }
-            views.repairMessage.text = "Found ${updated.macName} at ${updated.host}:${updated.port}. Connecting…"
-            onConnectRequested(
-                updated.host,
-                updated.port,
-                updated.token,
-                (android.os.Build.MODEL ?: "Android").take(64),
-                updated.macName,
-                updated.controlPortOverride,
-                privateLink.network,
-            )
-        }
-    }
-
-    private fun cancelPrivateLinkResolve() {
-        privateLinkHandler.removeCallbacksAndMessages(PRIVATE_LINK_DISCOVERY_TOKEN)
-        privateLinkResolveInFlight = false
-        privateLinkResolveDeadlineMs = 0L
     }
 
     private fun startManualReconnect() {
@@ -298,10 +121,6 @@ class WirelessTabController(
                 return
             }
 
-        if (privateLink.isRunning) {
-            showPrivateLinkReadyIfAvailable(entry)
-            return
-        }
         if (tryDiscoveryRecovery(entry)) {
             return
         }
@@ -375,7 +194,7 @@ class WirelessTabController(
             deviceName,
             parsed.macName,
             parsed.controlPortOverride,
-            privateLink.network,
+            parsed.alternateHosts,
         )
     }
 
@@ -395,10 +214,6 @@ class WirelessTabController(
         val cached = storage.load() ?: lastAttemptedEntry
         when (error) {
             is StreamClient.WirelessConnectError.NetworkUnreachable -> {
-                if (privateLink.isRunning && cached != null) {
-                    showPrivateLinkReadyIfAvailable(cached)
-                    return
-                }
                 if (cached != null && tryDiscoveryRecovery(cached)) {
                     return
                 }
@@ -449,7 +264,12 @@ class WirelessTabController(
                 return@resolve
             }
 
-            val updated = entry.copy(host = endpoint.host, port = endpoint.port)
+            val updated =
+                entry.copy(
+                    host = endpoint.host,
+                    port = endpoint.port,
+                    alternateHosts = endpoint.alternateHosts,
+                )
             lastAttemptedEntry = copyEntry(updated)
             try {
                 storage.save(updated)
@@ -465,7 +285,7 @@ class WirelessTabController(
                 deviceName,
                 updated.macName,
                 updated.controlPortOverride,
-                privateLink.network,
+                updated.alternateHosts,
             )
         }
         return true
@@ -487,21 +307,6 @@ class WirelessTabController(
         transition(State.REPAIR_NEEDED)
     }
 
-    private fun showPrivateLinkReadyIfAvailable(entry: PairedHostStorage.Entry) {
-        privateLink.currentDetails?.let(::showPrivateLinkReady)
-            ?: run {
-                views.privateLinkButton.isEnabled = true
-                views.privateLinkButton.text = "FIND MAC ON PRIVATE LINK"
-                views.privateLinkStopButton.visibility = View.VISIBLE
-                views.repairTitle.text = "Private Link active"
-                views.repairMessage.text =
-                    "Join the Mac to the displayed Private Link, then tap FIND MAC ON PRIVATE LINK."
-                configureRepairActions(needsRePair = false, entry = entry)
-                transition(State.REPAIR_NEEDED)
-                schedulePrivateLinkResolve(entry, initialDelayMs = 50)
-            }
-    }
-
     /**
      * When a pairing still exists, Reconnect is the primary recovery action.
      * Scan QR stays available as a secondary path, and becomes primary only
@@ -515,12 +320,6 @@ class WirelessTabController(
         views.repairReconnectButton.visibility = if (actions.reconnectVisible) View.VISIBLE else View.GONE
         views.rescanButton.visibility = View.VISIBLE
         views.rescanButton.text = actions.rescanLabel
-        views.privateLinkButton.visibility = if (needsRePair) View.GONE else View.VISIBLE
-        if (!privateLink.isRunning) {
-            views.privateLinkStopButton.visibility = View.GONE
-            views.privateLinkDetails.visibility = View.GONE
-            views.privateLinkButton.text = "USE PRIVATE LINK"
-        }
     }
 
     private fun showConnecting(
@@ -560,23 +359,7 @@ class WirelessTabController(
         }
     }
 
-    fun onPrivateLinkPermissionResult(granted: Boolean) {
-        if (granted) {
-            privateLink.start(PrivateLinkController.PERMISSION_REQUEST_CODE)
-        } else {
-            views.privateLinkButton.isEnabled = true
-            views.repairTitle.text = "Private Link permission denied"
-            views.repairMessage.text =
-                "Allow Nearby Wi-Fi access in Android Settings, then tap USE PRIVATE LINK again."
-            transition(State.REPAIR_NEEDED)
-        }
-    }
-
-    fun close() {
-        cancelPrivateLinkResolve()
-        privateLink.stop()
-        privateLinkHandler.removeCallbacksAndMessages(null)
-    }
+    fun close() = Unit
 
     private fun triggerScan() {
         if (cameraPerm.isPermanentlyDenied()) {
@@ -604,16 +387,12 @@ class WirelessTabController(
             deviceName,
             entry.macName,
             entry.effectiveControlPort(),
-            privateLink.network,
+            entry.alternateHosts,
         )
     }
 
     companion object {
         const val REQ_SCAN = 1001
         const val REQ_CAMERA = 1002
-        private const val PRIVATE_LINK_DISCOVERY_TIMEOUT_MS = 3_000L
-        private const val PRIVATE_LINK_DISCOVERY_RETRY_MS = 3_000L
-        private const val PRIVATE_LINK_DISCOVERY_WINDOW_MS = 120_000L
-        private val PRIVATE_LINK_DISCOVERY_TOKEN = Any()
     }
 }

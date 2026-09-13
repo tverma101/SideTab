@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.net.wifi.WifiManager
 import android.util.Log
+import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -19,7 +20,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * from the pairing token, so discovery never trusts a human-readable Mac name.
  */
 class SideScreenDiscovery(context: Context) {
-    data class Endpoint(val host: String, val port: Int)
+    data class Endpoint(
+        val host: String,
+        val port: Int,
+        val alternateHosts: List<String> = emptyList(),
+    )
 
     private val manager = context.applicationContext.getSystemService(NsdManager::class.java)
     private val connectivityManager =
@@ -74,13 +79,13 @@ class SideScreenDiscovery(context: Context) {
 
                 @Suppress("DEPRECATION")
                 override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                    val host = serviceInfo.host?.hostAddress
                     val port = serviceInfo.port
-                    if (host.isNullOrBlank() || port !in 1..65535) {
+                    val hosts = resolvedHosts(serviceInfo)
+                    if (hosts.isEmpty() || port !in 1..65535) {
                         finish(null)
                     } else {
-                        Log.i(TAG, "NSD recovered SideScreen endpoint $host:$port")
-                        finish(Endpoint(host, port))
+                        Log.i(TAG, "NSD recovered SideScreen endpoints ${hosts.joinToString()} port=$port")
+                        finish(Endpoint(hosts.first(), port, hosts.drop(1)))
                     }
                 }
             }
@@ -156,11 +161,51 @@ class SideScreenDiscovery(context: Context) {
         }
     }
 
-    private fun activeWifiNetwork(): Network? =
-        connectivityManager?.allNetworks?.firstOrNull { network ->
+    private fun activeWifiNetwork(): Network? {
+        connectivityManager?.activeNetwork?.let { active ->
+            if (connectivityManager.getNetworkCapabilities(active)
+                    ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            ) {
+                return active
+            }
+        }
+        return connectivityManager?.allNetworks?.firstOrNull { network ->
             connectivityManager.getNetworkCapabilities(network)
                 ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun resolvedHosts(serviceInfo: NsdServiceInfo): List<String> {
+        val addresses =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                try {
+                    serviceInfo.hostAddresses
+                } catch (_: Exception) {
+                    emptyList<InetAddress>()
+                }
+            } else {
+                emptyList()
+            }
+
+        val candidates =
+            addresses.mapNotNull(::usableHost) +
+                listOfNotNull(serviceInfo.host?.let(::usableHost))
+        return candidates
+            .distinct()
+            // Use IPv6 first when the access point filters IPv4 peer TCP, while
+            // retaining IPv4 as the normal fallback on older/home networks.
+            .sortedWith(compareBy<String> { if (it.contains(':')) 0 else 1 })
+    }
+
+    private fun usableHost(address: InetAddress): String? {
+        if (address.isAnyLocalAddress || address.isLoopbackAddress ||
+            address.isLinkLocalAddress || address.isMulticastAddress
+        ) {
+            return null
+        }
+        return address.hostAddress?.substringBefore('%')?.takeIf { it.isNotBlank() }
+    }
 
     private companion object {
         const val TAG = "SideScreenDiscovery"

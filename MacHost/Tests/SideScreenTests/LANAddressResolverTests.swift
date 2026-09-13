@@ -24,6 +24,18 @@ final class LANAddressResolverTests: XCTestCase {
 
     func testIsLinkLocalHelper() {
         XCTAssertTrue(LANAddressResolver.isLinkLocal("169.254.1.1"))
+        XCTAssertTrue(LANAddressResolver.isLinkLocal("fe80::1"))
         XCTAssertFalse(LANAddressResolver.isLinkLocal("192.168.1.42"))
+    }
+
+    func testEndpointBracketsIPv6() {
+        XCTAssertEqual(
+            LANAddressResolver.endpoint(host: "2001:db8::1", port: 54321),
+            "[2001:db8::1]:54321"
+        )
+        XCTAssertEqual(
+            LANAddressResolver.endpoint(host: "192.168.1.42", port: 54321),
+            "192.168.1.42:54321"
+        )
     }
 }

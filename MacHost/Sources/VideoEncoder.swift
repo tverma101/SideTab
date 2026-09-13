@@ -6,6 +6,10 @@ import os
 class VideoEncoder {
     private struct EncoderState {
         var pendingForceKeyframe = false
+        var encodeCalls: UInt64 = 0
+        var encodeErrors: UInt64 = 0
+        var encodedOutputs: UInt64 = 0
+        var pressureSkips: UInt64 = 0
     }
 
     private var compressionSession: VTCompressionSession?
@@ -18,8 +22,9 @@ class VideoEncoder {
     private var gamingBoost: Bool = false
     private var frameRate: Int = 60
     private let maxBitrateMbps: Int?
+    private let wireless: Bool
     private let stateLock = OSAllocatedUnfairLock(initialState: EncoderState())
-    init(width: Int, height: Int, codec: StreamCodec = .hevc, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60, maxBitrateMbps: Int? = nil) {
+    init(width: Int, height: Int, codec: StreamCodec = .hevc, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60, maxBitrateMbps: Int? = nil, wireless: Bool = false) {
         self.width = width
         self.height = height
         self.codec = codec
@@ -32,6 +37,7 @@ class VideoEncoder {
         self.gamingBoost = gamingBoost
         self.frameRate = frameRate
         self.maxBitrateMbps = maxBitrateMbps.map { max(1, $0) }
+        self.wireless = wireless
         setupCompressionSession()
     }
 
@@ -115,8 +121,10 @@ class VideoEncoder {
         }
 
         let expBitrate = UserDefaults.standard.object(forKey: "SideScreen_exp_bitrate") as? Int
-        let connectionMode = UserDefaults.standard.string(forKey: "SideScreen_connectionMode") ?? "usb"
-        let isWireless = connectionMode == "wireless"
+        // Transport mode is captured when this encoder is created. Reading the
+        // mutable preference here lets a mode toggle or stale defaults change
+        // rate control/GOP policy underneath an already-running USB session.
+        let isWireless = wireless
 
         // The historic UI bitrate control was designed for the USB path and
         // defaults to 1000 Mbps. Feeding that value into Wi-Fi defeats the
@@ -212,6 +220,13 @@ class VideoEncoder {
     func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
         guard let session = compressionSession else { return }
 
+        let callNumber: UInt64? = wireless
+            ? stateLock.withLock { state -> UInt64 in
+                state.encodeCalls &+= 1
+                return state.encodeCalls
+            }
+            : nil
+
         // Consume the force request first: recovery/startup keyframes must cut
         // through congestion. Routine captures, however, can be skipped safely
         // BEFORE VideoToolbox sees them when the wireless sender is backed up.
@@ -220,7 +235,8 @@ class VideoEncoder {
             state.pendingForceKeyframe = false
             return true
         }
-        if !shouldForceKeyframe && WirelessTransportPressure.shouldPauseEncoding {
+        if wireless && !shouldForceKeyframe && WirelessTransportPressure.shouldPauseEncoding {
+            stateLock.withLock { $0.pressureSkips &+= 1 }
             return
         }
 
@@ -229,7 +245,7 @@ class VideoEncoder {
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             : nil
 
-        VTCompressionSessionEncodeFrame(
+        let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTimeStamp,
@@ -238,6 +254,35 @@ class VideoEncoder {
             sourceFrameRefcon: nil,
             infoFlagsOut: nil
         )
+
+        if wireless && status != noErr {
+            let errorCount = stateLock.withLock { state -> UInt64 in
+                state.encodeErrors &+= 1
+                return state.encodeErrors
+            }
+            if errorCount <= 3 || errorCount.isMultiple(of: 60) {
+                debugLog("VideoToolbox encode rejected frame: status=\(status), errors=\(errorCount)")
+            }
+        }
+
+        if wireless, let callNumber = callNumber, callNumber.isMultiple(of: 60) {
+            let stats = stateLock.withLock { state in
+                (state.encodeCalls, state.encodedOutputs, state.encodeErrors, state.pressureSkips)
+            }
+            let pressure = WirelessTransportPressure.diagnosticSnapshot()
+            debugLog(
+                "Encoder cadence: calls=\(stats.0), outputs=\(stats.1), " +
+                "errors=\(stats.2), pressureSkips=\(stats.3), " +
+                "pressureInFlight=\(pressure.sendsInFlight), " +
+                "pressureBytes=\(pressure.bytesInFlight), " +
+                "tcpAvailable=\(pressure.availableSendBuffer.map(String.init) ?? "unknown")"
+            )
+        }
+    }
+
+    func noteEncodedOutput() {
+        guard wireless else { return }
+        stateLock.withLock { $0.encodedOutputs &+= 1 }
     }
 
     deinit {
@@ -358,5 +403,6 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         offset += Int(nalLength)
     }
 
+    encoder.noteEncodedOutput()
     encoder.onEncodedFrame?(frameData, timestamp, isKeyframe)
 }

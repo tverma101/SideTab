@@ -11,6 +11,8 @@ object PairingURL {
         val macName: String,
         /** null means the control endpoint follows videoPort + 1. */
         val controlPortOverride: Int?,
+        /** Additional LAN addresses advertised by the Mac, in retry order. */
+        val alternateHosts: List<String> = emptyList(),
     )
 
     fun parse(url: String): Parsed? {
@@ -43,6 +45,15 @@ object PairingURL {
             }
         if (controlPortOverride == null && port == 65535) return null
 
-        return Parsed(host, port, token, name, controlPortOverride)
+        val alternateHosts =
+            uri.getQueryParameters("h")
+                .asSequence()
+                .map(String::trim)
+                .filter { it.isNotEmpty() && it != host && it.length <= 255 }
+                .filter { candidate -> candidate.none { it.isWhitespace() || it.code < 0x20 } }
+                .distinct()
+                .toList()
+
+        return Parsed(host, port, token, name, controlPortOverride, alternateHosts)
     }
 }

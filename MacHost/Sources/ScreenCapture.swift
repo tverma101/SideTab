@@ -32,14 +32,43 @@ class ScreenCapture {
     private var virtualDisplayID: CGDirectDisplayID?
     private var refreshRate: Int = 60
     private var frameRateCap: Int?
+    /// Transport mode is supplied by AppDelegate once per session. Do not
+    /// infer it from an optional FPS cap: a future USB cadence cap must never
+    /// enable wireless-only capture/pressure behavior.
+    private var connectionMode: ConnectionMode = .usb
 
     // Thread-safe state for cross-thread access (frame output queue + main queue)
     private let stateLock = OSAllocatedUnfairLock(initialState: FrameMonitorState())
+    /// ScreenCaptureKit invokes the output callback on the queue supplied to
+    /// addStreamOutput. A dedicated high-priority serial queue keeps capture
+    /// ordering deterministic and avoids competing with unrelated global
+    /// work while the callback hands off to the encoder.
+    private let sampleHandlerQueue = DispatchQueue(
+        label: "com.sidescreen.capture.samples",
+        qos: .userInteractive
+    )
 
     private struct FrameMonitorState {
         var lastFrameTime: DispatchTime?
         var hasReceivedFirstFrame = false
         var fallbackActive = false
+        var captureCallbacks: UInt64 = 0
+        var idleCallbacks: UInt64 = 0
+        var dirtyRectSkips: UInt64 = 0
+        var pendingEncodeSkips: UInt64 = 0
+        var missingImageBufferCallbacks: UInt64 = 0
+        var completeWithoutImageCallbacks: UInt64 = 0
+        var encodeSubmissions: UInt64 = 0
+    }
+
+    private struct CaptureCadenceSnapshot {
+        let callbacks: UInt64
+        let idleCallbacks: UInt64
+        let dirtyRectSkips: UInt64
+        let pendingEncodeSkips: UInt64
+        let missingImageBufferCallbacks: UInt64
+        let completeWithoutImageCallbacks: UInt64
+        let encodeSubmissions: UInt64
     }
 
     private struct KeyframeRequestState {
@@ -48,6 +77,26 @@ class ScreenCapture {
     }
     private let keyframeRequestLock = OSAllocatedUnfairLock(initialState: KeyframeRequestState())
     private static let keyframeRequestThrottleNs: UInt64 = 500_000_000
+
+    private static func frameStatus(_ sampleBuffer: CMSampleBuffer) -> SCFrameStatus? {
+        guard let attachments =
+            (CMSampleBufferGetSampleAttachmentsArray(
+                sampleBuffer,
+                createIfNecessary: false
+            ) as? [[SCStreamFrameInfo: Any]])?.first,
+            let rawStatus = attachments[.status]
+        else {
+            return nil
+        }
+
+        if let status = rawStatus as? SCFrameStatus {
+            return status
+        }
+        if let number = rawStatus as? NSNumber {
+            return SCFrameStatus(rawValue: number.intValue)
+        }
+        return nil
+    }
 
     // Main-thread-only state
     private var frameMonitorTimer: DispatchSourceTimer?
@@ -230,11 +279,13 @@ class ScreenCapture {
     func setupForVirtualDisplay(
         _ displayID: CGDirectDisplayID,
         refreshRate: Int = 60,
-        frameRateCap: Int? = nil
+        frameRateCap: Int? = nil,
+        connectionMode: ConnectionMode = .usb
     ) async throws {
         self.virtualDisplayID = displayID
         self.refreshRate = refreshRate
         self.frameRateCap = frameRateCap
+        self.connectionMode = connectionMode
         try await setupDisplay()
         try await setupStream()
         await MainActor.run { registerWakeObservers() }
@@ -415,13 +466,20 @@ class ScreenCapture {
             break // leave SCKit's default (current production behavior)
         }
         config.showsCursor = true
+        // Keep four capture surfaces available. ScreenCaptureKit can otherwise
+        // starve the callback when VideoToolbox is still holding a pixel buffer
+        // during a high-resolution wireless frame, reducing source cadence
+        // before transport pressure has any chance to engage.
         config.queueDepth = 4
         config.capturesAudio = false
         config.backgroundColor = .clear
         config.scalesToFit = false
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: delegate)
-        try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        let sampleQueue: DispatchQueue = connectionMode == .usb
+            ? .global(qos: .userInteractive)
+            : sampleHandlerQueue
+        try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: sampleQueue)
 
         stream = scStream
         debugLog("Stream configured: \(width)x\(height) @ \(fps)fps (with delegate)")
@@ -438,15 +496,49 @@ class ScreenCapture {
 
         streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
             guard let self = self else { return }
+            let frameStatus = sessionFlags.wireless ? Self.frameStatus(sampleBuffer) : nil
 
-            // Thread-safe update of frame monitor state
-            let isFirst = self.stateLock.withLock { state -> Bool in
-                state.lastFrameTime = DispatchTime.now()
-                if !state.hasReceivedFirstFrame {
-                    state.hasReceivedFirstFrame = true
-                    return true
+            // Keep the proven low-overhead callback path for USB. Wireless
+            // enables the extra cadence counters because its bounded freshness
+            // policy needs those diagnostics during live tuning.
+            let isFirst: Bool
+            let cadence: CaptureCadenceSnapshot?
+            if sessionFlags.wireless {
+                let result = self.stateLock.withLock { state -> (Bool, CaptureCadenceSnapshot?) in
+                    state.lastFrameTime = DispatchTime.now()
+                    state.captureCallbacks &+= 1
+                    if frameStatus == .idle {
+                        state.idleCallbacks &+= 1
+                    }
+                    let isFirst = !state.hasReceivedFirstFrame
+                    if isFirst {
+                        state.hasReceivedFirstFrame = true
+                    }
+                    let cadence = state.captureCallbacks.isMultiple(of: 120)
+                        ? CaptureCadenceSnapshot(
+                            callbacks: state.captureCallbacks,
+                            idleCallbacks: state.idleCallbacks,
+                            dirtyRectSkips: state.dirtyRectSkips,
+                            pendingEncodeSkips: state.pendingEncodeSkips,
+                            missingImageBufferCallbacks: state.missingImageBufferCallbacks,
+                            completeWithoutImageCallbacks: state.completeWithoutImageCallbacks,
+                            encodeSubmissions: state.encodeSubmissions
+                        )
+                        : nil
+                    return (isFirst, cadence)
                 }
-                return false
+                isFirst = result.0
+                cadence = result.1
+            } else {
+                cadence = nil
+                isFirst = self.stateLock.withLock { state -> Bool in
+                    state.lastFrameTime = DispatchTime.now()
+                    if !state.hasReceivedFirstFrame {
+                        state.hasReceivedFirstFrame = true
+                        return true
+                    }
+                    return false
+                }
             }
 
             if isFirst {
@@ -469,6 +561,17 @@ class ScreenCapture {
                 )
                 self.onCaptureMethodChanged?("SCStream")
             }
+            if let cadence {
+                debugLog(
+                    "Capture cadence: callbacks=\(cadence.callbacks), " +
+                    "idle=\(cadence.idleCallbacks), " +
+                    "dirtySkips=\(cadence.dirtyRectSkips), " +
+                    "pendingSkips=\(cadence.pendingEncodeSkips), " +
+                    "missingImage=\(cadence.missingImageBufferCallbacks), " +
+                    "completeWithoutImage=\(cadence.completeWithoutImageCallbacks), " +
+                    "encodeSubmissions=\(cadence.encodeSubmissions)"
+                )
+            }
 
             // ScreenCaptureKit already tells us whether anything in the frame
             // changed. On wireless, an explicitly empty dirty-rect array lets
@@ -481,6 +584,7 @@ class ScreenCapture {
                 frameHasChanges: WirelessDirtyRectGate.frameHasChanges(sampleBuffer),
                 mutatesCapturedPixels: sessionFlags.mutatesCapturedPixels
             ) {
+                self.stateLock.withLock { $0.dirtyRectSkips &+= 1 }
                 return
             }
 
@@ -489,6 +593,9 @@ class ScreenCapture {
             // Backpressure: skip if encode queue already has 2+ frames pending
             let pending = OSAtomicAdd32(0, &self.pendingEncodes)
             if pending >= 2 {
+                if sessionFlags.wireless {
+                    self.stateLock.withLock { $0.pendingEncodeSkips &+= 1 }
+                }
                 return
             }
 
@@ -528,11 +635,27 @@ class ScreenCapture {
                     }
                 }
                 self.lastPixelBuffer = toEncode
+                if sessionFlags.wireless {
+                    self.stateLock.withLock { $0.encodeSubmissions &+= 1 }
+                }
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
                     self.encoder?.encode(pixelBuffer: toEncode, presentationTimeStamp: pts)
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
+            } else if sessionFlags.wireless {
+                self.stateLock.withLock { state in
+                    state.missingImageBufferCallbacks &+= 1
+                    if frameStatus == .complete || frameStatus == .started || frameStatus == nil {
+                        state.completeWithoutImageCallbacks &+= 1
+                    }
+                }
+                // ScreenCaptureKit's idle/blank/suspended callbacks are
+                // heartbeat metadata, not new pixels. Re-encoding the cached
+                // buffer here turns a static display into needless encoder and
+                // Wi-Fi work. A cached frame is replayed only by the explicit
+                // reconnect/keyframe path above.
+                return
             } else if let cached = self.lastPixelBuffer {
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
@@ -552,13 +675,15 @@ class ScreenCapture {
         gamingBoost: Bool = false,
         frameRate: Int = 60,
         bitrateCapMbps: Int? = nil,
-        frameRateCap: Int? = nil
+        frameRateCap: Int? = nil,
+        connectionMode: ConnectionMode = .usb
     ) {
         // Save parameters for potential restart
         currentServer = server
         self.frameRateCap = frameRateCap
+        self.connectionMode = connectionMode
         pipelineFlags = FramePipelineFlags(
-            wireless: frameRateCap != nil,
+            wireless: connectionMode == .wireless,
             mutatesCapturedPixels: PatternInjector.isActive() || DitherPass.enabled,
             skipsIdenticalFrames: FrameSkipper.enabled
         )
@@ -575,9 +700,8 @@ class ScreenCapture {
 
         isStreaming = true
 
-        // Keep the display awake for the whole streaming session so the virtual
-        // display never idle-sleeps (the sleep/wake cycle is what strands the
-        // cursor — see the wake handling above for the residual cases).
+        // Keep the display awake while a tablet is attached. The idle monitor
+        // releases this assertion after its no-client grace period.
         createDisplaySleepAssertion()
 
         let (width, height) = encodeSize(for: codec)
@@ -588,7 +712,7 @@ class ScreenCapture {
             HDRConverter.ensureSetup(width: width, height: height)
         }
 
-        encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: effFrameRate, maxBitrateMbps: currentBitrateCapMbps)
+        encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: effFrameRate, maxBitrateMbps: currentBitrateCapMbps, wireless: pipelineFlags.wireless)
         encoder?.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }
@@ -715,6 +839,9 @@ class ScreenCapture {
         let gen = idleGeneration
         stopFrameMonitor()
         debugLog("IDLE: pausing capture (no client)")
+        // There is no active display consumer now. Releasing this assertion is
+        // what lets macOS lower the panel/system power state during idle.
+        releaseDisplaySleepAssertion()
         Task {
             try? await stream?.stopCapture()
             guard isStreaming, idlePaused, gen == idleGeneration else {
@@ -739,6 +866,7 @@ class ScreenCapture {
         guard idlePaused else { return }
         idlePaused = false
         idleGeneration &+= 1
+        createDisplaySleepAssertion()
         debugLog("IDLE: resuming capture (client connected)")
         Task {
             try? await stream?.startCapture()
@@ -980,7 +1108,7 @@ class ScreenCapture {
     private func rebuildEncoder() {
         let (width, height) = encodeSize(for: codec)
         let server = currentServer
-        let newEncoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: currentBitrateMbps, quality: currentQuality, gamingBoost: currentGamingBoost, frameRate: currentFrameRate, maxBitrateMbps: currentBitrateCapMbps)
+        let newEncoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: currentBitrateMbps, quality: currentQuality, gamingBoost: currentGamingBoost, frameRate: currentFrameRate, maxBitrateMbps: currentBitrateCapMbps, wireless: pipelineFlags.wireless)
         newEncoder.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }

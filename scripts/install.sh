@@ -43,7 +43,7 @@ fi
 # Check ADB connection first
 echo "📱 Checking ADB connection..."
 "$ADB_BIN" start-server >/dev/null
-ADB_SERIAL="$("$ADB_BIN" devices | awk '$2 == "device" { print $1; exit }')"
+ADB_SERIAL="$(sidescreen_resolve_usb_serial "$ADB_BIN")"
 if [ -z "$ADB_SERIAL" ]; then
     echo "❌ No Android device found via ADB"
     echo "   Please connect your device via USB and enable USB debugging"
@@ -104,5 +104,5 @@ echo ""
 echo "💡 Troubleshooting:"
 echo "  • Connection fails: ./scripts/setup-usb.sh"
 echo "  • Check server: lsof -i :$ANDROID_USB_VIDEO_PORT"
-echo "  • Check forwarding: adb reverse --list (ports $ANDROID_USB_VIDEO_PORT/$ANDROID_USB_CONTROL_PORT)"
+echo "  • Check forwarding: adb -s <USB_SERIAL> reverse --list (ports $ANDROID_USB_VIDEO_PORT/$ANDROID_USB_CONTROL_PORT)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -90,7 +90,7 @@ echo "  OK"
 # 4. Install APK on device
 echo "[4/5] Installing APK..."
 if [ -n "$ADB_BIN" ]; then
-    ADB_SERIAL="$("$ADB_BIN" devices | awk '$2 == "device" { print $1; exit }')"
+    ADB_SERIAL="$(sidescreen_resolve_usb_serial "$ADB_BIN")"
 fi
 if [ -n "${ADB_SERIAL:-}" ]; then
     ADB="$ADB_BIN" SIDESCREEN_ADB_SERIAL="$ADB_SERIAL" "$SCRIPT_DIR/backup_android_apks.sh" >/dev/null

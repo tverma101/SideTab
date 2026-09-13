@@ -58,10 +58,17 @@ enum WirelessTransportPressure {
 
     /// Sample real TCP sender headroom before submitting an encoded frame.
     ///
-    /// If the socket cannot currently hold at least one frame (or a small 32 KiB
-    /// floor for tiny frames), pause *future pre-encode* routine captures for a
-    /// short bounded window. The deadline always expires by itself, guaranteeing
-    /// that a probe frame eventually gets through and re-samples the socket.
+    /// If the socket has less than a small amount of headroom, pause *future
+    /// pre-encode* routine captures for a short bounded window. Do not require
+    /// the kernel to have room for the entire encoded frame: a normal HEVC
+    /// frame can be larger than the currently available TCP window even when
+    /// the connection is healthy, and Network.framework will stream that frame
+    /// while the bounded in-flight budget prevents an unbounded queue. Using
+    /// the whole frame as the threshold self-throttles a healthy 60-Hz stream
+    /// to roughly every other frame on small Wi-Fi send buffers.
+    ///
+    /// The deadline always expires by itself, guaranteeing that a probe frame
+    /// eventually gets through and re-samples the socket.
     static func observeSendBuffer(
         generation: UInt64,
         availableBytes: UInt32,
@@ -73,8 +80,18 @@ enum WirelessTransportPressure {
         guard state.generation == generation, state.wireless, state.ready else { return }
 
         state.lastAvailableSendBuffer = availableBytes
-        let required = UInt64(max(WirelessFreshnessPolicy.minimumSendBufferHeadroomBytes, max(1, frameBytes)))
-        if UInt64(availableBytes) < required {
+        // `frameBytes` is intentionally not part of this threshold. It is a
+        // useful diagnostic input at call sites, but requiring one complete
+        // frame of kernel headroom made the sender skip every next frame when
+        // the frame was larger than the socket's advertised free window.
+        _ = frameBytes
+        let required = UInt64(WirelessFreshnessPolicy.minimumSendBufferHeadroomBytes)
+        // Network.framework reports zero for this metadata on some healthy
+        // Wi-Fi paths (including the IPv6 route used by the live tablet). Zero
+        // is therefore not a reliable low-water mark here. The explicit
+        // in-flight frame/byte budgets remain the hard safety boundary when
+        // the kernel does not provide a usable headroom sample.
+        if availableBytes > 0 && UInt64(availableBytes) < required {
             let deadline = nowNs &+ WirelessFreshnessPolicy.sendBufferPauseNs
             if deadline > state.pauseUntilNs {
                 state.pauseUntilNs = deadline
@@ -115,6 +132,26 @@ enum WirelessTransportPressure {
         return state.sendsInFlight >= WirelessFreshnessPolicy.maxSenderInFlightFrames ||
             state.bytesInFlight >= WirelessFreshnessPolicy.maxSenderInFlightBytes ||
             nowNs < state.pauseUntilNs
+    }
+
+    /// Lightweight live diagnostics for separating socket pressure from
+    /// encoder/capture pressure. The values are sampled under the same lock as
+    /// the admission decision, so the log cannot describe a different
+    /// transport generation.
+    static func diagnosticSnapshot() -> (
+        sendsInFlight: Int,
+        bytesInFlight: Int,
+        pauseUntilNs: UInt64,
+        availableSendBuffer: UInt32?
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (
+            state.sendsInFlight,
+            state.bytesInFlight,
+            state.pauseUntilNs,
+            state.lastAvailableSendBuffer
+        )
     }
 
     // Test visibility without exposing mutable state to production callers.

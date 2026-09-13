@@ -46,7 +46,7 @@ echo ""
 
 # Setup USB if device connected
 if [ -n "$ADB_BIN" ]; then
-    ADB_SERIAL="$("$ADB_BIN" devices | awk '$2 == "device" { print $1; exit }')"
+    ADB_SERIAL="$(sidescreen_resolve_usb_serial "$ADB_BIN")"
 fi
 if [ -n "${ADB_SERIAL:-}" ]; then
     echo "📱 Android device detected, setting up USB..."

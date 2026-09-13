@@ -54,6 +54,21 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 20_000_000))
     }
 
+    func testZeroTcpHeadroomSampleDoesNotSelfThrottleHealthyRoute() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        let now: UInt64 = 1_500_000_000
+
+        WirelessTransportPressure.observeSendBuffer(
+            generation: generation,
+            availableBytes: 0,
+            frameBytes: 64 * 1024,
+            nowNs: now
+        )
+
+        XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 1))
+    }
+
     func testHealthyTcpHeadroomReleasesOlderBufferPauseImmediately() {
         let generation = WirelessTransportPressure.reset(wireless: true)
         WirelessTransportPressure.setReady(generation: generation)

@@ -24,7 +24,7 @@ import javax.net.SocketFactory
  * while control reconnects, callers transparently use the in-band fallback.
  */
 class ControlChannel(
-    private val host: String,
+    initialHost: String,
     private val port: Int,
     authToken: ByteArray? = null,
     network: Network? = null,
@@ -36,6 +36,9 @@ class ControlChannel(
 
     @Volatile
     private var boundNetwork: Network? = network
+
+    @Volatile
+    private var host: String = initialHost
 
     var onLatencyMeasured: ((Double) -> Unit)? = null
 
@@ -344,6 +347,20 @@ class ControlChannel(
 
     fun setAuthToken(token: ByteArray?) {
         controlAuthToken = token?.clone()
+    }
+
+    /** Keep the out-of-band channel on the address that accepted video. */
+    fun setHost(newHost: String) {
+        val previous = host
+        if (previous == newHost) return
+        host = newHost
+
+        val activeSocket = synchronized(connectLock) { socket }
+        if (activeSocket != null) {
+            DiagLog.log("CC", "Video host changed $previous -> $newHost — rebinding control")
+            markTcpInactive(activeSocket)
+        }
+        wakeConnectionLoop()
     }
 
     /**

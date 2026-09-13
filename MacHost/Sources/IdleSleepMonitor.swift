@@ -13,7 +13,9 @@ import Foundation
 /// Knobs:
 ///   defaults write com.sidescreen.app SideScreen_exp_idleSleep -bool true
 ///   defaults write com.sidescreen.app SideScreen_exp_idleSleepSecs -int 15
-/// Gate is off by default — production behavior unchanged when unset.
+/// The monitor is enabled by default for wireless sessions. USB retains the
+/// legacy always-capturing behavior. Set SideScreen_exp_idleSleep to false to
+/// disable the monitor for wireless sessions.
 final class IdleSleepMonitor {
     private let isClientConnected: () -> Bool
     private let pause: () -> Void
@@ -48,6 +50,8 @@ final class IdleSleepMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
+        idleSince = nil
+        paused = false
     }
 
     private func tick() {

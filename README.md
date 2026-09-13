@@ -55,7 +55,7 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 ### USB-C or Wireless
 
-Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — the Mac app sets up adb-reverse forwarding for video on port `54321` and control on `54322`. **Wireless** lets you scan a QR code from the Mac; the tablet remembers the pairing and you can tap **Reconnect** on later launches (5 GHz strongly recommended). Wireless sessions use a bounded 60 FPS profile: up to 40 Mbps average, a 60 Mbps one-second peak ceiling, and freshness-aware backpressure between capture, TCP, decoding, and presentation. The auth token is generated locally and stays on your Mac; reset it any time to revoke access. See [the wireless 60 FPS path](docs/wireless-60fps.md) for the implementation contract and validation boundary.
+Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — the Mac app sets up adb-reverse forwarding for video on port `54321` and control on `54322`. **Wireless** uses a one-time QR pair; after that, the tablet keeps the encrypted pairing and **Reconnect** is the recovery action. The QR carries the Mac's preferred local address plus IPv4/IPv6 fallbacks, so a home WLAN that filters one address family can still use the other (5 GHz strongly recommended). Wireless sessions use a bounded 60 FPS profile: up to 40 Mbps average, a 60 Mbps one-second peak ceiling, and freshness-aware backpressure between capture, TCP, decoding, and presentation. The auth token is generated locally and stays on your Mac; reset it any time to revoke access. See [the wireless 60 FPS path](docs/wireless-60fps.md) for the implementation contract and validation boundary.
 
 ### Virtual Display
 
@@ -114,7 +114,7 @@ Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a la
 | **OS** | macOS 13 (Ventura)+ | Android 8.0 (API 26)+ |
 | **Hardware** | Apple Silicon or Intel | H.265 hardware decoder |
 | **USB mode** | USB-C port + `adb` (Android SDK platform-tools preferred; Homebrew is a fallback) | USB-C cable + USB Debugging enabled |
-| **Wireless mode** | Same WiFi network as the tablet (5 GHz recommended) | Camera (for QR scan) + Google Play Services (for ML Kit barcode) |
+| **Wireless mode** | Same WiFi network as the tablet (5 GHz recommended) | Camera for first pair/re-pair + Google Play Services (for ML Kit barcode) |
 
 ---
 
@@ -272,7 +272,8 @@ The connection checklist checks tablet-local prerequisites while idle; it does n
 
 - Both devices must be on the same WiFi network (and same subnet — some mesh routers isolate "guest" devices)
 - Click **Start** on the Mac before scanning the QR — the listener only binds when the server is running
-- If Android already has a pairing, tap **Reconnect** first. The repair screen keeps the saved pairing and makes **Scan QR instead** the secondary action; scan a fresh QR only if the Mac pairing token or address changed and reconnect/discovery cannot recover it
+- If Android already has a pairing, tap **Reconnect** first. The repair screen keeps the saved pairing and makes **Pair again (scan QR)** the secondary action; scan a fresh QR only if the Mac pairing token was reset or discovery cannot recover the Mac
+- The QR includes compatible local IPv4/IPv6 addresses, and Bonjour recovery also returns all usable addresses. This preserves normal WiFi/Internet on the tablet; Side Screen does not create a private hotspot
 - If both devices show addresses in the same subnet but Reconnect still times out, test device-to-device TCP reachability; campus or guest WiFi can isolate clients and block both TCP and Bonjour even when the addresses look local. Use a non-isolated SSID or disable client isolation on the access point.
 - macOS may prompt for **Local Network** permission on first wireless toggle — grant it; without it, LAN inbound is silently dropped
 </details>

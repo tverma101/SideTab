@@ -11,7 +11,7 @@ class WirelessRecoveryActionsTest {
         val actions = WirelessRecoveryActions.forState(hasPairing = true, requiresRePair = false)
 
         assertTrue(actions.reconnectVisible)
-        assertEquals(WirelessRecoveryActions.SCAN_QR_INSTEAD_LABEL, actions.rescanLabel)
+        assertEquals("Pair again (scan QR)", actions.rescanLabel)
     }
 
     @Test
