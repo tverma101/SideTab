@@ -1,16 +1,21 @@
+import CoreGraphics
 import CoreVideo
 import Foundation
+import ImageIO
 
-/// In-sender test-pattern injection (fork experiment harness) — RIG VALIDATION
-/// ONLY. The offline harness (probes/offline_enc/) is the primary measurement
-/// path; this exists so the one rig validation run shows known pixels.
+/// In-sender test-pattern injection — RIG VALIDATION ONLY. This exists so a
+/// validation run shows known pixels.
 ///
 /// Enabled by `SideScreen_exp_pattern` = "gradient" | "lowramp" | "stepped" |
 /// "text" | "color". ONE static pattern per sender run (NOT a wall-clock
 /// cycle): SCStream freezes when the display is idle and the keepalive
 /// re-encodes the last frame, so the tablet shows a stable pattern the whole
-/// run. Pattern math MUST stay in lockstep with harness fillY8/renderPatternSource
-/// in probes/offline_enc/main.swift (they produce the reference source PNGs).
+/// run.
+///
+/// This file is the single source of truth for the pattern math. An earlier
+/// revision pointed at a "probes/offline_enc/main.swift" harness that never
+/// existed in any commit on any branch, so nothing could drift out of lockstep
+/// with it — the cross-reference was pure rot and has been removed.
 ///
 /// Format guard: 8-bit full/video-range biplanar buffers (2 planes,
 /// interleaved CbCr) are supported — 10-bit biplanar buffers no-op with a log
@@ -77,7 +82,6 @@ enum PatternInjector {
         guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
               let cbCr = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return }
         let cRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
-        let cw = CVPixelBufferGetWidthOfPlane(buffer, 1)
         let w = min(rgb.width, bw), h = min(rgb.height, bh)
         for y in 0..<h {
             let yp = yBase + y * yRow
@@ -179,7 +183,6 @@ enum PatternInjector {
         // ---- CbCr plane (interleaved, 4:2:0: 1 pair per 2x2 luma) ----
         if kind == "color" {
             let cols = 6, rows = 4
-            let ph = h / rows
             let cpw = cw / cols, cph = cH / rows
             for i in 0..<colorPatches.count {
                 let (_, cb, cr) = ycbcr(
