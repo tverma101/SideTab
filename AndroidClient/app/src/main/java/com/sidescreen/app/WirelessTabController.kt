@@ -89,6 +89,8 @@ class WirelessTabController(
     }
 
     private fun startManualReconnect() {
+        discoveryRecoveryInFlight = false
+        discovery.cancel()
         val entry =
             storage.load() ?: lastAttemptedEntry ?: run {
                 transition(State.FIRST_TIME)
@@ -141,12 +143,14 @@ class WirelessTabController(
     /**
      * Called when the Wireless tab becomes visible. A cached pairing is shown
      * but not connected until the user asks, avoiding surprise connections
-     * merely from switching tabs.
+     * merely from switching tabs. A permanently denied camera only blocks QR
+     * re-pairing; a cached pairing still offers Reconnect.
      */
     fun show() {
         when {
-            cameraPerm.isPermanentlyDenied() -> transition(State.PERM_DENIED)
             state == State.CONNECTING || state == State.CONNECTED -> Unit
+            cameraPerm.isPermanentlyDenied() && (storage.load() ?: lastAttemptedEntry) == null ->
+                transition(State.PERM_DENIED)
             else -> {
                 val entry = storage.load() ?: lastAttemptedEntry
                 if (entry == null) {
@@ -162,8 +166,8 @@ class WirelessTabController(
     fun onScanResult(url: String) {
         val parsed = PairingURL.parse(url)
         if (parsed == null) {
-            views.repairTitle.text = "⚠ Invalid QR code"
-            views.repairMessage.text = "Scan the Side Screen QR shown in the Mac app."
+            views.repairTitle.text = activity.getString(R.string.wireless_qr_invalid_title)
+            views.repairMessage.text = activity.getString(R.string.wireless_qr_invalid_message)
             configureRepairActions(needsRePair = lastAttemptedEntry == null, entry = lastAttemptedEntry)
             transition(State.REPAIR_NEEDED)
             return
@@ -176,6 +180,7 @@ class WirelessTabController(
                 token = parsed.token,
                 macName = parsed.macName,
                 controlPortOverride = parsed.controlPortOverride,
+                alternateHosts = parsed.alternateHosts,
             )
         lastAttemptedEntry = copyEntry(entry)
         try {
@@ -201,6 +206,7 @@ class WirelessTabController(
     fun onUserDisconnected() {
         discoveryRecoveryArmed = true
         discoveryRecoveryInFlight = false
+        discovery.cancel()
         val entry = storage.load() ?: lastAttemptedEntry
         if (entry == null) {
             transition(State.FIRST_TIME)
@@ -222,12 +228,12 @@ class WirelessTabController(
 
             is StreamClient.WirelessConnectError.TokenRejected -> {
                 discoveryRecoveryArmed = false
-                views.repairTitle.text = "⚠ Re-pair required"
+                views.repairTitle.text = activity.getString(R.string.wireless_repair_token_title)
                 views.repairMessage.text =
                     if (cached != null) {
-                        "${cached.macName} reset its pairing token (for example, Reset Token was used or the Mac was reinstalled). Scan the new QR to pair again."
+                        activity.getString(R.string.wireless_repair_token_cached, cached.macName)
                     } else {
-                        "The Mac reset its pairing token. Scan the new QR to pair again."
+                        activity.getString(R.string.wireless_repair_token)
                     }
                 configureRepairActions(needsRePair = true, entry = cached)
                 transition(State.REPAIR_NEEDED)
@@ -235,12 +241,12 @@ class WirelessTabController(
 
             is StreamClient.WirelessConnectError.ProtocolError -> {
                 discoveryRecoveryArmed = false
-                views.repairTitle.text = "⚠ Connection error"
+                views.repairTitle.text = activity.getString(R.string.wireless_repair_protocol_title)
                 views.repairMessage.text =
                     if (cached != null) {
-                        "Couldn't complete the secure handshake with ${cached.macName}. Tap Reconnect to try again, or scan a fresh QR only if the Mac was reset."
+                        activity.getString(R.string.wireless_repair_protocol_cached, cached.macName)
                     } else {
-                        "Couldn't complete the secure handshake with the Mac. Scan the QR to pair."
+                        activity.getString(R.string.wireless_repair_protocol)
                     }
                 configureRepairActions(needsRePair = cached == null, entry = cached)
                 transition(State.REPAIR_NEEDED)
@@ -256,7 +262,10 @@ class WirelessTabController(
         if (!discoveryRecoveryArmed || discoveryRecoveryInFlight) return false
         discoveryRecoveryArmed = false
         discoveryRecoveryInFlight = true
-        showConnecting("Finding ${entry.macName}…", "Checking the local network")
+        showConnecting(
+            activity.getString(R.string.wireless_finding_mac, entry.macName),
+            activity.getString(R.string.wireless_checking_network),
+        )
         discovery.resolve(entry.token) { endpoint ->
             discoveryRecoveryInFlight = false
             if (endpoint == null) {
@@ -277,7 +286,10 @@ class WirelessTabController(
                 android.util.Log.w("WirelessTabController", "Couldn't persist recovered endpoint", e)
             }
             val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
-            showConnecting("Reconnecting to ${updated.macName}", "${updated.host}:${updated.port}")
+            showConnecting(
+                activity.getString(R.string.wireless_reconnecting_mac, updated.macName),
+                activity.getString(R.string.wireless_endpoint, updated.host, updated.port),
+            )
             onConnectRequested(
                 updated.host,
                 updated.port,
@@ -292,16 +304,17 @@ class WirelessTabController(
     }
 
     private fun showNetworkRepair(cached: PairedHostStorage.Entry?) {
-        views.repairTitle.text = "⚠ Couldn't reach Mac"
+        views.repairTitle.text = activity.getString(R.string.wireless_repair_network_title)
         views.repairMessage.text =
             if (cached != null) {
-                "No response from ${cached.macName} at ${cached.host}:${cached.port}.\n\n" +
-                    "SideScreen also searched the local network for the paired Mac but couldn't " +
-                    "resolve a working endpoint. Make sure the Mac app is running on the same WiFi, " +
-                    "then tap Reconnect. Scan QR only if you need to pair again."
+                activity.getString(
+                    R.string.wireless_repair_network_cached,
+                    cached.macName,
+                    cached.host,
+                    cached.port,
+                )
             } else {
-                "No response from your Mac. Make sure both devices are on the same WiFi " +
-                    "and the Mac app is running, then scan the QR to pair."
+                activity.getString(R.string.wireless_repair_network)
             }
         configureRepairActions(needsRePair = cached == null, entry = cached)
         transition(State.REPAIR_NEEDED)
@@ -344,7 +357,7 @@ class WirelessTabController(
 
     private fun showPairedIdle(entry: PairedHostStorage.Entry) {
         views.idleMacName.text = entry.macName
-        views.idleMacIp.text = "${entry.host}:${entry.port}"
+        views.idleMacIp.text = activity.getString(R.string.wireless_endpoint, entry.host, entry.port)
         transition(State.PAIRED_IDLE)
     }
 
@@ -354,16 +367,32 @@ class WirelessTabController(
     fun onCameraPermissionResult(granted: Boolean) {
         if (granted) {
             launchScanner()
-        } else if (cameraPerm.isPermanentlyDenied()) {
+            return
+        }
+        // Keep the current screen when a pairing exists: denial only blocks
+        // scanning, not Reconnect. First-time users get the denial screen.
+        if (cameraPerm.isPermanentlyDenied() &&
+            (storage.load() ?: lastAttemptedEntry) == null
+        ) {
             transition(State.PERM_DENIED)
         }
     }
 
-    fun close() = Unit
+    fun close() {
+        discoveryRecoveryInFlight = false
+        discovery.cancel()
+    }
 
     private fun triggerScan() {
         if (cameraPerm.isPermanentlyDenied()) {
-            transition(State.PERM_DENIED)
+            // Denial blocks only re-pairing. With a cached pairing, repair
+            // (with Reconnect) is more useful than the dead-end denial screen.
+            if ((storage.load() ?: lastAttemptedEntry) == null) {
+                transition(State.PERM_DENIED)
+            } else {
+                transition(State.REPAIR_NEEDED)
+                configureRepairActions(needsRePair = true, entry = storage.load() ?: lastAttemptedEntry)
+            }
             return
         }
         if (!cameraPerm.isGranted()) {

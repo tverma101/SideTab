@@ -9,15 +9,11 @@
 <p><em>Turn your Android tablet into a second display for macOS — USB-C or wireless over WiFi</em></p>
 
 <p>
-  <img src="https://img.shields.io/github/v/release/tranvuongquocdat/SideScreen?style=for-the-badge&label=version&color=blue" alt="Version">
-  <a href="https://github.com/tranvuongquocdat/SideScreen/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/tranvuongquocdat/SideScreen?style=for-the-badge&color=34C759" alt="License">
+  <a href="https://github.com/tverma101/SideScreen/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/tverma101/SideScreen?style=for-the-badge&color=34C759" alt="License">
   </a>
-  <a href="https://github.com/tranvuongquocdat/SideScreen/stargazers">
-    <img src="https://img.shields.io/github/stars/tranvuongquocdat/SideScreen?style=for-the-badge&color=FF9500" alt="Stars">
-  </a>
-  <a href="https://github.com/tranvuongquocdat/SideScreen/releases">
-    <img src="https://img.shields.io/github/downloads/tranvuongquocdat/SideScreen/total?style=for-the-badge&color=8E44AD&label=downloads" alt="Downloads">
+  <a href="https://github.com/tverma101/SideScreen/stargazers">
+    <img src="https://img.shields.io/github/stars/tverma101/SideScreen?style=for-the-badge&color=FF9500" alt="Stars">
   </a>
 </p>
 
@@ -99,7 +95,7 @@ Configure resolution (up to 4K/8K), frame rate (30–120 FPS; 60 FPS is the curr
   <img src="resources/screenshots/android_settings.png" alt="Android — Connection Screen" height="500"/>
 </div>
 
-### Headless / portable Mac (new in 0.11.0)
+### Headless / portable Mac
 
 Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a laptop in clamshell — using the tablet as its only screen. Enable Launch at Login and Auto-start streaming, and the Mac boots straight into serving the tablet, with nothing to press on the Mac.
 
@@ -120,10 +116,20 @@ Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a la
 
 ## Installation
 
-Download the latest release from [**GitHub Releases**](https://github.com/tranvuongquocdat/SideScreen/releases):
+This fork does not currently publish installers on GitHub Releases. Build the
+current source version shown in `VERSION` using the instructions below. The
+macOS build script writes each DMG and its source/checksum manifest under
+`dist/SideScreen-<version>/<build-id>/` so builds from different versions stay
+identifiable. After a successful build, `dist/current/` points to the newest
+build. Use that DMG when installing; the root `SideScreen.app` is build
+staging, while the installer manages the single user-facing copy at
+`~/Applications/SideScreen.app`.
 
-- **macOS**: Download `.dmg`, open it, drag Side Screen to Applications
-- **Android**: Download `.apk`, install on your tablet (enable "Unknown sources" if needed). Port forwarding is handled automatically by the Mac app.
+For Android, the APK built from the current checkout is always
+`AndroidClient/app/build/outputs/apk/debug/app-debug.apk`. Run
+`./scripts/install_android.sh` to rebuild and install that exact output. Files
+under `backups/apk/` are recovery snapshots and should not be selected as
+installers.
 
 > **⚠️ macOS Gatekeeper**
 > If macOS says the app is "damaged", open Terminal and run:
@@ -150,7 +156,7 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 <summary><strong>Build from source (for developers)</strong></summary>
 
 ```bash
-git clone https://github.com/tranvuongquocdat/SideScreen.git
+git clone https://github.com/tverma101/SideScreen.git
 cd SideScreen
 
 # macOS (universal signed app bundle; also removes stale local app snapshots)
@@ -159,8 +165,11 @@ cd SideScreen
 # Optional: install exactly one user-facing copy under ~/Applications
 ./scripts/install_mac.sh --launch
 
-# Android
-(cd AndroidClient && ./gradlew assembleDebug)
+# Android debug APK
+./scripts/build_android.sh
+
+# Put the current Mac DMG and Android APK in one versioned folder
+./scripts/package_current.sh
 
 # Rebuild the current source and install on the connected tablet
 ./scripts/install_android.sh
@@ -171,12 +180,31 @@ cd SideScreen
 ./scripts/backup_android_apks.sh
 ```
 
+The Mac DMG and its `BUILD-MANIFEST.txt` are written to
+`dist/SideScreen-<VERSION>/<build-id>/`; the newest is also reachable at
+`dist/current/SideScreen-<VERSION>-mac-universal.dmg`. Android APKs are
+generated under `AndroidClient/app/build/outputs/apk/`. Use the debug
+`app-debug.apk` there for this local checkout; the installer script rebuilds
+it before installing. The raw build output directories are excluded from Git.
+
+After both platform builds, `./scripts/package_current.sh` verifies the Mac
+signature and architectures, checks the APK metadata, then copies the pair
+into `artifacts/SideScreen-<VERSION>/` with source provenance and SHA-256
+checksums in `MANIFEST.txt`. That folder contains the two installers and
+manifest; it does not include a second loose `.app` bundle.
+
 The backup helper creates a non-overwriting snapshot under
-`backups/apk/<UTC-timestamp>/`. Each snapshot includes the available debug and
+`backups/apk/<UTC-timestamp>/`. These are local recovery files and are not
+tracked in Git. Each snapshot includes the available debug and
 release APK outputs, `installed-base.apk` when a connected ADB device has Side
 Screen installed, and `MANIFEST.txt` with version, signing-certificate, source
 revision, device, and SHA-256 details. Set `SIDESCREEN_ADB_SERIAL` when more
 than one Android device is connected.
+
+If the Mac status says **Authorize tablet**, ADB can see the USB device but
+the tablet has not trusted this Mac yet. Unlock the tablet and accept the USB
+debugging prompt. The USB reverse tunnel and Android connection cannot start
+until ADB reports the tablet as `device` rather than `unauthorized`.
 
 The macOS installer replaces the exact `~/Applications/SideScreen.app` target
 without creating `SideScreen.app.previous.*` copies. Successful macOS builds,
@@ -196,7 +224,18 @@ unrelated applications are never searched or changed.
 3. Open **Side Screen** on tablet → keep on the **USB** tab → tap **Connect**
 4. Done — drag windows to your new display
 
-### Wireless mode (new in 0.8.0 — no cable)
+The Android display stays awake while a stream is active and the app is
+visible. Android can sleep the display when the app is backgrounded; an
+unattended background session disconnects after five minutes by default.
+Leave the USB port field blank to use the defaults. A custom video port must
+be from `1` to `65534`, since Android uses the next port for control traffic.
+
+The Mac pauses screen capture after 15 seconds with no connected tablet and
+resumes it on Connect. When ScreenCaptureKit confirms the desktop has not
+changed, the Mac skips re-encoding that frame; Android's video and control
+pings keep quiet sessions alive without sending duplicate frames.
+
+### Wireless mode (no cable)
 
 1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
 2. Open **Side Screen** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
@@ -210,7 +249,7 @@ USB mode remains the lowest-latency option for drawing or fast-paced gaming. Its
 
 The Mac menu-bar menu includes a compact **Tablet Brightness** slider. It controls the Android panel through the low-latency control channel, remembers the selected level while disconnected, and reapplies it when the tablet reconnects.
 
-### Headless mode (new in 0.11.0 — no Mac interaction)
+### Headless mode (no Mac interaction)
 
 In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
 
@@ -297,8 +336,8 @@ Grant Screen Recording permission: **System Preferences → Privacy & Security �
 Contributions are welcome!
 
 - ⭐ **Star** this repo to help others discover it
-- 🐛 **Report bugs** via [Issues](https://github.com/tranvuongquocdat/SideScreen/issues)
-- 💡 **Suggest features** via [Issues](https://github.com/tranvuongquocdat/SideScreen/issues)
+- 🐛 **Report bugs** via [Issues](https://github.com/tverma101/SideScreen/issues)
+- 💡 **Suggest features** via [Issues](https://github.com/tverma101/SideScreen/issues)
 - 🔧 **Submit PRs** — see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ---
@@ -336,6 +375,6 @@ for the exact permissions and data-flow boundary.
 
 Made with ❤️ by **Tran Vuong Quoc Dat**
 
-[Report Bug](https://github.com/tranvuongquocdat/SideScreen/issues) · [Request Feature](https://github.com/tranvuongquocdat/SideScreen/issues) · [Discussions](https://github.com/tranvuongquocdat/SideScreen/discussions)
+[Report Bug](https://github.com/tverma101/SideScreen/issues) · [Request Feature](https://github.com/tverma101/SideScreen/issues) · [Discussions](https://github.com/tverma101/SideScreen/discussions)
 
 </div>

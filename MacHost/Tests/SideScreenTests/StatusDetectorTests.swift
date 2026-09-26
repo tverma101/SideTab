@@ -24,6 +24,32 @@ final class StatusDetectorTests: XCTestCase {
         XCTAssertEqual(StatusDetector.usbSerials(from: output), ["USB_SERIAL"])
     }
 
+    func testUsbStatusExplainsAuthorizationAndOfflineStates() {
+        XCTAssertEqual(
+            StatusDetector.usbDeviceStatus(from: "R52X30G5TNB unauthorized usb:0-2 model:SM_X800"),
+            .authorizationRequired(serial: "R52X30G5TNB")
+        )
+        XCTAssertEqual(
+            StatusDetector.usbDeviceStatus(from: "R52X30G5TNB offline usb:0-2 model:SM_X800"),
+            .offline(serial: "R52X30G5TNB")
+        )
+        XCTAssertEqual(StatusDetector.usbDeviceStatus(from: "List of devices attached"), .notDetected)
+    }
+
+    func testReadyPhysicalUsbDeviceTakesPriorityOverUnauthorizedDevices() {
+        let output = """
+        List of devices attached
+        unauthorized-device unauthorized usb:0-3
+        R52X30G5TNB device usb:0-2 model:SM_X800
+        192.168.1.130:45809 device model:SM_X800
+        """
+
+        XCTAssertEqual(
+            StatusDetector.usbDeviceStatus(from: output),
+            .connected(serial: "R52X30G5TNB")
+        )
+    }
+
     func testReverseMappingParserMatchesWholePortFields() {
         let output = """
         host-17 tcp:54321 tcp:54321

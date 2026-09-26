@@ -5,6 +5,11 @@ Thumbs.db
 DerivedData/
 *.app
 
+# Local runtime and audit evidence
+agent-evidence/
+docs/codex/
+docs/troubleshooting/
+
 # Android build
 AndroidClient/app/build/
 AndroidClient/.gradle/
@@ -32,10 +37,6 @@ AndroidClient/.idea/
 *.swo
 *~
 
-# OS
-.DS_Store
-Thumbs.db
-
 # Logs
 *.log
 
@@ -49,10 +50,6 @@ dist/
 .env
 .env.local
 *.pem
-
-# Docs (local design docs; explicitly publish the wireless runtime contract)
-docs/*
-!docs/wireless-60fps.md
 
 # Temporary
 tmp/

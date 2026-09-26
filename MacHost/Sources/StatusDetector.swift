@@ -1,5 +1,57 @@
 import Foundation
 
+enum ADBUSBDeviceStatus: Equatable {
+    case notDetected
+    case connected(serial: String?)
+    case authorizationRequired(serial: String)
+    case offline(serial: String)
+
+    var readySerial: String? {
+        guard case let .connected(serial) = self else { return nil }
+        return serial
+    }
+
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
+
+    var needsAction: Bool {
+        switch self {
+        case .authorizationRequired(_), .offline(_):
+            return true
+        case .notDetected, .connected(_):
+            return false
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .notDetected:
+            return "Not detected"
+        case .connected(_):
+            return "Detected"
+        case .authorizationRequired:
+            return "Authorize tablet"
+        case .offline:
+            return "Tablet offline"
+        }
+    }
+
+    var hint: String {
+        switch self {
+        case .notDetected:
+            return "No USB device is visible to ADB. Use a data-capable cable, unlock the tablet, and enable USB debugging."
+        case .connected(_):
+            return "An authorized Android tablet is visible to ADB. Side Screen sets up the USB reverse tunnel automatically."
+        case let .authorizationRequired(serial):
+            return "ADB sees \(serial), but the tablet has not authorized this Mac. Unlock the tablet and tap Allow USB debugging (choose Always allow if offered)."
+        case let .offline(serial):
+            return "ADB sees \(serial) as offline. Reconnect the cable, unlock the tablet, and check for a USB debugging prompt."
+        }
+    }
+}
+
 enum StatusDetector {
     static func adbInstalled() -> Bool {
         return adbExecutablePath() != nil
@@ -19,36 +71,56 @@ enum StatusDetector {
     /// enabled for the same tablet.
     static func usbDevices() -> [String] {
         guard !wirelessModeActive else { return [] }
-        guard let adbPath = adbExecutablePath() else { return [] }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: adbPath)
-        task.arguments = ["devices", "-l"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = pipe
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            return []
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        guard task.terminationStatus == 0 else { return [] }
+        guard let output = adbDevicesOutput() else { return [] }
         return usbSerials(from: output)
+    }
+
+    /// Preserve unauthorized/offline states so the Mac UI can tell the user
+    /// why USB reverse forwarding cannot be configured.
+    static func usbDeviceStatus() -> ADBUSBDeviceStatus {
+        guard !wirelessModeActive else { return .notDetected }
+        guard let output = adbDevicesOutput() else { return .notDetected }
+        return usbDeviceStatus(from: output)
+    }
+
+    static func usbDeviceStatus(from output: String) -> ADBUSBDeviceStatus {
+        let rows = usbRows(from: output)
+        if let ready = rows.first(where: { $0.state == "device" }) {
+            return .connected(serial: ready.serial)
+        }
+        if let unauthorized = rows.first(where: { $0.state == "unauthorized" }) {
+            return .authorizationRequired(serial: unauthorized.serial)
+        }
+        if let offline = rows.first(where: { $0.state == "offline" }) {
+            return .offline(serial: offline.serial)
+        }
+        return .notDetected
+    }
+
+    private static func adbDevicesOutput() -> String? {
+        guard let adbPath = adbExecutablePath() else { return nil }
+        guard let result = ADBCommandRunner.run(adbPath, arguments: ["devices", "-l"]),
+              result.succeeded else { return nil }
+        return result.output
     }
 
     /// Parse `adb devices -l` and keep only ready transports with a `usb:`
     /// descriptor. Wi-Fi ADB serials such as `192.168.1.130:45809` are
     /// intentionally excluded even though their state is also `device`.
     static func usbSerials(from output: String) -> [String] {
+        usbRows(from: output)
+            .filter { $0.state == "device" }
+            .map { $0.serial }
+    }
+
+    private static func usbRows(from output: String) -> [(serial: String, state: String)] {
         output.split(whereSeparator: \.isNewline).compactMap { line in
             let fields = line.split { $0 == " " || $0 == "\t" }
-            guard fields.count >= 3, fields[1] == "device" else { return nil }
-            guard fields.dropFirst(2).contains(where: { $0.hasPrefix("usb:") }) else {
+            guard fields.count >= 3,
+                  fields.dropFirst(2).contains(where: { $0.hasPrefix("usb:") }) else {
                 return nil
             }
-            return String(fields[0])
+            return (serial: String(fields[0]), state: String(fields[1]))
         }
     }
 
@@ -91,21 +163,11 @@ enum StatusDetector {
         cacheLock.unlock()
 
         guard let adbPath = adbExecutablePath() else { return nil }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: adbPath)
-        task.arguments = ["-s", serial, "reverse", "--list"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = pipe
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            return nil
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        guard task.terminationStatus == 0 else { return nil }
+        guard let result = ADBCommandRunner.run(
+            adbPath,
+            arguments: ["-s", serial, "reverse", "--list"]
+        ), result.succeeded else { return nil }
+        let output = result.output
 
         cacheLock.lock()
         cachedReverseList = output
@@ -151,32 +213,132 @@ enum StatusDetector {
             return path
         }
         // Fallback: ask `which adb` (covers PATH-installed setups).
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        task.arguments = ["adb"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !out.isEmpty,
-               FileManager.default.isExecutableFile(atPath: out) {
+        if let result = ADBCommandRunner.run(
+            "/usr/bin/which",
+            arguments: ["adb"],
+            timeout: ADBCommandRunner.shortLookupTimeout
+        ), result.succeeded {
+            let out = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !out.isEmpty, FileManager.default.isExecutableFile(atPath: out) {
                 adbPathCacheLock.lock()
                 cachedAdbPath = out
                 lastAdbCacheCheck = now
                 adbPathCacheLock.unlock()
                 return out
             }
-        } catch {
-            // ignore
         }
         adbPathCacheLock.lock()
         cachedAdbPath = nil
         lastAdbCacheCheck = now
         adbPathCacheLock.unlock()
         return nil
+    }
+}
+
+// MARK: - Subprocess runner
+
+/// Bounded `adb` (and `which`) invocation.
+///
+/// Two traps are avoided here, both of which are reachable with a real adb:
+/// the pipe is drained on a separate queue WHILE the child runs (reading only
+/// after `waitUntilExit()` deadlocks once the child outgrows the 64 KB pipe
+/// buffer), and the wait has a deadline (`waitUntilExit()` has no timeout
+/// variant, and adb can block forever — TCP 5037 squatted by another process
+/// makes `adb devices` print its header and hang, `adb reverse` blocks on a
+/// wedged transport). An adb that never returns used to latch the USB status
+/// refresh and the self-healing reverse repair for the life of the process.
+enum ADBCommandRunner {
+    struct Result {
+        let output: String
+        let exitCode: Int32
+        let timedOut: Bool
+
+        var succeeded: Bool { !timedOut && exitCode == 0 }
+    }
+
+    /// Deadline for a real adb call. Long enough for a cold adb-server start on
+    /// a busy machine, short enough that the 2 s status tick cannot pile up.
+    static let defaultTimeout: TimeInterval = 5
+    /// `which` is a local binary lookup: anything slower than this is a wedged
+    /// filesystem, not a slow PATH walk.
+    static let shortLookupTimeout: TimeInterval = 2
+    /// Grace period between SIGTERM and SIGKILL.
+    private static let killGrace: TimeInterval = 1
+    private static let unreapedExitCode: Int32 = -1
+
+    /// nil when the child could not be spawned at all.
+    static func run(
+        _ executable: String,
+        arguments: [String],
+        timeout: TimeInterval = defaultTimeout
+    ) -> Result? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        let collector = OutputCollector()
+        let drained = DispatchGroup()
+        drained.enter()
+        DispatchQueue.global(qos: .utility).async {
+            collector.store(pipe.fileHandleForReading.readDataToEndOfFile())
+            drained.leave()
+        }
+
+        let exited = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            process.waitUntilExit()
+            exited.signal()
+        }
+
+        var timedOut = false
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            timedOut = true
+            process.terminate()
+            if exited.wait(timeout: .now() + killGrace) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                if exited.wait(timeout: .now() + killGrace) == .timedOut {
+                    // Never reaped. `terminationStatus` raises for a process
+                    // that has not terminated, so it must not be read here.
+                    _ = drained.wait(timeout: .now() + killGrace)
+                    return Result(output: text(collector.value()), exitCode: unreapedExitCode, timedOut: true)
+                }
+            }
+        }
+
+        _ = drained.wait(timeout: .now() + killGrace)
+        return Result(
+            output: text(collector.value()),
+            exitCode: process.terminationStatus,
+            timedOut: timedOut
+        )
+    }
+
+    private static func text(_ data: Data) -> String {
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private final class OutputCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+
+        func store(_ data: Data) {
+            lock.lock()
+            self.data = data
+            lock.unlock()
+        }
+
+        func value() -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return data
+        }
     }
 }

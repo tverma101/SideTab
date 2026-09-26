@@ -7,6 +7,11 @@ import org.junit.Test
 
 class WirelessReconnectPolicyTest {
     @Test
+    fun briefWirelessOutageGetsSeveralRecoveryAttempts() {
+        assertEquals(8, StreamClient.MAX_WIRELESS_RECONNECT_ATTEMPTS)
+    }
+
+    @Test
     fun reconnectBackoffStartsFastAndCapsAtFiveSeconds() {
         val expected = listOf(250L, 500L, 1000L, 2000L, 4000L, 5000L, 5000L, 5000L)
         val actual = (1..expected.size).map { attempt -> StreamClient.reconnectDelayMs(attempt) }

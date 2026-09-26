@@ -7,6 +7,7 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.Locale
 import javax.net.SocketFactory
 
 /**
@@ -46,8 +47,11 @@ class ControlChannel(
     var onBrightnessCommand: ((Int) -> Unit)? = null
 
     private var socket: Socket? = null
+    /** Socket owned by the current connect attempt so disconnect can cancel it. */
+    private var pendingSocket: Socket? = null
     private var output: DataOutputStream? = null
     private var connectionGeneration = 0L
+    private var loopGeneration = 0L
 
     @Volatile
     private var tcpActive = false
@@ -78,6 +82,23 @@ class ControlChannel(
     @Volatile
     private var outstandingPing: OutstandingPing? = null
 
+    @Volatile
+    private var pingsPaused = false
+
+    /** Offset between the host's uptime clock and this device's monotonic clock. */
+    private val clockOffsetEstimator = ClockOffsetEstimator()
+
+    /**
+     * Best known host-to-local clock offset in nanoseconds (host clock minus
+     * System.nanoTime()), or null until a control pong has been answered.
+     */
+    val hostClockOffsetNs: Long?
+        get() = clockOffsetEstimator.offsetNs
+
+    /** Round trip of the sample the offset came from, or -1 before the first. */
+    val hostClockSampleRttMs: Double
+        get() = clockOffsetEstimator.sampleRttMs
+
     private val sendLock = Any()
     private val connectLock = Any()
 
@@ -97,7 +118,9 @@ class ControlChannel(
             synchronized(connectLock) {
                 if (running) return
                 running = true
-                Thread({ connectionLoop() }, "ControlConnection")
+                loopGeneration += 1L
+                val generation = loopGeneration
+                Thread({ connectionLoop(generation) }, "ControlConnection")
                     .apply {
                         isDaemon = true
                         priority = Thread.MAX_PRIORITY
@@ -107,15 +130,16 @@ class ControlChannel(
         thread.start()
     }
 
-    private fun connectionLoop() {
+    private fun connectionLoop(loopToken: Long) {
         var retryDelayMs = INITIAL_RETRY_MS
         try {
-            while (running) {
+            while (isLoopActive(loopToken)) {
                 if (!tcpActive) {
-                    if (tryTcp()) {
+                    if (tryTcp(loopToken)) {
                         retryDelayMs = INITIAL_RETRY_MS
                         continue
                     }
+                    if (!isLoopActive(loopToken)) break
                     if (!sleepInterruptibly(retryDelayMs)) {
                         // A route/socket event is actionable new information;
                         // retry immediately instead of finishing an obsolete
@@ -130,17 +154,26 @@ class ControlChannel(
                 // MainActivity already calls sendPing once per second. This slower
                 // safety poll is only a backstop for a ping whose caller disappears
                 // before the next tick; 4 wakeups/sec bought no useful latency.
-                val probe = outstandingPing
-                if (probe != null && System.nanoTime() - probe.sentAtNs > PONG_TIMEOUT_NS) {
-                    val active = activeTransport()
-                    if (active != null && active.generation == probe.connectionGeneration) {
-                        DiagLog.log("CC", "Control pong timeout — reconnecting")
-                        markTcpInactive(active.socket)
-                    } else if (active == null || active.generation != probe.connectionGeneration) {
-                        outstandingPing = null
+                synchronized(sendLock) {
+                    val probe = outstandingPing
+                    if (probe != null &&
+                        LivenessProbePolicy.isExpired(
+                            sentAtNs = probe.sentAtNs,
+                            nowNs = System.nanoTime(),
+                            timeoutNs = PONG_TIMEOUT_NS,
+                            paused = pingsPaused,
+                        )
+                    ) {
+                        val active = activeTransport()
+                        if (active != null && active.generation == probe.connectionGeneration) {
+                            DiagLog.log("CC", "Control pong timeout — reconnecting")
+                            markTcpInactive(active.socket)
+                        } else if (active == null || active.generation != probe.connectionGeneration) {
+                            outstandingPing = null
+                        }
                     }
                 }
-                sleepInterruptibly(HEALTH_POLL_MS)
+                if (isLoopActive(loopToken)) sleepInterruptibly(HEALTH_POLL_MS)
             }
         } finally {
             synchronized(connectLock) {
@@ -169,18 +202,22 @@ class ControlChannel(
         }
     }
 
+    private fun isLoopActive(loopToken: Long): Boolean =
+        synchronized(connectLock) { running && loopGeneration == loopToken }
+
     /** One bounded connection attempt. Never holds connectLock across I/O. */
-    private fun tryTcp(): Boolean {
-        synchronized(connectLock) {
-            if (!running || tcpActive || socket != null || connecting) return tcpActive
+    private fun tryTcp(loopToken: Long): Boolean {
+        val (targetNetwork, targetHost) = synchronized(connectLock) {
+            if (!running || loopGeneration != loopToken) return false
+            if (tcpActive || socket != null || connecting) return tcpActive
             connecting = true
+            boundNetwork to host
         }
 
-        // Snapshot the Android Network used for this attempt. Android's
+        // Use the Android Network snapshot captured with the host. Android's
         // per-network SocketFactory is the supported route; keep both the
         // process-default and legacy bindSocket forms as OEM fallbacks so the
         // control channel follows the same recovery path as video.
-        val targetNetwork = boundNetwork
         val routes: List<Pair<String, () -> Socket>> = buildList {
             if (targetNetwork != null) {
                 add("WiFi-factory" to { targetNetwork.socketFactory.createSocket() })
@@ -197,15 +234,32 @@ class ControlChannel(
         var lastError: Exception? = null
 
         for ((index, route) in routes.withIndex()) {
-            if (!running) break
+            if (!isLoopActive(loopToken)) return false
             var s: Socket? = null
             try {
                 val candidate = route.second()
                 s = candidate
+                val registered =
+                    synchronized(connectLock) {
+                        if (!running || loopGeneration != loopToken ||
+                            boundNetwork != targetNetwork || host != targetHost || socket != null ||
+                            pendingSocket != null
+                        ) {
+                            if (loopGeneration == loopToken) connecting = false
+                            false
+                        } else {
+                            pendingSocket = candidate
+                            true
+                        }
+                    }
+                if (!registered) {
+                    runCatching { candidate.close() }
+                    return false
+                }
                 DiagLog.log("CC", "Control socket using ${route.first} route")
                 candidate.tcpNoDelay = true
                 candidate.keepAlive = true
-                candidate.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+                candidate.connect(InetSocketAddress(targetHost, port), CONNECT_TIMEOUT_MS)
                 DiagLog.log(
                     "CC",
                     "Control socket connected on ${route.first} " +
@@ -217,13 +271,17 @@ class ControlChannel(
 
                 val installedGeneration =
                     synchronized(connectLock) {
-                        connecting = false
-                        if (!running || this.socket != null || boundNetwork != targetNetwork) {
+                        if (loopGeneration == loopToken) connecting = false
+                        if (!running || loopGeneration != loopToken || this.socket != null ||
+                            boundNetwork != targetNetwork || host != targetHost || pendingSocket !== candidate
+                        ) {
                             if (boundNetwork != targetNetwork) {
                                 DiagLog.log("CC", "Control connect finished on retired Android network — retrying")
                             }
+                            if (pendingSocket === candidate) pendingSocket = null
                             null
                         } else {
+                            pendingSocket = null
                             connectionGeneration += 1
                             this.socket = candidate
                             output = controlOutput
@@ -243,6 +301,7 @@ class ControlChannel(
 
                 DiagLog.log("CC", "Control channel ACTIVE mode=tcp generation=$installedGeneration")
                 declareBrightnessSupport()
+                declareStylusSupport()
                 Thread({ tcpReadLoop(candidate, installedGeneration) }, "ControlTcpThread")
                     .apply {
                         isDaemon = true
@@ -252,7 +311,9 @@ class ControlChannel(
             } catch (e: Exception) {
                 lastError = e
                 synchronized(connectLock) {
-                    if (this.socket === s) {
+                    if (pendingSocket === s) pendingSocket = null
+                    if (loopGeneration == loopToken) connecting = false
+                    if (s != null && this.socket === s) {
                         connectionGeneration += 1
                         this.socket = null
                         output = null
@@ -269,11 +330,12 @@ class ControlChannel(
                     "Control TCP ${route.first} route ${index + 1}/${routes.size} failed: " +
                         "${e.javaClass.simpleName}: ${e.message}",
                 )
+                if (!isLoopActive(loopToken) || boundNetwork != targetNetwork || host != targetHost) return false
             }
         }
 
         synchronized(connectLock) {
-            connecting = false
+            if (loopGeneration == loopToken) connecting = false
         }
         val error = lastError
         if (error != null) {
@@ -295,7 +357,10 @@ class ControlChannel(
         } catch (_: Exception) {
         }
         // Reuse the pong payload buffer for the life of this control socket.
-        val pongBuffer = ByteArray(16)
+        // A control pong is 17 bytes on the wire: [type][clientTs 8][hostSendTs 8].
+        // Reading 16 would strand the last host byte in the stream and the next
+        // type byte read would be garbage.
+        val pongBuffer = ByteArray(CONTROL_PONG_PAYLOAD_BYTES)
         try {
             val input = DataInputStream(BufferedInputStream(s.getInputStream(), 4096))
             while (running && isTransportCurrent(s, generation)) {
@@ -305,6 +370,7 @@ class ControlChannel(
                     5 -> {
                         input.readFully(pongBuffer)
                         val clientTs = readLongLE(pongBuffer, 0)
+                        val hostSendTs = readLongLE(pongBuffer, 8)
                         val probe = outstandingPing
                         if (probe?.connectionGeneration == generation && probe.sentAtNs == clientTs) {
                             outstandingPing = null
@@ -312,13 +378,18 @@ class ControlChannel(
                         val rtt = (arrival - clientTs) / 1_000_000.0
                         val processedAt = System.nanoTime()
                         val appDelay = (processedAt - arrival) / 1_000_000.0
+                        // Host clock read at send time: the only sample of the
+                        // Mac's uptime clock on a path this app controls.
+                        val offsetNs = clockOffsetEstimator.offer(clientTs, hostSendTs, arrival)
                         DiagLog.log(
                             "CC",
                             String.format(
-                                "PONG rtt=%.2fms appDelay=%.3fms transit=%.2fms mode=tcp",
+                                Locale.US,
+                                "PONG rtt=%.2fms appDelay=%.3fms transit=%.2fms mode=tcp hostSkewMs=%s",
                                 rtt,
                                 appDelay,
                                 rtt - appDelay,
+                                if (offsetNs == null) "n/a" else "%.0f".format(offsetNs / 1e6),
                             ),
                         )
                         onLatencyMeasured?.invoke(rtt)
@@ -328,6 +399,13 @@ class ControlChannel(
                         val value = input.readByte().toInt() and 0xFF
                         DiagLog.log("CC", "BRIGHT command value=$value")
                         onBrightnessCommand?.invoke(value)
+                    }
+
+                    StylusProtocol.SERVER_SUPPORTS_STYLUS -> {
+                        // Acknowledgement of the control-channel stylus advert.
+                        // The host need not send it, but an unknown type would
+                        // otherwise retire a healthy control socket.
+                        DiagLog.log("CC", "HOST STYLUS capability acknowledged")
                     }
 
                     else -> {
@@ -355,7 +433,12 @@ class ControlChannel(
         if (previous == newHost) return
         host = newHost
 
-        val activeSocket = synchronized(connectLock) { socket }
+        val activeSocket = synchronized(connectLock) {
+            val pending = pendingSocket
+            pendingSocket = null
+            runCatching { pending?.close() }
+            socket
+        }
         if (activeSocket != null) {
             DiagLog.log("CC", "Video host changed $previous -> $newHost — rebinding control")
             markTcpInactive(activeSocket)
@@ -373,7 +456,12 @@ class ControlChannel(
         if (previous == network) return
         boundNetwork = network
 
-        val activeSocket = synchronized(connectLock) { socket }
+        val activeSocket = synchronized(connectLock) {
+            val pending = pendingSocket
+            pendingSocket = null
+            runCatching { pending?.close() }
+            socket
+        }
         if (activeSocket != null) {
             DiagLog.log("CC", "Android network changed $previous -> $network — rebinding control")
             markTcpInactive(activeSocket)
@@ -440,11 +528,35 @@ class ControlChannel(
         }
     }
 
+    /**
+     * The host learned stylus support from the video socket alone, so every S
+     * Pen event that reached this socket was parsed and then dropped. The
+     * advert is payload-free, so a host that does not know it skips exactly
+     * one byte and the rest of the stream stays aligned.
+     */
+    private fun declareStylusSupport() {
+        val transport = activeTransport() ?: return
+        synchronized(sendLock) {
+            if (!isTransportCurrent(transport)) return
+            try {
+                transport.output.write(STYLUS_CAPABILITY)
+                DiagLog.log("CC", "Declared stylus support")
+            } catch (e: Exception) {
+                DiagLog.log("CC", "Stylus declaration failed: ${e.javaClass.simpleName}: ${e.message}")
+                markTcpInactive(transport.socket)
+            }
+        }
+    }
+
     fun sendPing(): Boolean {
         val transport = activeTransport() ?: return false
         val now = System.nanoTime()
         synchronized(sendLock) {
             if (!isTransportCurrent(transport)) return false
+            // Backgrounding intentionally suspends probe timeouts. Treat the
+            // skipped probe as handled so callers do not fall back to the
+            // in-band video socket while the Activity is stopped.
+            if (pingsPaused) return true
 
             // Never stack RTT probes. On a congested control socket an older
             // ping is the liveness measurement that matters; adding more only
@@ -471,6 +583,14 @@ class ControlChannel(
                 markTcpInactive(transport.socket)
                 false
             }
+        }
+    }
+
+    /** Suspend background probes without closing a healthy control socket. */
+    fun setPingsPaused(paused: Boolean) {
+        synchronized(sendLock) {
+            pingsPaused = paused
+            if (paused) outstandingPing = null
         }
     }
 
@@ -581,6 +701,7 @@ class ControlChannel(
         val thread =
             synchronized(connectLock) {
                 running = false
+                loopGeneration += 1L
                 connecting = false
                 connectionGeneration += 1
                 tcpActive = false
@@ -588,6 +709,9 @@ class ControlChannel(
                 outstandingPing = null
                 val activeSocket = socket
                 socket = null
+                val pending = pendingSocket
+                pendingSocket = null
+                runCatching { pending?.close() }
                 try {
                     activeSocket?.close()
                 } catch (_: Exception) {
@@ -642,6 +766,10 @@ class ControlChannel(
         const val MESSAGE_PING = 4
         const val MESSAGE_KEYFRAME_REQUEST = 7
         val BRIGHTNESS_CAPABILITY = byteArrayOf(3)
+        val STYLUS_CAPABILITY = byteArrayOf(StylusProtocol.CLIENT_SUPPORTS_STYLUS.toByte())
+
+        /** Pong payload after the type byte: [clientTs 8][hostSendTs 8]. */
+        const val CONTROL_PONG_PAYLOAD_BYTES = 16
 
         const val CONNECT_TIMEOUT_MS = 2_000
         const val INITIAL_RETRY_MS = 250L

@@ -20,14 +20,16 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 
 class QRScannerActivity : AppCompatActivity() {
-    private val scanner by lazy {
+    private val scannerDelegate = lazy {
         BarcodeScanning.getClient(
             BarcodeScannerOptions.Builder()
                 .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
                 .build(),
         )
     }
+    private val scanner by scannerDelegate
     private var alreadyDelivered = false
+    private var lastRejectedQr: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -40,6 +42,7 @@ class QRScannerActivity : AppCompatActivity() {
         val previewView = findViewById<PreviewView>(R.id.preview)
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
+            if (isFinishing || isDestroyed) return@addListener
             try {
                 val provider = providerFuture.get()
                 val preview =
@@ -61,22 +64,31 @@ class QRScannerActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @ExperimentalGetImage
+    @androidx.annotation.OptIn(ExperimentalGetImage::class)
     private fun analyze(proxy: ImageProxy) {
         val mediaImage = proxy.image
         if (mediaImage == null || alreadyDelivered) {
             proxy.close()
             return
         }
-        val input = InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees)
-        scanner.process(input)
+        val scanTask = try {
+            scanner.process(InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees))
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not start ML Kit scan", e)
+            proxy.close()
+            return
+        }
+        scanTask
             .addOnSuccessListener { barcodes ->
                 val raw = barcodes.firstOrNull { it.rawValue?.startsWith("sidescreen://") == true }?.rawValue
                 if (raw != null && !alreadyDelivered) {
                     alreadyDelivered = true
                     val parsed = PairingURL.parse(raw)
                     if (parsed == null) {
-                        Toast.makeText(this, "Invalid QR, expected SideScreen pairing code", Toast.LENGTH_SHORT).show()
+                        if (lastRejectedQr != raw) {
+                            lastRejectedQr = raw
+                            Toast.makeText(this, "Invalid QR, expected SideScreen pairing code", Toast.LENGTH_SHORT).show()
+                        }
                         alreadyDelivered = false
                     } else {
                         setResult(RESULT_OK, Intent().putExtra(EXTRA_URL, raw))
@@ -88,6 +100,14 @@ class QRScannerActivity : AppCompatActivity() {
                 Log.e(TAG, "ML Kit scan error", e)
             }
             .addOnCompleteListener { proxy.close() }
+    }
+
+    override fun onDestroy() {
+        if (scannerDelegate.isInitialized()) {
+            runCatching { scanner.close() }
+                .onFailure { Log.w(TAG, "ML Kit scanner close failed", it) }
+        }
+        super.onDestroy()
     }
 
     private fun finishCanceled() {
