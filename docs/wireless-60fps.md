@@ -34,11 +34,12 @@ the user's persisted USB settings.
 - The Android decoder targets 60 Hz and drops decoded wireless output older than
   two 60 Hz intervals (33.33 ms), while releasing the codec buffer normally.
   This bounds visible staleness without breaking the H.265 reference chain.
-- For wireless, the Android activity keeps the panel awake only while connected,
-  does not hold a partial CPU wake lock, and advertises the source cadence to
-  SurfaceFlinger. A device with a seamless 60-Hz mode may therefore avoid
-  running a 120-Hz panel for wireless video; devices without that mode keep
-  their existing mode. USB keeps its legacy display/wake-lock behavior.
+- The Android activity keeps the panel awake only while a stream is active and
+  the app is visible. It does not hold a partial CPU wake lock; Android may turn
+  the display off when the app leaves the foreground. Wireless also advertises
+  the source cadence to SurfaceFlinger. A device with a seamless 60-Hz mode may
+  therefore avoid running a 120-Hz panel for wireless video; devices without
+  that mode keep their existing mode.
 
 ## Efficiency decisions
 

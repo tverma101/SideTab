@@ -16,8 +16,15 @@ final class AsyncDebugLogger {
 
     private let lock = NSLock()
     private let writerQueue = DispatchQueue(label: "com.sidescreen.debuglog", qos: .utility)
-    private let url = URL(fileURLWithPath: "/tmp/sidescreen.log")
+    private let directoryURL: URL = {
+        let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library", isDirectory: true)
+        return library.appendingPathComponent("Logs/SideScreen", isDirectory: true)
+    }()
+    private var logURL: URL { directoryURL.appendingPathComponent("sidescreen.log") }
     private let maxPendingEntries = 1_024
+    private static let maxLogBytes = 4 * 1024 * 1024
+    private static let archivedGenerations = 2
 
     private var pending: [Entry] = []
     private var drainScheduled = false
@@ -82,13 +89,45 @@ final class AsyncDebugLogger {
     private func ensureFileHandle() -> FileHandle? {
         if let fileHandle { return fileHandle }
 
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
+        let fileManager = FileManager.default
+        try? fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        if let size = currentLogSize(), size >= Self.maxLogBytes {
+            rotate()
         }
-        guard let handle = try? FileHandle(forWritingTo: url) else { return nil }
-        handle.seekToEndOfFile()
+        // O_NOFOLLOW without O_EXCL: an existing log is reopened and appended
+        // to, but a symlink planted at the path is refused instead of
+        // redirecting every diagnostic line (and every byte the app can write)
+        // to a file the user chose. Mode 0600 keeps the log to its owner.
+        let descriptor = logURL.path.withCString { path in
+            open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o600)
+        }
+        guard descriptor >= 0 else { return nil }
+        // O_APPEND already positions every write at the end.
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         fileHandle = handle
         return handle
+    }
+
+    private func currentLogSize() -> Int? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path) else { return nil }
+        return (attrs[.size] as? NSNumber)?.intValue
+    }
+
+    /// Keep `sidescreen.log` plus `archivedGenerations` rotated archives, so a
+    /// login session's diagnostics can never grow without bound.
+    private func rotate() {
+        let fileManager = FileManager.default
+        let oldest = logURL.appendingPathExtension("\(Self.archivedGenerations)")
+        try? fileManager.removeItem(at: oldest)
+        for generation in stride(from: Self.archivedGenerations - 1, through: 1, by: -1) {
+            let source = logURL.appendingPathExtension("\(generation)")
+            guard fileManager.fileExists(atPath: source.path) else { continue }
+            try? fileManager.moveItem(
+                at: source,
+                to: logURL.appendingPathExtension("\(generation + 1)")
+            )
+        }
+        try? fileManager.moveItem(at: logURL, to: logURL.appendingPathExtension("1"))
     }
 
     private static let timestampFormatter: DateFormatter = {

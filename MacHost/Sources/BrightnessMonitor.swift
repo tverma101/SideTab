@@ -23,6 +23,7 @@ import Foundation
 ///
 /// Gate: `defaults write com.sidescreen.app SideScreen_exp_brightness -bool true`
 /// Default off — production behavior unchanged when unset.
+@MainActor
 final class BrightnessMonitor {
     var onBrightness: ((UInt8) -> Void)?
 
@@ -34,6 +35,7 @@ final class BrightnessMonitor {
     private var lastValue: Double?
     private var lastSentAt: TimeInterval = 0
     private var timer: Timer?
+    private var pendingDebounce: DispatchWorkItem?
     private let displayNames: [String]
 
     init(
@@ -48,19 +50,29 @@ final class BrightnessMonitor {
         self.displayNames = displayNames
     }
 
+    /// The timer is added to the main run loop, and RunLoop is documented as
+    /// not thread-safe — adding a timer to another thread's run loop can crash.
+    /// Being on the main actor also wakes the loop, so the 3 Hz poll is not
+    /// delayed by a main-loop idle period.
     func start() {
         guard timer == nil else { return }
         let t = Timer(timeInterval: pollS, repeats: true) { [weak self] _ in
-            self?.tick()
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
         debugLog("BrightnessMonitor: watching \(prefsPath) (poll \(pollS)s)")
     }
 
+    /// Also cancels a pending debounced send: without this a slider drag
+    /// coalesced just before stop() pushes its value through a stopped server.
     func stop() {
         timer?.invalidate()
         timer = nil
+        pendingDebounce?.cancel()
+        pendingDebounce = nil
     }
 
     private func tick() {
@@ -100,11 +112,20 @@ final class BrightnessMonitor {
                 send(v, display: did)
             } else {
                 // Coalesce slider drags: send the latest on the next tick.
-                DispatchQueue.main.asyncAfter(deadline: .now() + (debounceS - (now - lastSentAt))) { [weak self] in
-                    guard let self else { return }
-                    self.lastSentAt = ProcessInfo.processInfo.systemUptime
-                    self.send(v, display: did)
+                pendingDebounce?.cancel()
+                let work = DispatchWorkItem { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.pendingDebounce = nil
+                        self.lastSentAt = ProcessInfo.processInfo.systemUptime
+                        self.send(v, display: did)
+                    }
                 }
+                pendingDebounce = work
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + (debounceS - (now - lastSentAt)),
+                    execute: work
+                )
             }
         } else if value == nil && lastValue != nil {
             debugLog("BrightnessMonitor: value key vanished (pruned by BetterDisplay) — re-arming")

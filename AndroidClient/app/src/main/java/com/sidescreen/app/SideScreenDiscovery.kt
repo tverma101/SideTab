@@ -32,6 +32,19 @@ class SideScreenDiscovery(context: Context) {
     private val wifiManager = context.applicationContext.getSystemService(WifiManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val callbackExecutor = java.util.concurrent.Executor { command -> mainHandler.post(command) }
+    private var cancelActive: (() -> Unit)? = null
+    @Volatile private var generation = 0L
+
+    /**
+     * Invalidate and tear down any in-flight resolve. Cancellation suppresses
+     * its callback so an old lookup cannot reconnect after a newer user action.
+     */
+    fun cancel() {
+        generation += 1
+        val cancellation = cancelActive
+        cancelActive = null
+        cancellation?.invoke()
+    }
 
     fun resolve(
         token: ByteArray,
@@ -39,6 +52,8 @@ class SideScreenDiscovery(context: Context) {
         network: Network? = null,
         callback: (Endpoint?) -> Unit,
     ) {
+        cancel()
+        val requestGeneration = generation
         if (token.size != 32) {
             callback(null)
             return
@@ -67,7 +82,14 @@ class SideScreenDiscovery(context: Context) {
                 } catch (_: Exception) {
                 }
             }
-            mainHandler.post { callback(endpoint) }
+            if (requestGeneration == generation) {
+                cancelActive = null
+                mainHandler.post {
+                    // A newer request can begin after finish schedules the
+                    // callback but before the main queue delivers it.
+                    if (requestGeneration == generation) callback(endpoint)
+                }
+            }
         }
 
         val resolveListener =
@@ -94,11 +116,19 @@ class SideScreenDiscovery(context: Context) {
             object : NsdManager.DiscoveryListener {
                 override fun onDiscoveryStarted(serviceType: String) {
                     discoveryStarted = true
+                    if (finished.get() || requestGeneration != generation) {
+                        try {
+                            manager.stopServiceDiscovery(this)
+                        } catch (_: Exception) {
+                        }
+                        return
+                    }
                     Log.i(TAG, "NSD discovery started for $expectedName")
                 }
 
                 override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                    if (finished.get() || serviceInfo.serviceName != expectedName) return
+                    if (finished.get() || requestGeneration != generation) return
+                    if (serviceInfo.serviceName != expectedName) return
                     if (!resolving.compareAndSet(false, true)) return
                     Log.i(TAG, "NSD matched ${serviceInfo.serviceName}; resolving")
                     try {
@@ -130,6 +160,7 @@ class SideScreenDiscovery(context: Context) {
 
         timeout = Runnable { finish(null) }
         mainHandler.postDelayed(timeout, timeoutMs.coerceIn(500L, 10_000L))
+        cancelActive = { finish(null) }
         try {
             val wifiNetwork = network ?: activeWifiNetwork()
             if (wifiNetwork != null) {

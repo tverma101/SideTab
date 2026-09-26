@@ -1,4 +1,106 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <string name="app_name">Side Screen</string>
+
+    <string name="metric_latency_ms">%1$.1f ms</string>
+    <string name="metric_fps_value">%1$.1f</string>
+    <string name="metric_bitrate_mbps">%1$.1f Mbps</string>
+    <string name="stream_resolution">%1$dx%2$d</string>
+    <string name="connecting_status">Connecting…</string>
+    <string name="usb_host_invalid">Enter a valid host name or IP address.</string>
+    <string name="usb_port_invalid">Enter a video port number from 1 to 65534.</string>
+    <string name="vsr_cfl_fallback">cfl fallback</string>
+    <string name="vsr_fallback">fallback</string>
+    <string name="vsr_not_available">n/a</string>
+    <string name="settings_button_description">Settings</string>
+
+    <string name="wireless_qr_invalid_title">⚠ Invalid QR code</string>
+    <string name="wireless_qr_invalid_message">Scan the Side Screen QR shown in the Mac app.</string>
+    <string name="wireless_repair_token_title">⚠ Re-pair required</string>
+    <string name="wireless_repair_token_cached">%1$s reset its pairing token (for example, Reset Token was used or the Mac was reinstalled). Scan the new QR to pair again.</string>
+    <string name="wireless_repair_token">The Mac reset its pairing token. Scan the new QR to pair again.</string>
+    <string name="wireless_repair_protocol_title">⚠ Connection error</string>
+    <string name="wireless_repair_protocol_cached">Could not complete the secure handshake with %1$s. Tap Reconnect to try again, or scan a fresh QR only if the Mac was reset.</string>
+    <string name="wireless_repair_protocol">Could not complete the secure handshake with the Mac. Scan the QR to pair.</string>
+    <string name="wireless_repair_network_title">⚠ Could not reach Mac</string>
+    <string name="wireless_repair_network_cached">No response from %1$s at %2$s:%3$d.\n\nSideScreen also searched the local network for the paired Mac but could not resolve a working endpoint. Make sure the Mac app is running on the same WiFi, then tap Reconnect. Scan QR only if you need to pair again.</string>
+    <string name="wireless_repair_network">No response from your Mac. Make sure both devices are on the same WiFi and the Mac app is running, then scan the QR to pair.</string>
+    <string name="wireless_finding_mac">Finding %1$s…</string>
+    <string name="wireless_checking_network">Checking the local network</string>
+    <string name="wireless_reconnecting_mac">Reconnecting to %1$s</string>
+    <string name="wireless_endpoint">%1$s:%2$d</string>
+
+    <string name="ui_0_031">0.031</string>
+    <string name="ui_0_80">0.80</string>
+    <string name="ui_127_0_0_1">127.0.0.1</string>
+    <string name="ui_54321">54321</string>
+    <string name="ui_80" formatted="false">80%</string>
+    <string name="ui_advanced_settings">Advanced Settings</string>
+    <string name="ui_aim_camera_at_the_qr_on_your_mac">Aim camera at the QR on your Mac</string>
+    <string name="ui_arrow_down">↓</string>
+    <string name="ui_arrow_left">←</string>
+    <string name="ui_arrow_northeast">↗</string>
+    <string name="ui_arrow_northwest">↖</string>
+    <string name="ui_arrow_right">→</string>
+    <string name="ui_arrow_southeast">↘</string>
+    <string name="ui_arrow_southwest">↙</string>
+    <string name="ui_arrow_up">↑</string>
+    <string name="ui_bitrate">BITRATE</string>
+    <string name="ui_bridge">Bridge</string>
+    <string name="ui_camera_permission_required_to_scan_qr">Camera permission required to scan QR</string>
+    <string name="ui_cancel">Cancel</string>
+    <string name="ui_cas">CAS</string>
+    <string name="ui_connect">Connect</string>
+    <string name="ui_connected">● Connected</string>
+    <string name="ui_connecting">Connecting…</string>
+    <string name="ui_connection_checklist">Connection Checklist</string>
+    <string name="ui_could_not_connect">⚠ Could not connect</string>
+    <string name="ui_dash_placeholder">--</string>
+    <string name="ui_developer_mode_enabled">Developer Mode enabled</string>
+    <string name="ui_disconnect">Disconnect</string>
+    <string name="ui_disconnected">○ Disconnected</string>
+    <string name="ui_display_settings">Display Settings</string>
+    <string name="ui_done">DONE</string>
+    <string name="ui_edge_threshold_sgsr1" tools:ignore="Typos">Edge Threshold (SGSR1)</string>
+    <string name="ui_em_dash">—</string>
+    <string name="ui_forget_this_mac">Forget this Mac</string>
+    <string name="ui_fps">FPS</string>
+    <string name="ui_fps_bitrate_resolution">FPS, bitrate, resolution</string>
+    <string name="ui_gpu_postprocess_sgsr1_cas" tools:ignore="Typos">GPU postprocess (SGSR1 / CAS)</string>
+    <string name="ui_hide_settings_icon">Hide Settings Icon</string>
+    <string name="ui_host">Host</string>
+    <string name="ui_mac">Mac</string>
+    <string name="ui_mac_server_running">Mac server running</string>
+    <string name="ui_mac_server_not_checked">Mac server not checked</string>
+    <string name="ui_mac_server_not_responding">Mac server not responding</string>
+    <string name="ui_not_ready_to_connect">Check the connection checklist</string>
+    <string name="ui_mode">Mode</string>
+    <string name="ui_off">off</string>
+    <string name="ui_open_settings">Open Settings</string>
+    <string name="ui_open_side_screen_on_your_mac_switch_to_the_wireless_tab_scan_the_qr_shown">Open Side Screen on your Mac → switch to the Wireless tab → scan the QR shown</string>
+    <string name="ui_overlay_opacity">Overlay Opacity</string>
+    <string name="ui_pair_with_your_mac">Pair with your Mac</string>
+    <string name="ui_port">Port</string>
+    <string name="ui_proc">PROC</string>
+    <string name="ui_ready_to_connect">Ready to connect</string>
+    <string name="ui_tap_connect_to_check_server">Tap Connect to check the Mac server</string>
+    <string name="ui_reconnect">Reconnect</string>
+    <string name="ui_reset_button">Reset Button</string>
+    <string name="ui_reset_overlay">Reset Overlay</string>
+    <string name="ui_resolution">RESOLUTION</string>
+    <string name="ui_rtt">RTT</string>
+    <string name="ui_scan_a_fresh_qr_from_your_mac_to_re_pair">Scan a fresh QR from your Mac to re-pair.</string>
+    <string name="ui_scan_qr_code">Scan QR Code</string>
+    <string name="ui_settings_button_position">Settings Button Position</string>
+    <string name="ui_sgsr1" tools:ignore="Typos">SGSR1</string>
+    <string name="ui_sharpness_cas">Sharpness (CAS)</string>
+    <string name="ui_show_stats">Show Stats</string>
+    <string name="ui_turn_your_tablet_into_a_second_display">Turn your tablet into a second display</string>
+    <string name="ui_usb">USB</string>
+    <string name="ui_usb_cable_connected">USB cable connected</string>
+    <string name="ui_usb_debugging_enabled">USB Debugging enabled</string>
+    <string name="ui_use_the_back_gesture_to_reveal_it_while_streaming">Use the back gesture to reveal it while streaming</string>
+    <string name="ui_video_super_resolution">Video Super Resolution</string>
+    <string name="ui_wireless">Wireless</string>
+    <string name="ui_you_blocked_the_permission_open_settings_apps_side_screen_permissions_to_allow">You blocked the permission. Open Settings → Apps → Side Screen → Permissions to allow.</string>
 </resources>

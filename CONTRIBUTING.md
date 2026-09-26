@@ -59,7 +59,7 @@ The simplest way to help - star the repo to help others discover it!
 ### Prerequisites
 
 **macOS Development:**
-- macOS 14 (Sonoma) or later
+- macOS 13 (Ventura) or later
 - Xcode 15+ or Swift toolchain
 - Swift 5.9+
 
@@ -72,7 +72,7 @@ The simplest way to help - star the repo to help others discover it!
 
 ```bash
 # Clone the repository
-git clone https://github.com/tranvuongquocdat/SideScreen.git
+git clone https://github.com/tverma101/SideScreen.git
 cd SideScreen
 
 # Build macOS app

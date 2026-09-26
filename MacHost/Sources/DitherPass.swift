@@ -11,10 +11,15 @@ import CoreVideo
 /// integrates as smooth.
 ///
 /// Amplitude gating (the "engineered, not vibecoded" part):
-///   A(x,y) = min(ampMax, localRange * k)   — localRange over an 8px window
+///   A(x,y) = min(ampMax, (localRange/8) * k) — localRange is the 8px-window
+///   difference in 8-bit LSB, so (localRange/8) is the local SLOPE in LSB/px.
 ///   - flat areas (range 0)  -> NO noise (grain-free surfaces)
-///   - ramps (range ~0.7/8px)-> up to ampMax LSB
-///   - edges (range large)   -> capped at ampMax (invisible on high contrast)
+///   - 1-LSB ramps           -> sub-LSB amplitude
+///   - steep edges           -> capped at ampMax (invisible on high contrast)
+/// The amplitude is measured against an UNMUTATED copy of the source rows:
+/// measuring against the plane being written re-reads the noise this pass just
+/// injected, so a flat region manufactures its own local contrast and fills in
+/// with a visible value set — a direct violation of the contract above.
 /// Static pattern -> no temporal shimmer. Offline-validated by the D-series
 /// harness experiments (plateau collapse 17.8->2.8/1.5 post-Q98).
 ///
@@ -32,25 +37,38 @@ enum DitherPass {
         42, 26, 38, 22, 41, 25, 37, 21,
     ]
 
+    /// Window of the local-gradient estimate, in pixels. Also the divisor that
+    /// turns an 8px LSB difference into a slope in LSB/px.
+    private static let windowPx = 8
+
+    /// Pristine source rows kept in a ring so the vertical half of the gradient
+    /// never sees already-dithered pixels. Must be a power of two.
+    private static let sourceRingRows = 8
+
     static var enabled: Bool {
         UserDefaults.standard.integer(forKey: "SideScreen_exp_dither") > 0
     }
 
+    /// Amplitude cap in 8-bit LSB units, bounded by the container so the
+    /// fixed-point noise multiply below cannot overflow.
     static var ampMax: Int {
-        max(1, UserDefaults.standard.integer(forKey: "SideScreen_exp_dither"))
+        min(255, max(1, UserDefaults.standard.integer(forKey: "SideScreen_exp_dither")))
     }
 
-    /// 8px-window range -> amplitude scale (fixed point, 1/16 LSB units).
-    /// k = 5.5 maps a 256-step ramp's 8px range (~0.73) to ampMax.
+    /// Slope gain, fixed point in 1/16 LSB units per LSB/px. Bounded so a typo
+    /// in the knob cannot overflow the multiply.
     static var kQ16: Int {
         let k = UserDefaults.standard.double(forKey: "SideScreen_exp_ditherK")
-        return Int((k > 0 ? k : 5.5) * 16)
+        return min(4096, max(1, Int((k > 0 ? k : 5.5) * 16)))
     }
 
     /// Per-frame CPU budget (µs). Photo/video frames are the worst case for
     /// the per-pixel pass but banding is invisible there (noise-masked), so
-    /// partial coverage is free perceptually. The stop point is row-
-    /// deterministic -> consistent per frame -> no temporal shimmer.
+    /// partial coverage is free perceptually. The stop row depends on content
+    /// AND machine load, so the dithered band's lower edge can move between
+    /// frames — a moving horizontal seam. Inside the dithered region the pattern
+    /// is static, so there is no temporal shimmer; the moving edge is why this
+    /// pass stays experiment-only.
     static var budgetUs: Int {
         let b = UserDefaults.standard.integer(forKey: "SideScreen_exp_ditherBudget")
         return b > 0 ? b : 4000
@@ -77,13 +95,16 @@ enum DitherPass {
         let b = bayer
         let budgetNs = Int64(budgetUs) * 1000
         let t0 = Int64(DispatchTime.now().uptimeNanoseconds)
+        // Row padding is never read (x < w) and never snapshotted.
+        var sourceRing = [UInt8](repeating: 0, count: sourceRingRows * w)
+        var ampRow = [Int](repeating: 0, count: w)
 
         for y in 0..<h {
             if y & 31 == 0 && DispatchTime.now().uptimeNanoseconds - UInt64(t0) > UInt64(budgetNs) {
                 break  // time-boxed: photo frames degrade gracefully, no drops
             }
             let row = y * rowBytes
-            let y8 = max(0, y - 8) * rowBytes
+            let y8 = max(0, y - windowPx) * rowBytes
             let byRow = (y & 7) * 8
             // Row pre-check: sample both axes at 8 columns. All-zero => flat
             // row (the common UI case) -> skip in ~µs. A miss only means the
@@ -91,25 +112,38 @@ enum DitherPass {
             var rowFlat = true
             for s in 0..<8 {
                 let sx = (s * 2 + 1) * w / 16
-                if Int(p[row + sx]) - Int(p[row + max(0, sx - 8)]) != 0
+                if Int(p[row + sx]) - Int(p[row + max(0, sx - windowPx)]) != 0
                     || Int(p[row + sx]) - Int(p[y8 + sx]) != 0 {
                     rowFlat = false
                     break
                 }
             }
             if rowFlat { continue }
-            var x = 0
-            while x < w {
+
+            // Pass 1 — amplitudes, from the source only. Slot `y & 7` still
+            // holds row y-8's pristine samples, because rows are snapshotted
+            // after they are measured and before they are written.
+            let ringBase = (y & (sourceRingRows - 1)) * w
+            for x in 0..<w {
                 let v = Int(p[row + x])
-                let vx = Int(p[row + max(0, x - 8)])
-                let vy = Int(p[y8 + x])
-                var range = abs(v - vx)
-                let d = abs(v - vy)
-                if d > range { range = d }
-                // Flat fast path — most pixels of a structured row are flat.
-                if range == 0 { x += 1; continue }
-                var ampQ = range * kQ
-                if ampQ > ampMaxQ { ampQ = ampMaxQ }
+                let vx = Int(p[row + max(0, x - windowPx)])
+                let vy = y >= windowPx ? Int(sourceRing[ringBase + x]) : v
+                let dx = abs(v - vx)
+                let dy = abs(v - vy)
+                let range = dx > dy ? dx : dy
+                let ampQ = min((range * kQ) / windowPx, ampMaxQ)
+                ampRow[x] = ampQ
+            }
+            for x in 0..<w {
+                sourceRing[ringBase + x] = p[row + x]
+            }
+
+            // Pass 2 — apply. Each pixel is still pristine when it is read, and
+            // the amplitude depends on nothing this pass writes.
+            for x in 0..<w {
+                let ampQ = ampRow[x]
+                if ampQ == 0 { continue }  // flat: no noise
+                let v = Int(p[row + x])
                 // noise = amp * (bayer/31.5 - 1)  in 1/16-LSB fixed point:
                 //   nQ = ampQ * (b*2 - 63);  noise_LSB = nQ / (16 * 63)
                 //   exact divisor 1008; approximated by *65>>16 (0.02% error)
@@ -117,7 +151,6 @@ enum DitherPass {
                 var nv = v + ((nQ * 65 + 32768) >> 16)  // round-to-nearest
                 if nv < 0 { nv = 0 } else if nv > 255 { nv = 255 }
                 p[row + x] = UInt8(nv)
-                x += 1
             }
         }
         return true

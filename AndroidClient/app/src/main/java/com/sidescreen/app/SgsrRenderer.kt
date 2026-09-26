@@ -77,7 +77,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     }
 
     /** Invoked from the render thread every STAT_WINDOW frames. */
-    var onStats: ((Stats) -> Unit)? = null
+    @Volatile var onStats: ((Stats) -> Unit)? = null
 
     // --- Pass 1 shaders (OES -> 2D), identical to the Moonlight donor ---
     private val BLIT_VERTEX_SHADER =
@@ -200,7 +200,7 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     private val frameLock = Object()
     @Volatile private var frameAvailable = false
     @Volatile private var forceRender = false
-    private var renderThread: Thread? = null
+    @Volatile private var renderThread: Thread? = null
 
     // Post program params (applied on the render thread via dirty flags)
     @Volatile private var mode = Mode.SGSR1
@@ -252,6 +252,23 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
      */
     @Throws(IllegalStateException::class)
     fun initialize(
+        targetSurface: Surface,
+        streamW: Int,
+        streamH: Int,
+    ) {
+        if (streamW <= 0 || streamH <= 0) {
+            throw IllegalStateException("SgsrRenderer: invalid stream size ${streamW}x${streamH}")
+        }
+        try {
+            initializeGl(targetSurface, streamW, streamH)
+        } catch (failure: Throwable) {
+            running = false
+            teardownGl()
+            throw failure
+        }
+    }
+
+    private fun initializeGl(
         targetSurface: Surface,
         streamW: Int,
         streamH: Int,
@@ -418,10 +435,6 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     fun resizeStream(
         w: Int,
         h: Int,
-        cropL: Int,
-        cropR: Int,
-        cropT: Int,
-        cropB: Int,
     ) {
         if (w <= 0 || h <= 0) return
         pendingStreamW = w
@@ -433,8 +446,17 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     fun release() {
         running = false
         synchronized(frameLock) { frameLock.notifyAll() }
-        renderThread?.join(1500)
-        renderThread = null
+        val thread = renderThread
+        try {
+            if (thread != null && thread !== Thread.currentThread()) thread.join(150)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        if (thread == null) teardownGl()
+        if (thread != null && !thread.isAlive && renderThread === thread) renderThread = null
+        if (thread?.isAlive == true) {
+            DiagLog.log("SGSR", "render thread is still stopping; EGL cleanup remains on that thread")
+        }
         onStats = null
     }
 
@@ -457,49 +479,57 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     // ===================== RENDER THREAD =====================
 
     private fun renderLoop() {
-        val st = surfaceTexture ?: return teardownGl()
-        if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
-            DiagLog.log("SGSR", "render thread eglMakeCurrent failed: ${EGL14.eglGetError()}")
-            return teardownGl()
-        }
-        while (running) {
-            synchronized(frameLock) {
-                while (!frameAvailable && !forceRender && running) {
-                    try {
-                        frameLock.wait(100)
-                    } catch (e: InterruptedException) {
-                        return teardownGl()
-                    }
-                }
-                forceRender = false
+        try {
+            val st = surfaceTexture ?: return
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+                throw IllegalStateException("render thread eglMakeCurrent failed: ${EGL14.eglGetError()}")
             }
-            if (!running) break
-
-            // Drain-to-latest: consume every queued decoder frame, render only the newest.
-            var backlog = 0L
-            while (backlog < MAX_DRAIN) {
-                val hasFrame =
-                    synchronized(frameLock) {
-                        if (frameAvailable) {
-                            frameAvailable = false
-                            true
-                        } else {
-                            false
+            while (running) {
+                synchronized(frameLock) {
+                    while (!frameAvailable && !forceRender && running) {
+                        try {
+                            frameLock.wait(100)
+                        } catch (e: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            running = false
+                            break
                         }
                     }
-                if (!hasFrame) break
-                st.updateTexImage()
-                backlog++
+                    forceRender = false
+                }
+                if (!running) break
+
+                // Drain-to-latest: consume every queued decoder frame, render only the newest.
+                var backlog = 0L
+                while (backlog < MAX_DRAIN) {
+                    val hasFrame =
+                        synchronized(frameLock) {
+                            if (frameAvailable) {
+                                frameAvailable = false
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    if (!hasFrame) break
+                    st.updateTexImage()
+                    backlog++
+                }
+                if (backlog > 0) {
+                    renderFrame(backlog - 1)
+                } else {
+                    // forceRender with no new decoder frame: re-render the current texture
+                    // (mode / sharpness / threshold changed).
+                    renderFrame(0)
+                }
             }
-            if (backlog > 0) {
-                renderFrame(backlog - 1)
-            } else {
-                // forceRender with no new decoder frame: re-render the current texture
-                // (mode / sharpness / threshold changed).
-                renderFrame(0)
-            }
+        } catch (e: Exception) {
+            DiagLog.log("SGSR", "render loop failed: ${e.message}")
+        } finally {
+            running = false
+            teardownGl()
+            if (renderThread === Thread.currentThread()) renderThread = null
         }
-        teardownGl()
     }
 
     private fun renderFrame(backlog: Long) {
@@ -752,46 +782,50 @@ class SgsrRenderer(private val context: Context) : SurfaceTexture.OnFrameAvailab
     }
 
     private fun teardownGl() {
-        if (postProgram != 0) {
-            GLES31.glDeleteProgram(postProgram)
-            postProgram = 0
-        }
-        if (blitProgram != 0) {
-            GLES31.glDeleteProgram(blitProgram)
-            blitProgram = 0
-        }
-        if (fboId != 0) {
-            GLES31.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
-            fboId = 0
-        }
-        if (oesTextureId != 0 || fboTextureId != 0) {
-            GLES31.glDeleteTextures(2, intArrayOf(oesTextureId, fboTextureId), 0)
-            oesTextureId = 0
-            fboTextureId = 0
-        }
-        if (gpuQuery != 0) {
-            GLES30.glDeleteQueries(1, intArrayOf(gpuQuery), 0)
-            gpuQuery = 0
-        }
-        surfaceTexture?.setOnFrameAvailableListener(null)
-        surfaceTexture?.release()
-        surfaceTexture = null
-        decoderSurface?.release()
-        decoderSurface = null
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
-            EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
-            if (eglSurface != EGL14.EGL_NO_SURFACE) {
-                EGL14.eglDestroySurface(eglDisplay, eglSurface)
-                eglSurface = EGL14.EGL_NO_SURFACE
+            val contextCurrent =
+                eglContext != EGL14.EGL_NO_CONTEXT && eglSurface != EGL14.EGL_NO_SURFACE &&
+                    runCatching { EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext) }
+                        .getOrDefault(false)
+            if (contextCurrent) {
+                if (postProgram != 0) runCatching { GLES31.glDeleteProgram(postProgram) }
+                if (blitProgram != 0) runCatching { GLES31.glDeleteProgram(blitProgram) }
+                if (fboId != 0) runCatching { GLES31.glDeleteFramebuffers(1, intArrayOf(fboId), 0) }
+                if (oesTextureId != 0 || fboTextureId != 0) {
+                    runCatching { GLES31.glDeleteTextures(2, intArrayOf(oesTextureId, fboTextureId), 0) }
+                }
+                if (gpuQuery != 0) runCatching { GLES30.glDeleteQueries(1, intArrayOf(gpuQuery), 0) }
+                runCatching {
+                    EGL14.eglMakeCurrent(
+                        eglDisplay,
+                        EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_CONTEXT,
+                    )
+                }
             }
-            if (eglContext != EGL14.EGL_NO_CONTEXT) {
-                EGL14.eglDestroyContext(eglDisplay, eglContext)
-                eglContext = EGL14.EGL_NO_CONTEXT
-            }
-            EGL14.eglReleaseThread()
-            EGL14.eglTerminate(eglDisplay)
-            eglDisplay = EGL14.EGL_NO_DISPLAY
+            if (eglSurface != EGL14.EGL_NO_SURFACE) runCatching { EGL14.eglDestroySurface(eglDisplay, eglSurface) }
+            if (eglContext != EGL14.EGL_NO_CONTEXT) runCatching { EGL14.eglDestroyContext(eglDisplay, eglContext) }
+            runCatching { EGL14.eglReleaseThread() }
+            runCatching { EGL14.eglTerminate(eglDisplay) }
         }
+        runCatching { surfaceTexture?.setOnFrameAvailableListener(null) }
+        runCatching { decoderSurface?.release() }
+        runCatching { surfaceTexture?.release() }
+        surfaceTexture = null
+        decoderSurface = null
+        eglDisplay = EGL14.EGL_NO_DISPLAY
+        eglContext = EGL14.EGL_NO_CONTEXT
+        eglSurface = EGL14.EGL_NO_SURFACE
+        postProgram = 0
+        blitProgram = 0
+        fboId = 0
+        oesTextureId = 0
+        fboTextureId = 0
+        gpuQuery = 0
+        gpuQueryPending = false
+        frameAvailable = false
+        forceRender = false
         DiagLog.log("SGSR", "teardown complete")
     }
 
