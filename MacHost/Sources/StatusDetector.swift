@@ -43,7 +43,7 @@ enum ADBUSBDeviceStatus: Equatable {
         case .notDetected:
             return "No USB device is visible to ADB. Use a data-capable cable, unlock the tablet, and enable USB debugging."
         case .connected(_):
-            return "An authorized Android tablet is visible to ADB. Side Screen sets up the USB reverse tunnel automatically."
+            return "An authorized Android tablet is visible to ADB. SideTab sets up the USB reverse tunnel automatically."
         case let .authorizationRequired(serial):
             return "ADB sees \(serial), but the tablet has not authorized this Mac. Unlock the tablet and tap Allow USB debugging (choose Always allow if offered)."
         case let .offline(serial):
@@ -57,7 +57,7 @@ enum StatusDetector {
         return adbExecutablePath() != nil
     }
 
-    /// SideScreen wireless is a LAN service and does not require an Internet
+    /// SideTab wireless is a LAN service and does not require an Internet
     /// route. Reuse the same interface/address resolver as pairing instead of
     /// constructing a reachability probe to a public IP on every status tick.
     /// This also reports local-only Wi-Fi/Ethernet correctly.

@@ -394,7 +394,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Side Screen")
+            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "SideTab")
         }
 
         // Items are rebuilt on every open (menuNeedsUpdate) so the menu always
@@ -668,7 +668,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 height: size.height,
                 refreshRate: sessionFrameRate,
                 hiDPI: settings.hiDPI,
-                name: "SideScreen"
+                name: "SideTab"
             )
 
             // Disable mirror mode (may fail if already in extend mode)
@@ -1693,7 +1693,7 @@ extension AppDelegate: NSMenuDelegate {
         menu.addItem(settingsItem)
 
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit Side Screen", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit SideTab", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 }
 

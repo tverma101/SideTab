@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/resolve_adb.sh"
 ADB_BIN="$(sidescreen_resolve_adb 2>/dev/null || true)"
 ADB_SERIAL=""
 
-echo "🚀 Starting Side Screen..."
+echo "🚀 Starting SideTab..."
 
 # Keep the user-facing install directory free of snapshots left by older
 # installers. The helper is scoped to SideScreen.app.previous.* only.
@@ -24,7 +24,7 @@ sleep 0.3
 
 # Check if app bundle exists
 if [ -d "$ROOT_DIR/SideScreen.app" ]; then
-    echo "  Opening SideScreen.app..."
+    echo "  Opening SideTab from SideScreen.app..."
     /usr/bin/open -n "$ROOT_DIR/SideScreen.app"
 elif [ -f "$ROOT_DIR/MacHost/.build/release/SideScreen" ]; then
     echo "  Running release binary..."
@@ -36,7 +36,7 @@ else
     echo "❌ No build found. Building now..."
     "$SCRIPT_DIR/build_mac.sh"
     echo ""
-    echo "  Opening SideScreen.app..."
+    echo "  Opening SideTab from SideScreen.app..."
     /usr/bin/open -n "$ROOT_DIR/SideScreen.app"
 fi
 
@@ -59,5 +59,5 @@ fi
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Open 'Side Screen' on Android and tap Connect"
+echo "Open 'SideTab' on Android and tap Connect"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

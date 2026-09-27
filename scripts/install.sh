@@ -15,7 +15,7 @@ if [ -z "$ADB_BIN" ]; then
     exit 1
 fi
 
-echo "🚀 Installing Side Screen..."
+echo "🚀 Installing SideTab..."
 echo ""
 
 # Prefer an explicitly configured JDK, then Android Studio or the macOS Java locator.
@@ -98,7 +98,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "To start streaming:"
 echo "  1. Start Mac app: open SideScreen.app"
 echo "     (or run: MacHost/.build/release/SideScreen)"
-echo "  2. Open 'Side Screen' app on Android"
+echo "  2. Open 'SideTab' app on Android"
 echo "  3. Tap Connect"
 echo ""
 echo "💡 Troubleshooting:"

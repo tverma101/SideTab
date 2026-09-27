@@ -1,6 +1,6 @@
-# Contributing to Side Screen
+# Contributing to SideTab
 
-Thank you for your interest in contributing to Side Screen! This document provides guidelines and information for contributors.
+Thank you for your interest in contributing to SideTab! This document provides guidelines and information for contributors.
 
 ## Table of Contents
 
@@ -72,8 +72,8 @@ The simplest way to help - star the repo to help others discover it!
 
 ```bash
 # Clone the repository
-git clone https://github.com/tverma101/SideScreen.git
-cd SideScreen
+git clone https://github.com/tverma101/SideTab.git
+cd SideTab
 
 # Build macOS app
 cd MacHost
@@ -87,7 +87,7 @@ cd ../AndroidClient
 ### Project Structure
 
 ```
-SideScreen/
+SideTab/
 ├── MacHost/                 # macOS Swift application
 │   └── Sources/             # Swift source files
 ├── AndroidClient/           # Android Kotlin application
@@ -221,4 +221,4 @@ If you have questions about contributing, feel free to:
 - Open a discussion on GitHub
 - Ask in an issue with the `question` label
 
-Thank you for contributing to Side Screen!
+Thank you for contributing to SideTab!

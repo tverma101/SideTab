@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Side Screen dark display palette. Keep components on semantic tokens. -->
+    <!-- SideTab dark display palette. Keep components on semantic tokens. -->
     <color name="ss_background">#FF080B0E</color>
     <color name="ss_surface">#FF10161C</color>
     <color name="ss_surface_strong">#FF1C2730</color>

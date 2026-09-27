@@ -13,7 +13,7 @@ fi
 # Ad-hoc signatures normally use a changing CDHash as their designated
 # requirement. TCC then sees every local rebuild as a different application and
 # forgets Screen Recording approval. Embed an explicit, stable local-development
-# requirement so all SideScreen build paths retain the same TCC identity.
+# requirement so all SideTab build paths retain the same TCC identity.
 LOCAL_REQUIREMENT='=designated => identifier "com.sidescreen.app" and info[CFBundleName] = "Side Screen"'
 
 SIGNING_IDENTITY="${SIDESCREEN_CODESIGN_IDENTITY:-}"
