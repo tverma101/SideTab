@@ -1,24 +1,25 @@
-SideScreen versioned build artifacts
+Side Screen local validation package
 version=0.11.2
-source_commit=a8342825c8f111ec2a33a7579e845cd6087f2bda
-source_branch=codex/wireless-60fps-native
-built_utc=2026-09-13T21:51:01Z
+source_commit=8cc49e8eda25
+source_branch=fix/android-apk-hardening
+source_tree=dirty
+built_utc=2026-09-24T15:54:15Z
 
 [android]
 file=SideScreen-0.11.2-android-debug.apk
 variant=debug
+application_id=com.sidescreen.app
 version_code=1102
 version_name=0.11.2
-sha256=14a5b15f4a54c3456d14fbca7dfddf92acf37161443a335b5a7d73b5cf1ce4d3
+sha256=088caa36d6b656cb83d006bd1a3058277a3d5eb7837558693fbeea5ec342778d
 
-[macos_app]
-file=SideScreen.app
-architectures=x86_64 arm64
-executable_sha256=0e8ade797727797f4801337362ad561db6345219a6ad0f6bde512fe5a04dd18a
-bundle_file_set_sha256=7d51602d97215c95cda53d17802369b6ff491c926a73d8de6721bfec985c0da5
-validation=codesign --verify --deep --strict; lipo --archs => x86_64 arm64
-
-[macos_dmg]
+[macos]
 file=SideScreen-0.11.2-mac-universal.dmg
-sha256=7c0dd3658ab3f7f2b45ef0e00782b9ed7895c732cf753228ece7b8d073871ea6
-validation=hdiutil verify => VALID
+bundle_id=com.sidescreen.app
+version=0.11.2
+architectures=x86_64 arm64
+sha256=80e499a29a8b58bde30170581bdc7ae9fbc5604072866ad1c8083087c2f148e9
+validation=hdiutil verify; codesign and architecture validation passed
+
+The Mac installer is the DMG above. The Android source APK is
+AndroidClient/app/build/outputs/apk/debug/app-debug.apk.
