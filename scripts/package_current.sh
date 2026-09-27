@@ -41,7 +41,7 @@ PY
 )"
 read -r APPLICATION_ID VERSION_CODE VERSION_NAME <<< "$APK_METADATA_VALUES"
 if [ "$APPLICATION_ID" != "com.sidescreen.app" ] || [ "$VERSION_NAME" != "$VERSION" ]; then
-    echo "APK metadata does not match this SideScreen source version." >&2
+    echo "APK metadata does not match this SideTab source version." >&2
     echo "  applicationId=$APPLICATION_ID versionName=$VERSION_NAME expected=$VERSION" >&2
     exit 1
 fi
@@ -81,7 +81,7 @@ APK_SHA="$(shasum -a 256 "$OUTPUT_DIR/SideScreen-${VERSION}-android-debug.apk" |
 DMG_SHA="$(shasum -a 256 "$OUTPUT_DIR/SideScreen-${VERSION}-mac-universal.dmg" | awk '{print $1}')"
 
 cat > "$OUTPUT_DIR/MANIFEST.txt" <<EOF
-Side Screen local validation package
+SideTab local validation package
 version=$VERSION
 source_commit=$SOURCE_COMMIT
 source_branch=$SOURCE_BRANCH

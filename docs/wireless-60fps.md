@@ -1,6 +1,6 @@
 # Wireless 60 FPS path
 
-Side Screen's wireless session is a bounded real-time display path. The
+SideTab's wireless session is a bounded real-time display path. The
 wireless profile is resolved when the Mac starts the server; it does not rewrite
 the user's persisted USB settings.
 

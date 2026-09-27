@@ -2,13 +2,13 @@
 
 Effective date: 2026-09-05
 
-This document describes the data boundary of the Side Screen source release.
+This document describes the data boundary of the SideTab source release.
 It is a project disclosure, not legal advice or a guarantee about software,
 operating-system, network, hosting, or third-party-provider behavior.
 
 ## Location data
 
-Side Screen does not request, read, derive, store, or transmit device location.
+SideTab does not request, read, derive, store, or transmit device location.
 
 - The Android manifest does not declare `ACCESS_FINE_LOCATION`,
   `ACCESS_COARSE_LOCATION`, `ACCESS_BACKGROUND_LOCATION`, or
@@ -27,7 +27,7 @@ Side Screen does not request, read, derive, store, or transmit device location.
 - The Android client sends touch, connection, and optional brightness-control
   messages to the Mac host.
 - The QR scanner uses the camera locally to read pairing data. Camera frames
-  are not intentionally uploaded to a Side Screen service.
+  are not intentionally uploaded to a SideTab service.
 - Pairing tokens, device names, settings, and diagnostic messages may be held
   locally or exchanged with the paired peer as required for the connection.
 - The source contains no first-party analytics, advertising, user account, or

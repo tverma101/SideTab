@@ -1241,7 +1241,7 @@ class ScreenCapture {
     /// stopStreaming.
     private func createDisplaySleepAssertion() {
         guard !hasDisplaySleepAssertion else { return }
-        let reason = "Side Screen is streaming to an external tablet display" as CFString
+        let reason = "SideTab is streaming to an external tablet display" as CFString
         let result = IOPMAssertionCreateWithName(
             kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn),

@@ -1797,7 +1797,7 @@ class MainActivity : AppCompatActivity() {
                 val errorMessage =
                     when {
                         e is java.net.ConnectException -> {
-                            "Mac server is not running.\n\nPlease start Side Screen.app on your Mac first."
+                            "Mac server is not running.\n\nPlease start the Mac app first."
                         }
 
                         e is java.net.NoRouteToHostException || e is java.net.UnknownHostException -> {
@@ -1811,7 +1811,7 @@ class MainActivity : AppCompatActivity() {
 
                         else -> {
                             "Connection failed: ${e.message}\n\n" +
-                                "Try:\n• Start Side Screen.app on Mac\n" +
+                                "Try:\n• Start the Mac app\n" +
                                 "• Check USB connection\n• Run: adb reverse tcp:$port tcp:$port"
                         }
                     }

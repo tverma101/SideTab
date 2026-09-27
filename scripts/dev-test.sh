@@ -12,7 +12,7 @@ VERSION=$(cat "$ROOT_DIR/VERSION" | tr -d '[:space:]')
 APP_DIR="$ROOT_DIR/SideScreen.app"
 
 echo "======================================="
-echo "  Side Screen - Dev Test (v$VERSION)"
+echo "  SideTab - Dev Test (v$VERSION)"
 echo "======================================="
 echo ""
 
@@ -45,6 +45,8 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <string>com.sidescreen.app</string>
     <key>CFBundleName</key>
     <string>Side Screen</string>
+    <key>CFBundleDisplayName</key>
+    <string>SideTab</string>
     <key>CFBundleVersion</key>
     <string>$VERSION</string>
     <key>CFBundleShortVersionString</key>
@@ -58,7 +60,7 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Side Screen needs screen recording access to capture your virtual display.</string>
+    <string>SideTab needs screen recording access to capture your virtual display.</string>
 </dict>
 </plist>
 EOF
@@ -114,7 +116,7 @@ echo ""
 echo "======================================="
 echo "  Ready to test!"
 echo "  App: $APP_DIR"
-echo "  Open Side Screen on your tablet"
+echo "  Open SideTab on your tablet"
 echo "======================================="
 echo ""
 read -p "Test result? [y=OK / n=failed]: " RESULT

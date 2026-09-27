@@ -37,7 +37,7 @@ echo "Building version $VERSION..."
 cd "$ROOT_DIR/MacHost"
 
 # Kill running instance
-echo "Stopping running Side Screen..."
+echo "Stopping running SideTab..."
 # Match the executable name only; a broad `pkill -f SideScreen` can also
 # match this build script because the checkout path contains SideScreen.
 pkill -x SideScreen 2>/dev/null || true
@@ -102,7 +102,7 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>CFBundleName</key>
     <string>Side Screen</string>
     <key>CFBundleDisplayName</key>
-    <string>Side Screen</string>
+    <string>SideTab</string>
     <key>CFBundleVersion</key>
     <string>$VERSION</string><!-- VERSION -->
     <key>CFBundleShortVersionString</key>
@@ -118,9 +118,9 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Side Screen needs screen recording access to capture your virtual display and stream it to your Android device.</string>
+    <string>SideTab needs screen recording access to capture your virtual display and stream it to your Android device.</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Side Screen needs Local Network access so your Android tablet can connect to the Mac over WiFi for wireless mode. Without this, only USB-tethered connections work.</string>
+    <string>SideTab needs Local Network access so your Android tablet can connect to the Mac over WiFi for wireless mode. Without this, only USB-tethered connections work.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_sidescreen._tcp</string>
@@ -152,12 +152,12 @@ ln -s /Applications "$DMG_DIR/Applications"
 OUTPUT_DIR="$ROOT_DIR/dist/SideScreen-${VERSION}/${BUILD_ID}"
 mkdir -p "$OUTPUT_DIR"
 DMG_PATH="$OUTPUT_DIR/SideScreen-${VERSION}-mac-universal.dmg"
-hdiutil create -volname "Side Screen" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_PATH"
+hdiutil create -volname "SideTab" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_PATH"
 rm -rf "$DMG_DIR"
 
 DMG_SHA256=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
 cat > "$OUTPUT_DIR/BUILD-MANIFEST.txt" << EOF
-Side Screen macOS build
+SideTab macOS build
 version=$VERSION
 source_commit=$SOURCE_COMMIT
 source_branch=$SOURCE_BRANCH

@@ -2,18 +2,18 @@
 
 <div align="center">
 
-<img src="resources/logo/sidescreen-icon.png" alt="Side Screen" width="128"/>
+<img src="resources/logo/sidescreen-icon.png" alt="SideTab" width="128"/>
 
-<h1>Side Screen</h1>
+<h1>SideTab</h1>
 
 <p><em>Turn your Android tablet into a second display for macOS — USB-C or wireless over WiFi</em></p>
 
 <p>
-  <a href="https://github.com/tverma101/SideScreen/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/tverma101/SideScreen?style=for-the-badge&color=34C759" alt="License">
+  <a href="https://github.com/tverma101/SideTab/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/tverma101/SideTab?style=for-the-badge&color=34C759" alt="License">
   </a>
-  <a href="https://github.com/tverma101/SideScreen/stargazers">
-    <img src="https://img.shields.io/github/stars/tverma101/SideScreen?style=for-the-badge&color=FF9500" alt="Stars">
+  <a href="https://github.com/tverma101/SideTab/stargazers">
+    <img src="https://img.shields.io/github/stars/tverma101/SideTab?style=for-the-badge&color=FF9500" alt="Stars">
   </a>
 </p>
 
@@ -28,18 +28,20 @@
 ---
 
 <div align="center">
-  <img src="resources/screenshots/hero_screenshot.jpeg" alt="Side Screen — Mac + Android tablet as second display" width="800"/>
+  <img src="resources/screenshots/hero_screenshot.jpeg" alt="SideTab — Mac + Android tablet as second display" width="800"/>
 </div>
 
 ---
 
 ## About
 
-Side Screen brings true second-display functionality to your Android tablet — over USB-C cable for the lowest latency, or wirelessly over WiFi after a one-time QR pair. Something macOS doesn't natively support either way.
+SideTab brings true second-display functionality to your Android tablet — over USB-C cable for the lowest latency, or wirelessly over WiFi after a one-time QR pair. Something macOS doesn't natively support either way.
 
-While Apple's Sidecar only works with iPads, millions of Android tablets sit unused as potential workstations. Side Screen bridges that gap with hardware-accelerated H.265 streaming, sub-16ms pipeline latency on USB, and full touch input — making your tablet feel like a real monitor, not a laggy mirror.
+While Apple's Sidecar only works with iPads, millions of Android tablets sit unused as potential workstations. SideTab bridges that gap with hardware-accelerated H.265 streaming, sub-16ms pipeline latency on USB, and full touch input — making your tablet feel like a real monitor, not a laggy mirror.
 
-Built entirely open-source, Side Screen is designed to be fast, lightweight, and seamlessly integrated.
+Built entirely open-source, SideTab is designed to be fast, lightweight, and seamlessly integrated.
+
+The repository and product were renamed from Side Screen. Existing macOS and Android identifiers and the `sidescreen://` pairing scheme remain stable for compatibility.
 
 For full details, features, and documentation, please visit **[sidescreen.dev](https://sidescreen.dev)**
 
@@ -141,7 +143,7 @@ installers.
 > **⚠️ ADB Required**
 > The Mac app needs `adb` to communicate with your Android device. If the app doesn't show "Running" after launch, you likely need to install ADB:
 >
-> Side Screen uses the Android SDK's `platform-tools/adb` when it is installed, then falls back to Homebrew. This keeps the Mac app, APK installer, and `adb reverse` tunnel on one toolchain. Set `SIDESCREEN_ADB=/absolute/path/to/adb` when an alternate SDK must be used.
+> SideTab uses the Android SDK's `platform-tools/adb` when it is installed, then falls back to Homebrew. This keeps the Mac app, APK installer, and `adb reverse` tunnel on one toolchain. Set `SIDESCREEN_ADB=/absolute/path/to/adb` when an alternate SDK must be used.
 >
 > 1. Install Homebrew (if you don't have it):
 >    ```bash
@@ -156,8 +158,8 @@ installers.
 <summary><strong>Build from source (for developers)</strong></summary>
 
 ```bash
-git clone https://github.com/tverma101/SideScreen.git
-cd SideScreen
+git clone https://github.com/tverma101/SideTab.git
+cd SideTab
 
 # macOS (universal signed app bundle; also removes stale local app snapshots)
 ./scripts/build_mac.sh
@@ -220,8 +222,8 @@ unrelated applications are never searched or changed.
 ### USB mode (default — lowest latency)
 
 1. Connect tablet to Mac via **USB-C**
-2. Launch **Side Screen** on Mac (runs in menu bar — port forwarding is set up automatically)
-3. Open **Side Screen** on tablet → keep on the **USB** tab → tap **Connect**
+2. Launch **SideTab** on Mac (runs in menu bar — port forwarding is set up automatically)
+3. Open **SideTab** on tablet → keep on the **USB** tab → tap **Connect**
 4. Done — drag windows to your new display
 
 The Android display stays awake while a stream is active and the app is
@@ -237,8 +239,8 @@ pings keep quiet sessions alive without sending duplicate frames.
 
 ### Wireless mode (no cable)
 
-1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
-2. Open **Side Screen** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
+1. Launch **SideTab** on Mac → toggle to the **Wireless** tab → a QR code appears
+2. Open **SideTab** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
 3. The tablet remembers the Mac. On subsequent launches, open the Wireless tab and tap **Reconnect** — no rescan is needed unless the token or Mac address changed.
 
 Wireless mode requires both devices to be on the same WiFi network. **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. The pairing token authenticates the wireless stream but does not currently provide end-to-end encryption, so use a trusted network. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
@@ -251,7 +253,7 @@ The Mac menu-bar menu includes a compact **Tablet Brightness** slider. It contro
 
 ### Headless mode (no Mac interaction)
 
-In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
+In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open SideTab on the tablet and tap Connect (USB) or Reconnect (Wireless).
 
 First-time setup still needs a screen once to grant Screen Recording permission; after that the Mac runs fully headless. For wireless headless use, give the Mac a static IP or DHCP reservation, and consider enabling macOS Screen Sharing as a fallback way in.
 
@@ -274,7 +276,7 @@ First-time setup still needs a screen once to grant Screen Recording permission;
 ## Troubleshooting
 
 <details>
-<summary><strong>"SideScreen is damaged" on macOS</strong></summary>
+<summary><strong>"SideTab is damaged" on macOS</strong></summary>
 
 This happens because the app is not notarized by Apple. Run this command to fix it:
 ```bash
@@ -312,7 +314,7 @@ The connection checklist checks tablet-local prerequisites while idle; it does n
 - Both devices must be on the same WiFi network (and same subnet — some mesh routers isolate "guest" devices)
 - Click **Start** on the Mac before scanning the QR — the listener only binds when the server is running
 - If Android already has a pairing, tap **Reconnect** first. The repair screen keeps the saved pairing and makes **Pair again (scan QR)** the secondary action; scan a fresh QR only if the Mac pairing token was reset or discovery cannot recover the Mac
-- The QR includes compatible local IPv4/IPv6 addresses, and Bonjour recovery also returns all usable addresses. This preserves normal WiFi/Internet on the tablet; Side Screen does not create a private hotspot
+- The QR includes compatible local IPv4/IPv6 addresses, and Bonjour recovery also returns all usable addresses. This preserves normal WiFi/Internet on the tablet; SideTab does not create a private hotspot
 - If both devices show addresses in the same subnet but Reconnect still times out, test device-to-device TCP reachability; campus or guest WiFi can isolate clients and block both TCP and Bonjour even when the addresses look local. Use a non-isolated SSID or disable client isolation on the access point.
 - macOS may prompt for **Local Network** permission on first wireless toggle — grant it; without it, LAN inbound is silently dropped
 </details>
@@ -326,7 +328,7 @@ The Mac's auth token resets when you click **Reset Token (forget all)** or reins
 <details>
 <summary><strong>Virtual display not appearing</strong></summary>
 
-Grant Screen Recording permission: **System Preferences → Privacy & Security → Screen Recording → Enable Side Screen**
+Grant Screen Recording permission: **System Preferences → Privacy & Security → Screen Recording → Enable SideTab**
 </details>
 
 ---
@@ -336,15 +338,15 @@ Grant Screen Recording permission: **System Preferences → Privacy & Security �
 Contributions are welcome!
 
 - ⭐ **Star** this repo to help others discover it
-- 🐛 **Report bugs** via [Issues](https://github.com/tverma101/SideScreen/issues)
-- 💡 **Suggest features** via [Issues](https://github.com/tverma101/SideScreen/issues)
+- 🐛 **Report bugs** via [Issues](https://github.com/tverma101/SideTab/issues)
+- 💡 **Suggest features** via [Issues](https://github.com/tverma101/SideTab/issues)
 - 🔧 **Submit PRs** — see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ---
 
 ## Support
 
-If Side Screen is useful to you, consider supporting development:
+If SideTab is useful to you, consider supporting development:
 
 <div align="center">
 
@@ -360,7 +362,7 @@ If Side Screen is useful to you, consider supporting development:
 
 ## Privacy
 
-Side Screen does not request or collect device location. See [PRIVACY.md](PRIVACY.md)
+SideTab does not request or collect device location. See [PRIVACY.md](PRIVACY.md)
 for the exact permissions and data-flow boundary.
 
 ---
@@ -375,6 +377,6 @@ for the exact permissions and data-flow boundary.
 
 Made with ❤️ by **Tran Vuong Quoc Dat**
 
-[Report Bug](https://github.com/tverma101/SideScreen/issues) · [Request Feature](https://github.com/tverma101/SideScreen/issues) · [Discussions](https://github.com/tverma101/SideScreen/discussions)
+[Report Bug](https://github.com/tverma101/SideTab/issues) · [Request Feature](https://github.com/tverma101/SideTab/issues) · [Discussions](https://github.com/tverma101/SideTab/discussions)
 
 </div>

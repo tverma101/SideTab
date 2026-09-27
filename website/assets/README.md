@@ -1,6 +1,6 @@
 # Website Assets
 
-Assets cho Side Screen landing page.
+Assets cho SideTab landing page.
 
 ---
 
@@ -37,5 +37,5 @@ Update `website/index.html`:
 
 Thay placeholder image:
 ```html
-<img src="./assets/hero-screenshot.png" alt="Side Screen Demo">
+<img src="./assets/hero-screenshot.png" alt="SideTab Demo">
 ```
