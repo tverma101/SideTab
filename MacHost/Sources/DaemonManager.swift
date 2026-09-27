@@ -4,7 +4,7 @@ import os.log
 
 class DaemonManager {
     static let shared = DaemonManager()
-    
+
     private var appService: SMAppService {
         return SMAppService.mainApp
     }
@@ -21,7 +21,7 @@ class DaemonManager {
     static func isRegistered(status: SMAppService.Status) -> Bool {
         return status == .enabled || status == .requiresApproval
     }
-    
+
     var isEnabled: Bool {
         return Self.isRegistered(status: appService.status)
     }
