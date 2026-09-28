@@ -91,6 +91,10 @@ Enable Gaming Boost for the bounded ultra-low-latency encoder profile. The host 
 
 Configure resolution (up to 4K/8K), frame rate (30–120 FPS; 60 FPS is the current balanced default), bitrate and quality presets from the Mac app. The host applies a bounded encoder ladder rather than treating the UI bitrate as an unrestricted wire rate.
 
+### Power-aware Android playback
+
+While Side Screen is actively streaming in the foreground, the Android client requests the panel's 120 Hz mode when the tablet is externally powered—even if Android Battery Saver is enabled. On battery it requests 60 Hz to reduce display, decoder, and thermal load. When the app is backgrounded, the screen is off, or the session is disconnected, it clears its frame-rate and screen-on requests; an unused session is disconnected after the configured grace period (capped at 30 seconds on battery), allowing Android's normal screen timeout, Doze, and Battery Saver policies to take over. The Mac host still needs to be configured for a 120 FPS stream for the transport to carry 120 frames per second.
+
 <div align="center">
   <img src="resources/screenshots/mac_settings_1.png" alt="macOS Settings — Display & FPS" height="500"/>
   &nbsp;&nbsp;
