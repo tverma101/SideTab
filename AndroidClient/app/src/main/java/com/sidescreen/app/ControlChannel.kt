@@ -574,8 +574,14 @@ class ControlChannel(
             return try {
                 pingPacketScratch[0] = MESSAGE_PING.toByte()
                 putLongLE(pingPacketScratch, 1, now)
-                outstandingPing = OutstandingPing(transport.generation, now)
+                // Arm the deadline only once the ping is actually out. The
+                // packet carries the pre-write timestamp so the RTT we get
+                // back includes our own drain time, but the expiry clock must
+                // start when the bytes left us — otherwise a write that blocks
+                // on a full send buffer is mistaken for a lost pong the moment
+                // it completes.
                 transport.output.write(pingPacketScratch)
+                outstandingPing = OutstandingPing(transport.generation, System.nanoTime())
                 true
             } catch (e: Exception) {
                 outstandingPing = null
@@ -775,6 +781,23 @@ class ControlChannel(
         const val INITIAL_RETRY_MS = 250L
         const val MAX_RETRY_MS = 5_000L
         const val HEALTH_POLL_MS = 1_000L
-        const val PONG_TIMEOUT_NS = 4_000_000_000L
+        /**
+         * Budget for a control-channel pong.
+         *
+         * This was 4 s, which a control socket sharing a congested Wi-Fi link
+         * with the video stream loses routinely: three consecutive 1 Hz pongs
+         * can all be delayed by a momentary stall, and the client then closed a
+         * perfectly healthy socket. Worse, the resulting `sendPing() == false`
+         * used to short-circuit the video probe's "is video flowing?" guard, so
+         * a control hiccup armed the video watchdog at 1 Hz regardless of the
+         * video path — which is what made the video timeout fire at random.
+         *
+         * Fifteen seconds is comfortably above real Wi-Fi jitter on a link
+         * that is simultaneously carrying video, and still well inside the
+         * host's five-minute session deadline and the kernel keepalive floor
+         * the Mac now sets, so a genuinely dead control socket is still
+         * detected promptly by something.
+         */
+        const val PONG_TIMEOUT_NS = 15_000_000_000L
     }
 }

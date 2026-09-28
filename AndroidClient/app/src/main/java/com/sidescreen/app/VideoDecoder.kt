@@ -592,13 +592,25 @@ class VideoDecoder(
             val nowNs = System.nanoTime()
             val latencyNs = nowNs - info.presentationTimeUs * 1000L
             val hasValidLatency = latencyNs in 0..MAX_REASONABLE_LATENCY_NS
+            // `!hasValidLatency` used to short-circuit straight to "render",
+            // which meant every output older than MAX_REASONABLE_LATENCY_NS
+            // (2 s — about sixty times the wireless budget) bypassed the
+            // freshness policy and was drawn. That is exactly the
+            // decoder-backpressure case in which the read loop is also stalling,
+            // so the panel showed a multi-second-old desktop with a live-looking
+            // cursor — which users report as a disconnect or a freeze.
+            //
+            // Over budget now always means drop. `hasValidLatency` only decides
+            // which bound applies to a non-wireless (USB) session, where a
+            // looser ceiling is intentional.
             val shouldRender =
-                if (wireless && hasValidLatency) {
-                    WirelessFreshnessPolicy.shouldRender(latencyNs, isFirstOutput)
+                if (wireless) {
+                    WirelessFreshnessPolicy.shouldRender(
+                        decodedLatencyNs = if (hasValidLatency) latencyNs else Long.MAX_VALUE,
+                        isFirstFrame = isFirstOutput,
+                    )
                 } else {
-                    isFirstOutput ||
-                        !hasValidLatency ||
-                        latencyNs <= MAX_RENDER_LATENCY_NS
+                    isFirstOutput || !hasValidLatency || latencyNs <= MAX_RENDER_LATENCY_NS
                 }
 
             if (!shouldRender) {

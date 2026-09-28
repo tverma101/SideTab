@@ -30,7 +30,7 @@
         <activity
             android:name=".MainActivity"
             android:launchMode="singleTask"
-            android:configChanges="orientation|screenSize|screenLayout"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|colorMode|keyboard|keyboardHidden|navigation|layoutDirection|fontScale|locale"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
