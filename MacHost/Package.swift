@@ -1,5 +1,14 @@
 // swift-tools-version: 5.9
 import PackageDescription
+import Foundation
+
+// SwiftPM evaluates compiler flags from the build directory. Resolve the
+// bridge module map from this manifest so both swift build and swift test work
+// regardless of the caller's current directory.
+let sourcesPath = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources")
+    .path
 
 let package = Package(
     name: "SideScreen",
@@ -20,20 +29,20 @@ let package = Package(
             dependencies: [],
             path: "Sources",
             cSettings: [
-                .unsafeFlags(["-I", "Sources"])
+                .unsafeFlags(["-I", sourcesPath])
             ],
             swiftSettings: [
-                .unsafeFlags(["-Xcc", "-fmodule-map-file=Sources/module.modulemap"])
+                .unsafeFlags(["-Xcc", "-fmodule-map-file=\(sourcesPath)/module.modulemap"])
             ]),
         .testTarget(
             name: "SideScreenTests",
             dependencies: ["SideScreen"],
             path: "Tests/SideScreenTests",
             cSettings: [
-                .unsafeFlags(["-I", "Sources"])
+                .unsafeFlags(["-I", sourcesPath])
             ],
             swiftSettings: [
-                .unsafeFlags(["-Xcc", "-fmodule-map-file=Sources/module.modulemap"])
+                .unsafeFlags(["-Xcc", "-fmodule-map-file=\(sourcesPath)/module.modulemap"])
             ]
         )
     ]

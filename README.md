@@ -84,6 +84,10 @@ The repository build script creates a universal app bundle and DMG:
 open SideScreen.app
 ```
 
+The build reuses SwiftPM outputs, limits compilation to four jobs by default (`SIDESCREEN_BUILD_JOBS` overrides this), and does not stop a running Side Screen instance. Quit the old instance before launching the rebuilt app.
+
+After verifying a replacement Mac app, move superseded app backups and older `.app`/`.dmg` builds to Trash so Applications and active checkouts show only the current version. Keep any app bundle serving a live stream until that stream ends.
+
 On first launch, grant the requested **Screen Recording** and **Accessibility** permissions in System Settings.
 
 ### Android
@@ -99,6 +103,8 @@ The APK is written to:
 ```text
 AndroidClient/app/build/outputs/apk/debug/app-debug.apk
 ```
+
+For a separate device preview without replacing an installed Side Screen package, use `cd AndroidClient && ./gradlew assembleDebug -PsidescreenPreviewSuffix=.preview`. This builds `com.sidescreen.app.preview`.
 
 With an Android device connected through ADB, the repository installer can install the current debug build:
 
@@ -119,6 +125,8 @@ Release APKs intentionally require explicit release-signing credentials and do n
 5. Open Side Screen on Android and connect.
 
 The helper scripts use ADB reverse forwarding for the video and control ports.
+The Android USB checklist updates only while Side Screen is visible. It reads cable state without opening a network probe, and checks the Mac host when you press Connect. The tablet keeps its screen awake only while a stream is visible; a background stream holds a timed CPU wake lock until its existing auto-disconnect window ends.
+Wired SDR capture uses video-range YCbCr so Android displays colors and dark gradients without range clipping. The real-device regression check is in [wired color range troubleshooting](docs/troubleshooting/wired-color-range.md).
 
 ### Wireless
 

@@ -156,6 +156,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // A live USB stream already proves the tablet and reverse tunnel are
+        // usable. Polling `adb devices` and `adb reverse --list` every two
+        // seconds during capture only adds subprocess work; recheck as soon as
+        // the stream ends so unplug/replug recovery remains prompt.
+        if settings.clientConnected {
+            settings.adbInstalled = true
+            settings.usbDeviceConnected = true
+            settings.adbReverseConfigured = true
+            return
+        }
+
         settings.adbInstalled = StatusDetector.adbInstalled()
         let port = Int(settings.port)
         let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
@@ -166,6 +177,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 && StatusDetector.adbReverseConfigured(port: controlPort)
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
+                guard self.settings.connectionMode == .usb,
+                      !self.settings.clientConnected else { return }
                 
                 let isConnected = !devices.isEmpty
 
@@ -673,6 +686,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.releaseStylusIfNeeded()
                 Task { @MainActor in
                     self.settings.clientConnected = false
+                    if self.settings.connectionMode == .usb {
+                        self.refreshStatusIndicators()
+                    }
                     // Final lastConnected snapshot at the disconnect moment.
                     if let name = self.currentWirelessDevice {
                         self.pairedDeviceStore.upsert(name: name, lastConnected: Date())

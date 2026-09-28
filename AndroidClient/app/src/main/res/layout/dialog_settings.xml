@@ -8,9 +8,9 @@
     android:layout_marginEnd="24dp"
     android:layout_marginTop="40dp"
     android:layout_marginBottom="40dp"
-    app:cardCornerRadius="28dp"
-    app:cardBackgroundColor="@color/ss_scrim_strong"
-    app:cardElevation="24dp">
+    app:cardCornerRadius="24dp"
+    app:cardBackgroundColor="#F3132030"
+    app:cardElevation="12dp">
 
     <ScrollView
         android:layout_width="match_parent"
@@ -24,18 +24,25 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="32dp">
+        android:padding="24dp">
 
         <!-- Header -->
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Display Settings"
-            android:textColor="@color/ss_text_primary"
-            android:textSize="28sp"
+            android:text="Display settings"
+            android:textColor="#F7FBFF"
+            android:textSize="25sp"
             android:textStyle="bold"
-            android:gravity="center"
-            android:layout_marginBottom="32dp" />
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Tune the live picture and controls"
+            android:textColor="#AAC0CE"
+            android:textSize="13sp"
+            android:layout_marginBottom="24dp" />
 
         <!-- Show Stats Toggle -->
         <LinearLayout
@@ -56,14 +63,14 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="Show Stats"
-                    android:textColor="@color/ss_text_primary"
+                    android:textColor="#FFFFFF"
                     android:textSize="17sp"
                     android:textStyle="bold" />
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="FPS, bitrate, resolution"
-                    android:textColor="@color/ss_text_secondary"
+                    android:textColor="#AAC0CE"
                     android:textSize="13sp" />
             </LinearLayout>
 
@@ -95,7 +102,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="Video Super Resolution"
-                    android:textColor="@color/ss_text_primary"
+                    android:textColor="#FFFFFF"
                     android:textSize="17sp"
                     android:textStyle="bold" />
                 <TextView
@@ -103,7 +110,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="GPU postprocess (SGSR1 / CAS)"
-                    android:textColor="@color/ss_text_secondary"
+                    android:textColor="#AAC0CE"
                     android:textSize="13sp" />
             </LinearLayout>
 
@@ -131,7 +138,7 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:text="Mode"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="15sp"
                 android:textStyle="bold" />
 
@@ -142,11 +149,11 @@
                 android:layout_height="40dp"
                 android:minWidth="0dp"
                 android:text="Bridge"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="12sp"
                 android:layout_marginEnd="6dp"
                 app:cornerRadius="10dp"
-                app:strokeColor="@color/ss_accent"
+                app:strokeColor="#80E3D6"
                 app:strokeWidth="1dp" />
 
             <com.google.android.material.button.MaterialButton
@@ -156,11 +163,11 @@
                 android:layout_height="40dp"
                 android:minWidth="0dp"
                 android:text="SGSR1"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="12sp"
                 android:layout_marginEnd="6dp"
                 app:cornerRadius="10dp"
-                app:strokeColor="@color/ss_accent"
+                app:strokeColor="#80E3D6"
                 app:strokeWidth="1dp" />
 
             <com.google.android.material.button.MaterialButton
@@ -170,10 +177,10 @@
                 android:layout_height="40dp"
                 android:minWidth="0dp"
                 android:text="CAS"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="12sp"
                 app:cornerRadius="10dp"
-                app:strokeColor="@color/ss_accent"
+                app:strokeColor="#80E3D6"
                 app:strokeWidth="1dp" />
         </LinearLayout>
 
@@ -190,7 +197,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Sharpness (CAS)"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="17sp"
                 android:textStyle="bold"
                 android:layout_marginBottom="4dp" />
@@ -200,7 +207,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="0.80"
-                android:textColor="@color/ss_accent"
+                android:textColor="#80E3D6"
                 android:textSize="15sp"
                 android:layout_marginBottom="12dp" />
 
@@ -212,9 +219,9 @@
                 android:valueTo="1.0"
                 android:value="0.8"
                 android:stepSize="0.05"
-                app:thumbColor="@color/ss_text_primary"
-                app:trackColorActive="@color/ss_accent"
-                app:trackColorInactive="@color/ss_surface_tint_strong"
+                app:thumbColor="#FFFFFF"
+                app:trackColorActive="#80E3D6"
+                app:trackColorInactive="#33FFFFFF"
                 app:trackHeight="4dp" />
         </LinearLayout>
 
@@ -231,7 +238,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Edge Threshold (SGSR1)"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="17sp"
                 android:textStyle="bold"
                 android:layout_marginBottom="4dp" />
@@ -241,7 +248,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="0.031"
-                android:textColor="@color/ss_accent"
+                android:textColor="#80E3D6"
                 android:textSize="15sp"
                 android:layout_marginBottom="12dp" />
 
@@ -251,11 +258,11 @@
                 android:layout_height="wrap_content"
                 android:valueFrom="0.0"
                 android:valueTo="0.1"
-                android:value="0.03"
+                android:value="0.031"
                 android:stepSize="0.005"
-                app:thumbColor="@color/ss_text_primary"
-                app:trackColorActive="@color/ss_accent"
-                app:trackColorInactive="@color/ss_surface_tint_strong"
+                app:thumbColor="#FFFFFF"
+                app:trackColorActive="#80E3D6"
+                app:trackColorInactive="#33FFFFFF"
                 app:trackHeight="4dp" />
         </LinearLayout>
 
@@ -278,14 +285,14 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="Hide Settings Icon"
-                    android:textColor="@color/ss_text_primary"
+                    android:textColor="#FFFFFF"
                     android:textSize="17sp"
                     android:textStyle="bold" />
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="Use the back gesture to reveal it while streaming"
-                    android:textColor="@color/ss_text_secondary"
+                    android:textColor="#AAC0CE"
                     android:textSize="13sp" />
             </LinearLayout>
 
@@ -311,7 +318,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Overlay Opacity"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="17sp"
                 android:textStyle="bold"
                 android:layout_marginBottom="4dp" />
@@ -321,7 +328,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="80%"
-                android:textColor="@color/ss_accent"
+                android:textColor="#80E3D6"
                 android:textSize="15sp"
                 android:layout_marginBottom="12dp" />
 
@@ -333,9 +340,9 @@
                 android:valueTo="1.0"
                 android:value="0.8"
                 android:stepSize="0.05"
-                app:thumbColor="@color/ss_text_primary"
-                app:trackColorActive="@color/ss_accent"
-                app:trackColorInactive="@color/ss_surface_tint_strong"
+                app:thumbColor="#FFFFFF"
+                app:trackColorActive="#80E3D6"
+                app:trackColorInactive="#33FFFFFF"
                 app:trackHeight="4dp" />
         </LinearLayout>
 
@@ -352,7 +359,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Settings Button Position"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="17sp"
                 android:textStyle="bold"
                 android:layout_marginBottom="12dp" />
@@ -377,11 +384,11 @@
                         android:layout_height="44dp"
                         android:layout_weight="1"
                         android:text="↖"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="#FFFFFF"
                         android:textSize="18sp"
                         android:layout_marginEnd="3dp"
                         app:cornerRadius="10dp"
-                        app:strokeColor="@color/ss_accent"
+                        app:strokeColor="#80E3D6"
                         app:strokeWidth="1dp" />
 
                     <com.google.android.material.button.MaterialButton
@@ -391,12 +398,12 @@
                         android:layout_height="44dp"
                         android:layout_weight="1"
                         android:text="↑"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="#FFFFFF"
                         android:textSize="18sp"
                         android:layout_marginStart="3dp"
                         android:layout_marginEnd="3dp"
                         app:cornerRadius="10dp"
-                        app:strokeColor="@color/ss_accent"
+                        app:strokeColor="#80E3D6"
                         app:strokeWidth="1dp" />
 
                     <com.google.android.material.button.MaterialButton
@@ -406,11 +413,11 @@
                         android:layout_height="44dp"
                         android:layout_weight="1"
                         android:text="↗"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="#FFFFFF"
                         android:textSize="18sp"
                         android:layout_marginStart="3dp"
                         app:cornerRadius="10dp"
-                        app:strokeColor="@color/ss_accent"
+                        app:strokeColor="#80E3D6"
                         app:strokeWidth="1dp" />
                 </LinearLayout>
 
@@ -428,11 +435,11 @@
                         android:layout_height="44dp"
                         android:layout_weight="1"
                         android:text="←"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="#FFFFFF"
                         android:textSize="18sp"
                         android:layout_marginEnd="3dp"
                         app:cornerRadius="10dp"
-                        app:strokeColor="@color/ss_accent"
+                        app:strokeColor="#80E3D6"
                         app:strokeWidth="1dp" />
 
                     <!-- Empty center space -->
@@ -450,11 +457,11 @@
                         android:layout_height="44dp"
                         android:layout_weight="1"
                         android:text="→"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="#FFFFFF"
                         android:textSize="18sp"
                         android:layout_marginStart="3dp"
                         app:cornerRadius="10dp"
-                        app:strokeColor="@color/ss_accent"
+                        app:strokeColor="#80E3D6"
                         app:strokeWidth="1dp" />
                 </LinearLayout>
 
@@ -471,11 +478,11 @@
                         android:layout_height="44dp"
                         android:layout_weight="1"
                         android:text="↙"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="#FFFFFF"
                         android:textSize="18sp"
                         android:layout_marginEnd="3dp"
                         app:cornerRadius="10dp"
-                        app:strokeColor="@color/ss_accent"
+                        app:strokeColor="#80E3D6"
                         app:strokeWidth="1dp" />
 
                     <com.google.android.material.button.MaterialButton
@@ -485,12 +492,12 @@
                         android:layout_height="44dp"
                         android:layout_weight="1"
                         android:text="↓"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="#FFFFFF"
                         android:textSize="18sp"
                         android:layout_marginStart="3dp"
                         android:layout_marginEnd="3dp"
                         app:cornerRadius="10dp"
-                        app:strokeColor="@color/ss_accent"
+                        app:strokeColor="#80E3D6"
                         app:strokeWidth="1dp" />
 
                     <com.google.android.material.button.MaterialButton
@@ -500,11 +507,11 @@
                         android:layout_height="44dp"
                         android:layout_weight="1"
                         android:text="↘"
-                        android:textColor="@color/ss_text_primary"
+                        android:textColor="#FFFFFF"
                         android:textSize="18sp"
                         android:layout_marginStart="3dp"
                         app:cornerRadius="10dp"
-                        app:strokeColor="@color/ss_accent"
+                        app:strokeColor="#80E3D6"
                         app:strokeWidth="1dp" />
                 </LinearLayout>
 
@@ -528,13 +535,13 @@
                 android:layout_height="48dp"
                 android:layout_weight="1"
                 android:text="Reset Overlay"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="12sp"
                 android:layout_marginEnd="4dp"
                 app:cornerRadius="14dp"
-                app:strokeColor="@color/ss_surface_tint_strong"
+                app:strokeColor="#33FFFFFF"
                 app:strokeWidth="1dp"
-                app:backgroundTint="@color/ss_surface_tint" />
+                app:backgroundTint="#1AFFFFFF" />
 
             <!-- Reset Settings Button Position -->
             <com.google.android.material.button.MaterialButton
@@ -544,13 +551,13 @@
                 android:layout_height="48dp"
                 android:layout_weight="1"
                 android:text="Reset Button"
-                android:textColor="@color/ss_text_primary"
+                android:textColor="#FFFFFF"
                 android:textSize="12sp"
                 android:layout_marginStart="4dp"
                 app:cornerRadius="14dp"
-                app:strokeColor="@color/ss_surface_tint_strong"
+                app:strokeColor="#33FFFFFF"
                 app:strokeWidth="1dp"
-                app:backgroundTint="@color/ss_surface_tint" />
+                app:backgroundTint="#1AFFFFFF" />
         </LinearLayout>
 
         <!-- Disconnect Button -->
@@ -560,25 +567,26 @@
             android:layout_width="match_parent"
             android:layout_height="48dp"
             android:text="Disconnect"
-            android:textColor="@color/ss_error"
+            android:textColor="#FF9B91"
             android:textSize="13sp"
             android:layout_marginTop="8dp"
             app:cornerRadius="14dp"
-            app:strokeColor="@color/ss_error"
+            app:strokeColor="#FF9B91"
             app:strokeWidth="1dp"
-            app:backgroundTint="@color/ss_error_tint" />
+            app:backgroundTint="#26FF9B91" />
 
         <!-- Close Button -->
         <com.google.android.material.button.MaterialButton
             android:id="@+id/closeButton"
             android:layout_width="match_parent"
             android:layout_height="56dp"
-            android:text="DONE"
+            android:text="Done"
+            android:textColor="#10212A"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
             app:cornerRadius="16dp"
-            app:backgroundTint="@color/ss_accent" />
+            app:backgroundTint="#80E3D6" />
 
     </LinearLayout>
     </ScrollView>

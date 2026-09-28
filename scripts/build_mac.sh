@@ -11,29 +11,26 @@ echo "Building version $VERSION..."
 
 cd "$ROOT_DIR/MacHost"
 
-# Kill running instance
-echo "Stopping running Side Screen..."
-# Match the executable name only; a broad `pkill -f SideScreen` can also
-# match this build script because the checkout path contains SideScreen.
-pkill -x SideScreen 2>/dev/null || true
-sleep 0.5
+# Build Universal Binary (arm64 + x86_64); SwiftPM reuses valid build outputs.
+ARCH_BIN_DIR=$(mktemp -d)
+trap 'rm -rf "$ARCH_BIN_DIR"' EXIT
+BUILD_JOBS=${SIDESCREEN_BUILD_JOBS:-4}
 
-# Clean old build
-echo "Cleaning old build..."
-rm -rf .build
-
-# Build fresh (Universal Binary: arm64 + x86_64)
 echo "Building macOS Host (arm64)..."
-swift build -c release --arch arm64
+swift build -c release --arch arm64 --jobs "$BUILD_JOBS"
+ARM64_BUILD_DIR=$(swift build --show-bin-path -c release --arch arm64)
+cp "$ARM64_BUILD_DIR/SideScreen" "$ARCH_BIN_DIR/SideScreen-arm64"
 
 echo "Building macOS Host (x86_64)..."
-swift build -c release --arch x86_64
+swift build -c release --arch x86_64 --jobs "$BUILD_JOBS"
+X86_64_BUILD_DIR=$(swift build --show-bin-path -c release --arch x86_64)
+cp "$X86_64_BUILD_DIR/SideScreen" "$ARCH_BIN_DIR/SideScreen-x86_64"
 
 echo "Creating Universal Binary..."
 mkdir -p ".build/release-universal"
 lipo -create \
-  .build/arm64-apple-macosx/release/SideScreen \
-  .build/x86_64-apple-macosx/release/SideScreen \
+  "$ARCH_BIN_DIR/SideScreen-arm64" \
+  "$ARCH_BIN_DIR/SideScreen-x86_64" \
   -output .build/release-universal/SideScreen
 
 # Create .app bundle

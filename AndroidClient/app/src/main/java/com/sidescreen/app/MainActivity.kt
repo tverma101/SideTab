@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.BatteryManager
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.MotionEvent
@@ -75,7 +76,7 @@ class MainActivity : AppCompatActivity() {
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
     private var displayFlipHorizontal = false
     private var displayFlipVertical = false
-    private var wakeLock: PowerManager.WakeLock? = null
+    private var backgroundStreamWakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
     // All callbacks from an old StreamClient become inert as soon as a newer
@@ -99,6 +100,7 @@ class MainActivity : AppCompatActivity() {
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
     private var checklistRunnable: Runnable? = null
+    private var isActivityVisible = false
     private var isConnected = false // Track connection state to prevent checklist conflicts
     // A server status is only learned from an explicit stream attempt. Keeping
     // this as a local last-known value prevents the idle checklist from opening
@@ -122,9 +124,6 @@ class MainActivity : AppCompatActivity() {
         // Allow rotation based on device sensor when not connected
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
 
-        // Keep screen on
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
         // Enable edge-to-edge display (draw behind system bars and cutout)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             window.attributes.layoutInDisplayCutoutMode =
@@ -137,16 +136,12 @@ class MainActivity : AppCompatActivity() {
         // Apply fullscreen mode immediately
         enableFullscreenMode()
 
-        // Enable performance mode for gaming (after binding is initialized)
-        enablePerformanceMode()
-
         setupSurface()
         setupUI()
         setupDraggableOverlay()
         setupSettingsButton()
         restoreOverlayPosition()
         restoreSettingsButtonPosition()
-        startChecklistUpdates()
         setupModeToggle()
         setupWirelessController()
         setupVsrCommandReceiver()
@@ -176,11 +171,8 @@ class MainActivity : AppCompatActivity() {
     private fun applyModeVisibility(mode: ConnectionMode) {
         binding.usbModeContent.visibility = if (mode == ConnectionMode.USB) View.VISIBLE else View.GONE
         binding.wirelessModeContent.visibility = if (mode == ConnectionMode.WIRELESS) View.VISIBLE else View.GONE
-        // USB checklist polls 127.0.0.1:port every 2s via adb-reverse to verify Mac
-        // server reachability. While in Wireless mode that probe creates loopback
-        // connections that fight the wireless session for the Mac's single client
-        // slot — kicking the wireless client off seconds after it auths. Pause
-        // checklist updates whenever Wireless is the active tab.
+        // The local USB checklist is only useful on the USB tab. Keep its
+        // periodic device checks out of the wireless view.
         if (mode == ConnectionMode.WIRELESS) {
             stopChecklistUpdates()
         } else {
@@ -250,35 +242,6 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == WirelessTabController.REQ_CAMERA) {
             val granted = grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED
             wirelessController.onCameraPermissionResult(granted)
-        }
-    }
-
-    /**
-     * Enable performance mode for streaming
-     * NOTE: setSustainedPerformanceMode is DISABLED - it causes thermal throttling
-     * which makes the entire device laggy. Normal power management is more efficient.
-     */
-    private fun enablePerformanceMode() {
-        try {
-            // REMOVED: setSustainedPerformanceMode(true)
-            // Sustained performance mode forces max CPU/GPU clocks which causes
-            // thermal throttling on extended use, making the device laggy.
-            // Let the SoC manage power efficiently instead.
-
-            // Use PARTIAL_WAKE_LOCK with timeout to prevent battery drain
-            // Screen is already kept on via FLAG_KEEP_SCREEN_ON
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock =
-                powerManager.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "SideScreen::PerformanceMode",
-                )
-            // 30 minute timeout instead of infinite acquire
-            wakeLock?.acquire(30 * 60 * 1000L)
-
-            log("🎮 Performance mode ENABLED (balanced)")
-        } catch (e: Exception) {
-            log("⚠️ Performance mode failed: ${e.message}")
         }
     }
 
@@ -1368,6 +1331,7 @@ class MainActivity : AppCompatActivity() {
 
                 isConnected = connected
                 macServerKnownAvailable = connected
+                updateScreenAwake()
                 updateStatus(if (connected) "Connected - Streaming active" else "Disconnected")
                 binding.connectButton.isEnabled = !connected
                 binding.disconnectButton.isEnabled = connected
@@ -1560,6 +1524,7 @@ class MainActivity : AppCompatActivity() {
                         // Update connection state flag
                         isConnected = connected
                         macServerKnownAvailable = connected
+                        updateScreenAwake()
 
                         if (connected) {
                             updateStatus("Connected - Streaming active")
@@ -1709,6 +1674,7 @@ class MainActivity : AppCompatActivity() {
         displayFlipHorizontal = false
         displayFlipVertical = false
         runOnUiThread {
+            updateScreenAwake()
             updateStatus("Disconnected")
             binding.connectButton.isEnabled = true
             binding.disconnectButton.isEnabled = false
@@ -1756,16 +1722,6 @@ class MainActivity : AppCompatActivity() {
             currentTextureSurface?.release()
             currentTextureSurface = null
 
-            // Release wake lock safely
-            try {
-                if (wakeLock?.isHeld == true) {
-                    wakeLock?.release()
-                }
-            } catch (e: Exception) {
-                // Ignore wake lock release errors
-            }
-            wakeLock = null
-            log("🎮 Performance mode DISABLED")
         } catch (e: Exception) {
             log("⚠️ Cleanup error: ${e.message}")
         }
@@ -2037,6 +1993,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        isActivityVisible = true
+        updateScreenAwake()
+        if (!isConnected && prefs.connectionMode == ConnectionMode.USB) {
+            startChecklistUpdates()
+        }
         mainDiag(
             "onStart connected=$isConnected display=${displayWidth}x$displayHeight " +
                 "client=${streamClient != null}",
@@ -2060,6 +2021,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        isActivityVisible = false
+        updateScreenAwake()
+        stopChecklistUpdates()
         super.onStop()
         mainDiag(
             "onStop connected=$isConnected display=${displayWidth}x$displayHeight " +
@@ -2101,11 +2065,40 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         stopChecklistUpdates()
         cleanup()
+        backgroundStreamWakeLock?.let { if (it.isHeld) it.release() }
+        backgroundStreamWakeLock = null
     }
 
     // ==================== Connection Checklist ====================
 
+    private fun updateScreenAwake() {
+        // A visible stream needs the panel awake. A background stream needs
+        // CPU time only until the existing auto-disconnect timer expires.
+        if (isActivityVisible && isConnected) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        if (isConnected && !isActivityVisible) {
+            val lock = backgroundStreamWakeLock ?: run {
+                val manager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                manager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SideScreen::BackgroundStream")
+                    .also { backgroundStreamWakeLock = it }
+            }
+            if (!lock.isHeld) {
+                val graceSeconds =
+                    Settings.System.getInt(contentResolver, "sidescreen_auto_disconnect_secs", 300)
+                        .coerceAtLeast(10)
+                lock.acquire((graceSeconds + 10L) * 1000L)
+            }
+        } else {
+            backgroundStreamWakeLock?.let { if (it.isHeld) it.release() }
+        }
+        binding.connectionBackdrop.visibility = if (isConnected) View.GONE else View.VISIBLE
+    }
+
     private fun startChecklistUpdates() {
+        if (!isActivityVisible || isConnected || prefs.connectionMode != ConnectionMode.USB) return
         // Stop any existing runnable first to prevent duplicates. This loop
         // updates device-local prerequisites only; it never opens a network
         // socket. The Mac status is learned only from an explicit Connect.
@@ -2134,7 +2127,7 @@ class MainActivity : AppCompatActivity() {
         // Skip while connected or while an explicit connection attempt is in
         // flight. There are no automatic network probes here: a Mac status is
         // known only after the user has pressed Connect/Reconnect.
-        if (isConnected || streamClient != null) return
+        if (!isActivityVisible || isConnected || streamClient != null) return
 
         // Check Developer Mode (if we can run this app with USB debugging, dev mode is enabled)
         val isDeveloperModeEnabled =
@@ -2143,7 +2136,12 @@ class MainActivity : AppCompatActivity() {
                 Settings.Global.DEVELOPMENT_SETTINGS_ENABLED,
                 0,
             ) == 1
-        updateChecklistItem(binding.checkDeveloperMode, isDeveloperModeEnabled)
+        updateChecklistItem(
+            binding.checkDeveloperMode,
+            binding.textDeveloperMode,
+            isDeveloperModeEnabled,
+            if (isDeveloperModeEnabled) "Developer mode · On" else "Developer mode · Off",
+        )
 
         // Check USB Debugging (ADB enabled)
         val isAdbEnabled =
@@ -2152,7 +2150,12 @@ class MainActivity : AppCompatActivity() {
                 Settings.Global.ADB_ENABLED,
                 0,
             ) == 1
-        updateChecklistItem(binding.checkUsbDebugging, isAdbEnabled)
+        updateChecklistItem(
+            binding.checkUsbDebugging,
+            binding.textUsbDebugging,
+            isAdbEnabled,
+            if (isAdbEnabled) "USB debugging · On" else "USB debugging · Off",
+        )
 
         // In device/peripheral mode Android does not expose the Mac as a
         // UsbManager device. Read the protected sticky USB-state broadcast so
@@ -2167,50 +2170,63 @@ class MainActivity : AppCompatActivity() {
             usbState?.getBooleanExtra("connected", false) == true ||
                 usbState?.getBooleanExtra("configured", false) == true ||
                 usbManager.deviceList.isNotEmpty() ||
-                isCharging()
-        updateChecklistItem(binding.checkUsbConnected, isUsbConnected)
+                isUsbPowered()
+        updateChecklistItem(
+            binding.checkUsbConnected,
+            binding.textUsbConnected,
+            isUsbConnected,
+            if (isUsbConnected) "USB cable · Connected" else "USB cable · Not detected",
+        )
 
         // Do not probe the Mac here. A short health-check socket is still an
         // unsolicited connection and can be mistaken for a reconnect by the
         // host or by a user watching its logs.
-        updateChecklistItem(binding.checkMacServer, macServerKnownAvailable)
+        updateChecklistItem(
+            binding.checkMacServer,
+            binding.textMacServer,
+            if (macServerKnownAvailable) true else null,
+            if (macServerKnownAvailable) "Mac host · Connected" else "Mac host · Checked when you connect",
+        )
 
         // Update main status indicator based on local prerequisites plus the
         // last explicit connection result.
-        val allReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected && macServerKnownAvailable
-        updateMainStatus(allReady)
+        val localReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected
+        updateMainStatus(localReady)
     }
 
-    private fun updateMainStatus(allReady: Boolean) {
-        binding.statusIndicator.setBackgroundResource(
-            if (allReady) {
+    private fun updateMainStatus(localReady: Boolean) {
+        val indicator = binding.statusIndicator
+        indicator.setBackgroundResource(if (localReady) {
                 R.drawable.status_indicator_green
             } else {
                 R.drawable.status_indicator_red
-            },
-        )
-        binding.statusText.text = if (allReady) "Ready to connect" else "Not ready to connect"
+            })
+        val message = if (localReady) "Ready to connect" else "Check the USB steps above"
+        if (binding.statusText.text != message) binding.statusText.text = message
     }
 
     private fun updateChecklistItem(
         indicator: View,
-        isOk: Boolean,
+        label: TextView,
+        isOk: Boolean?,
+        text: String,
     ) {
-        indicator.setBackgroundResource(
-            if (isOk) {
-                R.drawable.status_indicator_green
-            } else {
-                R.drawable.status_indicator_red
-            },
-        )
+        val nextTag = isOk?.toString() ?: "unknown"
+        if (indicator.tag != nextTag) {
+            indicator.setBackgroundResource(when (isOk) {
+                true -> R.drawable.status_indicator_green
+                false -> R.drawable.status_indicator_red
+                null -> R.drawable.status_indicator_neutral
+            })
+            indicator.tag = nextTag
+        }
+        if (label.text != text) label.text = text
     }
 
-    private fun isCharging(): Boolean {
+    private fun isUsbPowered(): Boolean {
         val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         val batteryStatus = registerReceiver(null, intentFilter)
-        val status = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
-        return status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
-            status == android.os.BatteryManager.BATTERY_STATUS_FULL
+        return batteryStatus?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) == BatteryManager.BATTERY_PLUGGED_USB
     }
 
     private companion object {
