@@ -182,9 +182,31 @@ class StreamClient(
     @Volatile
     private var lastVideoFrameReceivedNs = 0L
 
+    /**
+     * Last instant the read loop consumed *any* byte on the video socket, not
+     * just a video frame. Display-config re-sends, codec selection and stylus
+     * advertisements are all proof of life, and the probe watchdog must not
+     * treat them as silence.
+     */
+    @Volatile
+    private var lastVideoReadNs = 0L
+
+    /** Diagnostic count of video-stream framing desyncs in this session. */
+    @Volatile
+    private var desyncedMessageCount = 0
+
     private val videoProbeLock = Any()
     private var videoProbeOutstanding: VideoProbe? = null
     private var lastVideoProbeSentNs = 0L
+
+    /**
+     * Consecutive probes the video path has failed to answer, and the instant
+     * the first of the current run was sent. A single miss is not evidence —
+     * a pong queued behind video data, a clean-frame gap on an idle desktop, or
+     * a decoder stall all produce one. Retirement needs corroboration.
+     */
+    private var unansweredVideoProbes = 0
+    private var firstUnansweredProbeNs = 0L
 
     /** Activity backgrounding pauses timeout enforcement without retiring TCP. */
     @Volatile
@@ -304,6 +326,13 @@ class StreamClient(
     }
 
     /**
+     * The video stream stopped being parseable. Distinct from a transport
+     * failure so a framing bug is never mistaken for a dropped connection.
+     */
+    class VideoStreamDesyncException(val messageType: Int) :
+        IOException("Video stream desynchronised on message type $messageType")
+
+    /**
      * Wireless connection with session-level recovery. The first user-requested
      * connect keeps generous timeouts. Once a session has existed, LAN retries
      * are deliberately short: if the cached endpoint is stale, token-bound
@@ -330,10 +359,28 @@ class StreamClient(
             while (!connectionAttemptCancelled) {
                 try {
                     val reconnecting = everConnected
+                    // A reconnect immediately after a live session dropped is
+                    // the common case for a Wi-Fi blip, and it races the host's
+                    // own bookkeeping: the Mac still considers the old client
+                    // live for a moment, so the new socket is held as a
+                    // contender that must prove itself inside
+                    // `authenticatedContenderWindow` (5 s). Budgeting less than
+                    // that made every one of those reconnects give up before the
+                    // host had finished deciding, and the short sequence of
+                    // attempts is what the user saw as a random disconnect.
+                    //
+                    // Later attempts stay short on purpose: by then a cached IP
+                    // is probably stale and failing over to the next candidate
+                    // quickly is more useful than waiting on it again.
+                    val patient = reconnecting && reconnectAttempt == 0
                     val connectTimeout =
-                        if (reconnecting) RECONNECT_CONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS
+                        if (patient) RECONNECT_PATIENT_CONNECT_TIMEOUT_MS
+                        else if (reconnecting) RECONNECT_CONNECT_TIMEOUT_MS
+                        else CONNECT_TIMEOUT_MS
                     val handshakeTimeout =
-                        if (reconnecting) RECONNECT_HANDSHAKE_TIMEOUT_MS else HANDSHAKE_TIMEOUT_MS
+                        if (patient) RECONNECT_PATIENT_HANDSHAKE_TIMEOUT_MS
+                        else if (reconnecting) RECONNECT_HANDSHAKE_TIMEOUT_MS
+                        else HANDSHAKE_TIMEOUT_MS
                     val generation =
                         openWirelessTransport(
                             token,
@@ -370,6 +417,17 @@ class StreamClient(
                         throw e
                     }
                     terminalError = e
+                } catch (e: VideoStreamDesyncException) {
+                    // Reachable and recoverable, but not a network problem. It
+                    // gets its own arm so the user-facing message and the logs
+                    // stop claiming the Mac was unreachable when the truth is
+                    // that the two ends disagreed about framing.
+                    cleanupTransport(stopControl = false)
+                    if (!everConnected) {
+                        throw WirelessConnectError.ProtocolError
+                    }
+                    terminalError = WirelessConnectError.ProtocolError
+                    Log.w(TAG, "Video stream desynchronised on type ${e.messageType} — reconnecting")
                 } catch (e: IOException) {
                     cleanupTransport(stopControl = false)
                     if (!everConnected) {
@@ -668,6 +726,7 @@ class StreamClient(
         stylusSupported = false
         lastKeyframeReceivedNs = 0L
         lastVideoFrameReceivedNs = 0L
+        lastVideoReadNs = 0L
         synchronized(keyframeRequestLock) {
             lastKeyframeRequestNs = 0L
         }
@@ -786,6 +845,11 @@ class StreamClient(
 
             while (isTransportGenerationCurrent(generation) && !connectionAttemptCancelled) {
                 val type = input.readByte()
+                // Any byte off the video socket is proof the host is alive, not
+                // just video frames. The probe watchdog used to watch frame
+                // arrivals only, so a stream that was demonstrably alive but
+                // between clean frames looked identical to a dead one.
+                noteVideoRead()
                 when (type.toInt()) {
                     MESSAGE_VIDEO_FRAME -> receiveVideoFrame(input, hasMetadata = false)
                     MESSAGE_VIDEO_FRAME_WITH_METADATA -> receiveVideoFrame(input, hasMetadata = true)
@@ -817,7 +881,10 @@ class StreamClient(
                             synchronized(videoProbeLock) {
                                 val probe = videoProbeOutstanding
                                 if (probe?.generation == generation && probe.sentAtNs == sentTime) {
+                                    // A matched pong is the strongest possible
+                                    // liveness evidence: end the miss run too.
                                     videoProbeOutstanding = null
+                                    resetUnansweredProbesLocked()
                                     true
                                 } else {
                                     false
@@ -842,7 +909,28 @@ class StreamClient(
                         diagLog("Mac host accepted S Pen stylus events")
                     }
 
-                    else -> throw IOException("Unknown message type ${type.toInt()}; stream may be misaligned")
+                    else -> {
+                        // The video stream is a byte-exact framing with no
+                        // resynchronisation marker, so a single lost, duplicated
+                        // or short byte — or a message type a newer host sends
+                        // that this build predates — lands here, and every
+                        // later field is read from the wrong offset. There is no
+                        // way to recover in place.
+                        //
+                        // What was wrong before was not the teardown, it was the
+                        // attribution: this was reported as a transport error
+                        // indistinguishable from a dead socket, so a protocol
+                        // desync and a real disconnect were conflated in the
+                        // field. It is now a distinct error type so the two are
+                        // separable in diagnostics, and the reconnect path
+                        // re-establishes a cleanly framed stream.
+                        desyncedMessageCount += 1
+                        diagLog(
+                            "Video stream desync on message type ${type.toInt()} " +
+                                "(occurrence $desyncedMessageCount) — reconnecting for a clean frame",
+                        )
+                        throw VideoStreamDesyncException(type.toInt())
+                    }
                 }
             }
         }
@@ -919,7 +1007,7 @@ class StreamClient(
             putIntLE(inBandTouchPacket, offset, write.action)
             transport.output.write(inBandTouchPacket, 0, 6 + count * 8)
         } catch (e: Exception) {
-            failVideoTransport(transport, "in-band touch write failed", e)
+            failVideoTransportIfReadPathDead(transport, "in-band touch write failed", e)
         }
     }
 
@@ -967,7 +1055,7 @@ class StreamClient(
             val size = StylusProtocol.encodeInto(write.event, inBandStylusPacket)
             transport.output.write(inBandStylusPacket, 0, size)
         } catch (e: Exception) {
-            failVideoTransport(transport, "in-band stylus write failed", e)
+            failVideoTransportIfReadPathDead(transport, "in-band stylus write failed", e)
         }
     }
 
@@ -1011,7 +1099,7 @@ class StreamClient(
                 inBandKeyframePacket[1] = flags.toByte()
                 transport.output.write(inBandKeyframePacket)
             } catch (e: Exception) {
-                failVideoTransport(transport, "in-band keyframe request failed", e)
+                failVideoTransportIfReadPathDead(transport, "in-band keyframe request failed", e)
             }
         }
     }
@@ -1025,40 +1113,78 @@ class StreamClient(
         val outstanding = synchronized(videoProbeLock) { videoProbeOutstanding }
         if (outstanding != null) {
             val transportFailed = synchronized(videoProbeLock) {
-                if (videoProbeOutstanding !== outstanding || livenessPaused ||
-                    !LivenessProbePolicy.isExpired(
+                if (videoProbeOutstanding !== outstanding || livenessPaused) {
+                    false
+                } else if (outstanding.generation != transport.generation) {
+                    videoProbeOutstanding = null
+                    resetUnansweredProbesLocked()
+                    false
+                } else {
+                    // Any inbound byte — a matched pong, a video frame, a
+                    // display-config re-send — clears the probe and the
+                    // accumulated misses together.
+                    val readPathAlive = VideoLivenessPolicy.isReadPathAlive(
+                        lastReadNs = lastVideoReadNs,
+                        nowNs = now,
+                        staleAfterNs = VIDEO_PROBE_INTERVAL_NS,
+                    )
+                    val probeExpired = LivenessProbePolicy.isExpired(
                         sentAtNs = outstanding.sentAtNs,
                         nowNs = now,
-                        timeoutNs = VIDEO_PROBE_TIMEOUT_NS,
+                        timeoutNs = VideoLivenessPolicy.PROBE_TIMEOUT_NS,
                         paused = false,
                     )
-                ) {
-                    false
-                } else if (outstanding.generation == transport.generation) {
-                    videoProbeOutstanding = null
-                    // Serialize timeout retirement with pause/resume and frame
-                    // arrival so a stale local probe snapshot cannot close a
-                    // socket after a valid pong or video frame cleared it.
-                    failVideoTransport(transport, "video-path ping timed out", null)
-                    true
-                } else {
-                    videoProbeOutstanding = null
-                    false
+                    when {
+                        readPathAlive -> {
+                            videoProbeOutstanding = null
+                            resetUnansweredProbesLocked()
+                            false
+                        }
+                        !probeExpired -> false
+                        else -> {
+                            // This probe's budget ran out. Record the miss and
+                            // free the slot so the next probe can go out and
+                            // either corroborate or clear the suspicion.
+                            videoProbeOutstanding = null
+                            unansweredVideoProbes += 1
+                            val shouldRetire = VideoLivenessPolicy.shouldRetireTransport(
+                                unansweredProbes = unansweredVideoProbes,
+                                readPathAlive = false,
+                                nowNs = now,
+                                firstProbeNs = firstUnansweredProbeNs,
+                                timeoutNs = VideoLivenessPolicy.PROBE_TIMEOUT_NS,
+                            )
+                            if (shouldRetire) {
+                                resetUnansweredProbesLocked()
+                                failVideoTransport(transport, "video path unresponsive", null)
+                            }
+                            shouldRetire
+                        }
+                    }
                 }
             }
             if (transportFailed) return
         }
 
-        val controlSent = controlChannel.sendPing()
-        val lastFrameNs = lastVideoFrameReceivedNs
-        val videoRecentlyActive =
-            lastFrameNs > 0L && now >= lastFrameNs && now - lastFrameNs < VIDEO_PROBE_INTERVAL_NS
+        controlChannel.sendPing()
+
+        val videoRecentlyActive = VideoLivenessPolicy.isReadPathAlive(
+            lastReadNs = lastVideoReadNs,
+            nowNs = now,
+            staleAfterNs = VIDEO_PROBE_INTERVAL_NS,
+        )
+        // The in-band probe is the video socket's own liveness check, so it
+        // runs on its own cadence and its own evidence. The control channel's
+        // success or failure must not change whether it is armed: `controlSent`
+        // used to short-circuit the videoRecentlyActive guard, so any control
+        // hiccup armed the probe every second regardless of whether video was
+        // flowing. That is what made the old timeout fire at random.
         val shouldProbeVideo =
             synchronized(videoProbeLock) {
                 !livenessPaused &&
                     videoProbeOutstanding == null &&
-                    (!controlSent ||
-                        (!videoRecentlyActive && now - lastVideoProbeSentNs >= VIDEO_PROBE_INTERVAL_NS))
+                    !videoRecentlyActive &&
+                    now - lastVideoProbeSentNs >= VIDEO_PROBE_INTERVAL_NS
             }
         if (!shouldProbeVideo) return
 
@@ -1072,6 +1198,9 @@ class StreamClient(
                 } else {
                     videoProbeOutstanding = VideoProbe(transport.generation, writeTime)
                     lastVideoProbeSentNs = writeTime
+                    if (unansweredVideoProbes == 0) {
+                        firstUnansweredProbeNs = writeTime
+                    }
                     true
                 }
             }
@@ -1082,6 +1211,16 @@ class StreamClient(
                 inBandPingPacket[0] = MESSAGE_PING.toByte()
                 putLongLE(inBandPingPacket, 1, writeTime)
                 transport.output.write(inBandPingPacket)
+                // A write that blocks this long means the send buffer is wedged.
+                // That is a transport fault in its own right, not an ambiguity
+                // the silence counter has to resolve.
+                val writeDurationNs = System.nanoTime() - writeTime
+                if (VideoLivenessPolicy.isWriteBlocked(writeDurationNs)) {
+                    synchronized(videoProbeLock) {
+                        videoProbeOutstanding = null
+                    }
+                    failVideoTransport(transport, "video-path ping write blocked", null)
+                }
             } catch (e: Exception) {
                 synchronized(videoProbeLock) {
                     val probe = videoProbeOutstanding
@@ -1089,7 +1228,7 @@ class StreamClient(
                         videoProbeOutstanding = null
                     }
                 }
-                failVideoTransport(transport, "video-path ping write failed", e)
+                failVideoTransportIfReadPathDead(transport, "video-path ping write failed", e)
             }
         }
     }
@@ -1111,6 +1250,60 @@ class StreamClient(
             controlChannel.setPingsPaused(false)
             livenessPaused = false
         }
+    }
+
+    /**
+     * Clears the accumulated unanswered-probe run. Caller must hold
+     * [videoProbeLock]. Any positive liveness evidence on the read path routes
+     * here, so a single good byte is enough to give the client a clean slate.
+     */
+    private fun resetUnansweredProbesLocked() {
+        unansweredVideoProbes = 0
+        firstUnansweredProbeNs = 0L
+    }
+
+    /**
+     * A write failed on the in-band socket. The read side of that same
+     * full-duplex socket may be perfectly healthy and actively delivering
+     * video, and a single transient failure — a probe, a keyframe request, a
+     * stylus event — is not proof the session is over. Retiring the transport
+     * here used to kill streams that were visibly working, because
+     * `requestKeyframe` alone fires from the read loop and from the decoder on
+     * every backpressure timeout.
+     *
+     * So: if the read path is still delivering, log and drop the packet, and
+     * let the probe watchdog (which has real corroboration) decide. Only a
+     * write failure on a read path that has itself gone quiet retires.
+     */
+    private fun noteVideoRead() {
+        val now = System.nanoTime()
+        lastVideoReadNs = now
+        // Positive liveness evidence wipes the accumulated unanswered-probe
+        // run, so one good byte gives the client a clean slate.
+        synchronized(videoProbeLock) {
+            videoProbeOutstanding = null
+            resetUnansweredProbesLocked()
+        }
+    }
+
+    private fun failVideoTransportIfReadPathDead(
+        transport: TransportSnapshot,
+        reason: String,
+        error: Exception?,
+    ) {
+        val readPathAlive = VideoLivenessPolicy.isReadPathAlive(
+            lastReadNs = lastVideoReadNs,
+            nowNs = System.nanoTime(),
+            staleAfterNs = VIDEO_PROBE_INTERVAL_NS,
+        )
+        if (readPathAlive) {
+            diagLog(
+                "Video transport write failed: $reason — read path still alive, " +
+                    "dropping packet instead of reconnecting",
+            )
+            return
+        }
+        failVideoTransport(transport, "$reason (read path also idle)", error)
     }
 
     private fun failVideoTransport(
@@ -1137,6 +1330,7 @@ class StreamClient(
         synchronized(videoProbeLock) {
             videoProbeOutstanding = null
             lastVideoProbeSentNs = 0L
+            resetUnansweredProbesLocked()
         }
     }
 
@@ -1195,9 +1389,12 @@ class StreamClient(
 
         // Receiving actual frame bytes is stronger liveness evidence than a
         // separate video ping. Do not reconnect an actively delivering stream
-        // merely because its pong is queued behind video data.
+        // merely because its pong is queued behind video data. The read loop
+        // already cleared the probe when it consumed the frame's type byte;
+        // this also covers the miss counter.
         synchronized(videoProbeLock) {
             videoProbeOutstanding = null
+            resetUnansweredProbesLocked()
         }
 
         checkKeyframeFreshness(receiveTimestamp, isKeyframe, previousFrameReceivedNs)
@@ -1432,6 +1629,11 @@ class StreamClient(
         private const val RECONNECT_CONNECT_TIMEOUT_MS = 1_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         private const val RECONNECT_HANDSHAKE_TIMEOUT_MS = 2_000
+        // Must exceed the host's `authenticatedContenderWindow` (5 s), which is
+        // how long the Mac will hold a new socket while the previous client is
+        // still recorded as live. One extra socket hop plus slack.
+        private const val RECONNECT_PATIENT_CONNECT_TIMEOUT_MS = 8_000
+        private const val RECONNECT_PATIENT_HANDSHAKE_TIMEOUT_MS = 8_000
         private const val AUTH_RESPONSE_SIZE = 5
         // Allow short Wi-Fi/AP interruptions to recover while retaining a
         // bounded retry window; delays still cap at five seconds per attempt.
@@ -1439,7 +1641,6 @@ class StreamClient(
         private const val WIRELESS_RECONNECT_INITIAL_MS = 250L
         private const val WIRELESS_RECONNECT_MAX_MS = 5_000L
         private const val VIDEO_PROBE_INTERVAL_NS = 3_000_000_000L
-        private const val VIDEO_PROBE_TIMEOUT_NS = 6_000_000_000L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         // Five-second wireless GOP on the Mac plus one second of scheduling/
         // decode slack. Decoder reset/error paths request keyframes directly.
