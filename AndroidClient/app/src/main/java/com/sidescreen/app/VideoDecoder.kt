@@ -27,6 +27,8 @@ class VideoDecoder(
      *  output on this SoC (ImageReader surfaces deliver opaque UBWC buffers
      *  whose plane access is a fatal JNI abort). */
     private val bufferOutput: Boolean = false,
+    /** The app-scoped refresh request selected by MainActivity's power policy. */
+    requestedFrameRate: Float? = null,
 ) {
     private var decoder: MediaCodec? = null
     private var decoderThread: HandlerThread? = null
@@ -61,7 +63,7 @@ class VideoDecoder(
 
     private val frameTimes = ArrayDeque<Long>(120)
 
-    private val displayRefreshRate = display?.refreshRate ?: 60f
+    private val displayRefreshRate = requestedFrameRate ?: display?.refreshRate ?: 60f
 
     private var currentWidth = initialWidth
     private var currentHeight = initialHeight

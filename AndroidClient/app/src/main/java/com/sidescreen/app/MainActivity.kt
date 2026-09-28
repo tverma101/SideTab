@@ -14,6 +14,7 @@ import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
 import android.hardware.usb.UsbManager
 import android.media.MediaFormat
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -75,8 +76,15 @@ class MainActivity : AppCompatActivity() {
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
     private var displayFlipHorizontal = false
     private var displayFlipVertical = false
-    private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
+
+    // Power policy state is app-scoped: it can choose SideScreen's surface
+    // rate and screen-on request, but never changes Android's global policy.
+    private var powerStateReceiver: BroadcastReceiver? = null
+    private var activityInForeground = false
+    private var externallyPowered = false
+    private var powerSaveMode = false
+    private var lastPowerPolicySignature: String? = null
 
     // All callbacks from an old StreamClient become inert as soon as a newer
     // connect starts. Without this generation fence, a sender restart can
@@ -105,11 +113,13 @@ class MainActivity : AppCompatActivity() {
     // a socket every few seconds and looking like a reconnect loop.
     private var macServerKnownAvailable = false
 
-    // Auto-disconnect: if the app stays backgrounded past the configured
-    // window (default 5 min; adb-tunable via
+    // Auto-disconnect: if the app stays backgrounded or the screen is off past
+    // the configured window (default 5 min; adb-tunable via
     //   adb shell settings put system sidescreen_auto_disconnect_secs <N>)
-    // the session tears itself down. A killed process needs no timer — its
-    // sockets die and the host's idle-sleep takes over.
+    // the session tears itself down. On battery, the grace window is capped
+    // at 30 seconds so an unused tablet can reach Android's normal idle/Doze
+    // path quickly. A killed process needs no timer — its sockets die and the
+    // host's idle-sleep takes over.
     private var backgroundedAtMs = 0L
     private var autoDisconnectJob: Job? = null
 
@@ -122,9 +132,6 @@ class MainActivity : AppCompatActivity() {
         // Allow rotation based on device sensor when not connected
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
 
-        // Keep screen on
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
         // Enable edge-to-edge display (draw behind system bars and cutout)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             window.attributes.layoutInDisplayCutoutMode =
@@ -134,11 +141,10 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        registerPowerStateReceiver()
+
         // Apply fullscreen mode immediately
         enableFullscreenMode()
-
-        // Enable performance mode for gaming (after binding is initialized)
-        enablePerformanceMode()
 
         setupSurface()
         setupUI()
@@ -253,32 +259,159 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Enable performance mode for streaming
-     * NOTE: setSustainedPerformanceMode is DISABLED - it causes thermal throttling
-     * which makes the entire device laggy. Normal power management is more efficient.
-     */
-    private fun enablePerformanceMode() {
+    private fun registerPowerStateReceiver() {
+        val filter =
+            IntentFilter().apply {
+                addAction(Intent.ACTION_BATTERY_CHANGED)
+                addAction(Intent.ACTION_POWER_CONNECTED)
+                addAction(Intent.ACTION_POWER_DISCONNECTED)
+                addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+            }
+        val initialBattery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        updatePowerState(initialBattery)
+        val receiver =
+            object : BroadcastReceiver() {
+                override fun onReceive(
+                    context: Context?,
+                    intent: Intent?,
+                ) {
+                    updatePowerState(intent)
+                }
+            }
+        ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        powerStateReceiver = receiver
+    }
+
+    private fun updatePowerState(intent: Intent?) {
+        when (intent?.action) {
+            Intent.ACTION_POWER_CONNECTED -> externallyPowered = true
+            Intent.ACTION_POWER_DISCONNECTED -> externallyPowered = false
+            Intent.ACTION_BATTERY_CHANGED -> {
+                if (intent.hasExtra(BatteryManager.EXTRA_PLUGGED)) {
+                    externallyPowered = isExternalPower(
+                        intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0),
+                    )
+                }
+            }
+        }
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        powerSaveMode = powerManager.isPowerSaveMode
+        applyPowerPolicy()
+
+        val action = intent?.action
+        if (!powerManager.isInteractive && isConnected) {
+            // Screen-off broadcasts do not always stop a fullscreen activity.
+            // Stop latency pings immediately and arm the same bounded idle
+            // teardown so the decoder cannot run indefinitely in the dark.
+            stopPingTimer()
+            if (autoDisconnectJob?.isActive != true || action == Intent.ACTION_POWER_DISCONNECTED) {
+                scheduleAutoDisconnect("screen-off")
+            }
+        } else if (
+            powerManager.isInteractive &&
+            activityInForeground &&
+            (action == null || action == Intent.ACTION_SCREEN_ON)
+        ) {
+            cancelAutoDisconnect()
+            if (action == Intent.ACTION_SCREEN_ON && isConnected) {
+                startPingTimer()
+            }
+        }
+    }
+
+    private fun isExternalPower(plugged: Int): Boolean {
+        val externalSources =
+            BatteryManager.BATTERY_PLUGGED_AC or
+                BatteryManager.BATTERY_PLUGGED_USB or
+                BatteryManager.BATTERY_PLUGGED_WIRELESS or
+                BatteryManager.BATTERY_PLUGGED_DOCK
+        return plugged and externalSources != 0
+    }
+
+    private fun displayForPowerPolicy(): android.view.Display? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay
+        }
+    }
+
+    private fun maxSupportedRefreshRate(display: android.view.Display?): Float {
+        val supported =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                display?.supportedModes?.maxOfOrNull { it.refreshRate }
+            } else {
+                null
+            }
+        return supported ?: display?.refreshRate ?: PowerPolicy.BATTERY_REFRESH_RATE_HZ
+    }
+
+    private fun applyPowerPolicy() {
+        if (!::binding.isInitialized) return
+        val displayObj = displayForPowerPolicy()
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val decision =
+            PowerPolicy.decide(
+                PowerPolicyInput(
+                    streaming = isConnected,
+                    foreground = activityInForeground,
+                    interactive = powerManager.isInteractive,
+                    externallyPowered = externallyPowered,
+                    powerSaveMode = powerSaveMode,
+                    maxRefreshRateHz = maxSupportedRefreshRate(displayObj),
+                ),
+            )
+
+        if (decision.keepScreenOn) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+
+        val attributes = window.attributes
+        if (attributes.preferredRefreshRate != decision.requestedRefreshRateHz) {
+            attributes.preferredRefreshRate = decision.requestedRefreshRateHz
+            window.attributes = attributes
+        }
+
+        applyFrameRateRequest(currentSurfaceHolder?.surface, decision.requestedRefreshRateHz)
+        applyFrameRateRequest(currentTextureSurface, decision.requestedRefreshRateHz)
+
+        val signature =
+            "${decision.reason}:${decision.requestedRefreshRateHz}:" +
+                "powered=$externallyPowered,saver=$powerSaveMode,foreground=$activityInForeground"
+        if (signature != lastPowerPolicySignature) {
+            lastPowerPolicySignature = signature
+            mainDiag(
+                "Power policy: ${decision.reason}, requested=${decision.requestedRefreshRateHz}Hz, " +
+                    "panelMax=${maxSupportedRefreshRate(displayObj)}Hz, powered=$externallyPowered, " +
+                    "saver=$powerSaveMode, foreground=$activityInForeground",
+            )
+        }
+    }
+
+    private fun applyFrameRateRequest(
+        surface: Surface?,
+        requestedRate: Float,
+    ) {
+        if (surface == null || !surface.isValid || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         try {
-            // REMOVED: setSustainedPerformanceMode(true)
-            // Sustained performance mode forces max CPU/GPU clocks which causes
-            // thermal throttling on extended use, making the device laggy.
-            // Let the SoC manage power efficiently instead.
-
-            // Use PARTIAL_WAKE_LOCK with timeout to prevent battery drain
-            // Screen is already kept on via FLAG_KEEP_SCREEN_ON
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock =
-                powerManager.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "SideScreen::PerformanceMode",
+            if (requestedRate == 0f && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                surface.clearFrameRate()
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                surface.setFrameRate(
+                    requestedRate,
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                    Surface.CHANGE_FRAME_RATE_ALWAYS,
                 )
-            // 30 minute timeout instead of infinite acquire
-            wakeLock?.acquire(30 * 60 * 1000L)
-
-            log("🎮 Performance mode ENABLED (balanced)")
-        } catch (e: Exception) {
-            log("⚠️ Performance mode failed: ${e.message}")
+            } else {
+                surface.setFrameRate(requestedRate, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            }
+        } catch (e: IllegalArgumentException) {
+            mainDiag("Frame-rate request rejected: ${e.message}")
         }
     }
 
@@ -346,6 +479,7 @@ class MainActivity : AppCompatActivity() {
                     )
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
+                    applyPowerPolicy()
                     initializeDecoderForCurrentSurface()
                 }
 
@@ -372,6 +506,7 @@ class MainActivity : AppCompatActivity() {
                 ) {
                     mainDiag("textureAvailable: ${width}x$height")
                     currentTextureSurface = Surface(surface)
+                    applyPowerPolicy()
                     initializeDecoderForCurrentSurface()
                 }
 
@@ -1252,7 +1387,28 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             val useBufferOutput = cflRenderer != null
-            videoDecoder = VideoDecoder(decoderSurface, displayObj, displayWidth, displayHeight, mime, bufferOutput = useBufferOutput)
+            val requestedFrameRate =
+                PowerPolicy.decide(
+                    PowerPolicyInput(
+                        streaming = isConnected,
+                        foreground = activityInForeground,
+                        interactive = (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive,
+                        externallyPowered = externallyPowered,
+                        powerSaveMode = powerSaveMode,
+                        maxRefreshRateHz = maxSupportedRefreshRate(displayObj),
+                    ),
+                ).requestedRefreshRateHz
+            applyFrameRateRequest(decoderSurface, requestedFrameRate)
+            videoDecoder =
+                VideoDecoder(
+                    surface = decoderSurface,
+                    display = displayObj,
+                    initialWidth = displayWidth,
+                    initialHeight = displayHeight,
+                    mime = mime,
+                    bufferOutput = useBufferOutput,
+                    requestedFrameRate = requestedFrameRate.takeIf { it > 0f },
+                )
             if (useBufferOutput) {
                 cflRenderer?.let { renderer ->
                     videoDecoder?.onDecodedImage = { img, done -> renderer.submitImage(img, done) }
@@ -1368,6 +1524,7 @@ class MainActivity : AppCompatActivity() {
 
                 isConnected = connected
                 macServerKnownAvailable = connected
+                applyPowerPolicy()
                 updateStatus(if (connected) "Connected - Streaming active" else "Disconnected")
                 binding.connectButton.isEnabled = !connected
                 binding.disconnectButton.isEnabled = connected
@@ -1560,6 +1717,7 @@ class MainActivity : AppCompatActivity() {
                         // Update connection state flag
                         isConnected = connected
                         macServerKnownAvailable = connected
+                        applyPowerPolicy()
 
                         if (connected) {
                             updateStatus("Connected - Streaming active")
@@ -1696,6 +1854,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun disconnect() {
         activeConnectionGeneration += 1
+        cancelAutoDisconnect()
         stopPingTimer()
         streamClient?.disconnect()
         streamClient = null
@@ -1708,6 +1867,7 @@ class MainActivity : AppCompatActivity() {
         displayHeight = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
+        applyPowerPolicy()
         runOnUiThread {
             updateStatus("Disconnected")
             binding.connectButton.isEnabled = true
@@ -1755,17 +1915,6 @@ class MainActivity : AppCompatActivity() {
             cflRenderer = null
             currentTextureSurface?.release()
             currentTextureSurface = null
-
-            // Release wake lock safely
-            try {
-                if (wakeLock?.isHeld == true) {
-                    wakeLock?.release()
-                }
-            } catch (e: Exception) {
-                // Ignore wake lock release errors
-            }
-            wakeLock = null
-            log("🎮 Performance mode DISABLED")
         } catch (e: Exception) {
             log("⚠️ Cleanup error: ${e.message}")
         }
@@ -2037,14 +2186,21 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        activityInForeground = true
+        updatePowerState(null)
         mainDiag(
             "onStart connected=$isConnected display=${displayWidth}x$displayHeight " +
                 "client=${streamClient != null}",
         )
-        // Back in the foreground — cancel any pending auto-disconnect.
-        backgroundedAtMs = 0L
-        autoDisconnectJob?.cancel()
-        autoDisconnectJob = null
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (powerManager.isInteractive) {
+            // Back in the foreground with the screen available — cancel any
+            // pending background/screen-off auto-disconnect.
+            cancelAutoDisconnect()
+        } else if (isConnected) {
+            // A fullscreen activity can restart while the screen is still off.
+            scheduleAutoDisconnect("screen-off")
+        }
         if (isConnected) {
             // Samsung firmware can defer background socket delivery. Do not
             // queue pings while stopped; resume fresh RTT samples only after
@@ -2061,6 +2217,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
+        activityInForeground = false
+        applyPowerPolicy()
         mainDiag(
             "onStop connected=$isConnected display=${displayWidth}x$displayHeight " +
                 "client=${streamClient != null}",
@@ -2071,25 +2229,64 @@ class MainActivity : AppCompatActivity() {
         stopPingTimer()
         // Backgrounded while streaming: arm the auto-disconnect timer.
         if (!isConnected) return
-        backgroundedAtMs = System.currentTimeMillis()
+        scheduleAutoDisconnect("backgrounded")
+    }
+
+    private fun scheduleAutoDisconnect(reason: String) {
+        if (!isConnected) return
+        if (backgroundedAtMs == 0L) {
+            backgroundedAtMs = System.currentTimeMillis()
+        }
+        val idleSinceMs = backgroundedAtMs
+        val configured =
+            Settings.System
+                .getInt(
+                    contentResolver,
+                    "sidescreen_auto_disconnect_secs",
+                    DEFAULT_BACKGROUND_DISCONNECT_SECS,
+                ).coerceAtLeast(10)
         val secs =
-            Settings.System.getInt(contentResolver, "sidescreen_auto_disconnect_secs", 300)
-                .coerceAtLeast(10)
+            if (externallyPowered) {
+                configured
+            } else {
+                minOf(configured, BATTERY_BACKGROUND_DISCONNECT_CAP_SECS)
+            }
+
+        autoDisconnectJob?.cancel()
         autoDisconnectJob =
             lifecycleScope.launch {
-                delay(secs * 1000L)
+                val deadlineMs = idleSinceMs + secs * 1000L
+                delay((deadlineMs - System.currentTimeMillis()).coerceAtLeast(0L))
+                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
                 if (
                     isConnected &&
-                    backgroundedAtMs > 0 &&
-                    System.currentTimeMillis() - backgroundedAtMs >= secs * 1000L
+                    backgroundedAtMs == idleSinceMs &&
+                    (!activityInForeground || !powerManager.isInteractive)
                 ) {
-                    DiagLog.log("MA", "auto-disconnect: backgrounded > ${secs}s — tearing down session")
+                    DiagLog.log(
+                        "MA",
+                        "auto-disconnect: $reason > ${secs}s — tearing down session",
+                    )
                     disconnect()
                 }
             }
     }
 
+    private fun cancelAutoDisconnect() {
+        backgroundedAtMs = 0L
+        autoDisconnectJob?.cancel()
+        autoDisconnectJob = null
+    }
+
     override fun onDestroy() {
+        powerStateReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: IllegalArgumentException) {
+                // The receiver was already removed by the activity context.
+            }
+            powerStateReceiver = null
+        }
         vsrCmdReceiver?.let {
             try {
                 unregisterReceiver(it)
@@ -2215,6 +2412,8 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val DIRECT_PIXEL_MIN_SCALE = 0.97f
+        const val DEFAULT_BACKGROUND_DISCONNECT_SECS = 300
+        const val BATTERY_BACKGROUND_DISCONNECT_CAP_SECS = 30
     }
 
     /**

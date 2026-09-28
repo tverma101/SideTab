@@ -61,3 +61,6 @@ temp/
 
 # Local ktlint binary (CI downloads its own)
 AndroidClient/ktlint
+
+# AirPlay level-2 test harness: a real device key, never commit it.
+scripts/airplay-level2/.tabs8_device_key

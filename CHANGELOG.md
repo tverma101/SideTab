@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security and maintenance
+- Android power handling is now app-scoped: an active foreground stream requests 120 Hz on external power, including while Battery Saver is on, falls back to 60 Hz on battery, and releases screen-on/frame-rate requests when idle, screen-off, or backgrounded. Idle sessions disconnect after the configured grace period, capped at 30 seconds on battery. The launch-time partial wake lock was removed.
 - Android pairing tokens are encrypted with the Android Keystore and are excluded from app backup; legacy plaintext preferences migrate on the next successful load.
 - Release APK builds no longer fall back to the debug signing key and fail with an actionable configuration error when release credentials are missing.
 - The VSR A/B broadcast hook is debug-only and is not registered by release builds.
