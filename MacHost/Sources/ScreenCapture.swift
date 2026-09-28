@@ -376,9 +376,11 @@ class ScreenCapture {
         //   SideScreen_exp_pixelFormat "10bit" -> 420YpCbCr10BiPlanarVideoRange (Main10 source)
         //   SideScreen_exp_colorSpace   "displayP3" | "bt2020" -> explicit color space
         let expPixelFormat = UserDefaults.standard.string(forKey: "SideScreen_exp_pixelFormat")
-        config.pixelFormat = expPixelFormat == "10bit"
-            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        config.pixelFormat = CaptureColorRange.pixelFormat(
+            wireless: UserDefaults.standard.string(forKey: "SideScreen_connectionMode") == "wireless",
+            hdrConversion: HDRConverter.enabled,
+            experimental10Bit: expPixelFormat == "10bit"
+        )
         switch UserDefaults.standard.string(forKey: "SideScreen_exp_colorSpace") {
         case "displayP3":
             config.colorSpaceName = "kCGColorSpaceDisplayP3" as CFString
@@ -845,7 +847,11 @@ class ScreenCapture {
 
         debugLog("CGDisplayStream fallback — display \(displayID) (\(width)x\(height))")
 
-        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        let pixelFormat = Int32(CaptureColorRange.pixelFormat(
+            wireless: UserDefaults.standard.string(forKey: "SideScreen_connectionMode") == "wireless",
+            hdrConversion: HDRConverter.enabled,
+            experimental10Bit: false
+        ))
         let queue = DispatchQueue(label: "com.sidescreen.cgdisplaystream", qos: .userInteractive)
 
         // Without kCGDisplayStreamShowCursor the fallback stream never

@@ -4,6 +4,7 @@ plugins {
 }
 
 val appVersion = rootProject.file("../VERSION").readText().trim()
+val previewSuffix = providers.gradleProperty("sidescreenPreviewSuffix").orNull
 val releaseKeystore = providers.environmentVariable("SIDESCREEN_RELEASE_KEYSTORE").orNull
 val releaseStorePassword = providers.environmentVariable("SIDESCREEN_RELEASE_STORE_PASSWORD").orNull
 val releaseKeyAlias = providers.environmentVariable("SIDESCREEN_RELEASE_KEY_ALIAS").orNull
@@ -45,6 +46,9 @@ android {
     }
 
     buildTypes {
+        debug {
+            if (!previewSuffix.isNullOrBlank()) applicationIdSuffix = previewSuffix
+        }
         release {
             isMinifyEnabled = false
             if (releaseSigningConfigured) {
