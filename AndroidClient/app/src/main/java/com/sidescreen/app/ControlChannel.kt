@@ -74,13 +74,8 @@ class ControlChannel(
         val generation: Long,
     )
 
-    private data class OutstandingPing(
-        val connectionGeneration: Long,
-        val sentAtNs: Long,
-    )
-
     @Volatile
-    private var outstandingPing: OutstandingPing? = null
+    private var outstandingPing: ControlPingProbe? = null
 
     @Volatile
     private var pingsPaused = false
@@ -158,7 +153,7 @@ class ControlChannel(
                     val probe = outstandingPing
                     if (probe != null &&
                         LivenessProbePolicy.isExpired(
-                            sentAtNs = probe.sentAtNs,
+                            sentAtNs = probe.armedAtNs,
                             nowNs = System.nanoTime(),
                             timeoutNs = PONG_TIMEOUT_NS,
                             paused = pingsPaused,
@@ -372,7 +367,7 @@ class ControlChannel(
                         val clientTs = readLongLE(pongBuffer, 0)
                         val hostSendTs = readLongLE(pongBuffer, 8)
                         val probe = outstandingPing
-                        if (probe?.connectionGeneration == generation && probe.sentAtNs == clientTs) {
+                        if (probe?.isAnsweredBy(generation, clientTs) == true) {
                             outstandingPing = null
                         }
                         val rtt = (arrival - clientTs) / 1_000_000.0
@@ -563,7 +558,7 @@ class ControlChannel(
             // consumes airtime/queue space and makes diagnosis noisier.
             val existing = outstandingPing
             if (existing?.connectionGeneration == transport.generation) {
-                if (now - existing.sentAtNs <= PONG_TIMEOUT_NS) {
+                if (now - existing.armedAtNs <= PONG_TIMEOUT_NS) {
                     return true
                 }
                 DiagLog.log("CC", "Control pong timeout detected by ping sender — reconnecting")
@@ -581,7 +576,12 @@ class ControlChannel(
                 // on a full send buffer is mistaken for a lost pong the moment
                 // it completes.
                 transport.output.write(pingPacketScratch)
-                outstandingPing = OutstandingPing(transport.generation, System.nanoTime())
+                outstandingPing =
+                    ControlPingProbe(
+                        connectionGeneration = transport.generation,
+                        wireTimestampNs = now,
+                        armedAtNs = System.nanoTime(),
+                    )
                 true
             } catch (e: Exception) {
                 outstandingPing = null
@@ -800,4 +800,24 @@ class ControlChannel(
          */
         const val PONG_TIMEOUT_NS = 15_000_000_000L
     }
+}
+
+/**
+ * One in-flight control ping. The host echoes the packet's timestamp verbatim,
+ * so [wireTimestampNs] is the only valid match key. [armedAtNs] starts the
+ * pong deadline once the bytes have left, so a write that blocked on a full
+ * send buffer is not mistaken for a lost pong. Matching on the arming time
+ * instead meant no pong ever matched: the first probe was never cleared, no
+ * second ping was sent, and every control connection timed out and reconnected
+ * after PONG_TIMEOUT_NS.
+ */
+internal data class ControlPingProbe(
+    val connectionGeneration: Long,
+    val wireTimestampNs: Long,
+    val armedAtNs: Long,
+) {
+    fun isAnsweredBy(
+        generation: Long,
+        echoedTimestampNs: Long,
+    ): Boolean = connectionGeneration == generation && wireTimestampNs == echoedTimestampNs
 }
