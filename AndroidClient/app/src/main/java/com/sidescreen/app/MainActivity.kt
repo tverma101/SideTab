@@ -683,6 +683,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun showError(message: String) {
         runOnUiThread {
+            // Callers fence on the connection generation, but this is a second
+            // post: the Activity can finish or be destroyed between the fence
+            // and here, and show() on a dead window throws
+            // WindowManager$BadTokenException (seen in the field, turning a
+            // dropped stream into an app death).
+            if (isFinishing || isDestroyed) return@runOnUiThread
             android.app.AlertDialog
                 .Builder(this)
                 .setTitle("Connection Error")
