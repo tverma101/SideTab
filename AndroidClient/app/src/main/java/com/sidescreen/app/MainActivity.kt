@@ -36,6 +36,7 @@ import androidx.constraintlayout.widget.ConstraintSet
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
@@ -123,6 +124,29 @@ class MainActivity : AppCompatActivity() {
     // reorder pointer indexes when a finger is also on the panel.
     private var activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
     private var regularTouchActive = false
+
+    // Which input sources reach the Mac, cached rather than read from
+    // SharedPreferences per MotionEvent: this is read on the UI thread at up to
+    // 240 Hz, and the mode must be able to change mid-stream without a
+    // reconnect. Seeded from prefs at connect and on every settings change.
+    @Volatile
+    private var inputMode: InputMode = InputMode.BOTH
+
+    // Last coordinates actually sent on each channel, in the same normalized
+    // space the wire uses. Needed to emit a terminating UP when the mode
+    // changes mid-gesture: without it the Mac is left holding a mouse button
+    // down, which then blocks *all* further finger input.
+    @Volatile
+    private var lastSentTouchX = 0f
+
+    @Volatile
+    private var lastSentTouchY = 0f
+
+    @Volatile
+    private var lastSentStylusX = 0f
+
+    @Volatile
+    private var lastSentStylusY = 0f
 
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
@@ -641,6 +665,8 @@ class MainActivity : AppCompatActivity() {
         val resetSettingsBtn = view.findViewById<View>(R.id.resetSettingsButton)
         val disconnectButton = view.findViewById<View>(R.id.disconnectSettingsButton)
         val closeButton = view.findViewById<View>(R.id.closeButton)
+        val inputModeToggleGroup =
+            view.findViewById<MaterialButtonToggleGroup>(R.id.inputModeToggleGroup)
 
         // Only show Disconnect when actually streaming. Otherwise the button is
         // a no-op and confuses users into clicking it twice.
@@ -688,6 +714,22 @@ class MainActivity : AppCompatActivity() {
             }
         }
         updatePositionSelection(prefs.settingsButtonCorner)
+
+        // Seed the selector before attaching the listener: check() fires
+        // onButtonChecked, which would otherwise write the default back over a
+        // previously chosen mode.
+        inputModeToggleGroup.check(inputModeButtonId(prefs.inputMode))
+        inputModeToggleGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            val mode = inputModeFromButtonId(checkedId) ?: return@addOnButtonCheckedListener
+            if (mode == inputMode) return@addOnButtonCheckedListener
+            prefs.inputMode = mode
+            // Applies live, including while streaming. This terminates any
+            // gesture the Mac still believes is in progress, because the host
+            // only ever learns a gesture ended from a terminating event and
+            // otherwise blocks all further input on the stuck button.
+            applyInputMode(mode)
+        }
 
         // Setup listeners
         showStatsSwitch.setOnCheckedChangeListener { _, isChecked ->
@@ -1668,6 +1710,9 @@ class MainActivity : AppCompatActivity() {
                     enableFullscreenMode()
                     binding.settingsPanel.visibility = View.GONE
                     applySettingsButtonVisibility()
+                    // Seed the live input mode. Nothing is in flight at connect,
+                    // so this bypasses the gesture-abort path deliberately.
+                    inputMode = prefs.inputMode
                     restoreSettingsButtonPosition()
                     updateOverlayVisibility(prefs.showStatsOverlay)
                     if (client.isWirelessSession) {
@@ -1899,6 +1944,11 @@ class MainActivity : AppCompatActivity() {
         macServerKnownAvailable = null
         activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
         regularTouchActive = false
+        // The Mac's input state is gone with the transport, so a mid-gesture
+        // abort is neither needed nor possible here. Re-seed the mode from prefs
+        // so a setting changed while disconnected takes effect on next connect.
+        inputPredictor.reset()
+        inputMode = prefs.inputMode
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
@@ -1965,6 +2015,24 @@ class MainActivity : AppCompatActivity() {
         event: MotionEvent,
     ) {
         val action = event.actionMasked
+
+        // Resolve the input mode against this event BEFORE any classification or
+        // ownership work. Deciding "is this the pen?" first is what made a
+        // disabled pen an input blocker: the pen still claimed the sequence and
+        // the ownership branch below then discarded every companion finger for
+        // the whole contact, so a pen resting on the tablet silenced touch.
+        if (!InputFilterPolicy.shouldForward(
+                mode = inputMode,
+                hasStylusPointer = eventHasStylusPointer(event),
+                stylusOwnsGesture = activeStylusPointerId != MotionEvent.INVALID_POINTER_ID,
+            )
+        ) {
+            // Consume rather than ignore: the surface listener already returns
+            // true for every event, and consuming keeps a filtered gesture from
+            // leaking into system edge gestures.
+            return
+        }
+
         val stylusIndex = findStylusPointerIndex(event)
 
         // A pen touching the display must start a direct mouse stroke. If a
@@ -2048,37 +2116,37 @@ class MainActivity : AppCompatActivity() {
                 regularTouchActive = true
                 inputPredictor.reset()
                 inputPredictor.addSample(x, y)
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
+                sendTouchToHost(x, y, TOUCH_ACTION_DOWN, pointerCount, x2, y2)
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
+                sendTouchToHost(x, y, TOUCH_ACTION_DOWN, pointerCount, x2, y2)
             }
 
             MotionEvent.ACTION_MOVE -> {
                 if (pointerCount == 1) {
                     inputPredictor.addSample(x, y)
                     val (px, py) = inputPredictor.predictPosition(12f)
-                    streamClient?.sendTouch(px, py, 1, 1)
+                    sendTouchToHost(px, py, TOUCH_ACTION_MOVE, 1)
                 } else {
-                    streamClient?.sendTouch(x, y, 1, pointerCount, x2, y2)
+                    sendTouchToHost(x, y, TOUCH_ACTION_MOVE, pointerCount, x2, y2)
                 }
             }
 
             MotionEvent.ACTION_UP -> {
                 regularTouchActive = false
                 inputPredictor.reset()
-                streamClient?.sendTouch(x, y, 2, 1)
+                sendTouchToHost(x, y, TOUCH_ACTION_UP, 1)
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                streamClient?.sendTouch(x, y, 2, pointerCount, x2, y2)
+                sendTouchToHost(x, y, TOUCH_ACTION_UP, pointerCount, x2, y2)
             }
 
             MotionEvent.ACTION_CANCEL -> {
                 regularTouchActive = false
                 inputPredictor.reset()
-                streamClient?.sendTouch(x, y, 2, 1)
+                sendTouchToHost(x, y, TOUCH_ACTION_UP, 1)
             }
         }
     }
@@ -2096,8 +2164,84 @@ class MainActivity : AppCompatActivity() {
         }
         val stylusIndex = findStylusPointerIndex(event)
         if (stylusIndex < 0) return false
+        if (!InputFilterPolicy.sendsStylusHover(inputMode)) return true
         sendStylusSample(view, event, stylusIndex, StylusProtocol.ACTION_HOVER)
         return true
+    }
+
+    /** Whether any pointer in this event is a pen or eraser. */
+    private fun eventHasStylusPointer(event: MotionEvent): Boolean {
+        for (index in 0 until event.pointerCount) {
+            if (isStylusTool(event.getToolType(index))) return true
+        }
+        return false
+    }
+
+    private fun inputModeButtonId(mode: InputMode): Int =
+        when (mode) {
+            InputMode.BOTH -> R.id.inputModeBoth
+            InputMode.TOUCH_ONLY -> R.id.inputModeTouch
+            InputMode.PEN_ONLY -> R.id.inputModePen
+            InputMode.OFF -> R.id.inputModeOff
+        }
+
+    private fun inputModeFromButtonId(id: Int): InputMode? =
+        when (id) {
+            R.id.inputModeBoth -> InputMode.BOTH
+            R.id.inputModeTouch -> InputMode.TOUCH_ONLY
+            R.id.inputModePen -> InputMode.PEN_ONLY
+            R.id.inputModeOff -> InputMode.OFF
+            else -> null
+        }
+
+    /**
+     * Abort any gesture the Mac currently believes is in progress, then adopt
+     * [mode].
+     *
+     * The host only ever learns a gesture ended from a terminating event:
+     * `StreamingServer` keeps a mouse button logically down until one arrives,
+     * and `AppDelegate.handleTouch` then refuses *all* finger input while
+     * `stylusIsDown`. So changing the mode mid-gesture without this would leave
+     * the Mac with a stuck button and a cursor that ignores the tablet.
+     *
+     * Both channels are terminated at the last coordinates actually sent, in the
+     * same normalized space as the wire, and the predictor is reset so the next
+     * enabled gesture is not extrapolated from the aborted one's samples.
+     */
+    private fun applyInputMode(mode: InputMode) {
+        if (inputMode == mode && !regularTouchActive &&
+            activeStylusPointerId == MotionEvent.INVALID_POINTER_ID
+        ) {
+            return
+        }
+        val client = streamClient
+        if (client != null) {
+            if (regularTouchActive) {
+                client.sendTouch(lastSentTouchX, lastSentTouchY, TOUCH_ACTION_UP, 1)
+            }
+            if (activeStylusPointerId != MotionEvent.INVALID_POINTER_ID) {
+                if (client.stylusSupported) {
+                    client.sendStylus(
+                        StylusInputEvent(
+                            x = lastSentStylusX,
+                            y = lastSentStylusY,
+                            action = StylusProtocol.ACTION_UP,
+                            toolType = MotionEvent.TOOL_TYPE_STYLUS,
+                            pressure = 0f,
+                            tilt = 0f,
+                            orientation = 0f,
+                            buttonState = 0,
+                        ),
+                    )
+                } else {
+                    client.sendTouch(lastSentStylusX, lastSentStylusY, TOUCH_ACTION_UP, 1)
+                }
+            }
+        }
+        regularTouchActive = false
+        activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
+        inputPredictor.reset()
+        inputMode = mode
     }
 
     private fun findStylusPointerIndex(event: MotionEvent): Int {
@@ -2134,7 +2278,7 @@ class MainActivity : AppCompatActivity() {
         if (pointerIndex !in 0 until event.pointerCount) return
         val x = PointerCoordinates.normalize(event.getX(pointerIndex), view.width)
         val y = PointerCoordinates.normalize(event.getY(pointerIndex), view.height)
-        streamClient?.sendTouch(x, y, action, 1)
+        sendTouchToHost(x, y, action, 1)
     }
 
     private fun sendStylusSample(
@@ -2162,13 +2306,36 @@ class MainActivity : AppCompatActivity() {
             )
 
         val client = streamClient ?: return
+        // Recorded before the send so applyInputMode() can terminate a stroke at
+        // the position the Mac last actually saw.
+        lastSentStylusX = x
+        lastSentStylusY = y
         if (client.stylusSupported) {
             client.sendStylus(sample)
         } else if (action != StylusProtocol.ACTION_HOVER) {
             // Older hosts do not acknowledge the extension. Preserve basic
             // touch compatibility until the host is updated.
+            lastSentTouchX = x
+            lastSentTouchY = y
             client.sendTouch(x, y, action.coerceAtMost(2), 1)
         }
+    }
+
+    /**
+     * Send a touch sample and remember where it went, so a mid-gesture input
+     * mode change can emit a terminating UP at the right coordinates.
+     */
+    private fun sendTouchToHost(
+        x: Float,
+        y: Float,
+        action: Int,
+        pointerCount: Int,
+        x2: Float = 0f,
+        y2: Float = 0f,
+    ) {
+        lastSentTouchX = x
+        lastSentTouchY = y
+        streamClient?.sendTouch(x, y, action, pointerCount, x2, y2)
     }
 
     private fun applyRotation(
@@ -2428,6 +2595,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private companion object {
+        // Wire action codes. Duplicated here rather than reaching into
+        // StreamClient's private constants; the host's parser
+        // (StreamingServer.handleTouchMessage) is the authority.
+        private const val TOUCH_ACTION_DOWN = 0
+        private const val TOUCH_ACTION_MOVE = 1
+        private const val TOUCH_ACTION_UP = 2
         const val DIRECT_PIXEL_MIN_SCALE = 0.97f
     }
 

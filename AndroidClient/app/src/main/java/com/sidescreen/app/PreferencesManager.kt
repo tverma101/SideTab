@@ -58,6 +58,15 @@ class PreferencesManager(
         get() = ConnectionMode.fromName(prefs.getString("connection_mode", null))
         set(value) = prefs.edit().putString("connection_mode", value.name).apply()
 
+    /**
+     * Which input sources reach the Mac. A single enum rather than two
+     * booleans so a "pen only" choice cannot disagree with a separate
+     * enable flag. See [InputMode].
+     */
+    var inputMode: InputMode
+        get() = InputMode.fromName(prefs.getString("input_mode", null))
+        set(value) = prefs.edit().putString("input_mode", value.name).apply()
+
     // Video Super Resolution (receiver-side GPU postprocess)
     var vsrEnabled: Boolean
         get() = prefs.getBoolean("vsr_enabled", false)

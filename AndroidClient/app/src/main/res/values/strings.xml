@@ -69,6 +69,12 @@
     <string name="ui_gpu_postprocess_sgsr1_cas" tools:ignore="Typos">GPU postprocess (SGSR1 / CAS)</string>
     <string name="ui_hide_settings_icon">Hide Settings Icon</string>
     <string name="ui_host">Host</string>
+    <string name="ui_input_both">Both</string>
+    <string name="ui_input_off">Off</string>
+    <string name="ui_input_pen_only">Pen</string>
+    <string name="ui_input_source">Input Source</string>
+    <string name="ui_input_source_hint">Chooses which inputs control the Mac. Changing this mid-gesture ends the current drag. The Mac\'s own Touch Control setting still applies.</string>
+    <string name="ui_input_touch_only">Touch</string>
     <string name="ui_mac">Mac</string>
     <string name="ui_mac_server_running">Mac server running</string>
     <string name="ui_mac_server_not_checked">Mac server not checked</string>
