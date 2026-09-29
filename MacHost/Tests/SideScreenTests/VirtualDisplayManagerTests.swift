@@ -28,6 +28,28 @@ final class VirtualDisplayManagerTests: XCTestCase {
         XCTAssertEqual(g?.pixelsHigh, 1080)
     }
 
+    /// macOS opens a new display in its default mode for the reported density.
+    /// At 110 PPI a HiDPI 2800x1752 display opened at 2800x1752 1x, so the
+    /// tablet got a desktop twice the intended size with half-size text.
+    func testHiDPIReportsRetinaDensity() throws {
+        let retina = try VirtualDisplayLimits.resolve(width: 1400, height: 876, refreshRate: 120, hiDPI: true)
+        XCTAssertEqual(retina.pixelsPerInch, 220)
+        XCTAssertEqual(retina.sizeInMillimeters.width, 323.3, accuracy: 0.1)
+        XCTAssertEqual(retina.sizeInMillimeters.height, 202.3, accuracy: 0.1)
+
+        let plain = try VirtualDisplayLimits.resolve(width: 2800, height: 1752, refreshRate: 120, hiDPI: false)
+        XCTAssertEqual(plain.pixelsPerInch, 110)
+        XCTAssertEqual(plain.sizeInMillimeters.width, 646.5, accuracy: 0.1)
+    }
+
+    /// Same logical desktop, same physical size: HiDPI changes the pixel count,
+    /// not how large the panel claims to be.
+    func testHiDPIKeepsThePhysicalSizeOfTheLogicalDesktop() throws {
+        let retina = try VirtualDisplayLimits.resolve(width: 1400, height: 876, refreshRate: 60, hiDPI: true)
+        let plain = try VirtualDisplayLimits.resolve(width: 1400, height: 876, refreshRate: 60, hiDPI: false)
+        XCTAssertEqual(retina.sizeInMillimeters, plain.sizeInMillimeters)
+    }
+
     /// UInt32(negative) traps with SIGTRAP rather than wrapping, so an
     /// unrepresentable request must throw instead of reaching the conversion.
     func testUnrepresentableSizesThrow() {
@@ -126,6 +148,7 @@ final class VirtualDisplayManagerTests: XCTestCase {
         pixelsHigh: Int = 1752,
         refreshRate: Int = 60,
         hiDPI: Bool = true,
+        pixelsPerInch: Int? = nil,
         productIDOverride: UInt32? = nil
     ) -> VirtualDisplaySerial.Seed {
         VirtualDisplaySerial.Seed(
@@ -137,7 +160,8 @@ final class VirtualDisplayManagerTests: XCTestCase {
             pixelsWide: pixelsWide,
             pixelsHigh: pixelsHigh,
             refreshRate: refreshRate,
-            hiDPI: hiDPI
+            hiDPI: hiDPI,
+            pixelsPerInch: pixelsPerInch ?? (hiDPI ? 220 : 110)
         )
     }
 
@@ -163,6 +187,16 @@ final class VirtualDisplayManagerTests: XCTestCase {
         ]
         let serials = configurations.map { VirtualDisplaySerial.number(for: $0) }
         XCTAssertEqual(Set(serials).count, configurations.count, "collision across \(serials)")
+    }
+
+    /// macOS restores the mode it saved for a (vendor, product, serial), even
+    /// after the density changes: a display saved at 1x under 110 PPI came back
+    /// at 1x under 220 PPI. A density change must therefore be a new monitor.
+    func testSerialChangesWithDensity() {
+        XCTAssertNotEqual(
+            VirtualDisplaySerial.number(for: seed(pixelsPerInch: 110)),
+            VirtualDisplaySerial.number(for: seed(pixelsPerInch: 220))
+        )
     }
 
     func testSerialIsNeverZero() {
