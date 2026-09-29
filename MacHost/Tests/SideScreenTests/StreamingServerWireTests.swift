@@ -61,8 +61,8 @@ final class StreamingServerWireTests: XCTestCase {
     }
 
     func testDecoderLimitsDecodeSplitsSevenBitHalves() {
-        // 3840 = 30 << 7 | 0, 2160 = 16 << 7 | 112
-        let limits = StreamingServer.decodeClientDecoderLimits([0x80 | 30, 0x80, 0x80 | 16, 0x80 | 112])
+        // 3840 = 30 << 7 | 0, 2160 = 16 << 7 | 112; each byte is 0x80 | half.
+        let limits = StreamingServer.decodeClientDecoderLimits([0x9E, 0x80, 0x90, 0xF0])
         XCTAssertEqual(limits?.width, 3_840)
         XCTAssertEqual(limits?.height, 2_160)
     }
