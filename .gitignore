@@ -8,7 +8,13 @@ DerivedData/
 # Local runtime and audit evidence
 agent-evidence/
 docs/codex/
-docs/troubleshooting/
+
+# docs/troubleshooting/ is deliberately NOT ignored. Those records are the
+# project's durable debugging memory and the project-memory skill routes future
+# work through them; ignoring the directory made the records local-only, so a
+# fresh clone had no history of past failures and they were silently lost when a
+# working copy was cleaned up. Generated `docs/codex/` index artifacts stay
+# ignored.
 
 # Android build
 AndroidClient/app/build/
