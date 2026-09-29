@@ -1,6 +1,6 @@
 # Logo & Icon Guide
 
-Hướng dẫn tạo logo cho Side Screen.
+Hướng dẫn tạo logo cho SideTab.
 
 ---
 

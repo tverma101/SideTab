@@ -1,6 +1,6 @@
 # Screenshots Guide
 
-Hướng dẫn capture screenshots đẹp cho Side Screen.
+Hướng dẫn capture screenshots đẹp cho SideTab.
 
 ---
 

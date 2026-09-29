@@ -4,7 +4,9 @@ import java.security.MessageDigest
 
 /** Stable Bonjour instance identity derived from (but not revealing) the pairing token. */
 object WirelessServiceIdentity {
-    const val SERVICE_TYPE = "_sidescreen._tcp."
+    // NsdManager expects the Bonjour service type without the presentation
+    // trailing dot. The callback may still report the canonical dotted form.
+    const val SERVICE_TYPE = "_sidescreen._tcp"
 
     fun nameForToken(token: ByteArray): String {
         require(token.size == 32) { "pairing token must be 32 bytes" }

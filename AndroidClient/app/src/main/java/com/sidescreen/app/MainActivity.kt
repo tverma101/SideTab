@@ -18,8 +18,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import android.provider.Settings
+import android.view.Display
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -43,6 +43,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -52,10 +53,15 @@ private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 //   --ez enabled true --es mode sgsr [--ef sharpness 0.8] [--ef edge_threshold 0.03]
 //   --ez enabled true --es mode cfl [--ef cfl_strength 0.15]
 private const val VSR_CMD_ACTION = "com.sidescreen.app.VSR_CMD"
-private const val DEFAULT_USB_HOST = "127.0.0.1"
-private const val DEFAULT_USB_PORT = 54321
 private const val LEGACY_E3_HOST = "10.77.0.1"
 private const val LEGACY_E3_PORT = 54326
+
+/**
+ * Bounded wait for the Mac's codec selection on a device that cannot decode
+ * HEVC. Long enough for a congested wireless connect, short enough that a
+ * negotiation the host never sends cannot hold the screen black.
+ */
+private const val CODEC_NEGOTIATION_GRACE_MS = 1_500L
 
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
@@ -63,7 +69,7 @@ class MainActivity : AppCompatActivity() {
     private val cameraPerm by lazy { CameraPermissionManager(this) }
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: PreferencesManager
-    private var videoDecoder: VideoDecoder? = null
+    @Volatile private var videoDecoder: VideoDecoder? = null
     private var sgsrRenderer: SgsrRenderer? = null
     private var cflRenderer: CflRenderer? = null
     @Volatile private var streamClient: StreamClient? = null
@@ -75,13 +81,35 @@ class MainActivity : AppCompatActivity() {
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
     private var displayFlipHorizontal = false
     private var displayFlipVertical = false
-    private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
     // All callbacks from an old StreamClient become inert as soon as a newer
     // connect starts. Without this generation fence, a sender restart can
     // leave several clients reconnecting at once and starve the decoder.
     @Volatile private var activeConnectionGeneration = 0L
+
+    /**
+     * Fence for the asynchronous video-pipeline build. Every path that retires
+     * the current pipeline (disconnect, new connection, surface recreation)
+     * advances it, so a build that finishes afterwards is discarded instead of
+     * publishing a decoder for a dead surface.
+     */
+    @Volatile private var videoPipelineGeneration = 0L
+
+    /**
+     * Main-thread only: the parameters of the decoder build now running off
+     * the main thread, until it publishes, fails or is retired. The host sends
+     * the display config twice on connect (again once it has read the client's
+     * capabilities), and each copy reached initializeDecoderForCurrentSurface
+     * before the first build had published. The second call retired the first
+     * build, which had already taken the surface, so the second one's
+     * low-latency configure failed and it fell back to a slower config.
+     */
+    private var inFlightPipelineKey: VideoPipelineKey? = null
+
+    /** Bounded wait for the Mac's codec selection on an AVC-only device. */
+    @Volatile private var codecNegotiationJob: Job? = null
+    private var displayConfigReceivedAtMs = 0L
 
     // For dragging stats overlay
     private var isDraggingOverlay = false
@@ -103,7 +131,7 @@ class MainActivity : AppCompatActivity() {
     // A server status is only learned from an explicit stream attempt. Keeping
     // this as a local last-known value prevents the idle checklist from opening
     // a socket every few seconds and looking like a reconnect loop.
-    private var macServerKnownAvailable = false
+    private var macServerKnownAvailable: Boolean? = null
 
     // Auto-disconnect: if the app stays backgrounded past the configured
     // window (default 5 min; adb-tunable via
@@ -122,9 +150,6 @@ class MainActivity : AppCompatActivity() {
         // Allow rotation based on device sensor when not connected
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
 
-        // Keep screen on
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
         // Enable edge-to-edge display (draw behind system bars and cutout)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             window.attributes.layoutInDisplayCutoutMode =
@@ -137,9 +162,6 @@ class MainActivity : AppCompatActivity() {
         // Apply fullscreen mode immediately
         enableFullscreenMode()
 
-        // Enable performance mode for gaming (after binding is initialized)
-        enablePerformanceMode()
-
         setupSurface()
         setupUI()
         setupDraggableOverlay()
@@ -150,6 +172,14 @@ class MainActivity : AppCompatActivity() {
         setupModeToggle()
         setupWirelessController()
         setupVsrCommandReceiver()
+
+        // The Mac only re-runs codec negotiation for a client that advertises
+        // inside a fixed window after connect, and a MediaCodecList walk can
+        // take longer than that. Resolve the device's codec capabilities now,
+        // off the main thread, so the first connect is a cache hit.
+        lifecycleScope.launch(Dispatchers.Default) {
+            CodecCapabilities.warmUp()
+        }
 
         // Connections are user initiated. Keep the last-session preference
         // out of startup so a stale host, a sleeping Mac, or a transport
@@ -167,9 +197,7 @@ class MainActivity : AppCompatActivity() {
             val mode = if (checkedId == R.id.modeWireless) ConnectionMode.WIRELESS else ConnectionMode.USB
             prefs.connectionMode = mode
             applyModeVisibility(mode)
-            if (mode == ConnectionMode.WIRELESS) {
-                wirelessController.show()
-            }
+            if (mode == ConnectionMode.WIRELESS) wirelessController.show()
         }
     }
 
@@ -205,6 +233,7 @@ class MainActivity : AppCompatActivity() {
                         disconnectButton = binding.wirelessDisconnectButton,
                         forgetButton = binding.wirelessForgetButton,
                         reconnectButton = binding.wirelessReconnectButton,
+                        repairReconnectButton = binding.wirelessRepairReconnectButton,
                         idleForgetButton = binding.wirelessIdleForgetButton,
                         openSettingsButton = binding.wirelessOpenSettingsButton,
                         connectedMacName = binding.connectedMacName,
@@ -218,12 +247,19 @@ class MainActivity : AppCompatActivity() {
                     ),
                 storage = pairedHostStorage,
                 cameraPerm = cameraPerm,
-                onConnectRequested = { host, port, token, deviceName, _ ->
-                    connectWireless(host, port, token, deviceName)
+                onConnectRequested = { host, port, token, deviceName, _, controlPort, alternateHosts ->
+                    connectWireless(host, port, token, deviceName, controlPort, alternateHosts)
                 },
             )
         wirelessController.bind()
-        binding.wirelessDisconnectButton.setOnClickListener { disconnect() }
+        binding.wirelessDisconnectButton.setOnClickListener {
+            disconnect()
+            // The generation fence intentionally suppresses the stale client's
+            // disconnected callback. Update the wireless state explicitly so a
+            // user-initiated disconnect returns to the paired-idle screen with
+            // its Reconnect action visible.
+            wirelessController.onUserDisconnected()
+        }
         if (prefs.connectionMode == ConnectionMode.WIRELESS) {
             wirelessController.show()
         }
@@ -253,33 +289,58 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Enable performance mode for streaming
-     * NOTE: setSustainedPerformanceMode is DISABLED - it causes thermal throttling
-     * which makes the entire device laggy. Normal power management is more efficient.
-     */
-    private fun enablePerformanceMode() {
-        try {
-            // REMOVED: setSustainedPerformanceMode(true)
-            // Sustained performance mode forces max CPU/GPU clocks which causes
-            // thermal throttling on extended use, making the device laggy.
-            // Let the SoC manage power efficiently instead.
-
-            // Use PARTIAL_WAKE_LOCK with timeout to prevent battery drain
-            // Screen is already kept on via FLAG_KEEP_SCREEN_ON
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock =
-                powerManager.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "SideScreen::PerformanceMode",
-                )
-            // 30 minute timeout instead of infinite acquire
-            wakeLock?.acquire(30 * 60 * 1000L)
-
-            log("🎮 Performance mode ENABLED (balanced)")
-        } catch (e: Exception) {
-            log("⚠️ Performance mode failed: ${e.message}")
+    /** Keep the panel awake only while a live stream is visible. */
+    private fun setDisplayKeepAwake(keepAwake: Boolean) {
+        if (keepAwake) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
+    }
+
+    /**
+     * Tell SurfaceFlinger the cadence of the source stream. On devices with a
+     * seamless 60-Hz mode this can avoid running a 120-Hz panel for a 60-FPS
+     * wireless stream; otherwise Android keeps the current mode and still
+     * uses the hint for frame pacing. This is only a scheduling hint and does
+     * not alter decoded pixels or frame rate.
+     */
+    private fun applyFrameRateHint() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+
+        val wireless = streamClient?.isWirelessSession == true
+        val connected = isConnected && streamClient != null && wireless
+        if (!connected) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                currentSurfaceHolder?.surface?.takeIf { it.isValid }?.clearFrameRate()
+                currentTextureSurface?.takeIf { it.isValid }?.clearFrameRate()
+            }
+            return
+        }
+
+        val requestedFps = WirelessFreshnessPolicy.TARGET_FRAME_RATE.toFloat()
+
+        val surfaces = listOfNotNull(
+            currentSurfaceHolder?.surface?.takeIf { it.isValid },
+            currentTextureSurface?.takeIf { it.isValid },
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            surfaces.forEach { surface ->
+                surface.setFrameRate(
+                requestedFps,
+                Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS,
+                )
+            }
+        } else {
+            surfaces.forEach { surface ->
+                surface.setFrameRate(
+                    requestedFps,
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                )
+            }
+        }
+        mainDiag("Frame-rate hint: ${"%.1f".format(requestedFps)}Hz, wireless=true")
     }
 
     /**
@@ -346,6 +407,7 @@ class MainActivity : AppCompatActivity() {
                     )
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
+                    applyFrameRateHint()
                     initializeDecoderForCurrentSurface()
                 }
 
@@ -353,10 +415,7 @@ class MainActivity : AppCompatActivity() {
                     mainDiag("surfaceDestroyed")
                     log("Surface destroyed")
                     if (!decoderUsingTextureView) {
-                        videoDecoder?.release()
-                        videoDecoder = null
-                        sgsrRenderer?.release()
-                        sgsrRenderer = null
+                        releaseVideoPipeline()
                     }
                     currentSurfaceHolder = null
                 }
@@ -372,6 +431,7 @@ class MainActivity : AppCompatActivity() {
                 ) {
                     mainDiag("textureAvailable: ${width}x$height")
                     currentTextureSurface = Surface(surface)
+                    applyFrameRateHint()
                     initializeDecoderForCurrentSurface()
                 }
 
@@ -387,10 +447,7 @@ class MainActivity : AppCompatActivity() {
                 override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                     mainDiag("textureDestroyed")
                     if (decoderUsingTextureView) {
-                        videoDecoder?.release()
-                        videoDecoder = null
-                        sgsrRenderer?.release()
-                        sgsrRenderer = null
+                        releaseVideoPipeline()
                     }
                     currentTextureSurface?.release()
                     currentTextureSurface = null
@@ -422,28 +479,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupUI() {
         binding.connectButton.setOnClickListener {
-            var host =
-                binding.hostInput.text
-                    .toString()
-                    .ifEmpty { DEFAULT_USB_HOST }
-            val port =
-                binding.portInput.text
-                    .toString()
-                    .toIntOrNull() ?: DEFAULT_USB_PORT
-
-            // Convert localhost to 127.0.0.1 for better Android compatibility
-            if (host.equals("localhost", ignoreCase = true)) {
-                host = "127.0.0.1"
+            when (val result = UsbConnectionTarget.parse(
+                binding.hostInput.text.toString(),
+                binding.portInput.text.toString(),
+            )) {
+                is UsbConnectionTarget.ParseResult.Valid -> {
+                    updateStatus(getString(R.string.connecting_status))
+                    connect(result.target.host, result.target.port)
+                }
+                UsbConnectionTarget.ParseResult.InvalidHost -> showError(getString(R.string.usb_host_invalid))
+                UsbConnectionTarget.ParseResult.InvalidPort -> showError(getString(R.string.usb_port_invalid))
             }
-
-            // Validate input
-            if (host.isBlank()) {
-                showError("Please enter a host address")
-                return@setOnClickListener
-            }
-
-            updateStatus("Connecting...")
-            connect(host, port)
         }
 
         binding.disconnectButton.setOnClickListener {
@@ -464,6 +510,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun showError(message: String) {
         runOnUiThread {
+            // Callers fence on the connection generation, but this is a second
+            // post: the Activity can finish or be destroyed between the fence
+            // and here, and show() on a dead window throws
+            // WindowManager$BadTokenException (seen in the field, turning a
+            // dropped stream into an app death).
+            if (isFinishing || isDestroyed) return@runOnUiThread
             android.app.AlertDialog
                 .Builder(this)
                 .setTitle("Connection Error")
@@ -481,7 +533,7 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("ClickableViewAccessibility", "InflateParams")
     private fun setupDraggableOverlay() {
-        binding.statusBar.setOnTouchListener { view, event ->
+        binding.streamStatusBarBinding.statusBar.setOnTouchListener { view, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     isDraggingOverlay = true
@@ -537,9 +589,9 @@ class MainActivity : AppCompatActivity() {
         val y = prefs.overlayY
 
         if (x >= 0 && y >= 0) {
-            binding.statusBar.post {
-                binding.statusBar.x = x
-                binding.statusBar.y = y
+            binding.streamStatusBarBinding.statusBar.post {
+                binding.streamStatusBarBinding.statusBar.x = x
+                binding.streamStatusBarBinding.statusBar.y = y
             }
         }
 
@@ -553,23 +605,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateOverlayOpacity(opacity: Float) {
-        binding.statusBar.alpha = opacity
+        binding.streamStatusBarBinding.statusBar.alpha = opacity
     }
 
     private fun updateOverlayVisibility(show: Boolean) {
         if (streamClient != null && show) {
-            binding.statusBar.visibility = View.VISIBLE
+            binding.streamStatusBarBinding.statusBar.visibility = View.VISIBLE
             // Restore position when showing
             val x = prefs.overlayX
             val y = prefs.overlayY
             if (x >= 0 && y >= 0) {
-                binding.statusBar.post {
-                    binding.statusBar.x = x
-                    binding.statusBar.y = y
+                binding.streamStatusBarBinding.statusBar.post {
+                    binding.streamStatusBarBinding.statusBar.x = x
+                    binding.streamStatusBarBinding.statusBar.y = y
                 }
             }
         } else {
-            binding.statusBar.visibility = View.GONE
+            binding.streamStatusBarBinding.statusBar.visibility = View.GONE
         }
     }
 
@@ -740,9 +792,9 @@ class MainActivity : AppCompatActivity() {
             prefs.overlayY = -1f
             // Use displayMetrics for reliable positioning
             val dm = resources.displayMetrics
-            binding.statusBar
+            binding.streamStatusBarBinding.statusBar
                 .animate()
-                .x(dm.widthPixels - binding.statusBar.width - 48f)
+                .x(dm.widthPixels - binding.streamStatusBarBinding.statusBar.width - 48f)
                 .y(48f)
                 .setDuration(300)
                 .start()
@@ -883,7 +935,7 @@ class MainActivity : AppCompatActivity() {
      * Supports 8 positions: 4 corners + 4 edges
      */
     private fun updateSettingsButtonPosition(position: Int) {
-        val constraintLayout = binding.root as ConstraintLayout
+        val constraintLayout = binding.root
         val constraintSet = ConstraintSet()
         constraintSet.clone(constraintLayout)
 
@@ -997,15 +1049,50 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Display config from a new Mac always arrives AFTER codecSelected, so a
-     * missing negotiation at this point proves the Mac app predates H.264
-     * support — surface that instead of a silent black screen.
+     * Display config from a new Mac arrives AFTER codecSelected, so a missing
+     * negotiation means the Mac never selected a codec: either its app predates
+     * H.264 support, or this client missed the host's post-connect window.
+     * Either way the client can still stream H.264, so say what is happening
+     * instead of leaving a silent black screen.
      */
     private fun warnIfAvcOnlyWithoutNegotiation() {
         if (!CodecCapabilities.hasHevcDecoder && streamClient?.codecNegotiated != true) {
-            mainDiag("AVC-only device but Mac did not negotiate codec — Mac app too old")
+            mainDiag("AVC-only device but Mac did not negotiate codec (old Mac app, or the negotiation window was missed)")
             runOnUiThread {
-                updateStatus("This device has no HEVC decoder. Update the SideScreen Mac app to enable H.264 support.")
+                updateStatus("This device has no HEVC decoder and the Mac selected no codec - trying H.264")
+            }
+        }
+    }
+
+    /**
+     * How long an AVC-only device waits for the Mac's codecSelected before
+     * building the H.264 decoder itself. The host's negotiation is single-shot:
+     * it arms a fixed timer after connect and only a later capability advert
+     * re-runs it, so codecSelected can legitimately never arrive. Waiting for it
+     * forever is a permanent black screen, so the wait is bounded.
+     */
+    private fun codecNegotiationGraceMs(): Long {
+        val configuredAt = displayConfigReceivedAtMs
+        if (configuredAt <= 0L) return 0L
+        return (configuredAt + CODEC_NEGOTIATION_GRACE_MS) - System.currentTimeMillis()
+    }
+
+    private fun awaitCodecNegotiation() {
+        val remainingMs = codecNegotiationGraceMs()
+        if (remainingMs <= 0L) {
+            mainDiag("AVC-only device with no codec negotiation — using H.264")
+            warnIfAvcOnlyWithoutNegotiation()
+            return
+        }
+        codecNegotiationJob?.cancel()
+        codecNegotiationJob = lifecycleScope.launch {
+            delay(remainingMs)
+            if (streamClient?.codecNegotiated != true &&
+                !CodecCapabilities.hasHevcDecoder &&
+                videoDecoder == null
+            ) {
+                mainDiag("codecSelected never arrived after ${CODEC_NEGOTIATION_GRACE_MS}ms — initializing H.264")
+                initializeDecoderForCurrentSurface()
             }
         }
     }
@@ -1020,6 +1107,8 @@ class MainActivity : AppCompatActivity() {
     private fun onStreamCodecSelected(isHevc: Boolean) {
         val expectedMime =
             if (isHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+        codecNegotiationJob?.cancel()
+        codecNegotiationJob = null
         runOnUiThread {
             val dec = videoDecoder
             when {
@@ -1047,14 +1136,24 @@ class MainActivity : AppCompatActivity() {
     /** Recreate the video path (decoder + optional VSR renderer) with current prefs. */
     private fun restartVideoPath() {
         if (!isConnected) return
+        releaseVideoPipeline()
+        applyDirectPixelMapping(displayWidth, displayHeight)
+        initializeDecoderForCurrentSurface()
+    }
+
+    /** Release codec and post-process resources before replacing their surface. */
+    private fun releaseVideoPipeline() {
+        videoPipelineGeneration += 1L
+        inFlightPipelineKey = null
+        codecNegotiationJob?.cancel()
+        codecNegotiationJob = null
         videoDecoder?.release()
         videoDecoder = null
         sgsrRenderer?.release()
         sgsrRenderer = null
         cflRenderer?.release()
         cflRenderer = null
-        applyDirectPixelMapping(displayWidth, displayHeight)
-        initializeDecoderForCurrentSurface()
+        decoderUsingTextureView = false
     }
 
     /**
@@ -1136,17 +1235,34 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Main-thread entry point. Everything expensive — MediaCodec construction
+     * (which enumerates the codec list) and the VSR renderers' EGL setup — runs
+     * on a background dispatcher, because this is reached from surfaceChanged,
+     * onDisplaySize, onStreamCodecSelected, onStart and the settings toggles,
+     * and each of those used to stall the UI thread for hundreds of
+     * milliseconds. The result is published back here behind the
+     * videoPipelineGeneration fence, so a build whose pipeline was retired
+     * while it ran is released instead of published.
+     */
     private fun initializeDecoderForCurrentSurface() {
         if (displayWidth <= 0 || displayHeight <= 0) {
             mainDiag("initializeDecoder skipped — no display config yet")
             return
         }
         // AVC-only device: an HEVC decoder can never decode the H.264 stream
-        // the Mac will send — defer until codecSelected arrives, then
-        // onStreamCodecSelected initializes with the correct mime.
+        // the Mac will send, so wait for codecSelected — but only for a bounded
+        // time. The host arms its negotiation once after connect and a client
+        // that misses the window is never told which codec to expect, so
+        // waiting for that message forever is a permanent black screen.
         if (!CodecCapabilities.hasHevcDecoder && streamClient?.codecNegotiated != true) {
-            mainDiag("initializeDecoder deferred — AVC-only device awaiting codec negotiation")
-            return
+            val graceRemainingMs = codecNegotiationGraceMs()
+            if (graceRemainingMs > 0L) {
+                mainDiag("initializeDecoder deferred — AVC-only device awaiting codec negotiation (${graceRemainingMs}ms left)")
+                awaitCodecNegotiation()
+                return
+            }
+            mainDiag("initializeDecoder proceeding with H.264 — the Mac never sent codecSelected")
         }
 
         val (surface, useTextureView) =
@@ -1156,199 +1272,366 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-        if (videoDecoder != null && decoderUsingTextureView == useTextureView && sgsrRenderer == null && cflRenderer == null) {
-            videoDecoder?.updateResolution(displayWidth, displayHeight)
+        val reusable = videoDecoder
+        if (reusable != null && decoderUsingTextureView == useTextureView && sgsrRenderer == null && cflRenderer == null) {
+            if (!reusable.needsResolutionUpdate(displayWidth, displayHeight)) return
+            val decoder = reusable
+            val width = displayWidth
+            val height = displayHeight
+            val generation = videoPipelineGeneration
+            lifecycleScope.launch(Dispatchers.Default) {
+                decoder.updateResolution(width, height)
+                if (generation != videoPipelineGeneration) return@launch
+                mainDiag("Decoder resolution updated to ${width}x$height")
+            }
             return
         }
 
-        videoDecoder?.release()
-        videoDecoder = null
-        sgsrRenderer?.release()
-        sgsrRenderer = null
-        cflRenderer?.release()
-        cflRenderer = null
+        val request =
+            VideoPipelineRequest(
+                surface = surface,
+                surfaceIsValid = surface.isValid,
+                width = displayWidth,
+                height = displayHeight,
+                display =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        display
+                    } else {
+                        @Suppress("DEPRECATION")
+                        windowManager.defaultDisplay
+                    },
+                mime =
+                    if (streamClient?.streamCodecIsHevc == false) {
+                        MediaFormat.MIMETYPE_VIDEO_AVC
+                    } else {
+                        MediaFormat.MIMETYPE_VIDEO_HEVC
+                    },
+                useTextureView = useTextureView,
+                gles31 = supportsGles31(),
+                vsrEnabled = prefs.vsrEnabled,
+                vsrMode = prefs.vsrMode,
+                cflStrength = prefs.cflStrength,
+                vsrSharpness = prefs.vsrSharpness,
+                vsrEdgeThreshold = prefs.vsrEdgeThreshold,
+                wirelessSession = streamClient?.isWirelessSession == true,
+            )
+        val key = request.key()
+        if (key == inFlightPipelineKey) {
+            mainDiag("initializeDecoder skipped — an identical decoder build is already running")
+            return
+        }
+
+        releaseVideoPipeline()
         decoderUsingTextureView = useTextureView
+        val generation = videoPipelineGeneration
+        inFlightPipelineKey = key
 
         mainDiag(
-            "initializeDecoder called, surface=$surface, valid=${surface.isValid}, " +
-                "res=${displayWidth}x$displayHeight, texture=$useTextureView",
+            "initializeDecoder called, surface=$surface, valid=${request.surfaceIsValid}, " +
+                "res=${request.width}x${request.height}, texture=$useTextureView",
         )
-        try {
-            val displayObj =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    display
-                } else {
-                    @Suppress("DEPRECATION")
-                    windowManager.defaultDisplay
-                }
-            val mime =
-                if (streamClient?.streamCodecIsHevc == false) {
-                    MediaFormat.MIMETYPE_VIDEO_AVC
-                } else {
-                    MediaFormat.MIMETYPE_VIDEO_HEVC
-                }
-            var decoderSurface = surface
-            val cflOn = prefs.vsrEnabled && prefs.vsrMode.equals("cfl", true) &&
-                supportsGles31() && !useTextureView
-            val vsrOn = prefs.vsrEnabled && supportsGles31() && !useTextureView && !cflOn
-            if (cflOn) {
-                // CfL chroma reconstruction via ByteBuffer-mode decode: the
-                // decoder is configured WITHOUT a surface and hands
-                // plane-accessible Images to the renderer (the ImageReader
-                // route is dead on this SoC — opaque UBWC buffers whose
-                // plane access is a fatal JNI abort).
+
+        lifecycleScope.launch(Dispatchers.Default) {
+            val startedNs = System.nanoTime()
+            val pipeline =
                 try {
-                    val renderer = CflRenderer()
-                    renderer.initialize(surface, displayWidth, displayHeight)
-                    renderer.onStats = { s ->
-                        mainDiag("VSR stats: ${s.summary()}")
-                        runOnUiThread { binding.vsrText.text = s.summary() }
-                    }
-                    val unavailable: (String) -> Unit = { reason ->
-                        mainDiag("CfL unavailable ($reason) — disabling, direct path")
-                        runOnUiThread {
-                            prefs.vsrEnabled = false
-                            binding.vsrText.text = "cfl fallback"
-                            restartVideoPath()
-                        }
-                    }
-                    renderer.onPlanesUnavailable = unavailable
-                    renderer.setStrength(prefs.cflStrength)
-                    cflRenderer = renderer
-                    mainDiag("CfL active (luma-guided chroma reconstruction, buffer decode)")
+                    buildVideoPipeline(request)
                 } catch (e: Exception) {
-                    mainDiag("CfL init failed (${e.message}) — falling back to direct surface")
-                    cflRenderer?.release()
-                    cflRenderer = null
-                    runOnUiThread { binding.vsrText.text = "fallback" }
-                }
-            } else if (vsrOn) {
-                try {
-                    val renderer = SgsrRenderer(applicationContext)
-                    renderer.initialize(surface, displayWidth, displayHeight)
-                    renderer.setMode(SgsrRenderer.Mode.from(prefs.vsrMode))
-                    renderer.setSharpness(prefs.vsrSharpness)
-                    renderer.setEdgeThreshold(prefs.vsrEdgeThreshold)
-                    renderer.onStats = { s ->
-                        mainDiag(
-                            "VSR stats: ${s.summary()} " +
-                                "p95=${"%.1f".format(s.cpuP95Ms)}ms",
-                        )
-                        runOnUiThread { binding.vsrText.text = s.summary() }
+                    mainDiag("Decoder init FAILED: ${e.message}")
+                    log("❌ Failed to initialize decoder: ${e.message}")
+                    withContext(Dispatchers.Main) {
+                        if (generation != videoPipelineGeneration) return@withContext
+                        inFlightPipelineKey = null
+                        updateStatus("Video decoder failed: ${e.message}")
                     }
-                    sgsrRenderer = renderer
-                    decoderSurface = renderer.decoderSurfaceRef ?: surface
-                    mainDiag("VSR active: mode=${prefs.vsrMode} sharpness=${prefs.vsrSharpness}")
-                } catch (e: Exception) {
-                    mainDiag("VSR init failed (${e.message}) — falling back to direct surface")
-                    sgsrRenderer?.release()
-                    sgsrRenderer = null
-                    runOnUiThread { binding.vsrText.text = "fallback" }
+                    return@launch
                 }
-            } else {
-                runOnUiThread {
-                    binding.vsrText.text =
-                        if (prefs.vsrEnabled) "n/a" else "off"
-                }
-            }
-            val useBufferOutput = cflRenderer != null
-            videoDecoder = VideoDecoder(decoderSurface, displayObj, displayWidth, displayHeight, mime, bufferOutput = useBufferOutput)
-            if (useBufferOutput) {
-                cflRenderer?.let { renderer ->
-                    videoDecoder?.onDecodedImage = { img, done -> renderer.submitImage(img, done) }
-                    videoDecoder?.onColorRange = { range -> renderer.setFullRange(range != 2) }
-                    videoDecoder?.onImageOutputUnavailable = {
-                        runOnUiThread {
-                            prefs.vsrEnabled = false
-                            binding.vsrText.text = "cfl fallback"
-                            restartVideoPath()
-                        }
+            mainDiag(
+                "Decoder pipeline built in ${"%.0f".format((System.nanoTime() - startedNs) / 1e6)}ms " +
+                    "(mime=${request.mime}, bufferOutput=${pipeline.decoder.bufferOutputMode})",
+            )
+            var handedOver = false
+            try {
+                withContext(Dispatchers.Main) {
+                    if (generation != videoPipelineGeneration) {
+                        mainDiag("Discarding stale decoder build (surface or connection changed)")
+                        pipeline.release()
+                    } else {
+                        inFlightPipelineKey = null
+                        publishVideoPipeline(pipeline, request)
                     }
+                    handedOver = true
                 }
-            }
-            videoDecoder?.onDecodeLatency = { avgMs, maxMs ->
-                mainDiag("decode latency avg=" + "%.1f".format(avgMs) + "ms max=" + "%.1f".format(maxMs) + "ms")
-            }
-            videoDecoder?.onDecodedFormat = { w, h, cl, cr, ct, cb ->
-                mainDiag("decoder output format ${w}x$h crop=$cl,$cr,$ct,$cb")
-                // CfL renderer self-sizes its textures from the first Image.
-                sgsrRenderer?.resizeStream(w, h, cl, cr, ct, cb)
-            }
-            videoDecoder?.onFrameDecoded = { buffer ->
-                streamClient?.releaseBuffer(buffer)
-            }
-            videoDecoder?.onKeyframeRequired = { force, reason ->
-                streamClient?.requestKeyframe(force = force, reason = reason)
-            }
-            videoDecoder?.onDecoderStalled = {
-                // Black screen with live stats: tell the user why instead of
-                // staying silent (issue #41). Toast renders above the (black)
-                // SurfaceView; the settings panel is hidden while streaming.
-                val cap = CodecCapabilities.maxDecodeSize(mime)
-                runOnUiThread {
-                    val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
-                    android.widget.Toast
-                        .makeText(
-                            this,
-                            "No video output — the stream resolution may exceed " +
-                                "this tablet's decoder limit$capText. " +
-                                "Lower the resolution or disable HiDPI on the Mac.",
-                            android.widget.Toast.LENGTH_LONG,
-                        ).show()
-                }
-            }
-            streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
-            mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, texture=$useTextureView")
-            log("✅ Decoder initialized ${displayWidth}x$displayHeight $mime (${displayObj?.refreshRate ?: 60f}Hz)")
-        } catch (e: Exception) {
-            decoderUsingTextureView = false
-            mainDiag("Decoder init FAILED: ${e.message}")
-            log("❌ Failed to initialize decoder: ${e.message}")
-            runOnUiThread {
-                updateStatus("Video decoder failed: ${e.message}")
+            } finally {
+                // A destroyed Activity cancels this coroutine mid-handover; a
+                // codec nobody ever published still has to be released.
+                if (!handedOver) pipeline.release()
             }
         }
     }
 
+    /** Everything the background build needs, read on the main thread. */
+    private class VideoPipelineRequest(
+        val surface: Surface,
+        val surfaceIsValid: Boolean,
+        val width: Int,
+        val height: Int,
+        val display: Display?,
+        val mime: String,
+        val useTextureView: Boolean,
+        val gles31: Boolean,
+        val vsrEnabled: Boolean,
+        val vsrMode: String,
+        val cflStrength: Float,
+        val vsrSharpness: Float,
+        val vsrEdgeThreshold: Float,
+        val wirelessSession: Boolean,
+    ) {
+        fun key() =
+            VideoPipelineKey(
+                surface = surface,
+                width = width,
+                height = height,
+                mime = mime,
+                useTextureView = useTextureView,
+                vsrEnabled = vsrEnabled,
+                vsrMode = vsrMode,
+                cflStrength = cflStrength,
+                vsrSharpness = vsrSharpness,
+                vsrEdgeThreshold = vsrEdgeThreshold,
+                wirelessSession = wirelessSession,
+            )
+    }
+
+    /** What makes two builds interchangeable. Surface compares by identity. */
+    private data class VideoPipelineKey(
+        val surface: Surface,
+        val width: Int,
+        val height: Int,
+        val mime: String,
+        val useTextureView: Boolean,
+        val vsrEnabled: Boolean,
+        val vsrMode: String,
+        val cflStrength: Float,
+        val vsrSharpness: Float,
+        val vsrEdgeThreshold: Float,
+        val wirelessSession: Boolean,
+    )
+
+    private class VideoPipeline(
+        val decoder: VideoDecoder,
+        val sgsr: SgsrRenderer?,
+        val cfl: CflRenderer?,
+    ) {
+        fun release() {
+            decoder.release()
+            sgsr?.release()
+            cfl?.release()
+        }
+    }
+
+    /** Background thread: renderer creation + decoder construction. */
+    private fun buildVideoPipeline(request: VideoPipelineRequest): VideoPipeline {
+        var sgsr: SgsrRenderer? = null
+        var cfl: CflRenderer? = null
+        var decoderSurface = request.surface
+        val cflOn =
+            request.vsrEnabled && request.vsrMode.equals("cfl", true) &&
+                request.gles31 && !request.useTextureView
+        val vsrOn = request.vsrEnabled && request.gles31 && !request.useTextureView && !cflOn
+
+        if (cflOn) {
+            // CfL chroma reconstruction via ByteBuffer-mode decode: the
+            // decoder is configured WITHOUT a surface and hands
+            // plane-accessible Images to the renderer (the ImageReader
+            // route is dead on this SoC — opaque UBWC buffers whose
+            // plane access is a fatal JNI abort).
+            try {
+                val renderer = CflRenderer()
+                cfl = renderer
+                renderer.onStats = { s ->
+                    mainDiag("VSR stats: ${s.summary()}")
+                    runOnUiThread { binding.streamStatusBarBinding.vsrText.text = s.summary() }
+                }
+                renderer.onUnavailable = { reason ->
+                    mainDiag("CfL unavailable ($reason) — disabling, direct path")
+                    runOnUiThread {
+                        prefs.vsrEnabled = false
+                        binding.streamStatusBarBinding.vsrText.text = getString(R.string.vsr_cfl_fallback)
+                        restartVideoPath()
+                    }
+                }
+                renderer.setStrength(request.cflStrength)
+                renderer.initialize(request.surface, request.width, request.height)
+                mainDiag("CfL active (luma-guided chroma reconstruction, buffer decode)")
+            } catch (e: Exception) {
+                mainDiag("CfL init failed (${e.message}) — falling back to direct surface")
+                cfl?.release()
+                cfl = null
+                runOnUiThread { binding.streamStatusBarBinding.vsrText.text = getString(R.string.vsr_fallback) }
+            }
+        } else if (vsrOn) {
+            try {
+                val renderer = SgsrRenderer(applicationContext)
+                sgsr = renderer
+                renderer.onStats = { s ->
+                    mainDiag(
+                        "VSR stats: ${s.summary()} " +
+                            "p95=${"%.1f".format(s.cpuP95Ms)}ms",
+                    )
+                    runOnUiThread { binding.streamStatusBarBinding.vsrText.text = s.summary() }
+                }
+                renderer.setMode(SgsrRenderer.Mode.from(request.vsrMode))
+                renderer.setSharpness(request.vsrSharpness)
+                renderer.setEdgeThreshold(request.vsrEdgeThreshold)
+                renderer.initialize(request.surface, request.width, request.height)
+                decoderSurface = renderer.decoderSurfaceRef ?: request.surface
+                mainDiag("VSR active: mode=${request.vsrMode} sharpness=${request.vsrSharpness}")
+            } catch (e: Exception) {
+                mainDiag("VSR init failed (${e.message}) — falling back to direct surface")
+                sgsr?.release()
+                sgsr = null
+                runOnUiThread { binding.streamStatusBarBinding.vsrText.text = getString(R.string.vsr_fallback) }
+            }
+        } else {
+            runOnUiThread {
+                binding.streamStatusBarBinding.vsrText.text =
+                    if (request.vsrEnabled) getString(R.string.vsr_not_available) else getString(R.string.ui_off)
+            }
+        }
+
+        val decoder =
+            try {
+                VideoDecoder(
+                    decoderSurface,
+                    request.display,
+                    request.width,
+                    request.height,
+                    request.mime,
+                    bufferOutput = cfl != null,
+                    wireless = request.wirelessSession,
+                    targetFrameRate =
+                        if (request.wirelessSession) WirelessFreshnessPolicy.TARGET_FRAME_RATE else null,
+                )
+            } catch (e: Exception) {
+                // The renderers are not published yet, so this is the only
+                // reference that can release them.
+                sgsr?.release()
+                cfl?.release()
+                throw e
+            }
+        return VideoPipeline(decoder, sgsr, cfl)
+    }
+
+    /** Main thread: wire callbacks and hand the pipeline to the frame path. */
+    private fun publishVideoPipeline(
+        pipeline: VideoPipeline,
+        request: VideoPipelineRequest,
+    ) {
+        val decoder = pipeline.decoder
+        videoDecoder = decoder
+        sgsrRenderer = pipeline.sgsr
+        cflRenderer = pipeline.cfl
+
+        streamClient?.let { client -> bindDecoderCallbacks(client, activeConnectionGeneration) }
+        pipeline.cfl?.let { renderer ->
+            decoder.onDecodedImage = { img, done -> renderer.submitImage(img, done) }
+            decoder.onColorRange = { range -> renderer.setFullRange(range == MediaFormat.COLOR_RANGE_FULL) }
+            decoder.onImageOutputUnavailable = {
+                runOnUiThread {
+                    prefs.vsrEnabled = false
+                    binding.streamStatusBarBinding.vsrText.text = getString(R.string.vsr_cfl_fallback)
+                    restartVideoPath()
+                }
+            }
+        }
+        decoder.onDecodeLatency = { avgMs, maxMs ->
+            mainDiag("decode latency avg=" + "%.1f".format(avgMs) + "ms max=" + "%.1f".format(maxMs) + "ms")
+        }
+        decoder.onDecodedFormat = { w, h, cl, cr, ct, cb ->
+            mainDiag("decoder output format ${w}x$h crop=$cl,$cr,$ct,$cb")
+            if (DisplayConfig.fromWire(w, h, 0) == null) {
+                mainDiag("ignored unsafe decoder output size ${w}x$h")
+            } else {
+                // CfL self-sizes from each Image; SGSR needs the coded output size.
+                sgsrRenderer?.resizeStream(w, h)
+            }
+        }
+        decoder.onDecoderStalled = {
+            // Black screen with live stats: tell the user why instead of
+            // staying silent (issue #41). Toast renders above the (black)
+            // SurfaceView; the settings panel is hidden while streaming.
+            val cap = CodecCapabilities.maxDecodeSize(request.mime)
+            runOnUiThread {
+                val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
+                android.widget.Toast
+                    .makeText(
+                        this,
+                        "No video output — the stream resolution may exceed " +
+                            "this tablet's decoder limit$capText. " +
+                            "Lower the resolution or disable HiDPI on the Mac.",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+            }
+        }
+        streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
+        mainDiag("Decoder initialized OK ${request.width}x${request.height} mime=${request.mime}, texture=${request.useTextureView}")
+        log(
+            "✅ Decoder initialized ${request.width}x${request.height} ${request.mime} " +
+                "(${request.display?.refreshRate ?: 60f}Hz)",
+        )
+    }
+
     /**
-     * Wire up the wireless client's callbacks with the same generation fence
-     * used by the USB path. A wireless connect can be cancelled while its
-     * handshake socket is still local to the IO coroutine, so every callback
-     * must remain tied to this exact client instance.
+     * Deliver frames from the socket thread without losing the first sync frame
+     * to the UI-thread decoder startup race. The Mac stream can begin sending
+     * immediately after display config; if the decoder is still being created,
+     * release the bytes and ask for a throttled refresh so the next frame is an
+     * IDR instead of leaving the decoder waiting on a P-frame forever.
      */
+    private fun deliverFrame(
+        client: StreamClient,
+        generation: Long,
+        frameData: ByteArray,
+        frameSize: Int,
+        timestamp: Long,
+        isKeyframe: Boolean,
+    ) {
+        if (!isCurrentConnection(client, generation)) {
+            client.releaseBuffer(frameData)
+            return
+        }
+
+        val decoder = videoDecoder?.takeIf { it.isReady }
+        if (decoder != null) {
+            decoder.decode(frameData, frameSize, timestamp, isKeyframe)
+            return
+        }
+
+        client.releaseBuffer(frameData)
+        if (displayWidth > 0 && displayHeight > 0) {
+            client.requestKeyframe(reason = "decoder not ready")
+        }
+        mainDiag("FRAME DROPPED: decoder not ready; requested refresh=$isKeyframe")
+    }
+
+    /** Wire all stream callbacks through the same client and generation fence. */
     private fun setupStreamClientCallbacks(
         client: StreamClient,
         generation: Long,
         host: String,
     ) {
         client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-            if (isCurrentConnection(client, generation)) {
-                val dec = videoDecoder
-                if (dec != null) {
-                    dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                } else {
-                    client.releaseBuffer(frameData)
-                    mainDiag("FRAME DROPPED: videoDecoder is null!")
-                }
-            } else {
-                client.releaseBuffer(frameData)
-            }
+            deliverFrame(client, generation, frameData, frameSize, timestamp, isKeyframe)
         }
 
-        videoDecoder?.onFrameDecoded = { buffer ->
-            client.releaseBuffer(buffer)
-        }
-        videoDecoder?.onKeyframeRequired = { force, reason ->
-            if (isCurrentConnection(client, generation)) {
-                client.requestKeyframe(force = force, reason = reason)
-            }
-        }
+        bindDecoderCallbacks(client, generation)
 
         client.onLatencyMeasured = { rttMs ->
             if (isCurrentConnection(client, generation)) {
                 runOnUiThread {
                     if (isCurrentConnection(client, generation)) {
-                        binding.latencyText.text = String.format("%.1f ms", rttMs)
+                        binding.streamStatusBarBinding.latencyText.text = getString(R.string.metric_latency_ms, rttMs)
                     }
                 }
             }
@@ -1375,29 +1658,50 @@ class MainActivity : AppCompatActivity() {
                     if (connected) android.R.color.holo_green_light else android.R.color.holo_red_light,
                 )
                 if (connected) {
-                    startPingTimer()
+                    val isForeground =
+                        lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
+                    client.setLivenessPaused(!isForeground)
+                    setDisplayKeepAwake(isForeground)
+                    if (client.isWirelessSession) applyFrameRateHint()
+                    if (isForeground) startPingTimer() else stopPingTimer()
                     stopChecklistUpdates()
                     enableFullscreenMode()
                     binding.settingsPanel.visibility = View.GONE
                     applySettingsButtonVisibility()
                     restoreSettingsButtonPosition()
                     updateOverlayVisibility(prefs.showStatsOverlay)
-                    val entry = pairedHostStorage.load()
-                    wirelessController.onConnectSuccess(
-                        entry?.macName ?: "Mac",
-                        entry?.host ?: host,
-                    )
+                    if (client.isWirelessSession) {
+                        val entry = pairedHostStorage.load()
+                        wirelessController.onConnectSuccess(
+                            entry?.macName ?: "Mac",
+                            client.connectedHost ?: entry?.host ?: host,
+                        )
+                    }
                 } else {
+                    setDisplayKeepAwake(false)
+                    applyFrameRateHint()
                     streamClient = null
                     stopPingTimer()
+                    releaseVideoPipeline()
+                    displayWidth = 0
+                    displayHeight = 0
+                    displayFlipHorizontal = false
+                    displayFlipVertical = false
+                    displayConfigReceivedAtMs = 0L
+                    applyDirectPixelMapping(0, 0)
                     disableFullscreenMode()
                     resetOrientationToSensor()
                     binding.settingsPanel.visibility = View.VISIBLE
                     binding.settingsButton.visibility = View.GONE
-                    binding.statusBar.visibility = View.GONE
-                    // Do not restart the USB checklist: its loopback probes can
-                    // contend with a wireless session on the Mac.
-                    wirelessController.onStreamDisconnected()
+                    binding.streamStatusBarBinding.statusBar.visibility = View.GONE
+                    if (client.isWirelessSession) {
+                        // Wireless reconnection uses token-bound discovery and does
+                        // not depend on the USB loopback checklist.
+                        wirelessController.onStreamDisconnected()
+                    } else {
+                        startChecklistUpdates()
+                        log("Connection lost — tap Connect to retry")
+                    }
                 }
             }
         }
@@ -1415,9 +1719,11 @@ class MainActivity : AppCompatActivity() {
                 displayRotation = rotation
                 displayFlipHorizontal = flipHorizontal
                 displayFlipVertical = flipVertical
+                displayConfigReceivedAtMs = System.currentTimeMillis()
                 runOnUiThread {
                     if (isCurrentConnection(client, generation)) {
-                        binding.resolutionText.text = "${width}x$height"
+                        binding.streamStatusBarBinding.resolutionText.text = getString(R.string.stream_resolution, width, height)
+                        applyFrameRateHint()
                         applyRotation(rotation, flipHorizontal, flipVertical)
                         applyDirectPixelMapping(width, height)
                         initializeDecoderForCurrentSurface()
@@ -1431,10 +1737,20 @@ class MainActivity : AppCompatActivity() {
             if (isCurrentConnection(client, generation)) {
                 runOnUiThread {
                     if (isCurrentConnection(client, generation)) {
-                        binding.fpsText.text = String.format("%.1f", fps)
-                        binding.bitrateText.text = String.format("%.1f Mbps", mbps)
+                        binding.streamStatusBarBinding.fpsText.text = getString(R.string.metric_fps_value, fps)
+                        binding.streamStatusBarBinding.bitrateText.text = getString(R.string.metric_bitrate_mbps, mbps)
                     }
                 }
+            }
+        }
+    }
+
+    /** Bind a decoder to the exact client that supplied its pooled frame buffers. */
+    private fun bindDecoderCallbacks(client: StreamClient, generation: Long) {
+        videoDecoder?.onFrameDecoded = { buffer -> client.releaseBuffer(buffer) }
+        videoDecoder?.onKeyframeRequired = { force, reason ->
+            if (isCurrentConnection(client, generation)) {
+                client.requestKeyframe(force = force, reason = reason)
             }
         }
     }
@@ -1444,14 +1760,29 @@ class MainActivity : AppCompatActivity() {
         port: Int,
         token: ByteArray,
         deviceName: String,
+        controlPort: Int? = null,
+        alternateHosts: List<String> = emptyList(),
     ) {
         val generation = activeConnectionGeneration + 1
         activeConnectionGeneration = generation
         streamClient?.disconnect()
         streamClient = null
+        releaseVideoPipeline()
         isConnected = false
+        displayWidth = 0
+        displayHeight = 0
+        displayFlipHorizontal = false
+        displayFlipVertical = false
+        displayConfigReceivedAtMs = 0L
 
-        val client = StreamClient(host, port, applicationContext)
+        val client =
+            StreamClient(
+                host,
+                port,
+                applicationContext,
+                controlPort = controlPort ?: port + 1,
+                alternateHosts = alternateHosts,
+            )
         streamClient = client
         setupStreamClientCallbacks(client, generation, host)
 
@@ -1490,7 +1821,13 @@ class MainActivity : AppCompatActivity() {
         activeConnectionGeneration = generation
         streamClient?.disconnect()
         streamClient = null
+        releaseVideoPipeline()
         isConnected = false
+        displayWidth = 0
+        displayHeight = 0
+        displayFlipHorizontal = false
+        displayFlipVertical = false
+        displayConfigReceivedAtMs = 0L
 
         // E3 carries bulk video through 10.77.0.1:54326. Keep tiny
         // latency/control packets on their dedicated adb-reverse port
@@ -1505,183 +1842,37 @@ class MainActivity : AppCompatActivity() {
                 controlPort = if (usesE3VideoPath) 54322 else port + 1,
             )
         streamClient = client
+        setupStreamClientCallbacks(client, generation, host)
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
-
-                client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-                    if (isCurrentConnection(client, generation)) {
-                        val dec = videoDecoder
-                        if (dec != null) {
-                            dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                        } else {
-                            client.releaseBuffer(frameData)
-                        }
-                    } else {
-                        client.releaseBuffer(frameData)
-                    }
-                }
-
-                // Wire up buffer release callback for buffer pooling
-                // When decode completes, buffer is returned to StreamClient's pool
-                videoDecoder?.onFrameDecoded = { buffer -> client.releaseBuffer(buffer) }
-                videoDecoder?.onKeyframeRequired = { force, reason ->
-                    if (isCurrentConnection(client, generation)) {
-                        client.requestKeyframe(force = force, reason = reason)
-                    }
-                }
-
-                // Latency measurement via ping/pong
-                client.onLatencyMeasured = { rttMs ->
-                    if (isCurrentConnection(client, generation)) {
-                        runOnUiThread {
-                            if (isCurrentConnection(client, generation)) {
-                                binding.latencyText.text = String.format("%.1f ms", rttMs)
-                            }
-                        }
-                    }
-                }
-
-                // Real panel backlight from the host (BRIGHT over control channel).
-                client.onBrightness = { v ->
-                    if (isCurrentConnection(client, generation)) applyBacklight(v)
-                }
-
-                client.onConnectionStatus = { connected ->
-                    runOnUiThread {
-                        if (!isCurrentConnection(client, generation)) {
-                            // A stale client must never flip the UI to
-                            // disconnected or alter the active session.
-                            if (connected) client.disconnect()
-                            return@runOnUiThread
-                        }
-
-                        // Update connection state flag
-                        isConnected = connected
-                        macServerKnownAvailable = connected
-
-                        if (connected) {
-                            updateStatus("Connected - Streaming active")
-                        } else {
-                            updateStatus("Disconnected")
-                        }
-
-                        binding.connectButton.isEnabled = !connected
-                        binding.disconnectButton.isEnabled = connected
-
-                        // Update status indicator color
-                        binding.statusIndicator.setBackgroundResource(
-                            if (connected) {
-                                android.R.color.holo_green_light
-                            } else {
-                                android.R.color.holo_red_light
-                            },
-                        )
-
-                        if (connected) {
-                            // Start periodic ping for latency measurement
-                            startPingTimer()
-
-                            // Stop checklist updates when connected (prevents socket conflicts)
-                            stopChecklistUpdates()
-
-                            // Enter fullscreen mode when connected
-                            enableFullscreenMode()
-
-                            binding.settingsPanel.visibility = View.GONE
-                            applySettingsButtonVisibility()
-                            restoreSettingsButtonPosition()
-                            updateOverlayVisibility(prefs.showStatsOverlay)
-                        } else {
-                            streamClient = null
-                            // Stop ping timer
-                            stopPingTimer()
-
-                            // Exit fullscreen mode when disconnected
-                            disableFullscreenMode()
-
-                            // Reset to follow device sensor when disconnected
-                            resetOrientationToSensor()
-
-                            binding.settingsPanel.visibility = View.VISIBLE
-                            binding.settingsButton.visibility = View.GONE
-                            binding.statusBar.visibility = View.GONE
-
-                            // Restart checklist updates immediately
-                            log("📋 Restarting checklist updates")
-                            startChecklistUpdates()
-
-                            // A dropped session stays disconnected until the
-                            // user presses Connect again.
-                            log("Connection lost — tap Connect to retry")
-                        }
-                    }
-                }
-
-                client.onCodecSelected = { isHevc ->
-                    if (isCurrentConnection(client, generation)) onStreamCodecSelected(isHevc)
-                }
-
-                client.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
-                    if (isCurrentConnection(client, generation)) {
-                        mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-                        warnIfAvcOnlyWithoutNegotiation()
-                        displayWidth = width
-                        displayHeight = height
-                        displayRotation = rotation
-                        displayFlipHorizontal = flipHorizontal
-                        displayFlipVertical = flipVertical
-
-                        runOnUiThread {
-                            if (isCurrentConnection(client, generation)) {
-                                binding.resolutionText.text = "${width}x$height"
-                                applyRotation(rotation, flipHorizontal, flipVertical)
-                                applyDirectPixelMapping(width, height)
-                                initializeDecoderForCurrentSurface()
-                            }
-                        }
-                        log("Display: ${width}x$height @ $rotation°")
-                    }
-                }
-
-                client.onStats = { fps, mbps ->
-                    if (isCurrentConnection(client, generation)) {
-                        runOnUiThread {
-                            if (isCurrentConnection(client, generation)) {
-                                binding.fpsText.text = String.format("%.1f", fps)
-                                binding.bitrateText.text = String.format("%.1f Mbps", mbps)
-                            }
-                        }
-                    }
-                }
-
                 client.connect()
             } catch (e: Exception) {
-                if (!isCurrentConnection(client, generation)) return@launch
+                if (activeConnectionGeneration != generation) return@launch
                 val errorMessage =
                     when {
-                        e.message?.contains("ECONNREFUSED") == true -> {
-                            "Mac server is not running.\n\nPlease start Side Screen.app on your Mac first."
+                        e is java.net.ConnectException -> {
+                            "Mac server is not running.\n\nPlease start the Mac app first."
                         }
 
-                        e.message?.contains("Network is unreachable") == true -> {
+                        e is java.net.NoRouteToHostException || e is java.net.UnknownHostException -> {
                             "Cannot reach Mac.\n\n" +
                                 "Make sure both devices are connected via USB cable and ADB reverse is configured."
                         }
 
-                        e.message?.contains("timeout") == true -> {
+                        e is java.net.SocketTimeoutException -> {
                             "Connection timeout.\n\nCheck if Mac firewall is blocking port $port."
                         }
 
                         else -> {
                             "Connection failed: ${e.message}\n\n" +
-                                "Try:\n• Start Side Screen.app on Mac\n" +
+                                "Try:\n• Start the Mac app\n" +
                                 "• Check USB connection\n• Run: adb reverse tcp:$port tcp:$port"
                         }
                     }
                 runOnUiThread {
-                    if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                    if (activeConnectionGeneration != generation) return@runOnUiThread
                     updateStatus("Connection failed")
                     showError(errorMessage)
                 }
@@ -1694,13 +1885,18 @@ class MainActivity : AppCompatActivity() {
         generation: Long,
     ): Boolean = activeConnectionGeneration == generation && streamClient === client
 
-    private fun disconnect() {
+    private fun disconnect(restoreUi: Boolean = true) {
         activeConnectionGeneration += 1
         stopPingTimer()
         streamClient?.disconnect()
         streamClient = null
+        releaseVideoPipeline()
         isConnected = false
-        macServerKnownAvailable = false
+        setDisplayKeepAwake(false)
+        applyFrameRateHint()
+        // The server was reachable for this session; a user-initiated local
+        // disconnect says nothing about its current availability.
+        macServerKnownAvailable = null
         activeStylusPointerId = MotionEvent.INVALID_POINTER_ID
         regularTouchActive = false
         // Reset display config so next connect defers decoder init until config arrives
@@ -1708,16 +1904,21 @@ class MainActivity : AppCompatActivity() {
         displayHeight = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
+        displayConfigReceivedAtMs = 0L
+        if (!restoreUi) {
+            log("Disconnected")
+            return
+        }
         runOnUiThread {
             updateStatus("Disconnected")
             binding.connectButton.isEnabled = true
             binding.disconnectButton.isEnabled = false
-            binding.statusIndicator.setBackgroundResource(android.R.color.holo_red_light)
+            binding.statusIndicator.setBackgroundResource(R.drawable.status_indicator_neutral)
             disableFullscreenMode()
             resetOrientationToSensor()
             binding.settingsPanel.visibility = View.VISIBLE
             binding.settingsButton.visibility = View.GONE
-            binding.statusBar.visibility = View.GONE
+            binding.streamStatusBarBinding.statusBar.visibility = View.GONE
             applyDirectPixelMapping(0, 0)
             binding.textureView.visibility = View.GONE
             applyTextureTransform()
@@ -1746,26 +1947,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun cleanup() {
         try {
-            disconnect()
-            videoDecoder?.release()
-            videoDecoder = null
-            sgsrRenderer?.release()
-            sgsrRenderer = null
-            cflRenderer?.release()
-            cflRenderer = null
+            // The activity is going away: do not resurrect checklist polling or
+            // touch views that are being torn down.
+            disconnect(restoreUi = false)
             currentTextureSurface?.release()
             currentTextureSurface = null
 
-            // Release wake lock safely
-            try {
-                if (wakeLock?.isHeld == true) {
-                    wakeLock?.release()
-                }
-            } catch (e: Exception) {
-                // Ignore wake lock release errors
-            }
-            wakeLock = null
-            log("🎮 Performance mode DISABLED")
+            setDisplayKeepAwake(false)
+            applyFrameRateHint()
         } catch (e: Exception) {
             log("⚠️ Cleanup error: ${e.message}")
         }
@@ -1835,19 +2024,23 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val rawX = event.x / view.width.toFloat()
-        val rawY = event.y / view.height.toFloat()
-        val x = if (displayFlipHorizontal) 1f - rawX else rawX
-        val y = if (displayFlipVertical) 1f - rawY else rawY
+        // A SurfaceView reports width/height 0 before its first layout, and
+        // 0/0 is NaN: coerceIn returns NaN unchanged, and the host's touch
+        // parser has no finiteness guard. Normalise through the shared helper so
+        // touch and stylus cannot disagree.
+        if (!PointerCoordinates.isUsable(view.width, view.height)) {
+            mainDiag("touch ignored — surface has no measured size (${view.width}x${view.height})")
+            return
+        }
+        val x = PointerCoordinates.normalize(event.x, view.width, displayFlipHorizontal)
+        val y = PointerCoordinates.normalize(event.y, view.height, displayFlipVertical)
         val pointerCount = event.pointerCount.coerceAtMost(2)
 
         var x2 = 0f
         var y2 = 0f
         if (pointerCount >= 2) {
-            val rawX2 = event.getX(1) / view.width.toFloat()
-            val rawY2 = event.getY(1) / view.height.toFloat()
-            x2 = if (displayFlipHorizontal) 1f - rawX2 else rawX2
-            y2 = if (displayFlipVertical) 1f - rawY2 else rawY2
+            x2 = PointerCoordinates.normalize(event.getX(1), view.width, displayFlipHorizontal)
+            y2 = PointerCoordinates.normalize(event.getY(1), view.height, displayFlipVertical)
         }
 
         when (action) {
@@ -1937,9 +2130,10 @@ class MainActivity : AppCompatActivity() {
         pointerIndex: Int,
         action: Int,
     ) {
-        if (view.width <= 0 || view.height <= 0) return
-        val x = (event.getX(pointerIndex) / view.width.toFloat()).coerceIn(0f, 1f)
-        val y = (event.getY(pointerIndex) / view.height.toFloat()).coerceIn(0f, 1f)
+        if (!PointerCoordinates.isUsable(view.width, view.height)) return
+        if (pointerIndex !in 0 until event.pointerCount) return
+        val x = PointerCoordinates.normalize(event.getX(pointerIndex), view.width)
+        val y = PointerCoordinates.normalize(event.getY(pointerIndex), view.height)
         streamClient?.sendTouch(x, y, action, 1)
     }
 
@@ -1949,12 +2143,11 @@ class MainActivity : AppCompatActivity() {
         pointerIndex: Int,
         action: Int,
     ) {
-        if (view.width <= 0 || view.height <= 0 || pointerIndex !in 0 until event.pointerCount) return
+        if (!PointerCoordinates.isUsable(view.width, view.height)) return
+        if (pointerIndex !in 0 until event.pointerCount) return
 
-        val rawX = (event.getX(pointerIndex) / view.width.toFloat()).coerceIn(0f, 1f)
-        val rawY = (event.getY(pointerIndex) / view.height.toFloat()).coerceIn(0f, 1f)
-        val x = if (displayFlipHorizontal) 1f - rawX else rawX
-        val y = if (displayFlipVertical) 1f - rawY else rawY
+        val x = PointerCoordinates.normalize(event.getX(pointerIndex), view.width, displayFlipHorizontal)
+        val y = PointerCoordinates.normalize(event.getY(pointerIndex), view.height, displayFlipVertical)
         val pressure = if (action == StylusProtocol.ACTION_HOVER) 0f else event.getPressure(pointerIndex)
         val sample =
             StylusInputEvent(
@@ -2027,6 +2220,8 @@ class MainActivity : AppCompatActivity() {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
     }
 
+    // Local diagnostic text is intentionally not translated.
+    @SuppressLint("SetTextI18n")
     private fun log(message: String) {
         runOnUiThread {
             val current = binding.logText.text.toString()
@@ -2037,6 +2232,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        setDisplayKeepAwake(isConnected && streamClient != null)
         mainDiag(
             "onStart connected=$isConnected display=${displayWidth}x$displayHeight " +
                 "client=${streamClient != null}",
@@ -2049,6 +2245,7 @@ class MainActivity : AppCompatActivity() {
             // Samsung firmware can defer background socket delivery. Do not
             // queue pings while stopped; resume fresh RTT samples only after
             // the activity and decoder surface are visible again.
+            streamClient?.setLivenessPaused(false)
             startPingTimer()
             // Some Android builds recreate the SurfaceView without delivering a
             // second display-config packet. Rebind the decoder to the new
@@ -2061,6 +2258,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
+        // Android may turn the screen off after this Activity leaves the foreground.
+        setDisplayKeepAwake(false)
         mainDiag(
             "onStop connected=$isConnected display=${displayWidth}x$displayHeight " +
                 "client=${streamClient != null}",
@@ -2068,6 +2267,7 @@ class MainActivity : AppCompatActivity() {
         // Do not queue pings while the activity is backgrounded. If Android
         // delays delivery, those pongs would otherwise be measured as
         // multi-second latency after the next foreground transition.
+        streamClient?.setLivenessPaused(true)
         stopPingTimer()
         // Backgrounded while streaming: arm the auto-disconnect timer.
         if (!isConnected) return
@@ -2098,6 +2298,7 @@ class MainActivity : AppCompatActivity() {
             }
             vsrCmdReceiver = null
         }
+        wirelessController.close()
         super.onDestroy()
         stopChecklistUpdates()
         cleanup()
@@ -2174,33 +2375,46 @@ class MainActivity : AppCompatActivity() {
         // unsolicited connection and can be mistaken for a reconnect by the
         // host or by a user watching its logs.
         updateChecklistItem(binding.checkMacServer, macServerKnownAvailable)
+        binding.textMacServer.text =
+            getString(
+                when (macServerKnownAvailable) {
+                    true -> R.string.ui_mac_server_running
+                    false -> R.string.ui_mac_server_not_responding
+                    null -> R.string.ui_mac_server_not_checked
+                },
+            )
 
-        // Update main status indicator based on local prerequisites plus the
-        // last explicit connection result.
-        val allReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected && macServerKnownAvailable
-        updateMainStatus(allReady)
+        val localPrerequisitesReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected
+        updateMainStatus(
+            ConnectionReadinessPolicy.evaluate(localPrerequisitesReady, macServerKnownAvailable),
+        )
     }
 
-    private fun updateMainStatus(allReady: Boolean) {
-        binding.statusIndicator.setBackgroundResource(
-            if (allReady) {
-                R.drawable.status_indicator_green
-            } else {
-                R.drawable.status_indicator_red
-            },
-        )
-        binding.statusText.text = if (allReady) "Ready to connect" else "Not ready to connect"
+    private fun updateMainStatus(state: ConnectionReadinessState) {
+        val (indicator, statusText) =
+            when (state) {
+                ConnectionReadinessState.LOCAL_SETUP_REQUIRED ->
+                    R.drawable.status_indicator_red to R.string.ui_not_ready_to_connect
+                ConnectionReadinessState.SERVER_UNCHECKED ->
+                    R.drawable.status_indicator_neutral to R.string.ui_tap_connect_to_check_server
+                ConnectionReadinessState.SERVER_UNAVAILABLE ->
+                    R.drawable.status_indicator_red to R.string.ui_mac_server_not_responding
+                ConnectionReadinessState.READY ->
+                    R.drawable.status_indicator_green to R.string.ui_ready_to_connect
+            }
+        binding.statusIndicator.setBackgroundResource(indicator)
+        binding.statusText.setText(statusText)
     }
 
     private fun updateChecklistItem(
         indicator: View,
-        isOk: Boolean,
+        isOk: Boolean?,
     ) {
         indicator.setBackgroundResource(
-            if (isOk) {
-                R.drawable.status_indicator_green
-            } else {
-                R.drawable.status_indicator_red
+            when (isOk) {
+                true -> R.drawable.status_indicator_green
+                false -> R.drawable.status_indicator_red
+                null -> R.drawable.status_indicator_neutral
             },
         )
     }

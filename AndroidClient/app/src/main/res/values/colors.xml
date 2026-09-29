@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Side Screen dark display palette. Keep components on semantic tokens. -->
+    <!-- SideTab dark display palette. Keep components on semantic tokens. -->
     <color name="ss_background">#FF080B0E</color>
     <color name="ss_surface">#FF10161C</color>
-    <color name="ss_surface_raised">#FF151D24</color>
     <color name="ss_surface_strong">#FF1C2730</color>
     <color name="ss_outline">#FF2B3945</color>
     <color name="ss_outline_strong">#FF3F5261</color>
@@ -28,9 +27,7 @@
     <color name="ss_surface_tint_strong">#33F4F7F9</color>
     <color name="ss_accent_tint">#2653D8FF</color>
     <color name="ss_error_tint">#26FF6B7A</color>
-    <color name="ss_transparent">#00000000</color>
 
     <!-- Compatibility names retained for platform/vector resources. -->
     <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
 </resources>

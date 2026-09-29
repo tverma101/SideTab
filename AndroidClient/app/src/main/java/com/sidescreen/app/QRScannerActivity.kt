@@ -39,6 +39,9 @@ class QRScannerActivity : AppCompatActivity() {
         }
     private val alreadyDelivered = AtomicBoolean(false)
 
+    // Touched only from main-executor callbacks, so it needs no synchronization.
+    private var lastRejectedQr: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_qr_scanner)
@@ -81,16 +84,26 @@ class QRScannerActivity : AppCompatActivity() {
             return
         }
 
-        val input = InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees)
         val mainExecutor = ContextCompat.getMainExecutor(this)
-        scanner.process(input)
+        val scanTask =
+            try {
+                scanner.process(InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees))
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not start ML Kit scan", e)
+                proxy.close()
+                return
+            }
+        scanTask
             .addOnSuccessListener(mainExecutor) { barcodes ->
                 if (isFinishing || isDestroyed) return@addOnSuccessListener
                 val raw = barcodes.firstOrNull { it.rawValue?.startsWith("sidescreen://") == true }?.rawValue
                 if (raw != null && alreadyDelivered.compareAndSet(false, true)) {
                     val parsed = PairingURL.parse(raw)
                     if (parsed == null) {
-                        Toast.makeText(this, "Invalid QR, expected SideScreen pairing code", Toast.LENGTH_SHORT).show()
+                        if (lastRejectedQr != raw) {
+                            lastRejectedQr = raw
+                            Toast.makeText(this, "Invalid QR, expected SideTab pairing code", Toast.LENGTH_SHORT).show()
+                        }
                         alreadyDelivered.set(false)
                     } else {
                         setResult(RESULT_OK, Intent().putExtra(EXTRA_URL, raw))
@@ -109,7 +122,8 @@ class QRScannerActivity : AppCompatActivity() {
     override fun onDestroy() {
         analyzerExecutor.shutdownNow()
         if (scannerDelegate.isInitialized()) {
-            scanner.close()
+            runCatching { scanner.close() }
+                .onFailure { Log.w(TAG, "ML Kit scanner close failed", it) }
         }
         super.onDestroy()
     }

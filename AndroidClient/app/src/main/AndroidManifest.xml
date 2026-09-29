@@ -3,9 +3,10 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <!-- Real panel backlight control (Settings.System.SCREEN_BRIGHTNESS).
          This is a deliberate special-access capability. It is not expected to
          be granted like a normal runtime permission; supported development
@@ -27,7 +28,6 @@
         <activity
             android:name=".MainActivity"
             android:launchMode="singleTask"
-            android:screenOrientation="fullUser"
             android:configChanges="orientation|screenSize|screenLayout"
             android:exported="true">
             <intent-filter>
@@ -38,8 +38,7 @@
 
         <activity
             android:name=".QRScannerActivity"
-            android:exported="false"
-            android:screenOrientation="portrait" />
+            android:exported="false" />
     </application>
 
 </manifest>

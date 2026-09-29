@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug to help us improve Side Screen
+about: Report a bug to help us improve SideTab
 title: '[Bug] '
 labels: bug
 assignees: ''
@@ -15,12 +15,12 @@ A clear and concise description of the bug.
 **macOS Host:**
 - macOS Version: [e.g., 14.2 Sonoma]
 - Mac Model: [e.g., MacBook Pro M3]
-- Side Screen Version: [e.g., 1.0.0]
+- SideTab Version: [e.g., 1.0.0]
 
 **Android Client:**
 - Android Version: [e.g., Android 14]
 - Device Model: [e.g., Samsung Galaxy Tab S9]
-- Side Screen Version: [e.g., 1.0.0]
+- SideTab Version: [e.g., 1.0.0]
 
 **Connection:**
 - USB Cable: [e.g., USB-C to USB-C]

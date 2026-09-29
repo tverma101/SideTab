@@ -1,7 +1,8 @@
 import Foundation
 import Network
+import os
 
-private enum WireMessage {
+enum WireMessage {
     static let legacyVideoFrame: UInt8 = 0
     static let displayConfig: UInt8 = 1
     static let touchEvent: UInt8 = 2
@@ -9,6 +10,9 @@ private enum WireMessage {
     static let pong: UInt8 = 5
     static let videoFrameWithMetadata: UInt8 = 6
     static let keyframeRequest: UInt8 = 7
+    /// Client→server, payload-free capability: "I understand the 14-byte frame
+    /// header". Old hosts consume this unknown type as one byte, so sending it
+    /// unsolicited is safe.
     static let clientSupportsFrameMetadata: UInt8 = 8
     /// Client→server, payload-free (old hosts consume 1 byte safely):
     /// "this device has no HEVC decoder".
@@ -17,16 +21,12 @@ private enum WireMessage {
     /// clients that sent clientAvcOnly — old clients disconnect on unknown
     /// message types, so this must never be sent unsolicited.
     static let codecSelected: UInt8 = 10
-    /// Client→server, payload-free capability: "I understand BRIGHT (type 11)".
-    /// Old servers log unknown control types and skip — safe unsolicited.
-    static let clientSupportsBrightness: UInt8 = 3
     /// Server→client, 1-byte payload (0..255). Sent ONLY to clients that sent
     /// clientSupportsBrightness — old clients disconnect on unknown types.
     static let bright: UInt8 = 11
-    /// Client→server, 4-byte payload: the client's max decode size (issue
-    /// #41). Every payload byte has the high bit set, so old hosts that
-    /// consume unknown types byte-by-byte skip the payload harmlessly.
-    static let clientDecoderLimits: UInt8 = 11
+    /// Client→server, payload-free capability: "I understand BRIGHT (type 11)".
+    /// Old servers log unknown control types and skip — safe unsolicited.
+    static let clientSupportsBrightness: UInt8 = 3
     /// Client→server, payload-free capability: "I understand direct stylus
     /// events". Older hosts consume this unknown type as one byte and keep
     /// the legacy touch protocol aligned.
@@ -37,6 +37,31 @@ private enum WireMessage {
     static let serverSupportsStylus: UInt8 = 13
     /// Client→server, fixed 28-byte direct stylus event.
     static let stylusEvent: UInt8 = 14
+    /// Client→server, 4-byte payload: the client's max decode size (issue
+    /// #41). It must not share a tag with a server→client message: the client
+    /// dispatches on the tag alone, so one value can only ever name one
+    /// message per direction. A byte-at-a-time skipper (this host's own
+    /// `default` arms) consumes 1 of the 5 bytes and desyncs the rest of the
+    /// stream, so "the payload is skipped harmlessly" is not a safe design.
+    /// 11 was taken by `bright`; 15 is the next free tag.
+    static let clientDecoderLimits: UInt8 = 15
+    /// Client→server decoder limits as sent by Android builds from before the
+    /// move to 15: the same 4-byte payload under the old tag. Without this an
+    /// un-updated tablet's report is skipped a byte at a time and the input
+    /// stream desyncs. Inbound only — the host never reads `bright` from a
+    /// client — so it deliberately stays out of `all`, which lists one tag per
+    /// message.
+    static let legacyClientDecoderLimits: UInt8 = 11
+
+    /// Every tag value in use. A duplicate means two messages share one
+    /// wire type and the client cannot tell them apart.
+    static let all: [UInt8] = [
+        legacyVideoFrame, displayConfig, touchEvent, clientSupportsBrightness,
+        ping, pong, videoFrameWithMetadata, keyframeRequest,
+        clientSupportsFrameMetadata, clientAvcOnly, codecSelected, bright,
+        clientSupportsStylus, serverSupportsStylus, stylusEvent,
+        clientDecoderLimits
+    ]
 }
 
 private let controlAuthMagic = Data([0x53, 0x53, 0x57, 0x43]) // "SSWC"
@@ -70,6 +95,11 @@ private extension NWEndpoint {
 
 class StreamingServer {
     private let port: UInt16
+    /// Transport selection belongs to the server session, not to whichever
+    /// endpoint happens to arrive first. A USB reverse-forward is loopback at
+    /// Network.framework, while wireless is LAN; keeping this explicit also
+    /// prevents pressure policy from changing when a probe or contender joins.
+    private var transportMode: ConnectionMode = .usb
     private var listener: NWListener?
     private var connection: NWConnection?
 
@@ -86,6 +116,10 @@ class StreamingServer {
     private var lastControlTouchNs: UInt64 = 0
     private var maxControlTouchGapMs = 0.0
     private var clientSupportsBrightness = false
+    /// Latest requested level. Queue it while the Android client is still
+    /// negotiating capabilities so a menu-bar change cannot be lost during
+    /// the short connection-startup race.
+    private var lastBrightness: UInt8?
     private let controlQueue = DispatchQueue(label: "controlQueue", qos: .userInteractive)
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
@@ -108,12 +142,53 @@ class StreamingServer {
     // Wireless auth: when non-nil, non-loopback connections must present this
     // 32-byte token before being allowed to proceed. nil means wireless mode
     // is inactive — non-loopback connections are rejected immediately.
-    var expectedAuthToken: Data?
+    var expectedAuthToken: Data? {
+        get { sessionState.withLock { $0.expectedAuthToken } }
+        set { sessionState.withLock { $0.expectedAuthToken = newValue } }
+    }
     var onWirelessClientPaired: ((String) -> Void)?
 
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
     private let networkQueue = DispatchQueue(label: "networkQueue", qos: .userInteractive)
+
+    /// Everything both the video and the control socket can observe, plus the
+    /// session lifecycle flags. These fields are written by the input parser on
+    /// receiveQueue, read by the control parser on controlQueue, by the
+    /// startup timer on networkQueue and by the frame sender on frameQueue, so
+    /// a plain `sync` on any one of those queues orders nothing. `sessionState`
+    /// is a LEAF lock: it is never held across a queue hop, a connection send,
+    /// or a callback into the host.
+    private struct SessionState {
+        var stopped = false
+        var receiving = false
+        var connectionReady = false
+        var clientSupportsFrameMetadata = false
+        var clientIsAvcOnly = false
+        /// SESSION-scoped, not per-connection: the client advertises it on
+        /// whichever socket is up, and a video-socket reconnect must not erase
+        /// what the still-live control socket established — otherwise every S
+        /// Pen stroke is dropped mid-drag with no client-visible error. Only
+        /// a full stop() clears it; nothing is sent to the client on the
+        /// strength of it, so a device switch cannot be harmed by a stale true.
+        var clientSupportsStylus = false
+        var clientDecodeLimits: (width: Int, height: Int)?
+        var selectedCodec: StreamCodec?
+        var codecSelectedSent = false
+        var startupPublished = false
+        var publishedMetadataSupport: Bool?
+        var publishedDecodeLimits: (width: Int, height: Int)?
+        var displayWidth = 1920
+        var displayHeight = 1080
+        var rotation = 0
+        var flipHorizontal = false
+        var flipVertical = false
+        /// Snapshot of the pairing token taken when the listener starts. The UI
+        /// can rotate the token mid-session, so this is read and written from
+        /// both the network queue and the main actor and must stay in the lock.
+        var expectedAuthToken: Data?
+    }
+    private let sessionState = OSAllocatedUnfairLock(initialState: SessionState())
 
     // Encoded frames are never dropped after VideoToolbox emits them: ordinary
     // H.264/HEVC P-frames may reference earlier P-frames. Instead, the pressure
@@ -132,31 +207,42 @@ class StreamingServer {
     private var frameCount: UInt64 = 0
     private var droppedFrames: UInt64 = 0
     private var lastStatsTime = DispatchTime.now()
-    private var displayWidth = 1920
-    private var displayHeight = 1080
-    private var rotation = 0
-    private var flipHorizontal = false
-    private var flipVertical = false
-    private var isReceiving = false
-    private var isStopped = false
-    private var connectionReady = false
-    private var clientSupportsFrameMetadata = false
-    private var clientIsAvcOnly = false
-    private var clientSupportsStylus = false
-    /// Max decode size reported by the connected client (issue #41).
-    private(set) var clientDecodeLimits: (width: Int, height: Int)?
     private var inputBuffer = Data()
+
+    /// Max decode size reported by the connected client (issue #41).
+    var clientDecodeLimits: (width: Int, height: Int)? {
+        sessionState.withLock { $0.clientDecodeLimits }
+    }
+
+    private var isStopped: Bool { sessionState.withLock { $0.stopped } }
+    private var isReceiving: Bool { sessionState.withLock { $0.receiving } }
+    private var connectionReady: Bool { sessionState.withLock { $0.connectionReady } }
+    private var clientSupportsStylus: Bool { sessionState.withLock { $0.clientSupportsStylus } }
 
     init(port: UInt16, controlPort: UInt16? = nil) {
         self.port = port
         self.controlPort = controlPort ?? ControlPortResolver.effective(videoPort: port)
     }
 
-    func start() {
-        isStopped = false
+    /// Read-only mirror of the control listener's port, for the pairing tests.
+    var controlPortNumber: UInt16 { controlPort }
+
+    func start(wireless: Bool = false) {
+        sessionState.withLock { $0.stopped = false }
+        transportMode = wireless ? .wireless : .usb
         do {
             let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
+            // No allowLocalEndpointReuse: probed on this machine, a second
+            // NWListener binds the same port with NO error while the FIRST
+            // binder keeps 100% of the connections. With reuse on, a second
+            // SideScreen instance prints "server started", renders a QR, and
+            // every client goes to the other process. The app never rebinds a
+            // port it still holds, so reuse buys nothing and hides the steal.
+            // Both transports get .interactiveVideo: .bestEffort is
+            // Network.framework's do-not-care class (Apple documents it as the
+            // choice when you have no specific need), and the control listener
+            // was using the *more* latency-sensitive .responsiveData for a
+            // 17-byte pong, which inverts the priority.
             params.serviceClass = .interactiveVideo
 
             // Optimize TCP for low-latency streaming
@@ -179,10 +265,17 @@ class StreamingServer {
                 self?.handleConnection(newConnection)
             }
 
-            listener?.stateUpdateHandler = { state in
+            listener?.stateUpdateHandler = { [weak self] state in
+                guard let self = self else { return }
                 switch state {
                 case .ready:
-                    debugLog("TCP Server listening on port \(self.port)")
+                    debugLog("TCP Server listening on port \(self.port) [\(self.transportMode.rawValue)]")
+                    if self.transportMode == .wireless, LANAddressResolver.primaryHost() == nil {
+                        // A pairing URL built with no routable address falls back
+                        // to 0.0.0.0, which the client connects to as its OWN
+                        // loopback forever. Nothing else reports that state.
+                        debugLog("WARNING: no routable LAN address on this Mac — any pairing URL would carry 0.0.0.0 and no tablet can connect")
+                    }
                 case .failed(let error):
                     debugLog("Server failed: \(error)")
                 default:
@@ -201,9 +294,19 @@ class StreamingServer {
     /// Dedicated control-channel listener: ping/pong + keyframe requests on
     /// their own connection, so pongs never contend with video frames.
     private func startControlListener() {
+        // A control port that collides with the video port makes one of the two
+        // listeners a permanent black hole: the client would connect to a port
+        // that only ever answers the other protocol.
+        if controlPort == port {
+            debugLog("Control listener NOT started: control port \(controlPort) equals video port \(port) — set \(ControlPortResolver.defaultsKey) to a different port")
+            return
+        }
+        if Int(controlPort) <= ControlPortResolver.privilegedPortCeiling {
+            debugLog("Control listener NOT started: port \(controlPort) is privileged and cannot be bound without root — set \(ControlPortResolver.defaultsKey) above \(ControlPortResolver.privilegedPortCeiling)")
+            return
+        }
         do {
             let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
             params.serviceClass = .responsiveData
             if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
                 tcpOptions.noDelay = true
@@ -212,7 +315,8 @@ class StreamingServer {
             controlListener?.newConnectionHandler = { [weak self] newConnection in
                 self?.handleControlConnection(newConnection)
             }
-            controlListener?.stateUpdateHandler = { state in
+            controlListener?.stateUpdateHandler = { [weak self] state in
+                guard let self = self else { return }
                 switch state {
                 case .ready:
                     debugLog("Control listener ready on port \(self.controlPort)")
@@ -230,13 +334,19 @@ class StreamingServer {
 
     private func handleControlConnection(_ newConnection: NWConnection) {
         debugLog("Control connection incoming")
+        let mode = transportMode
         let isLoopback = newConnection.endpoint.isLoopback
-        if !isLoopback && expectedAuthToken == nil {
-            debugLog("Rejecting non-loopback control candidate: wireless mode not active")
+        if mode == .usb && !isLoopback {
+            debugLog("Rejecting LAN control candidate: USB mode is active")
             newConnection.cancel()
             return
         }
-        let requiresAuth = !isLoopback
+        if mode == .wireless && !isLoopback && expectedAuthToken == nil {
+            debugLog("Rejecting non-loopback control candidate: wireless auth is unavailable")
+            newConnection.cancel()
+            return
+        }
+        let requiresAuth = mode == .wireless && !isLoopback
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self, let newConnection else { return }
             switch state {
@@ -250,7 +360,7 @@ class StreamingServer {
                     // first message before allowing it to replace control.
                     self.routeLoopbackControlCandidate(newConnection)
                 } else {
-                    self.installControlConnection(newConnection, initialBuffer: Data())
+                    self.installControlConnection(newConnection, initialBuffer: Data(), authenticated: true)
                 }
             case .failed(let error):
                 debugLog("Control candidate failed: \(error)")
@@ -270,16 +380,32 @@ class StreamingServer {
     /// (type 3), so promote it and preserve the bytes already received.
     private func routeLoopbackControlCandidate(_ candidate: NWConnection) {
         var buffer = Data()
+        // The probe window is bounded in both size and time. A ping is 9 bytes
+        // and a client opener is 1, so anything past this cap is a flood that
+        // would otherwise re-arm this receive loop forever, appending up to 256
+        // bytes per completion. Reachable by any local process in USB mode.
+        let timeout = DispatchWorkItem { [weak candidate] in
+            debugLog("Loopback control probe silent — rejecting, active control untouched")
+            candidate?.cancel()
+        }
+        controlQueue.asyncAfter(deadline: .now() + Self.contenderProofWindow, execute: timeout)
         var receiveNext: (() -> Void)!
         receiveNext = { [weak self, weak candidate] in
             guard let self, let candidate else { return }
             candidate.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, isComplete, error in
                 guard error == nil, !isComplete else {
+                    timeout.cancel()
                     candidate.cancel()
                     return
                 }
                 if let data, !data.isEmpty {
                     buffer.append(data)
+                }
+                guard buffer.count <= Self.loopbackControlProbeMaxBytes else {
+                    timeout.cancel()
+                    debugLog("Loopback control probe exceeded \(Self.loopbackControlProbeMaxBytes)B without identifying itself — rejecting")
+                    candidate.cancel()
+                    return
                 }
                 guard let first = buffer.first else {
                     receiveNext()
@@ -291,6 +417,7 @@ class StreamingServer {
                         receiveNext()
                         return
                     }
+                    timeout.cancel()
                     let clientTimestamp = Data(buffer.dropFirst().prefix(8))
                     var pong = Data(capacity: 17)
                     pong.append(WireMessage.pong)
@@ -302,8 +429,9 @@ class StreamingServer {
                         candidate.cancel()
                     })
                 } else {
+                    timeout.cancel()
                     debugLog("Loopback control client replacing prior control connection")
-                    self.installControlConnection(candidate, initialBuffer: buffer)
+                    self.installControlConnection(candidate, initialBuffer: buffer, authenticated: true)
                 }
             }
         }
@@ -352,7 +480,8 @@ class StreamingServer {
                 debugLog("Control authentication accepted")
                 self.installControlConnection(
                     candidate,
-                    initialBuffer: Data(buffer.dropFirst(requiredBytes))
+                    initialBuffer: Data(buffer.dropFirst(requiredBytes)),
+                    authenticated: true
                 )
             }
         }
@@ -360,12 +489,19 @@ class StreamingServer {
     }
 
     /// Promote an authenticated connection, replacing the prior client only now.
-    private func installControlConnection(_ newConnection: NWConnection, initialBuffer: Data) {
+    /// `authenticated` is the caller's claim, not this function's: the
+    /// invariant is local so no future caller can accidentally install an
+    /// unauthenticated socket and silence the auth gate below.
+    private func installControlConnection(
+        _ newConnection: NWConnection,
+        initialBuffer: Data,
+        authenticated: Bool
+    ) {
         // Publish the replacement first. A terminal callback from the old
         // connection is then guaranteed to fail the identity guard below.
         let oldConnection = controlConnection
         controlInputBuffer = initialBuffer  // fresh storage — never keep poisoned inline slices
-        controlAuthenticated = true
+        controlAuthenticated = authenticated
         controlTouchCount = 0
         lastControlTouchNs = 0
         maxControlTouchGapMs = 0
@@ -555,6 +691,26 @@ class StreamingServer {
                 controlInputBuffer = Data(controlInputBuffer.dropFirst())
                 clientSupportsBrightness = true
                 debugLog("Client supports brightness (BRIGHT armed)")
+                if let value = lastBrightness {
+                    sendBrightnessMessage(value, on: connection, path: "control")
+                }
+
+            case WireMessage.clientSupportsStylus:
+                // The client opens its control session with this advert, so the
+                // capability is established here for the whole session — the
+                // same flag the video parser writes. Without this arm the flag
+                // stayed false until a video reconnect re-sent the advert, and
+                // every stroke on the control socket was dropped with no error
+                // visible to the client.
+                controlInputBuffer = Data(controlInputBuffer.dropFirst())
+                let firstAdvert = !sessionState.withLock { state -> Bool in
+                    let wasSupported = state.clientSupportsStylus
+                    state.clientSupportsStylus = true
+                    return wasSupported
+                }
+                if firstAdvert {
+                    debugLog("Client supports S Pen stylus events (control channel)")
+                }
 
             default:
                 debugLog("Unknown control type: \(msgType)")
@@ -568,12 +724,27 @@ class StreamingServer {
     /// disconnect on unknown message types, so never send unsolicited.
     /// No-op when the control connection is not ready. Call from any queue.
     func sendBrightness(_ value: UInt8) {
-        guard clientSupportsBrightness, let connection = controlConnection else { return }
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            self.lastBrightness = value
+            guard self.clientSupportsBrightness else {
+                debugLog("BRIGHT queued: \(value) (client capability not armed)")
+                return
+            }
+            guard let connection = self.controlConnection else {
+                debugLog("BRIGHT queued: \(value) (no control connection)")
+                return
+            }
+            self.sendBrightnessMessage(value, on: connection, path: "control")
+        }
+    }
+
+    private func sendBrightnessMessage(_ value: UInt8, on connection: NWConnection, path: String) {
         var msg = Data(capacity: 2)
         msg.append(WireMessage.bright)
         msg.append(value)
         connection.send(content: msg, completion: .contentProcessed { _ in })
-        debugLog("BRIGHT sent: \(value)")
+        debugLog("BRIGHT sent (\(path)): \(value)")
     }
 
     // Contender: a new connection that arrived while a live client is
@@ -588,6 +759,7 @@ class StreamingServer {
     private var contenderDeadline: DispatchWorkItem?
     private static let contenderProofWindow: TimeInterval = 1.5
     private static let authenticatedContenderWindow: TimeInterval = 5.0
+    private static let loopbackControlProbeMaxBytes = 64
 
     private func handleConnection(_ newConnection: NWConnection) {
         debugLog("New connection incoming...")
@@ -609,29 +781,43 @@ class StreamingServer {
         alreadyStarted: Bool = false,
         alreadyAuthenticated: Bool = false
     ) {
+        // A stop() that is already draining networkQueue must not be followed
+        // by a socket installed behind its back.
+        if isStopped {
+            debugLog("Rejecting connection that arrived after stop()")
+            newConnection.cancel()
+            return
+        }
         // Publish the replacement before cancelling the prior client. The old
         // connection's .cancelled/.failed callback then cannot pass the
         // identity guard and tear down the promoted connection.
         let oldConnection = connection
         connection = newConnection
-        connectionReady = false
-        clientSupportsFrameMetadata = false
-        clientIsAvcOnly = false
-        clientSupportsStylus = false
-        clientDecodeLimits = nil
+        sessionState.withLock { state in
+            state.connectionReady = false
+            state.clientSupportsFrameMetadata = false
+            state.clientIsAvcOnly = false
+            state.clientDecodeLimits = nil
+            state.selectedCodec = nil
+            state.codecSelectedSent = false
+            state.startupPublished = false
+            state.publishedMetadataSupport = nil
+            state.publishedDecodeLimits = nil
+        }
         inputBuffer.removeAll(keepingCapacity: true)
         resetFrameTransport(newConnection)
 
         if let oldConnection, oldConnection !== newConnection {
-            isReceiving = false
+            sessionState.withLock { $0.receiving = false }
             oldConnection.cancel()
         }
 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
-            guard let self = self else { return }
+            guard let self, let newConnection else { return }
             // Identity guard: a terminal callback from a replaced connection
             // must not tear down the newer live one (same pattern as the
-            // control connection above).
+            // control connection above). Binding newConnection first is also
+            // what keeps `===` from comparing two nils, which is `true`.
             guard self.connection === newConnection else {
                 if case .failed = state { debugLog("Video state STALE terminal callback (connection replaced)") }
                 return
@@ -639,7 +825,7 @@ class StreamingServer {
             debugLog("Connection state: \(state)")
             switch state {
             case .ready:
-                self.onConnectionReady(newConnection!, alreadyAuthenticated: alreadyAuthenticated)
+                self.onConnectionReady(newConnection, alreadyAuthenticated: alreadyAuthenticated)
             case .failed(let error):
                 debugLog("Connection failed: \(error)")
                 self.markDisconnected()
@@ -653,7 +839,8 @@ class StreamingServer {
 
         if alreadyStarted {
             if newConnection.state == .ready {
-                networkQueue.async {
+                networkQueue.async { [weak self, weak newConnection] in
+                    guard let self, let newConnection else { return }
                     self.onConnectionReady(newConnection, alreadyAuthenticated: alreadyAuthenticated)
                 }
             }
@@ -670,7 +857,7 @@ class StreamingServer {
                 WirelessTransportPressure.retire(generation: framePressureGeneration)
             }
             frameSendGeneration &+= 1
-            framePressureGeneration = WirelessTransportPressure.reset(wireless: !newConnection.endpoint.isLoopback)
+            framePressureGeneration = WirelessTransportPressure.reset(wireless: transportMode == .wireless)
             frameSendConnection = newConnection
             frameTransportReady = false
             frameWaitingForSync = true
@@ -686,9 +873,12 @@ class StreamingServer {
     }
 
     private func markFrameTransportReady(_ expected: NWConnection) {
+        // Read the capability BEFORE entering frameQueue: sessionState is a leaf
+        // lock and must never be taken while a queue hop is outstanding.
+        let usesMetadata = sessionState.withLock { $0.clientSupportsFrameMetadata }
         frameQueue.sync {
             guard frameSendConnection === expected else { return }
-            frameUsesMetadata = clientSupportsFrameMetadata
+            frameUsesMetadata = usesMetadata
             frameTransportReady = true
             WirelessTransportPressure.setReady(generation: framePressureGeneration)
         }
@@ -715,16 +905,37 @@ class StreamingServer {
     /// sends promotes it via installConnection (seeded with those bytes, so
     /// no client advertisement is lost); silence past the window cancels it.
     private func armContender(_ newConnection: NWConnection) {
-        clearContender(newConnection, cancelSocket: true)  // one contender at a time
+        // Evict the PREVIOUS contender, never the new one. Passing the new
+        // connection to clearContender(cancelSocket: true) cancelled the socket
+        // that had not even been started yet, so it never reached .ready and a
+        // legitimate USB/loopback reconnect could never take over — the user
+        // had to stop and restart the server. It also left the old contender
+        // un-cancelled (the `contender === c` test fails, so the property was
+        // not nil'd while its deadline still fired), orphaning an accepted
+        // socket with a live receive and no owner; one TCP fd per rejection.
+        if let previous = contender, previous !== newConnection {
+            debugLog("Superseded contender — cancelling it to keep one contender at a time")
+            clearContender(previous, cancelSocket: true)
+        }
         contender = newConnection
-        let isWireless = !newConnection.endpoint.isLoopback
+        let mode = transportMode
+        let isLoopback = newConnection.endpoint.isLoopback
+        guard mode == .wireless || isLoopback else {
+            debugLog("Rejecting LAN contender: USB mode is active")
+            clearContender(newConnection, cancelSocket: true)
+            return
+        }
+        let isWireless = mode == .wireless && !isLoopback
 
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
-            guard let self = self else { return }
+            guard let self, let newConnection else { return }
+            // `===` on two optionals is true when BOTH are nil, so bind the
+            // candidate first: the old nil === nil form let a deallocated
+            // connection through to a force-unwrap.
             guard self.contender === newConnection else { return }
             switch state {
             case .ready:
-                guard let candidate = newConnection else { return }
+                let candidate = newConnection
                 if isWireless {
                     guard let expected = self.expectedAuthToken else {
                         debugLog("Wireless contender rejected — wireless mode is not active")
@@ -735,8 +946,8 @@ class StreamingServer {
                     self.runAuthHandshake(
                         connection: candidate,
                         expectedToken: expected,
-                        onSuccess: { [weak self, weak candidate] in
-                            guard let self, let candidate else { return }
+                        onSuccess: { [weak candidate] in
+                            guard let candidate else { return }
                             self.promoteAuthenticatedContender(candidate)
                         }
                     )
@@ -745,9 +956,9 @@ class StreamingServer {
                 }
             case .failed(let error):
                 debugLog("Contender failed before proving: \(error)")
-                self.clearContender(newConnection!, cancelSocket: false)
+                self.clearContender(newConnection, cancelSocket: false)
             case .cancelled:
-                self.clearContender(newConnection!, cancelSocket: false)
+                self.clearContender(newConnection, cancelSocket: false)
             default:
                 break
             }
@@ -801,8 +1012,10 @@ class StreamingServer {
     /// after "Connection reset by peer"), and report the disconnect once.
     private func markDisconnected() {
         let disconnectedConnection = connection
-        connectionReady = false
-        isReceiving = false
+        sessionState.withLock { state in
+            state.connectionReady = false
+            state.receiving = false
+        }
         retireFrameTransport(disconnectedConnection)
         connection = nil
         inputBuffer.removeAll(keepingCapacity: true)
@@ -810,21 +1023,30 @@ class StreamingServer {
     }
 
     private func onConnectionReady(_ conn: NWConnection, alreadyAuthenticated: Bool = false) {
+        // A .ready that lands after stop() drained the queues would otherwise
+        // install a session nobody will ever tear down.
+        if isStopped {
+            debugLog("Rejecting connection that became ready after stop()")
+            conn.cancel()
+            return
+        }
         if alreadyAuthenticated {
-            guard !isStopped else {
-                conn.cancel()
-                return
-            }
             beginExistingProtocol(on: conn)
+            return
+        }
+        let mode = transportMode
+        if mode == .usb && !conn.endpoint.isLoopback {
+            debugLog("Rejecting LAN client: USB mode is active")
+            conn.cancel()
             return
         }
         if conn.endpoint.isLoopback {
-            debugLog("Client connected via loopback (USB) — skipping auth")
+            debugLog("Client connected via loopback (\(mode.rawValue)) — skipping auth")
             beginExistingProtocol(on: conn)
             return
         }
-        guard let expected = expectedAuthToken else {
-            debugLog("Rejecting non-loopback client: wireless mode not active")
+        guard mode == .wireless, let expected = expectedAuthToken else {
+            debugLog("Rejecting non-loopback client: wireless mode/auth is not active")
             conn.cancel()
             return
         }
@@ -841,38 +1063,97 @@ class StreamingServer {
         // The client's capability adverts (decoder limits, metadata support)
         // land right after connect; a client racing a just-rebooted server
         // can deliver them past 100ms, silently downgrading the session to
-        // the legacy no-metadata path. 250ms covers that race; the type-8
-        // handler below still short-circuits startup the moment adverts
-        // arrive, so well-behaved clients pay no extra delay.
+        // the legacy no-metadata path. 250ms covers that race; the capability
+        // handlers below still short-circuit startup the moment adverts arrive,
+        // so well-behaved clients pay no extra delay. Negotiation stays
+        // re-runnable: this timer is only the fallback for a client that never
+        // advertises, and a late advert must still be able to correct it.
         networkQueue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self, weak conn] in
             guard let self = self, let conn = conn else { return }
             self.finishProtocolStartup(on: conn)
         }
     }
 
-    private func finishProtocolStartup(on conn: NWConnection) {
-        guard connection === conn, !isStopped, !connectionReady else { return }
+    private struct StartupPlan {
+        let codec: StreamCodec
+        /// Only an AVC-only client (which opted in with clientAvcOnly) is told.
+        let sendCodecSelected: Bool
+        let firstPublish: Bool
+    }
 
-        let codec: StreamCodec = clientIsAvcOnly ? .h264 : .hevc
-        if clientIsAvcOnly {
-            // Safe to send: this client opted in via type 9. Must precede the
-            // display config so the client knows the codec before it sizes
-            // and configures its decoder.
-            let msg = Data([WireMessage.codecSelected, codec.wireId])
+    /// Decide — atomically — what the caller must publish, or nil when the wire
+    /// already reflects every client capability (the caller's no-op case).
+    ///
+    /// This is reached from the networkQueue startup timer AND from receiveQueue
+    /// in the capability arms, so the old "read a plain Bool, then set it twenty
+    /// lines later" guard let both queues through: onCodecNegotiated fired twice
+    /// for one connection, the host rebuilt the encoder twice (one orphaned) and
+    /// the client received two displayConfig messages.
+    private func planProtocolStartup(on conn: NWConnection) -> StartupPlan? {
+        sessionState.withLock { state in
+            guard !state.stopped, connection === conn else { return nil }
+            let codec: StreamCodec = state.clientIsAvcOnly ? .h264 : .hevc
+            let firstPublish = !state.startupPublished
+            let changed = firstPublish
+                || state.selectedCodec != codec
+                || state.publishedMetadataSupport != state.clientSupportsFrameMetadata
+                || !limitsMatch(state.publishedDecodeLimits, state.clientDecodeLimits)
+            guard changed else { return nil }
+            let plan = StartupPlan(
+                codec: codec,
+                sendCodecSelected: codec == .h264 && !state.codecSelectedSent,
+                firstPublish: firstPublish
+            )
+            state.selectedCodec = codec
+            state.codecSelectedSent = state.codecSelectedSent || plan.sendCodecSelected
+            state.startupPublished = true
+            state.publishedMetadataSupport = state.clientSupportsFrameMetadata
+            state.publishedDecodeLimits = state.clientDecodeLimits
+            return plan
+        }
+    }
+
+    private func limitsMatch(
+        _ lhs: (width: Int, height: Int)?,
+        _ rhs: (width: Int, height: Int)?
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil): return true
+        case let (lhs?, rhs?): return lhs.width == rhs.width && lhs.height == rhs.height
+        default: return false
+        }
+    }
+
+    private func finishProtocolStartup(on conn: NWConnection) {
+        guard let plan = planProtocolStartup(on: conn) else { return }
+
+        if plan.sendCodecSelected {
+            // Must precede the display config so the client knows the codec
+            // before it sizes and configures its decoder. Safe to send: this
+            // client opted in via clientAvcOnly, and codecSelectedSent in the
+            // plan guarantees it goes out at most once per connection.
+            let msg = Data([WireMessage.codecSelected, plan.codec.wireId])
             conn.send(content: msg, completion: .contentProcessed { _ in })
             debugLog("Sent codecSelected: H.264")
         }
         // Synchronous, before sendDisplaySize(): the handler switches the
         // encoder AND updates displayWidth/Height (clamped for H.264) so the
-        // display config below carries decoder-safe dimensions.
-        onCodecNegotiated?(codec)
+        // display config below carries decoder-safe dimensions. It is
+        // idempotent for an unchanged codec+size, so re-running it for a late
+        // advert costs no rebuild.
+        onCodecNegotiated?(plan.codec)
 
-        debugLog("Client connected - sending display config first")
+        debugLog(plan.firstPublish
+            ? "Client connected - sending display config first"
+            : "Client capability update - re-sending display config")
         sendDisplaySize()
-        connectionReady = true
+        sessionState.withLock { $0.connectionReady = true }
         markFrameTransportReady(conn)
-        debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), codec=\(codec))")
-        onClientConnected?()
+        if plan.firstPublish {
+            let metadata = sessionState.withLock { $0.clientSupportsFrameMetadata }
+            debugLog("Connection ready for frames (metadata=\(metadata ? "on" : "off"), codec=\(plan.codec))")
+            onClientConnected?()
+        }
     }
 
     private func runAuthHandshake(
@@ -968,33 +1249,108 @@ class StreamingServer {
         })
     }
 
+    /// Largest dimension the client will accept from a display config.
+    static let maxWireDimension = 16_384
+    /// Largest total pixel count the client will accept (8K UHD).
+    static let maxWirePixels: Int64 = 33_554_432
+
+    /// DisplayConfig.fromWire on the client THROWS for a rotation outside
+    /// {0,90,180,270}, a dimension outside 1...16384, or more than 8K pixels,
+    /// and the client treats that as a fatal protocol error: an immediate,
+    /// permanent reconnect loop with no host-side diagnostic. Normalize here so
+    /// the host can never put such a value on the wire.
+    static func normalizedRotation(_ rotation: Int) -> Int {
+        let wrapped = ((rotation % 360) + 360) % 360
+        let snapped = ((wrapped + 45) / 90) * 90
+        return min(snapped, 270)
+    }
+
+    static func clampedDisplaySize(width: Int, height: Int) -> (width: Int, height: Int) {
+        var w = min(max(width, 1), maxWireDimension)
+        var h = min(max(height, 1), maxWireDimension)
+        guard Int64(w) * Int64(h) > maxWirePixels else { return (w, h) }
+        let overflow = Double(w) * Double(h) / Double(maxWirePixels)
+        let scale = 1 / overflow.squareRoot()
+        w = max(1, Int((Double(w) * scale).rounded(.down)))
+        h = max(1, Int((Double(h) * scale).rounded(.down)))
+        // Flooring both can still land a few pixels over the client's ceiling.
+        if Int64(w) * Int64(h) > maxWirePixels {
+            let remaining = Double(w) * Double(h) / Double(maxWirePixels)
+            w = max(1, Int((Double(w) / remaining).rounded(.down)))
+            h = max(1, Int((Double(h) / remaining).rounded(.down)))
+        }
+        return (w, h)
+    }
+
+    /// Decodes the 4-byte decoder-limits payload, [w-hi][w-lo][h-hi][h-lo],
+    /// 7 data bits each with the high bit always set. Returns nil when any
+    /// byte lacks the marker bit.
+    static func decodeClientDecoderLimits(_ payload: [UInt8]) -> (width: Int, height: Int)? {
+        guard payload.count == 4, payload.allSatisfy({ $0 & 0x80 != 0 }) else { return nil }
+        let width = (Int(payload[0] & 0x7F) << 7) | Int(payload[1] & 0x7F)
+        let height = (Int(payload[2] & 0x7F) << 7) | Int(payload[3] & 0x7F)
+        return (width, height)
+    }
+
+    static func displayConfigPayload(
+        width: Int,
+        height: Int,
+        rotation: Int,
+        flipHorizontal: Bool,
+        flipVertical: Bool
+    ) -> Data {
+        let size = clampedDisplaySize(width: width, height: height)
+        let transform = normalizedRotation(rotation)
+            + (flipHorizontal ? 1000 : 0)
+            + (flipVertical ? 2000 : 0)
+        var data = Data()
+        data.append(WireMessage.displayConfig)
+        data.append(contentsOf: withUnsafeBytes(of: Int32(size.width).bigEndian) { Data($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Int32(size.height).bigEndian) { Data($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Int32(transform).bigEndian) { Data($0) })
+        return data
+    }
+
     func setDisplaySize(width: Int, height: Int, rotation: Int = 0, flipHorizontal: Bool = false, flipVertical: Bool = false) {
-        displayWidth = width
-        displayHeight = height
-        self.rotation = rotation
-        self.flipHorizontal = flipHorizontal
-        self.flipVertical = flipVertical
+        let size = Self.clampedDisplaySize(width: width, height: height)
+        let snapped = Self.normalizedRotation(rotation)
+        if size.width != width || size.height != height || snapped != rotation {
+            debugLog("Display config normalized: \(width)x\(height) @ \(rotation)° -> \(size.width)x\(size.height) @ \(snapped)°")
+        }
+        sessionState.withLock { state in
+            state.displayWidth = size.width
+            state.displayHeight = size.height
+            state.rotation = snapped
+            state.flipHorizontal = flipHorizontal
+            state.flipVertical = flipVertical
+        }
     }
 
     func updateDisplayTransform(rotation: Int, flipHorizontal: Bool, flipVertical: Bool) {
-        self.rotation = rotation
-        self.flipHorizontal = flipHorizontal
-        self.flipVertical = flipVertical
+        let snapped = Self.normalizedRotation(rotation)
+        sessionState.withLock { state in
+            state.rotation = snapped
+            state.flipHorizontal = flipHorizontal
+            state.flipVertical = flipVertical
+        }
         sendDisplaySize()
     }
 
     func sendDisplaySize() {
         guard let connection = connection else { return }
-
-        let transform = rotation + (flipHorizontal ? 1000 : 0) + (flipVertical ? 2000 : 0)
-        var data = Data()
-        data.append(WireMessage.displayConfig)
-        data.append(contentsOf: withUnsafeBytes(of: Int32(displayWidth).bigEndian) { Data($0) })
-        data.append(contentsOf: withUnsafeBytes(of: Int32(displayHeight).bigEndian) { Data($0) })
-        data.append(contentsOf: withUnsafeBytes(of: Int32(transform).bigEndian) { Data($0) })
-
+        let geometry = sessionState.withLock {
+            (width: $0.displayWidth, height: $0.displayHeight, rotation: $0.rotation,
+             flipHorizontal: $0.flipHorizontal, flipVertical: $0.flipVertical)
+        }
+        let data = Self.displayConfigPayload(
+            width: geometry.width,
+            height: geometry.height,
+            rotation: geometry.rotation,
+            flipHorizontal: geometry.flipHorizontal,
+            flipVertical: geometry.flipVertical
+        )
         connection.send(content: data, completion: .contentProcessed { _ in })
-        debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
+        debugLog("Sent display config: \(geometry.width)x\(geometry.height) @ \(geometry.rotation)°, h=\(geometry.flipHorizontal), v=\(geometry.flipVertical)")
     }
 
     private func startReceivingTouch() {
@@ -1002,7 +1358,7 @@ class StreamingServer {
             debugLog("Already receiving touch events")
             return
         }
-        isReceiving = true
+        sessionState.withLock { $0.receiving = true }
         debugLog("Starting input receive loop... (touch=\(touchEnabled ? "on" : "off"))")
 
         // Use loop-based pattern instead of recursion to prevent stack overflow
@@ -1013,7 +1369,7 @@ class StreamingServer {
 
     private func touchReceiveLoop() {
         guard let connection = connection, isReceiving, !isStopped else {
-            isReceiving = false
+            sessionState.withLock { $0.receiving = false }
             return
         }
 
@@ -1024,7 +1380,7 @@ class StreamingServer {
             guard let self = self, self.isReceiving, !self.isStopped, self.connection === connection else { return }
 
             if error != nil || isComplete {
-                self.isReceiving = false
+                self.sessionState.withLock { $0.receiving = false }
                 self.inputBuffer.removeAll(keepingCapacity: true)
                 return
             }
@@ -1105,55 +1461,67 @@ class StreamingServer {
                 // One-byte opt-in from newer clients. Keeping this payload-free
                 // lets older hosts safely ignore it without misaligning input.
                 consumeInputBytes(1)
-                if !clientSupportsFrameMetadata {
-                    clientSupportsFrameMetadata = true
+                let firstAdvert = !sessionState.withLock { state -> Bool in
+                    let wasSupported = state.clientSupportsFrameMetadata
+                    state.clientSupportsFrameMetadata = true
+                    return wasSupported
+                }
+                if firstAdvert {
                     debugLog("Client supports video frame metadata")
                 }
                 finishProtocolStartup(on: connection)
 
             case WireMessage.clientAvcOnly:
                 // Payload-free opt-in (same convention as type 8): the client
-                // has no HEVC decoder, stream H.264 instead. Clients send this
-                // BEFORE type 8, so it lands before finishProtocolStartup runs.
+                // has no HEVC decoder, stream H.264 instead.
                 consumeInputBytes(1)
-                if !clientIsAvcOnly {
-                    clientIsAvcOnly = true
+                let firstAdvert = !sessionState.withLock { state -> Bool in
+                    let wasAvcOnly = state.clientIsAvcOnly
+                    state.clientIsAvcOnly = true
+                    return wasAvcOnly
+                }
+                if firstAdvert {
                     debugLog("Client is AVC-only — will negotiate H.264")
                 }
+                finishProtocolStartup(on: connection)
 
-            case WireMessage.clientDecoderLimits:
-                // Type + 4 payload bytes: [w-hi][w-lo][h-hi][h-lo], 7 data
-                // bits each with the high bit always set (old hosts skip the
-                // payload harmlessly). Sent BEFORE type 8, like type 9.
+            case WireMessage.clientDecoderLimits, WireMessage.legacyClientDecoderLimits:
                 guard inputBuffer.count >= 5 else { return }
 
                 let payload = (1...4).map { inputByte(at: $0) }
                 consumeInputBytes(5)
-                guard payload.allSatisfy({ $0 & 0x80 != 0 }) else {
+                guard let limits = Self.decodeClientDecoderLimits(payload) else {
                     debugLog("Malformed decoder-limits payload — ignoring")
                     continue
                 }
-                let w = (Int(payload[0] & 0x7F) << 7) | Int(payload[1] & 0x7F)
-                let h = (Int(payload[2] & 0x7F) << 7) | Int(payload[3] & 0x7F)
-                // Anything below QVGA-ish is a nonsense report — ignore it.
-                if w >= 256 && h >= 256 {
-                    clientDecodeLimits = (w, h)
-                    debugLog("Client decoder limit: \(w)x\(h)")
+                if msgType == WireMessage.legacyClientDecoderLimits {
+                    debugLog("Client sent decoder limits under legacy tag 11 — outdated Android build")
                 }
+                // Anything below QVGA-ish is a nonsense report — ignore it.
+                if limits.width >= 256 && limits.height >= 256 {
+                    sessionState.withLock { $0.clientDecodeLimits = (limits.width, limits.height) }
+                    debugLog("Client decoder limit: \(limits.width)x\(limits.height)")
+                }
+                finishProtocolStartup(on: connection)
 
             case WireMessage.clientSupportsStylus:
                 // Payload-free opt-in. The acknowledgement is emitted only
                 // for a client that explicitly sent this byte, so old Android
                 // clients never receive an unknown server message.
                 consumeInputBytes(1)
-                if !clientSupportsStylus {
-                    clientSupportsStylus = true
+                let firstAdvert = !sessionState.withLock { state -> Bool in
+                    let wasSupported = state.clientSupportsStylus
+                    state.clientSupportsStylus = true
+                    return wasSupported
+                }
+                if firstAdvert {
                     connection.send(
                         content: Data([WireMessage.serverSupportsStylus]),
                         completion: .contentProcessed { _ in }
                     )
                     debugLog("Client supports S Pen stylus events")
                 }
+                finishProtocolStartup(on: connection)
 
             default:
                 debugLog("Unknown client input type: \(msgType)")
@@ -1175,6 +1543,15 @@ class StreamingServer {
 
         let actionOffset = 2 + pointerCount * 8
         let action = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: actionOffset, as: Int32.self) }
+
+        // Mirror decodeStylusEvent's guard. A zero-extent client view yields
+        // 0/0, and Kotlin's coerceIn passes NaN through unchanged, so a
+        // non-finite coordinate reaches the cursor math and pins the pointer.
+        guard x1.isFinite, y1.isFinite, x1 >= 0, x1 <= 1, y1 >= 0, y1 <= 1,
+              x2.isFinite, y2.isFinite, x2 >= 0, x2 <= 1, y2 >= 0, y2 <= 1 else {
+            debugLog("Non-finite or out-of-range touch payload — dropping")
+            return
+        }
 
         DispatchQueue.main.async {
             self.onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2)
@@ -1250,6 +1627,16 @@ class StreamingServer {
         }
     }
 
+    /// Mirrors MAX_FRAME_SIZE in the Android client's StreamClient. A frame
+    /// above it is rejected there with an IOException, which the user sees as
+    /// an endless crash/reconnect loop that looks like a network fault. nil
+    /// means the frame cannot be described in the 4-byte size field at all.
+    static func wireFrameSize(_ size: Int) -> UInt32? {
+        guard size > 0, size <= maxFrameBytes else { return nil }
+        return UInt32(size)
+    }
+    static let maxFrameBytes = 5 * 1024 * 1024
+
     private func sendEncodedFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool) {
         guard !isStopped,
               frameTransportReady,
@@ -1267,10 +1654,18 @@ class StreamingServer {
             debugLog("First keyframe accepted for new client")
         }
 
+        guard let wireSize = Self.wireFrameSize(data.count) else {
+            // Advertising a truncated size would desync the client's parser, so
+            // the whole frame goes instead.
+            droppedFrames += 1
+            debugLog("Dropping \(data.count)B frame — above the client's \(Self.maxFrameBytes)B frame limit")
+            return
+        }
+
         let generation = frameSendGeneration
         let pressureGeneration = framePressureGeneration
         let header = makeFrameHeader(
-            size: data.count,
+            size: wireSize,
             timestamp: timestamp,
             isKeyframe: isKeyframe,
             usesMetadata: frameUsesMetadata
@@ -1285,7 +1680,7 @@ class StreamingServer {
         }
         frameSendsInFlight += 1
         if pressureGeneration != 0 {
-            WirelessTransportPressure.beginSend(generation: pressureGeneration)
+            WirelessTransportPressure.beginSend(generation: pressureGeneration, bytes: data.count)
         }
 
         // Avoid copying the entire encoded frame merely to prepend a 5/14-byte
@@ -1315,7 +1710,7 @@ class StreamingServer {
                     // Pressure completion is generation-fenced independently,
                     // so an old callback can never reduce the replacement count.
                     if pressureGeneration != 0 {
-                        WirelessTransportPressure.completeSend(generation: pressureGeneration)
+                        WirelessTransportPressure.completeSend(generation: pressureGeneration, bytes: data.count)
                     }
 
                     self.frameQueue.async {
@@ -1342,7 +1737,7 @@ class StreamingServer {
     }
 
     private func makeFrameHeader(
-        size: Int,
+        size: UInt32,
         timestamp: UInt64,
         isKeyframe: Bool,
         usesMetadata: Bool
@@ -1365,8 +1760,11 @@ class StreamingServer {
         return header
     }
 
-    private func appendFrameSize(_ size: Int, to packet: inout Data) {
-        var frameSize = Int32(size).bigEndian
+    private func appendFrameSize(_ size: UInt32, to packet: inout Data) {
+        // The caller has already rejected anything above the client's frame
+        // limit, so the value fits Int32 and the reinterpretation is exact.
+        // Int32(size) would trap for an out-of-range frame instead.
+        var frameSize = Int32(bitPattern: size).bigEndian
         withUnsafeBytes(of: &frameSize) { packet.append(contentsOf: $0) }
     }
 
@@ -1405,24 +1803,51 @@ class StreamingServer {
         }
     }
 
+    /// Main-thread only (AppDelegate.stopServer is @MainActor). MUST NOT be
+    /// called from networkQueue, receiveQueue, controlQueue or frameQueue: the
+    /// blocks below `sync` onto each of them, so a call from inside one would
+    /// self-deadlock.
     func stop() {
-        isStopped = true
-        isReceiving = false
-        retireFrameTransport(connection)
+        // Latch first: a .ready or newConnectionHandler already queued behind
+        // this point sees `stopped` and cancels its own socket instead of
+        // installing a session nothing will ever tear down.
+        sessionState.withLock { state in
+            state.stopped = true
+            state.receiving = false
+            state.connectionReady = false
+            state.clientSupportsStylus = false
+        }
 
-        // Wait for pending operations before cancelling
+        // Every remaining field has exactly one owning queue, so teardown runs
+        // as a block on that queue rather than racing it from main. Draining
+        // networkQueue first is what makes the latch above authoritative: a
+        // connection installed after it would otherwise leak its socket.
+        networkQueue.sync {
+            connection?.cancel()
+            listener?.cancel()
+            if let c = contender { clearContender(c, cancelSocket: true) }
+            connection = nil
+            listener = nil
+        }
+        // The cancelled sockets' terminal callbacks queue behind this block and
+        // fail the identity guard (connection is already nil), so no spurious
+        // onClientDisconnected is reported.
+        controlQueue.sync {
+            controlConnection?.cancel()
+            controlListener?.cancel()
+            controlConnection = nil
+            controlListener = nil
+            controlInputBuffer.removeAll(keepingCapacity: true)
+            controlAuthenticated = false
+            controlTouchCount = 0
+            lastControlTouchNs = 0
+            maxControlTouchGapMs = 0
+            clientSupportsBrightness = false
+            lastBrightness = nil
+        }
+        // Its own frameQueue.sync — never call this from frameQueue.
+        retireFrameTransport(nil)
         frameQueue.sync {}
         receiveQueue.sync {}
-        controlQueue.sync {}
-
-        connection?.cancel()
-        listener?.cancel()
-        controlConnection?.cancel()
-        controlListener?.cancel()
-        if let c = contender { clearContender(c, cancelSocket: true) }
-        connection = nil
-        listener = nil
-        controlConnection = nil
-        controlListener = nil
     }
 }

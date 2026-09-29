@@ -1,7 +1,6 @@
 package com.sidescreen.app
 
 import android.media.MediaCodec
-import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
@@ -13,6 +12,11 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 private fun diagLog(msg: String) = DiagLog.log("VD", msg)
+
+// Keep these optional codec hints as string keys so the app remains compatible
+// with minSdk 26 without linking to newer MediaFormat fields.
+private const val CODEC_KEY_LOW_LATENCY = "low-latency"
+private const val CODEC_KEY_MAX_B_FRAMES = "max-bframes"
 
 class VideoDecoder(
     private val surface: Surface,
@@ -27,8 +31,17 @@ class VideoDecoder(
      *  output on this SoC (ImageReader surfaces deliver opaque UBWC buffers
      *  whose plane access is a fatal JNI abort). */
     private val bufferOutput: Boolean = false,
+    /** Wireless sessions use a tighter stale-output gate and a fixed 60 Hz
+     *  operating-rate target. USB preserves the panel's reported refresh rate. */
+    private val wireless: Boolean = false,
+    private val targetFrameRate: Int? = null,
 ) {
-    private var decoder: MediaCodec? = null
+    @Volatile private var decoder: MediaCodec? = null
+
+    // Written by the constructing thread and read by a release() from any
+    // thread; without volatile a racing release can miss the write and leak a
+    // MediaCodec plus a hardware decoder instance.
+    @Volatile private var initializingCodec: MediaCodec? = null
     private var decoderThread: HandlerThread? = null
     private var decoderHandler: Handler? = null
 
@@ -61,14 +74,33 @@ class VideoDecoder(
 
     private val frameTimes = ArrayDeque<Long>(120)
 
-    private val displayRefreshRate = display?.refreshRate ?: 60f
+    private val displayRefreshRate =
+        (targetFrameRate?.toFloat() ?: display?.refreshRate ?: 60f).coerceAtLeast(30f)
 
-    private var currentWidth = initialWidth
-    private var currentHeight = initialHeight
+    @Volatile private var currentWidth = initialWidth
+    @Volatile private var currentHeight = initialHeight
 
     @Volatile private var isRunning = false
 
+    /**
+     * True only after MediaCodec.start() has returned. [isRunning] flips first
+     * so no input-buffer callback is lost, but frame callers must not treat the
+     * decoder as usable until start() is done: an input buffer cannot be polled
+     * before the codec reaches the Executing state, and the resulting "no input
+     * buffer" path forces a keyframe request and drops the IDR that is already
+     * in flight.
+     */
+    @Volatile private var codecStarted = false
+
     @Volatile private var needsKeyframe = true
+
+    /** True only after the codec has started and is published to frame callers. */
+    val isReady: Boolean
+        get() = isRunning && codecStarted && decoder != null
+
+    /** True when frames arrive as plane-accessible Images instead of Surface output. */
+    val bufferOutputMode: Boolean
+        get() = bufferOutput
 
     private var lastKeyframeRequestNs = 0L
 
@@ -101,13 +133,28 @@ class VideoDecoder(
     private var stallReported = false
     private var queuedInputCount = 0L
 
-    // Available input buffer indices — fed by onInputBufferAvailable callback
-    private val availableInputBuffers = LinkedBlockingQueue<Int>()
+    // The callback is asynchronous and can finish after release() starts. Keep
+    // the codec generation with every index so a recreated decoder can never
+    // consume a stale index from its predecessor.
+    private data class InputBufferRef(
+        val generation: Long,
+        val index: Int,
+    )
+
+    // Available input buffers — fed by onInputBufferAvailable callback.
+    private val availableInputBuffers = LinkedBlockingQueue<InputBufferRef>()
+    @Volatile private var decoderGeneration = 0L
 
     init {
         setupDecoder()
     }
 
+    /**
+     * Reconfigure for a new stream size. Serialized because a resolution
+     * change can now arrive from a background dispatcher: two overlapping
+     * rebuilds would interleave release() and setupDecoder() on one codec.
+     */
+    @Synchronized
     fun updateResolution(
         width: Int,
         height: Int,
@@ -121,28 +168,43 @@ class VideoDecoder(
         }
     }
 
+    /** True when the configured size differs — lets callers skip a rebuild
+     *  without paying for one on the thread that only wants to ask. */
+    fun needsResolutionUpdate(
+        width: Int,
+        height: Int,
+    ): Boolean = width != currentWidth || height != currentHeight
+
     private fun setupDecoder() {
-        decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
-        decoderHandler = Handler(decoderThread!!.looper)
+        val generation = decoderGeneration + 1L
+        decoderGeneration = generation
+        val thread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY)
+        decoderThread = thread
+        try {
+            thread.start()
+            decoderHandler = Handler(thread.looper)
 
-        // Find a decoder that supports our resolution (prefer HW, fallback to SW)
-        val decoderName = findBestDecoder(currentWidth, currentHeight)
-        diagLog("setupDecoder: ${currentWidth}x$currentHeight, decoder=$decoderName")
+            // Find a decoder that supports our resolution (prefer HW, fallback to SW)
+            val decoderName = findBestDecoder(currentWidth, currentHeight)
+            diagLog("setupDecoder: ${currentWidth}x$currentHeight, decoder=$decoderName")
 
-        val codec =
-            if (decoderName != null) {
-                MediaCodec.createByCodecName(decoderName)
-            } else {
-                MediaCodec.createDecoderByType(mime)
-            }
+            val codec =
+                if (decoderName != null) {
+                    MediaCodec.createByCodecName(decoderName)
+                } else {
+                    MediaCodec.createDecoderByType(mime)
+                }
+            initializingCodec = codec
 
-        val callback =
-            object : MediaCodec.Callback() {
+            val callback =
+                object : MediaCodec.Callback() {
                 override fun onInputBufferAvailable(
                     codec: MediaCodec,
                     index: Int,
                 ) {
-                    availableInputBuffers.offer(index)
+                    if (decoderGeneration == generation) {
+                        availableInputBuffers.offer(InputBufferRef(generation, index))
+                    }
                 }
 
                 override fun onOutputBufferAvailable(
@@ -150,13 +212,14 @@ class VideoDecoder(
                     index: Int,
                     info: MediaCodec.BufferInfo,
                 ) {
-                    handleOutputBuffer(codec, index, info)
+                    handleOutputBuffer(codec, index, info, generation)
                 }
 
                 override fun onError(
                     codec: MediaCodec,
                     e: MediaCodec.CodecException,
                 ) {
+                    if (decoderGeneration != generation || decoder !== codec) return
                     diagLog("Codec error: ${e.diagnosticInfo}")
                     Log.e(TAG, "Codec error: ${e.diagnosticInfo}", e)
                     needsKeyframe = true
@@ -167,6 +230,7 @@ class VideoDecoder(
                     codec: MediaCodec,
                     format: MediaFormat,
                 ) {
+                    if (decoderGeneration != generation || decoder !== codec) return
                     diagLog("Output format changed: $format")
                     runCatching {
                         val w = format.getInteger(MediaFormat.KEY_WIDTH)
@@ -177,34 +241,32 @@ class VideoDecoder(
                         val cb = runCatching { format.getInteger("crop-bottom") }.getOrDefault(0)
                         onDecodedFormat?.invoke(w, h, cl, cr, ct, cb)
                     }
-                    // color-range: 1 = full, 2 = limited/video (observed on
-                    // this decoder: 8-bit SCK capture → 1, 10-bit VideoRange
-                    // capture → 2). The CfL renderer needs it to pick the
-                    // right YUV→RGB matrix.
-                    val range = runCatching { format.getInteger("color-range") }.getOrDefault(1)
-                    diagLog("color-range=$range (${if (range == 2) "limited" else "full"})")
+                    // color-range: full (COLOR_RANGE_FULL) or limited/video
+                    // swing. The CfL renderer needs it to pick the right
+                    // YUV→RGB matrix. KEY_COLOR_RANGE is documented as
+                    // OPTIONAL and AOSP's ColorUtils only writes it when the
+                    // codec reported a non-zero value, so on the decode path it
+                    // can be absent — and the Mac's default capture is limited
+                    // range, not full.
+                    val range = resolveColorRange(runCatching { format.getInteger(MediaFormat.KEY_COLOR_RANGE) }.getOrNull())
+                    diagLog("color-range=$range (${if (range == MediaFormat.COLOR_RANGE_LIMITED) "limited" else "full"})")
                     onColorRange?.invoke(range)
                 }
             }
-        codec.setCallback(callback, decoderHandler)
+            codec.setCallback(callback, decoderHandler)
 
-        val format =
-            MediaFormat.createVideoFormat(
-                mime,
-                currentWidth,
-                currentHeight,
-            )
-
+        val maxInputSize = maxInputSizeBytes(currentWidth, currentHeight)
         val targetSurface: Surface? = if (bufferOutput) null else surface
 
         var configured = false
 
         // Attempt 1: Full low-latency config
         try {
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            val format = videoFormat(maxInputSize)
+            format.setInteger(CODEC_KEY_LOW_LATENCY, 1)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
             format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
-            format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            format.setInteger(CODEC_KEY_MAX_B_FRAMES, 0)
             codec.configure(format, targetSurface, null, 0)
             configured = true
             diagLog("Configured with full low-latency${if (bufferOutput) " (buffer output)" else ""}")
@@ -217,14 +279,9 @@ class VideoDecoder(
         // Attempt 2: Without KEY_LOW_LATENCY
         if (!configured) {
             try {
-                val basicFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
+                val basicFormat = videoFormat(maxInputSize)
                 basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
-                basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                basicFormat.setInteger(CODEC_KEY_MAX_B_FRAMES, 0)
                 codec.configure(basicFormat, targetSurface, null, 0)
                 configured = true
                 diagLog("Configured with basic format")
@@ -235,16 +292,10 @@ class VideoDecoder(
             }
         }
 
-        // Attempt 3: Minimal config (just resolution)
+        // Attempt 3: Minimal config (resolution + input size)
         if (!configured) {
             try {
-                val minimalFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
-                codec.configure(minimalFormat, targetSurface, null, 0)
+                codec.configure(videoFormat(maxInputSize), targetSurface, null, 0)
                 diagLog("Configured with minimal format")
             } catch (e: Exception) {
                 diagLog("All configure attempts failed: ${e.message}")
@@ -257,16 +308,52 @@ class VideoDecoder(
             }
         }
 
-        codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
-        needsKeyframe = true
-        isRunning = true
-        codec.start()
-        decoder = codec
-        diagLog(
-            "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
-                "surface=$surface, valid=${surface.isValid}",
-        )
+            codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+            needsKeyframe = true
+            // isRunning first so no input-buffer callback is dropped, then
+            // start(), and only publish the decoder once the codec is actually
+            // executing — isReady gates frame callers on codecStarted.
+            isRunning = true
+            codec.start()
+            codecStarted = true
+            initializingCodec = null
+            decoder = codec
+            diagLog(
+                "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
+                    "maxInputSize=$maxInputSize, wireless=$wireless, " +
+                    "surface=$surface, valid=${surface.isValid}",
+            )
+        } catch (failure: Throwable) {
+            isRunning = false
+            codecStarted = false
+            decoderGeneration += 1L
+            availableInputBuffers.clear()
+            val codec = decoder ?: initializingCodec
+            decoder = null
+            initializingCodec = null
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            thread.quitSafely()
+            if (decoderThread === thread) {
+                decoderThread = null
+                decoderHandler = null
+            }
+            throw failure
+        }
     }
+
+    /**
+     * MediaFormat for this decoder. KEY_MAX_INPUT_SIZE is the key a decoder
+     * sizes getInputBuffer() from; without it the input buffers are sized for
+     * an AVERAGE frame, and a full IDR (the host allows frames up to 5 MB at
+     * 60 Mbps) throws BufferOverflowException, which triggers a keyframe
+     * request that overflows again — a live-lock. It must therefore be on
+     * every variant, including the reduced ones.
+     */
+    private fun videoFormat(maxInputSize: Int): MediaFormat =
+        MediaFormat
+            .createVideoFormat(mime, currentWidth, currentHeight)
+            .also { it.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxInputSize) }
 
     /**
      * Find the best decoder for [mime] at the given resolution.
@@ -277,73 +364,21 @@ class VideoDecoder(
         width: Int,
         height: Int,
     ): String? {
-        try {
-            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
-            val targetRate = displayRefreshRate.toDouble().coerceAtLeast(30.0)
-            var hwRateDecoder: String? = null
-            var hwSizeDecoder: String? = null
-            var swRateDecoder: String? = null
-            var swSizeDecoder: String? = null
-
-            for (info in codecList.codecInfos) {
-                if (info.isEncoder) continue
-                val caps =
-                    try {
-                        info.getCapabilitiesForType(mime)
-                    } catch (_: Exception) {
-                        continue
-                    }
-
-                val videoCaps = caps.videoCapabilities ?: continue
-                val isHardware =
-                    !info.name.startsWith("c2.android.") &&
-                        !info.name.startsWith("OMX.google.")
-                val supported = videoCaps.isSizeSupported(width, height)
-                val rateSupported =
-                    supported &&
-                        try {
-                            videoCaps.areSizeAndRateSupported(width, height, targetRate)
-                        } catch (_: Exception) {
-                            false
-                        }
-
-                diagLog(
-                    "$mime decoder '${info.name}': " +
-                        "width=${videoCaps.supportedWidths}, " +
-                        "height=${videoCaps.supportedHeights}, " +
-                        "hw=$isHardware, supports ${width}x$height=$supported, " +
-                        "supports @${"%.0f".format(targetRate)}fps=$rateSupported",
-                )
-
-                if (supported) {
-                    if (isHardware && rateSupported && hwRateDecoder == null) {
-                        hwRateDecoder = info.name
-                    } else if (isHardware && hwSizeDecoder == null) {
-                        hwSizeDecoder = info.name
-                    } else if (!isHardware && rateSupported && swRateDecoder == null) {
-                        swRateDecoder = info.name
-                    } else if (!isHardware && swSizeDecoder == null) {
-                        swSizeDecoder = info.name
-                    }
-                }
+        val chosen =
+            runCatching {
+                CodecCapabilities.bestDecoderName(mime, width, height, displayRefreshRate)
+            }.getOrElse { error ->
+                diagLog("Decoder search failed: ${error.message}")
+                null
             }
-
-            // Prefer hardware that advertises the target refresh rate, then any
-            // hardware decoder for the size, then software as a last resort.
-            val chosen = hwRateDecoder ?: hwSizeDecoder ?: swRateDecoder ?: swSizeDecoder
+        diagLog(
             if (chosen != null) {
-                diagLog(
-                    "Selected decoder: $chosen " +
-                        "(rateSupported=${chosen == hwRateDecoder || chosen == swRateDecoder})",
-                )
+                "Selected decoder: $chosen for ${width}x$height @${displayRefreshRate.toInt()}fps"
             } else {
-                diagLog("No decoder supports ${width}x$height — will use default")
-            }
-            return chosen
-        } catch (e: Exception) {
-            diagLog("Decoder search failed: ${e.message}")
-        }
-        return null
+                "No decoder advertises ${width}x$height — will use default"
+            },
+        )
+        return chosen
     }
 
     fun decode(
@@ -394,16 +429,10 @@ class VideoDecoder(
 
         // Fast path is still non-blocking. Only wait when the callback hand-off
         // queue is momentarily empty, and never for longer than one 60-Hz frame.
-        var index = availableInputBuffers.poll()
+        val generation = decoderGeneration
+        val waitStartedNs = System.nanoTime()
+        var index = pollInputBuffer(generation)
         if (index == null) {
-            val waitStartedNs = System.nanoTime()
-            index =
-                try {
-                    availableInputBuffers.poll(INPUT_BUFFER_WAIT_MS, TimeUnit.MILLISECONDS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    null
-                }
             val waitedNs = System.nanoTime() - waitStartedNs
             inputBufferWaitCount++
             inputBufferWaitSumNs += waitedNs
@@ -430,6 +459,34 @@ class VideoDecoder(
         queueFrame(codec, index, frameData, frameSize, frameTimestamp, isKeyframe)
     }
 
+    /**
+     * Wait for an input buffer from this decoder generation only. Old
+     * MediaCodec callbacks may still enqueue after release(), so silently
+     * discard those references while preserving the bounded wait budget.
+     */
+    private fun pollInputBuffer(generation: Long): Int? {
+        val deadlineNs = System.nanoTime() + INPUT_BUFFER_WAIT_MS * 1_000_000L
+        while (isRunning && decoderGeneration == generation) {
+            val ref =
+                availableInputBuffers.poll()
+                    ?: run {
+                        val remainingNs = deadlineNs - System.nanoTime()
+                        if (remainingNs <= 0L) return null
+                        try {
+                            availableInputBuffers.poll(remainingNs, TimeUnit.NANOSECONDS)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return null
+                        }
+                    }
+                    ?: return null
+            if (ref.generation == generation && decoderGeneration == generation) {
+                return ref.index
+            }
+        }
+        return null
+    }
+
     private fun queueFrame(
         codec: MediaCodec,
         index: Int,
@@ -442,6 +499,19 @@ class VideoDecoder(
             val inputBuffer =
                 codec.getInputBuffer(index)
                     ?: throw IllegalStateException("Input buffer $index is null")
+            // A frame larger than the configured input buffer would throw
+            // BufferOverflowException on the copy below, whose recovery path
+            // requests another keyframe that overflows too. Report the real
+            // cause instead of looping on it.
+            if (frameSize < 0 || frameSize > inputBuffer.capacity()) {
+                diagLog(
+                    "Frame exceeds the codec input buffer: frame=$frameSize " +
+                        "capacity=${inputBuffer.capacity()} ${currentWidth}x$currentHeight",
+                )
+                needsKeyframe = true
+                requestKeyframe("frame exceeds input buffer", force = true)
+                return
+            }
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
@@ -502,11 +572,47 @@ class VideoDecoder(
         codec: MediaCodec,
         index: Int,
         info: MediaCodec.BufferInfo,
+        generation: Long,
     ) {
+        if (generation != decoderGeneration || !isRunning || decoder !== codec) {
+            runCatching { codec.releaseOutputBuffer(index, false) }
+            return
+        }
         try {
             outputFrameCount++
-            if (outputFrameCount == 1L) {
+            val isFirstOutput = outputFrameCount == 1L
+            if (isFirstOutput) {
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
+            }
+
+            // Decoder PTS is the Android receive timestamp encoded when the
+            // frame entered MediaCodec. Releasing an old output without
+            // rendering it keeps the codec reference chain intact while
+            // preventing Wi-Fi jitter from becoming visible input lag.
+            val nowNs = System.nanoTime()
+            val latencyNs = nowNs - info.presentationTimeUs * 1000L
+            val hasValidLatency = latencyNs in 0..MAX_REASONABLE_LATENCY_NS
+            val shouldRender =
+                if (wireless && hasValidLatency) {
+                    WirelessFreshnessPolicy.shouldRender(latencyNs, isFirstOutput)
+                } else {
+                    isFirstOutput ||
+                        !hasValidLatency ||
+                        latencyNs <= MAX_RENDER_LATENCY_NS
+                }
+
+            if (!shouldRender) {
+                droppedFrames++
+                staleOutputDrops++
+                if (staleOutputDrops <= 3L || staleOutputDrops % 60L == 0L) {
+                    diagLog(
+                        "Dropping stale output frame: latency=${"%.1f".format(latencyNs / 1_000_000.0)}ms, " +
+                            "wireless=$wireless, staleDrops=$staleOutputDrops",
+                    )
+                }
+                codec.releaseOutputBuffer(index, false)
+                updateStats()
+                return
             }
 
             // ByteBuffer mode (CfL): hand the plane-accessible Image to the
@@ -544,9 +650,6 @@ class VideoDecoder(
             // Decoder latency: time from queueInputBuffer (where we encoded
             // System.nanoTime()/1000 as PTS) to now. Captures how long the
             // frame spent inside the codec's input/reorder/output queues.
-            val nowNs = System.nanoTime()
-            val latencyNs = nowNs - info.presentationTimeUs * 1000L
-            val hasValidLatency = latencyNs in 0..MAX_REASONABLE_LATENCY_NS
             if (hasValidLatency) {
                 latencySumNs += latencyNs
                 latencySamples++
@@ -579,25 +682,6 @@ class VideoDecoder(
                 inputBufferWaitSumNs = 0
                 inputBufferWaitMaxNs = 0
                 inputBufferWaitTimeouts = 0
-            }
-
-            val shouldRender =
-                outputFrameCount == 1L ||
-                    !hasValidLatency ||
-                    latencyNs <= MAX_RENDER_LATENCY_NS
-
-            if (!shouldRender) {
-                droppedFrames++
-                staleOutputDrops++
-                if (staleOutputDrops <= 3L || staleOutputDrops % 60L == 0L) {
-                    diagLog(
-                        "Dropping stale output frame: latency=${"%.1f".format(latencyNs / 1_000_000.0)}ms, " +
-                            "staleDrops=$staleOutputDrops",
-                    )
-                }
-                codec.releaseOutputBuffer(index, false)
-                updateStats()
-                return
             }
 
             codec.releaseOutputBuffer(index, true)
@@ -642,16 +726,22 @@ class VideoDecoder(
 
     fun release() {
         isRunning = false
-        try {
-            availableInputBuffers.clear()
-            decoder?.stop()
-            decoder?.release()
-            decoder = null
-            decoderThread?.quitSafely()
-            decoderThread = null
-            decoderHandler = null
-        } catch (_: Exception) {
+        codecStarted = false
+        decoderGeneration += 1L
+        availableInputBuffers.clear()
+        val activeCodec = decoder
+        val pendingCodec = initializingCodec
+        decoder = null
+        initializingCodec = null
+        runCatching { activeCodec?.stop() }
+        runCatching { activeCodec?.release() }
+        if (pendingCodec !== activeCodec) {
+            runCatching { pendingCodec?.stop() }
+            runCatching { pendingCodec?.release() }
         }
+        decoderThread?.quitSafely()
+        decoderThread = null
+        decoderHandler = null
     }
 
     companion object {
@@ -662,5 +752,31 @@ class VideoDecoder(
         private const val INPUT_BUFFER_WAIT_MS = 25L
         private const val MAX_RENDER_LATENCY_NS = 100_000_000L
         private const val MAX_REASONABLE_LATENCY_NS = 2_000_000_000L
+        private const val MIN_MAX_INPUT_SIZE = 256 * 1024
+        private const val MAX_MAX_INPUT_SIZE = 5 * 1024 * 1024
+
+        /**
+         * KEY_MAX_INPUT_SIZE for [width] × [height]: one uncompressed 4:2:0
+         * frame is the practical ceiling for a single compressed frame, and the
+         * host never sends more than 5 MB. Input buffers are allocated from
+         * this, so it is deliberately not larger than the host's own frame cap.
+         */
+        internal fun maxInputSizeBytes(
+            width: Int,
+            height: Int,
+        ): Int {
+            if (width <= 0 || height <= 0) return MIN_MAX_INPUT_SIZE
+            val rawFrameBytes = width.toLong() * height.toLong() * 3L / 2L
+            return rawFrameBytes.coerceIn(MIN_MAX_INPUT_SIZE.toLong(), MAX_MAX_INPUT_SIZE.toLong()).toInt()
+        }
+
+        /**
+         * MediaFormat.KEY_COLOR_RANGE is OPTIONAL: AOSP's ColorUtils only adds
+         * "color-range" to a format when the codec supplied a non-zero value,
+         * so a decode-side read can legitimately fail. Absent means the Mac's
+         * default capture, which is limited (studio) range.
+         */
+        internal fun resolveColorRange(raw: Int?): Int =
+            if (raw == MediaFormat.COLOR_RANGE_FULL) MediaFormat.COLOR_RANGE_FULL else MediaFormat.COLOR_RANGE_LIMITED
     }
 }
