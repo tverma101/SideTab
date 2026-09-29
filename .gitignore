@@ -1,6 +1,5 @@
 # macOS
 .DS_Store
-**/.DS_Store
 Thumbs.db
 DerivedData/
 *.app
@@ -21,6 +20,8 @@ AndroidClient/.idea/
 *.dmg
 *.iml
 *.keystore
+# Local safety snapshots produced by scripts/backup_android_apks.sh
+backups/apk/
 
 # macOS build (main + test apps)
 **/.build/
