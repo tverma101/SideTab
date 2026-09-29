@@ -74,14 +74,16 @@ tablet's installed APK hash matches the fresh build.
 
 ## Residual gaps and revalidation triggers
 
-- **No end-to-end streaming session was observed on the new builds** in this
-  pass. The server is not auto-started, and starting it needs a click on the
-  Mac. Revalidate with a USB session. Also confirm that an old APK, if one is
-  ever reinstalled, now logs the legacy-tag line and streams.
-- `swift test` writes to the same `~/Library/Logs/SideScreen/sidescreen.log` as
-  the live host. The `Dirty-rect gate`, `test-hang` and `Annex-B walk` lines
-  interleaved with real sessions came from test runs, not from the app. Filter
-  on them or run the tests elsewhere before reading that log as evidence.
+- **The legacy tag was not why the old client got no video.** The host of that
+  time already contained the keyframe-detection regression, so no client, old or
+  new, received a frame. See
+  [no-video-keyframe-and-pong-2026-09-29](no-video-keyframe-and-pong-2026-09-29.md),
+  which also records the live USB session on the new builds. An old APK, if one
+  is ever reinstalled, has still not been observed logging the legacy-tag line
+  and streaming.
+- Before 2026-09-29, `swift test` wrote to the live host log, so `Dirty-rect
+  gate`, `test-hang` and `Annex-B walk` lines in logs from before then came from
+  test runs, not from the app. Tests now log under `$TMPDIR/SideScreenTests/`.
 - Any future tag move needs the same treatment: keep accepting the old inbound
   tag for at least one release, because a tablet and a Mac are updated
   independently.
