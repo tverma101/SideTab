@@ -1,4 +1,6 @@
 import CoreMedia
+import os
+import VideoToolbox
 import XCTest
 @testable import SideScreen
 
@@ -74,20 +76,93 @@ final class VideoEncoderWireFormatTests: XCTestCase {
 
     // MARK: - Sync sample decision
 
-    /// Fail-closed keyframe detection. CMSampleBuffer's attachment array is the
-    /// only evidence, and anything other than an explicit NotSync=false means
-    /// "not a sync sample": announcing a P-frame as an IDR melts bandwidth and
-    /// disarms the client's stale-keyframe watchdog.
-    func testKeyframeDetectionFailsClosed() {
+    /// CoreMedia defines a missing NotSync key as a sync sample, and that is
+    /// exactly how VideoToolbox marks its IDRs.
+    func testKeyframeDetectionFollowsCoreMediaContract() {
         XCTAssertTrue(isSyncSample(attachments: [[kCMSampleAttachmentKey_NotSync: false]]))
         XCTAssertFalse(isSyncSample(attachments: [[kCMSampleAttachmentKey_NotSync: true]]))
-        // Missing evidence of any kind.
-        XCTAssertFalse(isSyncSample(attachments: nil))
-        XCTAssertFalse(isSyncSample(attachments: []))
-        XCTAssertFalse(isSyncSample(attachments: [[:]]))
-        // Wrong type for the key.
+        // VideoToolbox's real attachments, as observed from an HEVC and an
+        // H.264 session: an IDR omits NotSync, a P-frame sets it.
+        XCTAssertTrue(isSyncSample(attachments: [[kCMSampleAttachmentKey_DependsOnOthers: false]]))
+        XCTAssertFalse(isSyncSample(attachments: [[
+            kCMSampleAttachmentKey_DependsOnOthers: true,
+            kCMSampleAttachmentKey_NotSync: true,
+        ]]))
+        // No NotSync key anywhere: absence implies sync.
+        XCTAssertTrue(isSyncSample(attachments: nil))
+        XCTAssertTrue(isSyncSample(attachments: []))
+        XCTAssertTrue(isSyncSample(attachments: [[:]]))
+        // A present key with the wrong type is malformed, not absent.
         XCTAssertFalse(isSyncSample(attachments: [[kCMSampleAttachmentKey_NotSync: "false"]]))
         XCTAssertFalse(isSyncSample(attachments: [[kCMSampleAttachmentKey_NotSync: 0]]))
+    }
+
+    /// End to end through VideoToolbox: a fresh session's first output is an
+    /// IDR, and it has to leave the encoder flagged as one, with its parameter
+    /// sets in front. When this regressed, every keyframe was reported as a
+    /// P-frame and the host sent no video at all.
+    func testRealEncoderFlagsItsFirstFrameAsKeyframe() throws {
+        let width = 320
+        let height = 192
+        try XCTSkipUnless(
+            Self.canCreateCompressionSession(width: width, height: height),
+            "VideoToolbox has no H.264 encoder on this machine"
+        )
+        let encoder = VideoEncoder(width: width, height: height, codec: .h264, frameRate: 30)
+        let output = OSAllocatedUnfairLock<(data: Data, isKeyframe: Bool)?>(initialState: nil)
+        let delivered = expectation(description: "first encoded frame")
+        encoder.onEncodedFrame = { data, _, isKeyframe in
+            let isFirst = output.withLock { state -> Bool in
+                guard state == nil else { return false }
+                state = (data, isKeyframe)
+                return true
+            }
+            if isFirst { delivered.fulfill() }
+        }
+
+        let pixelBuffer = try XCTUnwrap(Self.makePixelBuffer(width: width, height: height))
+        encoder.encode(
+            pixelBuffer: pixelBuffer,
+            presentationTimeStamp: CMTime(
+                value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1_000),
+                timescale: 1_000_000
+            )
+        )
+        wait(for: [delivered], timeout: 5)
+        encoder.onEncodedFrame = nil
+
+        let first = try XCTUnwrap(output.withLock { $0 })
+        XCTAssertTrue(first.isKeyframe, "a session's first frame is an IDR and must be flagged as one")
+        // Parameter sets are prepended only to keyframes: the first NAL unit
+        // after the leading start code must be an H.264 SPS (type 7).
+        let bytes = Array(first.data.prefix(5))
+        XCTAssertEqual(Array(bytes.prefix(4)), startCode)
+        XCTAssertEqual(bytes.count == 5 ? bytes[4] & 0x1F : nil, 7)
+    }
+
+    private static func canCreateCompressionSession(width: Int, height: Int) -> Bool {
+        var session: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: Int32(width),
+            height: Int32(height),
+            codecType: kCMVideoCodecType_H264,
+            encoderSpecification: nil,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: nil,
+            refcon: nil,
+            compressionSessionOut: &session
+        )
+        if let session { VTCompressionSessionInvalidate(session) }
+        return status == noErr && session != nil
+    }
+
+    private static func makePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attributes, &buffer)
+        return buffer
     }
 
     private func isSyncSample(attachments: [[CFString: Any]]?) -> Bool {
