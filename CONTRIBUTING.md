@@ -1,6 +1,6 @@
-# Contributing to Side Screen
+# Contributing to SideTab
 
-Thanks for helping improve Side Screen. This repository contains a macOS host, an Android client, protocol code, hardware-dependent display/codec paths, and a number of active experiments. The most useful contributions are small enough to review and explicit about what was actually tested.
+Thanks for helping improve SideTab. This repository contains a macOS host, an Android client, protocol code, hardware-dependent display/codec paths, and a number of active experiments. The most useful contributions are small enough to review and explicit about what was actually tested.
 
 Before starting substantial work, read [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) and check the existing issues and pull requests. Several older draft PRs target evaluation branches and may overlap code that is already on `main`.
 
@@ -26,8 +26,8 @@ The Android application currently targets API 34 and supports API 26+.
 ## Clone and build
 
 ```bash
-git clone https://github.com/tverma101/SideScreen.git
-cd SideScreen
+git clone https://github.com/tverma101/SideTab.git
+cd SideTab
 ```
 
 Build the macOS app bundle and DMG:
@@ -57,7 +57,7 @@ Release Android builds require explicit signing credentials. Do not add debug-si
 ## Repository layout
 
 ```text
-SideScreen/
+SideTab/
 ├── MacHost/                 macOS Swift host
 │   ├── Sources/             application/runtime source
 │   └── Tests/               Swift tests
@@ -121,7 +121,7 @@ Large refactors should explain why the existing ownership boundary is insufficie
 
 ## Testing expectations
 
-Different changes need different proof. A green hosted build is useful, but it cannot validate every Side Screen behavior.
+Different changes need different proof. A green hosted build is useful, but it cannot validate every SideTab behavior.
 
 ### Usually suitable for deterministic tests
 
@@ -181,7 +181,7 @@ Do not present an untested hardware hypothesis as a completed fix. If target-dev
 
 Please include:
 
-- Side Screen version or commit SHA;
+- SideTab version or commit SHA;
 - Mac model and macOS version;
 - Android device model and Android version;
 - USB or wireless mode;

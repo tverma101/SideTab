@@ -26,22 +26,36 @@ class PairedHostStorage(context: Context) {
         val macName: String,
         /** null means derive the dedicated control endpoint as videoPort + 1. */
         val controlPortOverride: Int? = null,
+        /** Other addresses for the same authenticated Mac, in retry order. */
+        val alternateHosts: List<String> = emptyList(),
     ) {
         fun effectiveControlPort(): Int? =
             controlPortOverride ?: (port + 1).takeIf { it <= 65535 }
+
+        fun allHosts(): List<String> =
+            (listOf(host) + alternateHosts)
+                .map(String::trim)
+                .filter { it.isNotEmpty() }
+                .distinct()
 
         override fun equals(other: Any?): Boolean {
             if (other !is Entry) return false
             return host == other.host &&
                 port == other.port &&
                 controlPortOverride == other.controlPortOverride &&
+                alternateHosts == other.alternateHosts &&
                 macName == other.macName &&
                 token.contentEquals(other.token)
         }
 
-        override fun hashCode(): Int =
-            ((((host.hashCode() * 31 + port) * 31 + (controlPortOverride ?: 0)) * 31 + macName.hashCode()) * 31) +
-                token.contentHashCode()
+        override fun hashCode(): Int {
+            var result = host.hashCode()
+            result = 31 * result + port
+            result = 31 * result + (controlPortOverride ?: 0)
+            result = 31 * result + alternateHosts.hashCode()
+            result = 31 * result + macName.hashCode()
+            return 31 * result + token.contentHashCode()
+        }
     }
 
     fun save(entry: Entry) {
@@ -49,6 +63,12 @@ class PairedHostStorage(context: Context) {
         require(entry.effectiveControlPort() != null) { "invalid derived control port" }
         entry.controlPortOverride?.let {
             require(it in 1..65535) { "invalid control port override" }
+        }
+        entry.allHosts().forEach { candidate ->
+            require(candidate.length <= 255) { "invalid alternate host" }
+            require(candidate.none { it.isWhitespace() || it.code < 0x20 || it == HOST_SEPARATOR }) {
+                "invalid alternate host"
+            }
         }
 
         // Mark this save before doing KeyStore work. If Forget Pairing or a
@@ -85,13 +105,14 @@ class PairedHostStorage(context: Context) {
         if (controlPortOverride == null && port == 65535) return@synchronized null
 
         val macName = prefs.getString("mac_name", null) ?: "Mac"
+        val alternateHosts = loadAlternateHosts().filter { it != host }
         val encryptedToken = loadEncryptedToken()
         if (encryptedToken != null) {
             if (encryptedToken.size != TOKEN_SIZE) {
                 invalidateStoredPairing("encrypted credential has invalid length")
                 return@synchronized null
             }
-            return@synchronized Entry(host, port, encryptedToken, macName, controlPortOverride)
+            return@synchronized Entry(host, port, encryptedToken, macName, controlPortOverride, alternateHosts)
         }
 
         val legacyToken = loadLegacyToken()
@@ -102,7 +123,7 @@ class PairedHostStorage(context: Context) {
             return@synchronized null
         }
 
-        if (!migrate(host, port, controlPortOverride, legacyToken, macName)) {
+        if (!migrate(host, port, controlPortOverride, alternateHosts, legacyToken, macName)) {
             // Never keep using a recoverable plaintext credential if secure
             // migration cannot be committed. Re-pairing is safer than silently
             // continuing with a token that remains in SharedPreferences.
@@ -110,7 +131,7 @@ class PairedHostStorage(context: Context) {
             return@synchronized null
         }
 
-        Entry(host, port, legacyToken, macName, controlPortOverride)
+        Entry(host, port, legacyToken, macName, controlPortOverride, alternateHosts)
     }
 
     fun clear() {
@@ -160,14 +181,24 @@ class PairedHostStorage(context: Context) {
             }
         }?.takeIf { it.size == TOKEN_SIZE }
 
+    private fun loadAlternateHosts(): List<String> =
+        prefs.getString("alternate_hosts", null)
+            ?.split(HOST_SEPARATOR)
+            ?.map(String::trim)
+            ?.filter { it.isNotEmpty() && it.length <= 255 }
+            ?.filter { candidate -> candidate.none { it.isWhitespace() || it.code < 0x20 } }
+            ?.distinct()
+            ?: emptyList()
+
     private fun migrate(
         host: String,
         port: Int,
         controlPortOverride: Int?,
+        alternateHosts: List<String>,
         token: ByteArray,
         macName: String,
     ): Boolean {
-        val entry = Entry(host, port, token, macName, controlPortOverride)
+        val entry = Entry(host, port, token, macName, controlPortOverride, alternateHosts)
         val operationGeneration = synchronized(mutationLock) {
             mutationGeneration += 1
             mutationGeneration
@@ -222,6 +253,11 @@ class PairedHostStorage(context: Context) {
                 .putString("token_ciphertext_b64", encode(encrypted.ciphertext))
                 .putString("token_iv_b64", encode(encrypted.iv))
                 .putString("mac_name", entry.macName)
+                .putString(
+                    "alternate_hosts",
+                    entry.alternateHosts.filter { it != entry.host }.distinct()
+                        .joinToString(HOST_SEPARATOR.toString()),
+                )
                 .remove("token_b64")
         if (entry.controlPortOverride != null) {
             editor.putInt("control_port_override", entry.controlPortOverride)
@@ -290,5 +326,6 @@ class PairedHostStorage(context: Context) {
         private const val TOKEN_SIZE = 32
         private const val GCM_IV_SIZE = 12
         private const val GCM_TAG_BITS = 128
+        private const val HOST_SEPARATOR = '\u001F'
     }
 }

@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Standalone Activity root passed directly to setContentView; a merge root is invalid here. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/ss_background">
+    tools:ignore="MergeRootFrame">
 
     <androidx.camera.view.PreviewView
         android:id="@+id/preview"
@@ -21,7 +23,7 @@
         android:layout_height="wrap_content"
         android:layout_gravity="top|center"
         android:layout_marginTop="48dp"
-        android:text="Aim camera at the QR on your Mac"
+        android:text="@string/ui_aim_camera_at_the_qr_on_your_mac"
         android:textColor="@color/ss_text_primary"
         android:textSize="14sp"
         android:shadowColor="@color/black"
@@ -35,5 +37,5 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|center"
         android:layout_marginBottom="32dp"
-        android:text="Cancel" />
+        android:text="@string/ui_cancel" />
 </FrameLayout>

@@ -80,6 +80,4 @@ object StylusProtocol {
         target[offset + 2] = (value ushr 16).toByte()
         target[offset + 3] = (value ushr 24).toByte()
     }
-
-    private fun Float.finiteOr(fallback: Float): Float = if (isFinite()) this else fallback
 }

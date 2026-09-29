@@ -4,6 +4,11 @@ Thumbs.db
 DerivedData/
 *.app
 
+# Local runtime and audit evidence
+agent-evidence/
+docs/codex/
+docs/troubleshooting/
+
 # Android build
 AndroidClient/app/build/
 AndroidClient/.gradle/
@@ -55,3 +60,6 @@ temp/
 
 # Local ktlint binary (CI downloads its own)
 AndroidClient/ktlint
+
+# Local device-install recovery backups
+backups/apk/

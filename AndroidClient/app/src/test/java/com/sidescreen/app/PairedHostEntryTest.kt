@@ -44,4 +44,18 @@ class PairedHostEntryTest {
             )
         assertEquals(55000, entry.effectiveControlPort())
     }
+
+    @Test
+    fun allHostsKeepsPrimaryThenDistinctAlternates() {
+        val entry =
+            PairedHostStorage.Entry(
+                host = "2001:db8::1",
+                port = 54321,
+                token = token,
+                macName = "Mac",
+                alternateHosts = listOf("192.168.1.4", "2001:db8::1", "192.168.1.4"),
+            )
+
+        assertEquals(listOf("2001:db8::1", "192.168.1.4"), entry.allHosts())
+    }
 }
