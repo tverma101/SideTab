@@ -36,6 +36,21 @@ jobs:
         working-directory: AndroidClient
         run: ./gradlew --no-daemon testDebugUnitTest --stacktrace
 
+      - name: Android lint
+        working-directory: AndroidClient
+        run: |
+          status=0
+          ./gradlew --no-daemon lintDebug --stacktrace || status=$?
+          if [ "$status" -ne 0 ]; then
+            report="app/build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/lint-results-debug.txt"
+            if [ -f "$report" ]; then
+              echo "::group::Android Lint report"
+              cat "$report"
+              echo "::endgroup::"
+            fi
+          fi
+          exit "$status"
+
       - name: Build debug APK
         working-directory: AndroidClient
         run: ./gradlew --no-daemon assembleDebug --stacktrace

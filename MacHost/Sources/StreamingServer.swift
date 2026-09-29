@@ -45,6 +45,13 @@ enum WireMessage {
     /// stream, so "the payload is skipped harmlessly" is not a safe design.
     /// 11 was taken by `bright`; 15 is the next free tag.
     static let clientDecoderLimits: UInt8 = 15
+    /// Client→server decoder limits as sent by Android builds from before the
+    /// move to 15: the same 4-byte payload under the old tag. Without this an
+    /// un-updated tablet's report is skipped a byte at a time and the input
+    /// stream desyncs. Inbound only — the host never reads `bright` from a
+    /// client — so it deliberately stays out of `all`, which lists one tag per
+    /// message.
+    static let legacyClientDecoderLimits: UInt8 = 11
 
     /// Every tag value in use. A duplicate means two messages share one
     /// wire type and the client cannot tell them apart.
@@ -1415,6 +1422,16 @@ class StreamingServer {
         return (w, h)
     }
 
+    /// Decodes the 4-byte decoder-limits payload, [w-hi][w-lo][h-hi][h-lo],
+    /// 7 data bits each with the high bit always set. Returns nil when any
+    /// byte lacks the marker bit.
+    static func decodeClientDecoderLimits(_ payload: [UInt8]) -> (width: Int, height: Int)? {
+        guard payload.count == 4, payload.allSatisfy({ $0 & 0x80 != 0 }) else { return nil }
+        let width = (Int(payload[0] & 0x7F) << 7) | Int(payload[1] & 0x7F)
+        let height = (Int(payload[2] & 0x7F) << 7) | Int(payload[3] & 0x7F)
+        return (width, height)
+    }
+
     static func displayConfigPayload(
         width: Int,
         height: Int,
@@ -1618,23 +1635,22 @@ class StreamingServer {
                 }
                 finishProtocolStartup(on: connection)
 
-            case WireMessage.clientDecoderLimits:
-                // Type + 4 payload bytes: [w-hi][w-lo][h-hi][h-lo], 7 data
-                // bits each with the high bit always set.
+            case WireMessage.clientDecoderLimits, WireMessage.legacyClientDecoderLimits:
                 guard inputBuffer.count >= 5 else { return }
 
                 let payload = (1...4).map { inputByte(at: $0) }
                 consumeInputBytes(5)
-                guard payload.allSatisfy({ $0 & 0x80 != 0 }) else {
+                guard let limits = Self.decodeClientDecoderLimits(payload) else {
                     debugLog("Malformed decoder-limits payload — ignoring")
                     continue
                 }
-                let w = (Int(payload[0] & 0x7F) << 7) | Int(payload[1] & 0x7F)
-                let h = (Int(payload[2] & 0x7F) << 7) | Int(payload[3] & 0x7F)
+                if msgType == WireMessage.legacyClientDecoderLimits {
+                    debugLog("Client sent decoder limits under legacy tag 11 — outdated Android build")
+                }
                 // Anything below QVGA-ish is a nonsense report — ignore it.
-                if w >= 256 && h >= 256 {
-                    sessionState.withLock { $0.clientDecodeLimits = (w, h) }
-                    debugLog("Client decoder limit: \(w)x\(h)")
+                if limits.width >= 256 && limits.height >= 256 {
+                    sessionState.withLock { $0.clientDecodeLimits = (limits.width, limits.height) }
+                    debugLog("Client decoder limit: \(limits.width)x\(limits.height)")
                 }
                 finishProtocolStartup(on: connection)
 

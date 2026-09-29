@@ -1619,7 +1619,7 @@ struct WirelessSection: View {
                     port: port,
                     token: token,
                     name: name,
-                    alternateHosts: Array(hosts.dropFirst()),
+                    alternateHosts: Array(hosts.dropFirst())
                 )
             }
             // CoreImage work and the raster both belong off the main thread; the
