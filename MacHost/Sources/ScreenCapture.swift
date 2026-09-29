@@ -719,6 +719,12 @@ class ScreenCapture {
 
         streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
             guard let self = self else { return }
+            // Spans the whole ScreenCaptureKit callback, which is the only stage
+            // this file owns. See FramePipelineSignpost for why. The category is
+            // fixed; the complete/idle distinction this callback already
+            // computes is reported through the existing cadence counters.
+            let pipelineSignpost = FramePipelineSignpost.captureCallback.beginInterval("frame")
+            defer { FramePipelineSignpost.captureCallback.endInterval("frame", pipelineSignpost) }
             guard self.stateLock.withLock({ $0.acceptingFrames }) else { return }
             let frameStatus = Self.frameStatus(sampleBuffer)
 
@@ -889,10 +895,12 @@ class ScreenCapture {
                 }
             }
             queue.async {
+                let hopSignpost = FramePipelineSignpost.encodeQueueHop.beginInterval("hop")
                 if self.stateLock.withLock({ $0.acceptingFrames }) {
                     self.encoder?.encode(pixelBuffer: frameToEncode.buffer, presentationTimeStamp: pts)
                 }
                 backpressure.release()
+                FramePipelineSignpost.encodeQueueHop.endInterval("hop", hopSignpost)
             }
             enqueued = true
         }
