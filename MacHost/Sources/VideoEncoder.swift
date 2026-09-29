@@ -644,15 +644,16 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
 }
 
 extension VideoEncoder {
-    /// Fail closed: only an explicit NotSync=false is a sync sample. Collapsing a
-    /// nil attachment array / missing key / non-Bool value to "sync" would
-    /// announce every P-frame as an IDR — parameter sets prepended to each one
-    /// and the wire keyframe bit set, which also clears the client's
-    /// needsKeyframe flag, melting bandwidth and disarming its stale-keyframe
-    /// watchdog. VideoToolbox always sets the attribute, so the fail-closed
-    /// branch is unreachable in practice.
+    /// CoreMedia's contract (CMSampleBuffer.h): "absence of this key implies
+    /// Sync". VideoToolbox relies on it — its IDRs carry no NotSync key at all
+    /// (`[DependsOnOthers: 0]`), and only dependent frames carry NotSync=true.
+    /// Demanding an explicit NotSync=false therefore classified every real
+    /// keyframe as a P-frame, and StreamingServer's wait-for-sync gate dropped
+    /// the entire stream. Only a present key with a non-Boolean value is
+    /// treated as "not sync", since that is malformed rather than absent.
     static func isSyncSample(attachments: [[CFString: Any]]?) -> Bool {
-        (attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) == false
+        guard let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] else { return true }
+        return (notSync as? Bool) == false
     }
 
     /// Converts length-prefixed NAL units to Annex-B (4-byte start codes) and
