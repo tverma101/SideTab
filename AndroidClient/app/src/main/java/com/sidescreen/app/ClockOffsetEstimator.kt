@@ -11,6 +11,18 @@ package com.sidescreen.app
  * [hostSendNs] - [arrivalNs] and [hostSendNs] - [clientSentNs]; the sample with
  * the lowest round trip has the tightest bracket, so it is the one kept.
  *
+ * Keeping only the tightest sample is not enough on its own. The host clock is
+ * `mach_absolute_time`, which stops advancing while the Mac is asleep, so after
+ * a host sleep the true offset moves and the latched sample is simply wrong. It
+ * is also nearly unbeatable once latched: an early 200 microsecond sample on an
+ * idle network can never be improved on, so the estimate would stay wrong for
+ * the rest of the session. Two rules keep it honest:
+ *
+ *  - A new sample whose bracket does not contain the current estimate *proves*
+ *    the offset moved, so it is adopted immediately regardless of its RTT.
+ *  - The latched sample expires after [maxSampleAgeNs] so a drift that keeps the
+ *    brackets overlapping (a slow relative slip) is still eventually re-based.
+ *
  * Only the best sample is retained, and consumers must still treat a result as
  * an estimate: it drifts with host wake/sleep and with a peer whose monotonic
  * base is reset, so a derived latency is clamped rather than trusted.
@@ -19,7 +31,15 @@ internal class ClockOffsetEstimator {
     private val lock = Any()
     private var bestRttNs = Long.MAX_VALUE
     private var bestOffsetNs = 0L
+    private var bestSampleAtLocalNs = 0L
     private var hasSample = false
+
+    /**
+     * How long a latched sample stays authoritative. Long enough that ordinary
+     * jitter never re-bases mid-session, short enough that a host sleep or a
+     * slow relative slip is corrected well within a stream's lifetime.
+     */
+    var maxSampleAgeNs: Long = 60_000_000_000L
 
     /**
      * Record one pong. Returns the current best offset (host clock minus local
@@ -35,13 +55,49 @@ internal class ClockOffsetEstimator {
         synchronized(lock) {
             val rttNs = arrivalNs - clientSentNs
             if (rttNs < 0 || hostSendNs < 0) return@synchronized currentOffsetLocked()
-            if (!hasSample || rttNs < bestRttNs) {
-                bestRttNs = rttNs
-                bestOffsetNs = hostSendNs - (clientSentNs + rttNs / 2)
-                hasSample = true
+            // The true offset lies within this half-open bracket: the host read
+            // its clock no earlier than we sent, and no later than it arrived.
+            val lowerBound = hostSendNs - arrivalNs
+            val upperBound = hostSendNs - clientSentNs
+            val offsetNs = hostSendNs - (clientSentNs + rttNs / 2)
+
+            if (!hasSample) {
+                adoptLocked(rttNs, offsetNs, arrivalNs)
+                return@synchronized bestOffsetNs
+            }
+
+            // Proof of drift: if the latched estimate is not inside this
+            // sample's bracket, no round trip can reconcile them, so the host
+            // clock has moved relative to ours. Take the new reading now.
+            if (bestOffsetNs < lowerBound || bestOffsetNs > upperBound) {
+                adoptLocked(rttNs, offsetNs, arrivalNs)
+                return@synchronized bestOffsetNs
+            }
+
+            val sampleAgeNs = arrivalNs - bestSampleAtLocalNs
+            if (sampleAgeNs >= 0 && sampleAgeNs > maxSampleAgeNs) {
+                // Expired. A slower reading beats a stale precise one, because
+                // a wrong offset makes every derived latency wrong too.
+                adoptLocked(rttNs, offsetNs, arrivalNs)
+                return@synchronized bestOffsetNs
+            }
+
+            if (rttNs < bestRttNs) {
+                adoptLocked(rttNs, offsetNs, arrivalNs)
             }
             bestOffsetNs
         }
+
+    private fun adoptLocked(
+        rttNs: Long,
+        offsetNs: Long,
+        localNowNs: Long,
+    ) {
+        bestRttNs = rttNs
+        bestOffsetNs = offsetNs
+        bestSampleAtLocalNs = localNowNs
+        hasSample = true
+    }
 
     /** Best known offset, or null when no pong has been answered yet. */
     val offsetNs: Long?

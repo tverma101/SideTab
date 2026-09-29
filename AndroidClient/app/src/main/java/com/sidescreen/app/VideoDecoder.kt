@@ -592,14 +592,20 @@ class VideoDecoder(
             val nowNs = System.nanoTime()
             val latencyNs = nowNs - info.presentationTimeUs * 1000L
             val hasValidLatency = latencyNs in 0..MAX_REASONABLE_LATENCY_NS
+            // Over budget always means drop on wireless, including when the
+            // latency is too large to interpret at all. The decision lives in
+            // WirelessFreshnessPolicy so it is covered by tests; inlining it
+            // here is what let a `!hasValidLatency` escape hatch ship, which
+            // rendered exactly the frames the policy exists to drop.
             val shouldRender =
-                if (wireless && hasValidLatency) {
-                    WirelessFreshnessPolicy.shouldRender(latencyNs, isFirstOutput)
-                } else {
-                    isFirstOutput ||
-                        !hasValidLatency ||
-                        latencyNs <= MAX_RENDER_LATENCY_NS
-                }
+                WirelessFreshnessPolicy.shouldRenderOutput(
+                    decodedLatencyNs = latencyNs,
+                    hasValidLatency = hasValidLatency,
+                    isFirstOutput = isFirstOutput,
+                    wireless = wireless,
+                    maxReasonableLatencyNs = MAX_REASONABLE_LATENCY_NS,
+                    maxRenderLatencyNs = MAX_RENDER_LATENCY_NS,
+                )
 
             if (!shouldRender) {
                 droppedFrames++
