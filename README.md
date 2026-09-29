@@ -2,36 +2,42 @@
 
 <div align="center">
 
-<img src="resources/logo/sidescreen-icon.png" alt="SideTab" width="128"/>
+<img src="resources/logo/sidescreen-icon.png" alt="SideTab icon" width="112" />
 
-<h1>SideTab</h1>
+# SideTab
 
-<p><em>Turn your Android tablet into a second display for macOS — USB-C or wireless over WiFi</em></p>
+**Use an Android tablet as a second display for macOS over USB or Wi‑Fi.**
 
-<p>
-  <a href="https://github.com/tverma101/SideTab/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/tverma101/SideTab?style=for-the-badge&color=34C759" alt="License">
-  </a>
-  <a href="https://github.com/tverma101/SideTab/stargazers">
-    <img src="https://img.shields.io/github/stars/tverma101/SideTab?style=for-the-badge&color=FF9500" alt="Stars">
-  </a>
+[![License](https://img.shields.io/github/license/tverma101/SideTab?style=flat-square)](LICENSE)
+[![macOS 13+](https://img.shields.io/badge/macOS-13%2B-111111?style=flat-square&logo=apple)](MacHost/Package.swift)
+[![Android 8+](https://img.shields.io/badge/Android-8%2B-3DDC84?style=flat-square&logo=android&logoColor=white)](AndroidClient/app/build.gradle.kts)
+[![GitHub stars](https://img.shields.io/github/stars/tverma101/SideTab?style=flat-square)](https://github.com/tverma101/SideTab/stargazers)
+
+</div>
+
+<p align="center">
+  <img src="resources/screenshots/hero_screenshot.jpeg" alt="SideTab running on macOS and Android" width="760" />
 </p>
 
-![Swift](https://img.shields.io/badge/Swift-FA7343?style=for-the-badge&logo=swift&logoColor=white)
-![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)
-![macOS](https://img.shields.io/badge/macOS_13+-000000?style=for-the-badge&logo=apple&logoColor=white)
-![Android](https://img.shields.io/badge/Android_8+-3DDC84?style=for-the-badge&logo=android&logoColor=white)
-![Universal Binary](https://img.shields.io/badge/Universal_Binary-Apple_Silicon_+_Intel-000000?style=for-the-badge&logo=apple&logoColor=white)
+## Project status
 
-</div>
+SideTab is under active development. The repository version is **0.11.2**; `main` also contains unreleased fixes and performance work newer than that version.
 
----
+This fork currently does **not** publish binaries through GitHub Releases. Build from source when testing this repository so the Mac host and Android client come from the same code revision.
 
-<div align="center">
-  <img src="resources/screenshots/hero_screenshot.jpeg" alt="SideTab — Mac + Android tablet as second display" width="800"/>
-</div>
+| Area | Current state |
+| --- | --- |
+| USB display | Primary validation path; video, touch, high refresh rates, and S Pen support are implemented |
+| Wireless display | Functional, but transport/security and reconnect work remain |
+| Display profile | Current fork uses a fixed 1400×876 logical HiDPI profile (2800×1752 physical) |
+| Refresh rate | 30 / 60 / 90 / 120 Hz are exposed; 60 Hz is the normal default |
+| macOS | macOS 13 Ventura or newer |
+| Android | API 26 / Android 8.0 or newer |
 
----
+See [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for the current production blockers, experiments, and issue map.
+
+> [!IMPORTANT]
+> Wireless video traffic is not yet end-to-end encrypted. Use wireless mode only on a trusted network until the Protocol V2 / TLS work is complete. USB remains local through the ADB reverse-forwarding path.
 
 ## About
 
@@ -356,50 +362,46 @@ Grant Screen Recording permission: **System Preferences → Privacy & Security �
 
 ---
 
+## Development
+
+Useful entry points:
+
+```text
+MacHost/Sources/                  macOS host
+MacHost/Tests/                    Swift tests
+AndroidClient/app/src/main/       Android client
+AndroidClient/app/src/test/       JVM tests
+scripts/                          build, install, benchmark, and maintenance tools
+docs/                             architecture, validation, and experiment notes
+```
+
+Before opening a pull request, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Changes to capture, encode, transport, decode, rendering, lifecycle, or input paths should include deterministic tests where possible and real-device evidence when the behavior cannot be proven on hosted CI.
+
+## Known work
+
+The issue tracker contains both product blockers and research/measurement tasks. The highest-value unfinished areas are:
+
+- authenticated, encrypted Protocol V2 for wireless sessions;
+- macOS lock/sleep and Android wake/reconnect lifecycle handling;
+- Android runtime/session ownership cleanup;
+- trustworthy end-to-end latency and smoothness instrumentation;
+- WindowServer / 120 Hz cost attribution;
+- real-device validation of adaptive high-refresh behavior.
+
+A curated map with issue numbers and merge gates lives in [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
+
 ## Contributing
 
-Contributions are welcome!
+Bug reports should include the exact Mac model/macOS version, Android device/Android version, connection mode, app revision, reproduction steps, and relevant logs. For performance reports, include the configured resolution/refresh rate and whether the symptom is visible stutter, latency, decoder recovery, bandwidth, CPU/GPU load, or connection failure.
 
-- ⭐ **Star** this repo to help others discover it
-- 🐛 **Report bugs** via [Issues](https://github.com/tverma101/SideTab/issues)
-- 💡 **Suggest features** via [Issues](https://github.com/tverma101/SideTab/issues)
-- 🔧 **Submit PRs** — see [CONTRIBUTING.md](CONTRIBUTING.md)
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full workflow.
 
----
+## Privacy and security
 
-## Support
+See [`PRIVACY.md`](PRIVACY.md) for data-handling boundaries. Do not post pairing secrets, signing credentials, private network credentials, or other sensitive material in public issues or logs.
 
-If SideTab is useful to you, consider supporting development:
+## License and attribution
 
-<div align="center">
+SideTab is available under the [MIT License](LICENSE).
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/tranvuongqk)
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-EA4AAA?style=for-the-badge&logo=github-sponsors&logoColor=white)](https://github.com/sponsors/tranvuongquocdat)
-[![VietQR](https://img.shields.io/badge/Vietnam-VietQR-DA251D?style=for-the-badge&logoColor=white)](https://sidescreen.dev/donate.html)
-
-</div>
-
-🇻🇳 Vietnamese users — scan VietQR for a local bank transfer (no international fees) at [sidescreen.dev/donate](https://sidescreen.dev/donate.html).
-
----
-
-## Privacy
-
-SideTab does not request or collect device location. See [PRIVACY.md](PRIVACY.md)
-for the exact permissions and data-flow boundary.
-
----
-
-## License
-
-[MIT License](LICENSE) — free for personal and commercial use.
-
----
-
-<div align="center">
-
-Made with ❤️ by **Tran Vuong Quoc Dat**
-
-[Report Bug](https://github.com/tverma101/SideTab/issues) · [Request Feature](https://github.com/tverma101/SideTab/issues) · [Discussions](https://github.com/tverma101/SideTab/discussions)
-
-</div>
+This repository is a maintained fork of the Side Screen project originally created by **Trần Vương Quốc Đạt**. Historical changelog entries and contributor credits are preserved so authorship remains clear. Fork-specific maintenance and development are tracked in this repository.

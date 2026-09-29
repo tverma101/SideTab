@@ -39,6 +39,39 @@ final class StreamingServerWireTests: XCTestCase {
         XCTAssertEqual(WireMessage.clientDecoderLimits, 15)
     }
 
+    /// Android builds from before the move to 15 still send decoder limits
+    /// under 11. The host accepts that tag inbound so an un-updated tablet does
+    /// not desync; it must stay out of the one-tag-per-message table.
+    func testLegacyDecoderLimitsTagIsInboundOnly() {
+        XCTAssertEqual(WireMessage.legacyClientDecoderLimits, 11)
+        XCTAssertNotEqual(WireMessage.legacyClientDecoderLimits, WireMessage.clientDecoderLimits)
+        XCTAssertFalse(
+            WireMessage.all.filter { $0 == WireMessage.legacyClientDecoderLimits }.count > 1,
+            "legacy tag must not be listed alongside bright"
+        )
+    }
+
+    // MARK: - Decoder limits
+
+    /// The exact bytes a pre-15 Android build sent after tag 11: 8192x8192.
+    func testDecoderLimitsDecodeTheLegacyClientPayload() {
+        let limits = StreamingServer.decodeClientDecoderLimits([0xC0, 0x80, 0xC0, 0x80])
+        XCTAssertEqual(limits?.width, 8_192)
+        XCTAssertEqual(limits?.height, 8_192)
+    }
+
+    func testDecoderLimitsDecodeSplitsSevenBitHalves() {
+        // 3840 = 30 << 7 | 0, 2160 = 16 << 7 | 112
+        let limits = StreamingServer.decodeClientDecoderLimits([0x80 | 30, 0x80, 0x80 | 16, 0x80 | 112])
+        XCTAssertEqual(limits?.width, 3_840)
+        XCTAssertEqual(limits?.height, 2_160)
+    }
+
+    func testDecoderLimitsRejectAByteWithoutTheMarkerBit() {
+        XCTAssertNil(StreamingServer.decodeClientDecoderLimits([0xC0, 0x00, 0xC0, 0x80]))
+        XCTAssertNil(StreamingServer.decodeClientDecoderLimits([0xC0, 0x80, 0xC0]))
+    }
+
     // MARK: - Display config
 
     /// The client's DisplayConfig.fromWire throws — and the client treats it as
