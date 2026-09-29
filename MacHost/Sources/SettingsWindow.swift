@@ -72,6 +72,11 @@ struct VisualEffectBlur: NSViewRepresentable {
 
 struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
+    /// Runtime values are observed only by the small sections that render them.
+    /// Do not make these `@ObservedObject` here: doing so relays every stream
+    /// status/metric update through the entire settings view.
+    let runtime: DisplayRuntimeState
+    let performance: DisplayPerformanceState
     @State private var showPermissionAlert = false
     @State private var showResetConfirmation = false
     @State private var headerHovered = false
@@ -376,38 +381,12 @@ struct SettingsView: View {
                         }
 
                         // Network Settings (port — applies to both modes; listener binds on it)
-                        FrostedGroupBox(title: "Network Settings", icon: "network") {
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("Server Port")
-                                        .font(.system(size: 11))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    TextField("Port", value: $settings.port, format: .number)
-                                        .textFieldStyle(.roundedBorder)
-                                        .frame(width: 80)
-                                        .disabled(settings.isRunning)
-                                }
-
-                                if settings.isRunning {
-                                    Text("Stop server to change port")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.orange)
-                                } else if settings.connectionMode == .wireless {
-                                    Text("Changing the port invalidates existing pairings — re-scan the QR on each tablet.")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.secondary)
-                                } else if settings.port != 54321 {
-                                    Text("Custom port set — Android client must use the same port.")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                        }
+                        NetworkSettingsSection(settings: settings, runtime: runtime)
 
                         // Wireless-mode-only: QR + Paired Devices.
                         if settings.connectionMode == .wireless {
                             WirelessSection(settings: settings,
+                                            runtime: runtime,
                                             pairedDeviceStore: (NSApp.delegate as? AppDelegate)?.pairedDeviceStore ?? PairedDeviceStore())
                         }
 
@@ -621,272 +600,16 @@ struct SettingsView: View {
                             }
                         }
 
-                        // Status
-                        FrostedGroupBox(title: "Status", icon: "checkmark.circle") {
-                            VStack(alignment: .leading, spacing: 12) {
-                                StatusRow(title: "Virtual Display",
-                                          status: settings.displayCreated ? "Active" : "Inactive",
-                                          color: settings.displayCreated ? .green : .secondary,
-                                          hint: "The macOS virtual display we render into. Created when you click Start; the tablet streams its pixels.")
-                                StatusRow(title: "Client Connected",
-                                          status: settings.clientConnected ? "Yes" : "No",
-                                          color: settings.clientConnected ? .green : .secondary,
-                                          hint: "Whether the Android client app currently has an active stream session.")
-                                StatusRow(
-                                    title: ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 ? "Screen & System Audio" : "Screen Recording",
-                                    status: settings.hasScreenRecordingPermission ? "Granted" : "Required",
-                                    color: settings.hasScreenRecordingPermission ? .green : .red,
-                                    hint: "macOS privacy permission required to capture the virtual display. Grant in System Settings → Privacy & Security → Screen Recording."
-                                )
-                                StatusRow(title: "Accessibility",
-                                          status: settings.hasAccessibilityPermission ? "Granted" : "Optional",
-                                          color: settings.hasAccessibilityPermission ? .green : .orange,
-                                          hint: "Optional permission. Required only if you want touch/tap input from the tablet to control the Mac. Streaming works without it.")
-                                if settings.isRunning {
-                                    StatusRow(title: "Capture Method",
-                                              status: settings.captureMethod,
-                                              color: captureMethodColor(settings.captureMethod),
-                                              hint: "Which macOS API is currently capturing the virtual display. SCStream is the modern path; CGDisplayStream fallback activates if SCStream fails (e.g. on certain virtual display configs).")
-                                }
-
-                                // Mode-aware contextual rows
-                                Divider().padding(.vertical, 4)
-                                if settings.connectionMode == .usb {
-                                    StatusRow(title: "ADB installed",
-                                              status: settings.adbInstalled ? "Installed" : "Missing",
-                                              color: settings.adbInstalled ? .green : .red,
-                                              hint: "USB mode tunnels the TCP stream through the cable using `adb reverse`. The Android SDK platform-tools copy is preferred, then Homebrew, /usr/local/bin, and PATH.")
-                                    if !settings.adbInstalled {
-                                        Text("brew install android-platform-tools")
-                                            .font(.system(size: 10, design: .monospaced))
-                                            .padding(6)
-                                            .background(Color.black.opacity(0.08))
-                                            .cornerRadius(4)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .textSelection(.enabled)
-                                    }
-                                    StatusRow(title: "ADB reverse",
-                                              status: settings.adbReverseConfigured ? "OK" : "Pending",
-                                              color: settings.adbReverseConfigured ? .green : .orange,
-                                              hint: "Whether `adb reverse tcp:\(settings.port) tcp:\(settings.port)` is currently configured. The Mac app sets this up automatically when you click Start. Goes green within ~2 seconds after the tablet is plugged in and authorized.")
-                                    StatusRow(title: "USB device",
-                                              status: settings.usbDeviceStatus.label,
-                                              color: settings.usbDeviceStatus.isConnected ? .green : (settings.usbDeviceStatus.needsAction ? .orange : .red),
-                                              hint: settings.usbDeviceStatus.hint)
-                                } else {
-                                    StatusRow(title: "WiFi",
-                                              status: settings.wifiConnected ? "Connected" : "Disconnected",
-                                              color: settings.wifiConnected ? .green : .red,
-                                              hint: "Whether the Mac has an active local-network address. This does not prove that the access point allows peer-to-peer TCP or Bonjour; wireless mode still requires the tablet to reach the listening address.")
-                                    StatusRow(title: "Listening on",
-                                              status: settings.listeningAddress.map { LANAddressResolver.endpoint(host: $0, port: settings.port) } ?? "—",
-                                              color: settings.listeningAddress != nil ? .green : .secondary,
-                                              hint: "The QR includes the preferred local address plus compatible fallbacks. If the Mac changes networks, refresh the QR before pairing a new tablet.")
-                                }
-
-                                if !settings.hasScreenRecordingPermission {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        HStack(spacing: 6) {
-                                            Image(systemName: "exclamationmark.triangle.fill")
-                                                .foregroundColor(.orange)
-                                            Text(ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 ? "Screen & System Audio Recording Required" : "Screen Recording Required")
-                                                .font(.system(size: 12, weight: .medium))
-                                        }
-                                        Text(ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
-                                            ? "Required to capture the virtual display. Go to System Settings > Privacy & Security > Screen & System Audio Recording."
-                                            : "Required to capture the virtual display.")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.secondary)
-                                        HStack(spacing: 8) {
-                                            Button(action: {
-                                                settings.requestScreenRecordingPermission()
-                                            }) {
-                                                HStack {
-                                                    Image(systemName: "record.circle")
-                                                    Text("Request Access")
-                                                }
-                                            }
-                                            .buttonStyle(.borderedProminent)
-
-                                            Button(action: {
-                                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-                                            }) {
-                                                HStack {
-                                                    Image(systemName: "gear")
-                                                    Text("Open Settings")
-                                                }
-                                            }
-                                            .buttonStyle(.bordered)
-                                        }
-                                        .controlSize(.small)
-                                    }
-                                    .padding(10)
-                                    .background(Color.orange.opacity(0.1))
-                                    .cornerRadius(8)
-                                }
-
-                                if !settings.hasAccessibilityPermission {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        HStack(spacing: 6) {
-                                            Image(systemName: "hand.tap.fill")
-                                                .foregroundColor(.blue)
-                                            Text("Enable Touch Control")
-                                                .font(.system(size: 12, weight: .medium))
-                                        }
-                                        Text("Control your Mac from your tablet.")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.secondary)
-                                        Button(action: {
-                                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                                        }) {
-                                            HStack {
-                                                Image(systemName: "gear")
-                                                Text("Open Settings")
-                                            }
-                                            .frame(maxWidth: .infinity)
-                                        }
-                                        .buttonStyle(.borderedProminent)
-                                        .controlSize(.small)
-                                    }
-                                    .padding(10)
-                                    .background(Color.blue.opacity(0.08))
-                                    .cornerRadius(8)
-                                }
-                            }
-                        }
-
-                        // Performance (when connected)
-                        if settings.clientConnected {
-                            FrostedGroupBox(title: "Performance", icon: "speedometer") {
-                                HStack {
-                                    VStack(alignment: .leading) {
-                                        Text("FPS")
-                                            .font(.system(size: 10))
-                                            .foregroundColor(.secondary)
-                                        Text(String(format: "%.1f", settings.currentFPS))
-                                            .font(.system(size: 16, weight: .semibold))
-                                            .foregroundColor(.green)
-                                    }
-                                    Spacer()
-                                    VStack(alignment: .leading) {
-                                        Text("Bitrate")
-                                            .font(.system(size: 10))
-                                            .foregroundColor(.secondary)
-                                        Text(String(format: "%.1f Mbps", settings.currentBitrate))
-                                            .font(.system(size: 16, weight: .semibold))
-                                            .foregroundColor(.accentColor)
-                                    }
-                                }
-                            }
-                        }
+                        RuntimeStatusSection(settings: settings, runtime: runtime)
+                        PerformanceSection(runtime: runtime, performance: performance)
                     }
                     .padding(20)
                 }
 
-                // Footer
-                VStack(spacing: 0) {
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.06))
-                        .frame(height: 1)
-
-                    HStack(spacing: 12) {
-                        Button(action: {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                                settings.toggleServer()
-                            }
-                        }) {
-                            HStack(spacing: 6) {
-                                Image(systemName: settings.isRunning ? "stop.fill" : "play.fill")
-                                    .font(.system(size: 12))
-                                Text(settings.isRunning ? "Stop" : "Start")
-                                    .font(.system(size: 13, weight: .medium))
-                            }
-                            .frame(width: 90)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(settings.isRunning ? .red : .accentColor)
-                        .controlSize(.large)
-                        .disabled(!settings.hasScreenRecordingPermission)
-
-                        if settings.isRunning {
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(Color.green)
-                                    .frame(width: 8, height: 8)
-                                    .overlay {
-                                        Circle()
-                                            .stroke(Color.green.opacity(0.3), lineWidth: 2)
-                                            .scaleEffect(1.5)
-                                    }
-                                Text("Running on port \(settings.port)")
-                                    .font(.system(size: 12))
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background {
-                                Capsule().fill(.ultraThinMaterial)
-                                    .overlay {
-                                        Capsule().strokeBorder(Color.green.opacity(0.2), lineWidth: 1)
-                                    }
-                            }
-                            .transition(.scale.combined(with: .opacity))
-                        }
-
-                        Spacer()
-
-                        // Restart button
-                        Button(action: {
-                            restartApp()
-                        }) {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.secondary)
-                                .frame(width: 32, height: 32)
-                                .background {
-                                    Circle().fill(.ultraThinMaterial)
-                                        .overlay {
-                                            Circle().strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
-                                        }
-                                }
-                        }
-                        .buttonStyle(.plain)
-                        .help("Restart App")
-
-                        // Quit button
-                        Button(action: {
-                            NSApp.terminate(nil)
-                        }) {
-                            Image(systemName: "power")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.secondary)
-                                .frame(width: 32, height: 32)
-                                .background {
-                                    Circle().fill(.ultraThinMaterial)
-                                        .overlay {
-                                            Circle().strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
-                                        }
-                                }
-                        }
-                        .buttonStyle(.plain)
-                        .help("Quit SideTab (⌘Q)")
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 14)
-                    .background(.ultraThinMaterial)
-                }
+                SettingsFooter(settings: settings, runtime: runtime, onRestart: restartApp)
             }
         }
         .frame(width: 480, height: 780)
-    }
-
-    /// Only two capture methods are ever reported: "SCStream" and
-    /// "CGDisplayStream (fallback)". Anything else — the initial
-    /// "Initializing…", or a method a future build adds — is an unknown state
-    /// and must not be drawn in the success colour.
-    private func captureMethodColor(_ method: String) -> Color {
-        if method.contains("fallback") { return .orange }
-        if method.contains("SCStream") { return .green }
-        return .secondary
     }
 
     /// Restart the app by launching a new instance and terminating current one
@@ -913,6 +636,324 @@ struct SettingsView: View {
 }
 
 // MARK: - Supporting Views
+
+/// A small child view keeps live port/server state out of the root settings
+/// layout while preserving immediate control updates.
+private struct NetworkSettingsSection: View {
+    @ObservedObject var settings: DisplaySettings
+    @ObservedObject var runtime: DisplayRuntimeState
+
+    var body: some View {
+        FrostedGroupBox(title: "Network Settings", icon: "network") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Server Port")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    TextField("Port", value: $settings.port, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 80)
+                        .disabled(runtime.isRunning)
+                }
+
+                if runtime.isRunning {
+                    Text("Stop server to change port")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                } else if settings.connectionMode == .wireless {
+                    Text("Changing the port invalidates existing pairings — re-scan the QR on each tablet.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                } else if settings.port != 54321 {
+                    Text("Custom port set — Android client must use the same port.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+}
+
+/// Status rows update independently from the large configuration form.
+private struct RuntimeStatusSection: View {
+    @ObservedObject var settings: DisplaySettings
+    @ObservedObject var runtime: DisplayRuntimeState
+
+    var body: some View {
+        FrostedGroupBox(title: "Status", icon: "checkmark.circle") {
+            VStack(alignment: .leading, spacing: 12) {
+                StatusRow(title: "Virtual Display",
+                          status: runtime.displayCreated ? "Active" : "Inactive",
+                          color: runtime.displayCreated ? .green : .secondary,
+                          hint: "The macOS virtual display we render into. Created when you click Start; the tablet streams its pixels.")
+                StatusRow(title: "Client Connected",
+                          status: runtime.clientConnected ? "Yes" : "No",
+                          color: runtime.clientConnected ? .green : .secondary,
+                          hint: "Whether the Android client app currently has an active stream session.")
+                StatusRow(
+                    title: ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 ? "Screen & System Audio" : "Screen Recording",
+                    status: runtime.hasScreenRecordingPermission ? "Granted" : "Required",
+                    color: runtime.hasScreenRecordingPermission ? .green : .red,
+                    hint: "macOS privacy permission required to capture the virtual display. Grant in System Settings → Privacy & Security → Screen Recording."
+                )
+                StatusRow(title: "Accessibility",
+                          status: runtime.hasAccessibilityPermission ? "Granted" : "Optional",
+                          color: runtime.hasAccessibilityPermission ? .green : .orange,
+                          hint: "Optional permission. Required only if you want touch/tap input from the tablet to control the Mac. Streaming works without it.")
+                if runtime.isRunning {
+                    StatusRow(title: "Capture Method",
+                              status: runtime.captureMethod,
+                              color: Self.captureMethodColor(runtime.captureMethod),
+                              hint: "Which macOS API is currently capturing the virtual display. SCStream is the modern path; CGDisplayStream fallback activates if SCStream fails (e.g. on certain virtual display configs).")
+                }
+
+                // Mode-aware contextual rows
+                Divider().padding(.vertical, 4)
+                if settings.connectionMode == .usb {
+                    StatusRow(title: "ADB installed",
+                              status: runtime.adbInstalled ? "Installed" : "Missing",
+                              color: runtime.adbInstalled ? .green : .red,
+                              hint: "USB mode tunnels the TCP stream through the cable using `adb reverse`. The Android SDK platform-tools copy is preferred, then Homebrew, /usr/local/bin, and PATH.")
+                    if !runtime.adbInstalled {
+                        Text("brew install android-platform-tools")
+                            .font(.system(size: 10, design: .monospaced))
+                            .padding(6)
+                            .background(Color.black.opacity(0.08))
+                            .cornerRadius(4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    StatusRow(title: "ADB reverse",
+                              status: runtime.adbReverseConfigured ? "OK" : "Pending",
+                              color: runtime.adbReverseConfigured ? .green : .orange,
+                              hint: "Whether `adb reverse tcp:\(settings.port) tcp:\(settings.port)` is currently configured. The Mac app sets this up automatically when you click Start. Goes green within ~2 seconds after the tablet is plugged in and authorized.")
+                    StatusRow(title: "USB device",
+                              status: runtime.usbDeviceStatus.label,
+                              color: runtime.usbDeviceStatus.isConnected ? .green : (runtime.usbDeviceStatus.needsAction ? .orange : .red),
+                              hint: runtime.usbDeviceStatus.hint)
+                } else {
+                    StatusRow(title: "WiFi",
+                              status: runtime.wifiConnected ? "Connected" : "Disconnected",
+                              color: runtime.wifiConnected ? .green : .red,
+                              hint: "Whether the Mac has an active local-network address. This does not prove that the access point allows peer-to-peer TCP or Bonjour; wireless mode still requires the tablet to reach the listening address.")
+                    StatusRow(title: "Listening on",
+                              status: runtime.listeningAddress.map { LANAddressResolver.endpoint(host: $0, port: settings.port) } ?? "—",
+                              color: runtime.listeningAddress != nil ? .green : .secondary,
+                              hint: "The QR includes the preferred local address plus compatible fallbacks. If the Mac changes networks, refresh the QR before pairing a new tablet.")
+                }
+
+                if !runtime.hasScreenRecordingPermission {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                            Text(ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 ? "Screen & System Audio Recording Required" : "Screen Recording Required")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        Text(ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
+                            ? "Required to capture the virtual display. Go to System Settings > Privacy & Security > Screen & System Audio Recording."
+                            : "Required to capture the virtual display.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        HStack(spacing: 8) {
+                            Button(action: {
+                                settings.requestScreenRecordingPermission()
+                            }) {
+                                HStack {
+                                    Image(systemName: "record.circle")
+                                    Text("Request Access")
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button(action: {
+                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                            }) {
+                                HStack {
+                                    Image(systemName: "gear")
+                                    Text("Open Settings")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(10)
+                    .background(Color.orange.opacity(0.1))
+                    .cornerRadius(8)
+                }
+
+                if !runtime.hasAccessibilityPermission {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "hand.tap.fill")
+                                .foregroundColor(.blue)
+                            Text("Enable Touch Control")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        Text("Control your Mac from your tablet.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        Button(action: {
+                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                        }) {
+                            HStack {
+                                Image(systemName: "gear")
+                                Text("Open Settings")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                    .padding(10)
+                    .background(Color.blue.opacity(0.08))
+                    .cornerRadius(8)
+                }
+            }
+        }
+    }
+
+    /// Only two capture methods are ever reported: "SCStream" and
+    /// "CGDisplayStream (fallback)". Anything else — the initial
+    /// "Initializing…", or a method a future build adds — is an unknown state
+    /// and must not be drawn in the success colour.
+    static func captureMethodColor(_ method: String) -> Color {
+        if method.contains("fallback") { return .orange }
+        if method.contains("SCStream") { return .green }
+        return .secondary
+    }
+}
+
+private struct PerformanceSection: View {
+    @ObservedObject var runtime: DisplayRuntimeState
+    @ObservedObject var performance: DisplayPerformanceState
+
+    @ViewBuilder
+    var body: some View {
+        if runtime.clientConnected {
+            FrostedGroupBox(title: "Performance", icon: "speedometer") {
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text("FPS")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                        Text(String(format: "%.1f", performance.currentFPS))
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(.green)
+                    }
+                    Spacer()
+                    VStack(alignment: .leading) {
+                        Text("Bitrate")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                        Text(String(format: "%.1f Mbps", performance.currentBitrate))
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(.accentColor)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct SettingsFooter: View {
+    @ObservedObject var settings: DisplaySettings
+    @ObservedObject var runtime: DisplayRuntimeState
+    let onRestart: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.06))
+                .frame(height: 1)
+
+            HStack(spacing: 12) {
+                Button(action: {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                        settings.toggleServer()
+                    }
+                }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: runtime.isRunning ? "stop.fill" : "play.fill")
+                            .font(.system(size: 12))
+                        Text(runtime.isRunning ? "Stop" : "Start")
+                            .font(.system(size: 13, weight: .medium))
+                    }
+                    .frame(width: 90)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(runtime.isRunning ? .red : .accentColor)
+                .controlSize(.large)
+                .disabled(!runtime.hasScreenRecordingPermission)
+
+                if runtime.isRunning {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 8, height: 8)
+                            .overlay {
+                                Circle()
+                                    .stroke(Color.green.opacity(0.3), lineWidth: 2)
+                                    .scaleEffect(1.5)
+                            }
+                        Text("Running on port \(settings.port)")
+                            .font(.system(size: 12))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background {
+                        Capsule().fill(.ultraThinMaterial)
+                            .overlay {
+                                Capsule().strokeBorder(Color.green.opacity(0.2), lineWidth: 1)
+                            }
+                    }
+                    .transition(.scale.combined(with: .opacity))
+                }
+
+                Spacer()
+
+                // Restart button
+                Button(action: onRestart) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .frame(width: 32, height: 32)
+                        .background {
+                            Circle().fill(.ultraThinMaterial)
+                                .overlay {
+                                    Circle().strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                                }
+                        }
+                }
+                .buttonStyle(.plain)
+                .help("Restart App")
+
+                // Quit button
+                Button(action: {
+                    NSApp.terminate(nil)
+                }) {
+                    Image(systemName: "power")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .frame(width: 32, height: 32)
+                        .background {
+                            Circle().fill(.ultraThinMaterial)
+                                .overlay {
+                                    Circle().strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                                }
+                        }
+                }
+                .buttonStyle(.plain)
+                .help("Quit SideTab (⌘Q)")
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            .background(.ultraThinMaterial)
+        }
+    }
+}
 
 struct StatusRow: View {
     let title: String
@@ -1122,24 +1163,8 @@ class DisplaySettings: ObservableObject {
         didSet { save("startupMode", startupMode.rawValue) }
     }
 
-    // Runtime state (not persisted)
-    @Published var displayCreated = false
-    @Published var clientConnected = false
-    /// Device name of the wireless client currently streaming (nil when none).
-    /// WirelessSection reads this to show a "Connected" badge on the matching row.
-    @Published var currentWirelessDevice: String?
-    @Published var hasScreenRecordingPermission = false
-    @Published var hasAccessibilityPermission = false
-    @Published var adbInstalled = false
-    @Published var adbReverseConfigured = false
-    @Published var usbDeviceConnected = false
-    @Published var usbDeviceStatus: ADBUSBDeviceStatus = .notDetected
-    @Published var wifiConnected = false
-    @Published var listeningAddress: String?
-    @Published var isRunning = false
-    @Published var currentFPS: Double = 0
-    @Published var currentBitrate: Double = 0
-    @Published var captureMethod: String = "Initializing..."
+    // Runtime state (not persisted) lives in DisplayRuntimeState and
+    // DisplayPerformanceState so live status never relays out this form.
 
     var onToggleServer: (() -> Void)?
     var onRequestScreenRecordingPermission: (() -> Void)?
@@ -1318,7 +1343,9 @@ class DisplaySettings: ObservableObject {
 // MARK: - Window Controller
 
 class SettingsWindowController: NSWindowController, NSWindowDelegate {
-    convenience init(settings: DisplaySettings) {
+    convenience init(settings: DisplaySettings,
+                     runtime: DisplayRuntimeState,
+                     performance: DisplayPerformanceState) {
         let window = ConstrainedWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 780),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -1331,7 +1358,11 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.backgroundColor = .windowBackgroundColor
         window.isMovableByWindowBackground = true
         window.center()
-        window.contentView = NSHostingView(rootView: SettingsView(settings: settings))
+        window.contentView = NSHostingView(rootView: SettingsView(
+            settings: settings,
+            runtime: runtime,
+            performance: performance
+        ))
         window.isReleasedWhenClosed = false
 
         self.init(window: window)
@@ -1396,6 +1427,7 @@ class ConstrainedWindow: NSWindow {
 
 struct WirelessSection: View {
     @ObservedObject var settings: DisplaySettings
+    @ObservedObject var runtime: DisplayRuntimeState
     let pairedDeviceStore: PairedDeviceStore
     @State private var qrImage: NSImage?
     /// Last payload actually rasterised. A tick that produces the same string
@@ -1424,7 +1456,7 @@ struct WirelessSection: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            if !settings.isRunning {
+            if !runtime.isRunning {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
@@ -1437,7 +1469,7 @@ struct WirelessSection: View {
                 .background(Color.orange.opacity(0.12))
                 .cornerRadius(6)
             }
-            if tokenResetPending && settings.isRunning {
+            if tokenResetPending && runtime.isRunning {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
@@ -1489,7 +1521,7 @@ struct WirelessSection: View {
                     // Querying the resolver here would run getifaddrs() plus a
                     // getnameinfo() per address on every objectWillChange —
                     // including the ones a mouse-move over this panel produces.
-                    Text(settings.listeningAddress.map { "Listening: \(LANAddressResolver.endpoint(host: $0, port: settings.port))" } ?? "WiFi disconnected — no LAN address")
+                    Text(runtime.listeningAddress.map { "Listening: \(LANAddressResolver.endpoint(host: $0, port: settings.port))" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
@@ -1508,7 +1540,7 @@ struct WirelessSection: View {
                 } else {
                     VStack(spacing: 6) {
                         ForEach(pairedDevices) { device in
-                            let isLive = settings.currentWirelessDevice == device.name
+                            let isLive = runtime.currentWirelessDevice == device.name
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(device.name).font(.system(size: 12, weight: .medium))
@@ -1568,7 +1600,7 @@ struct WirelessSection: View {
         }
         // A fresh listener snapshots the Keychain at start, which is the moment
         // a token reset becomes the token in effect.
-        .onChange(of: settings.isRunning) { running in
+        .onChange(of: runtime.isRunning) { running in
             if running { tokenResetPending = false }
         }
         // One-parameter onChange(of:perform:) works on macOS 13+. The
@@ -1590,7 +1622,7 @@ struct WirelessSection: View {
             Button("Cancel", role: .cancel) { }
             Button("Reset", role: .destructive) { resetToken() }
         } message: {
-            Text(settings.isRunning
+            Text(runtime.isRunning
                  ? "This forgets every paired device and mints a new pairing token. The listener that is running right now keeps accepting the current token, so stop the server and start it again before anyone scans the new QR."
                  : "This will disconnect all paired devices. They will need to scan the new QR to connect again.")
         }
@@ -1649,7 +1681,7 @@ struct WirelessSection: View {
     private func resetToken() {
         // Nothing is pending when no listener is running: the next start reads
         // the freshly persisted token itself.
-        tokenResetPending = settings.isRunning
+        tokenResetPending = runtime.isRunning
         DispatchQueue.global(qos: .userInitiated).async {
             // SecItemDelete + SecItemAdd is one synchronous securityd round trip
             // that measured ~9 ms on the main thread — 56% of a 60 Hz frame.
