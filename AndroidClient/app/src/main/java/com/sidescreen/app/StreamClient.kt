@@ -964,9 +964,15 @@ class StreamClient(
     private fun scheduleTouchMoveDrain(epoch: Long) {
         if (touchExecutor.isShutdown) return
         touchScope.launch {
-            repeat(COALESCED_INPUT_BURST) {
-                val write = touchMoveCoalescer.takeLatest(epoch) ?: return@repeat
+            // An explicit loop, not `repeat`: a null take means this epoch's
+            // motion is exhausted and the burst is over. `return@repeat` in the
+            // old form fell through to the next iteration and burned a slot
+            // instead, and `break` cannot target `repeat` at all.
+            var sent = 0
+            while (sent < COALESCED_INPUT_BURST) {
+                val write = touchMoveCoalescer.takeLatest(epoch) ?: break
                 sendTouchNow(write)
+                sent += 1
             }
             if (touchMoveCoalescer.finishBurst(epoch) && !touchExecutor.isShutdown) {
                 scheduleTouchMoveDrain(epoch)
@@ -1033,9 +1039,11 @@ class StreamClient(
     private fun scheduleStylusMotionDrain(epoch: Long) {
         if (touchExecutor.isShutdown) return
         touchScope.launch {
-            repeat(COALESCED_INPUT_BURST) {
-                val write = stylusMotionCoalescer.takeLatest(epoch) ?: return@repeat
+            var sent = 0
+            while (sent < COALESCED_INPUT_BURST) {
+                val write = stylusMotionCoalescer.takeLatest(epoch) ?: break
                 sendStylusNow(write)
+                sent += 1
             }
             if (stylusMotionCoalescer.finishBurst(epoch) && !touchExecutor.isShutdown) {
                 scheduleStylusMotionDrain(epoch)
