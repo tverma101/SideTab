@@ -877,18 +877,12 @@ class StreamClient(
                         input.readFully(pongBuffer)
                         val sentTime = readLongLE(pongBuffer, 0)
                         val rtt = (System.nanoTime() - sentTime) / 1_000_000.0
+                        // noteVideoRead() already retired the outstanding probe
+                        // and its miss run when this pong's type byte arrived,
+                        // so only report whether it answers the latest probe.
                         val matchedProbe =
                             synchronized(videoProbeLock) {
-                                val probe = videoProbeOutstanding
-                                if (probe?.generation == generation && probe.sentAtNs == sentTime) {
-                                    // A matched pong is the strongest possible
-                                    // liveness evidence: end the miss run too.
-                                    videoProbeOutstanding = null
-                                    resetUnansweredProbesLocked()
-                                    true
-                                } else {
-                                    false
-                                }
+                                sentTime == lastVideoProbeSentNs
                             }
                         diagLog(String.format(Locale.US, "VIDEO PONG rtt=%.2fms matched=%s", rtt, matchedProbe))
                         if (!controlChannel.isConnected) {
