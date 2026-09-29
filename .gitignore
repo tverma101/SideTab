@@ -69,3 +69,6 @@ AndroidClient/ktlint
 
 # Local device-install recovery backups
 backups/apk/
+
+# AirPlay level-2 test harness: a real device key, never commit it.
+scripts/airplay-level2/.tabs8_device_key

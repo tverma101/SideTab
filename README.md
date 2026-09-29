@@ -103,6 +103,10 @@ Configure resolution (up to 4K/8K), frame rate (30–120 FPS; 60 FPS is the curr
   <img src="resources/screenshots/android_settings.png" alt="Android — Connection Screen" height="500"/>
 </div>
 
+### Power-aware Android playback
+
+While SideTab is streaming in the foreground over USB, the Android client requests the panel's 120 Hz mode when the tablet is externally powered — even with Android Battery Saver on — and 60 Hz on battery to reduce display, decoder and thermal load. Wireless streams keep a seamless-only 60 Hz request. When the app is backgrounded, the screen is off, or the session ends, SideTab clears its frame-rate and screen-on requests; an unattended session disconnects after the configured grace period (`adb shell settings put system sidescreen_auto_disconnect_secs <N>`, default 300), capped at 30 seconds on battery. The Mac host must still be set to 120 FPS for the stream itself to carry 120 frames per second.
+
 ### Headless / portable Mac
 
 Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a laptop in clamshell — using the tablet as its only screen. Enable Launch at Login and Auto-start streaming, and the Mac boots straight into serving the tablet, with nothing to press on the Mac.
