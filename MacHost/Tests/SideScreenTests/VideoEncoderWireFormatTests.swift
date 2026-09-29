@@ -104,9 +104,11 @@ final class VideoEncoderWireFormatTests: XCTestCase {
     func testRealEncoderFlagsItsFirstFrameAsKeyframe() throws {
         let width = 320
         let height = 192
+        // Hosted CI runners are VMs with no hardware encoder; there VideoToolbox
+        // still creates a session but never delivers a frame.
         try XCTSkipUnless(
-            Self.canCreateCompressionSession(width: width, height: height),
-            "VideoToolbox has no H.264 encoder on this machine"
+            Self.hasHardwareEncoder(width: width, height: height),
+            "no hardware H.264 encoder on this machine"
         )
         let encoder = VideoEncoder(width: width, height: height, codec: .h264, frameRate: 30)
         let output = OSAllocatedUnfairLock<(data: Data, isKeyframe: Bool)?>(initialState: nil)
@@ -140,14 +142,14 @@ final class VideoEncoderWireFormatTests: XCTestCase {
         XCTAssertEqual(bytes.count == 5 ? bytes[4] & 0x1F : nil, 7)
     }
 
-    private static func canCreateCompressionSession(width: Int, height: Int) -> Bool {
+    private static func hasHardwareEncoder(width: Int, height: Int) -> Bool {
         var session: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: nil,
+            encoderSpecification: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: nil,
