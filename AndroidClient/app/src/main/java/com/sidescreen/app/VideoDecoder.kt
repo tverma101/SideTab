@@ -32,7 +32,7 @@ class VideoDecoder(
      *  whose plane access is a fatal JNI abort). */
     private val bufferOutput: Boolean = false,
     /** Wireless sessions use a tighter stale-output gate and a fixed 60 Hz
-     *  operating-rate target. USB preserves the panel's reported refresh rate. */
+     *  operating-rate target. USB is provisioned for the maximum stream rate. */
     private val wireless: Boolean = false,
     private val targetFrameRate: Int? = null,
 ) {
@@ -74,8 +74,15 @@ class VideoDecoder(
 
     private val frameTimes = ArrayDeque<Long>(120)
 
-    private val displayRefreshRate =
-        (targetFrameRate?.toFloat() ?: display?.refreshRate ?: 60f).coerceAtLeast(30f)
+    // Provision the decoder for the rate the host can send, not whatever
+    // variable-refresh mode the panel happened to be in when this object was
+    // created: the power policy may be holding the panel at 60 Hz while a USB
+    // stream still carries 120 FPS, and every frame has to be decoded to keep
+    // the reference chain intact. The configure ladder falls back cleanly if a
+    // codec rejects the operating-rate hint.
+    private val decoderTargetRate =
+        (targetFrameRate?.toFloat() ?: DisplayRefreshPolicy.STREAM_INTENT_HZ).coerceAtLeast(30f)
+    private val panelRefreshRate = display?.refreshRate ?: 60f
 
     @Volatile private var currentWidth = initialWidth
     @Volatile private var currentHeight = initialHeight
@@ -265,18 +272,39 @@ class VideoDecoder(
             val format = videoFormat(maxInputSize)
             format.setInteger(CODEC_KEY_LOW_LATENCY, 1)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
+            format.setInteger(MediaFormat.KEY_OPERATING_RATE, decoderTargetRate.toInt())
             format.setInteger(CODEC_KEY_MAX_B_FRAMES, 0)
             codec.configure(format, targetSurface, null, 0)
             configured = true
-            diagLog("Configured with full low-latency${if (bufferOutput) " (buffer output)" else ""}")
+            diagLog(
+                "Configured with full low-latency @ ${decoderTargetRate.toInt()}fps" +
+                    if (bufferOutput) " (buffer output)" else "",
+            )
         } catch (e: Exception) {
             diagLog("Full low-latency config failed: ${e.message}")
             codec.reset()
             codec.setCallback(callback, decoderHandler)
         }
 
-        // Attempt 2: Without KEY_LOW_LATENCY
+        // Attempt 2: some decoders reject KEY_LOW_LATENCY but still accept an
+        // operating-rate hint. Keep the rate provisioning before dropping it.
+        if (!configured) {
+            try {
+                val rateFormat = videoFormat(maxInputSize)
+                rateFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                rateFormat.setInteger(MediaFormat.KEY_OPERATING_RATE, decoderTargetRate.toInt())
+                rateFormat.setInteger(CODEC_KEY_MAX_B_FRAMES, 0)
+                codec.configure(rateFormat, targetSurface, null, 0)
+                configured = true
+                diagLog("Configured without low-latency key @ ${decoderTargetRate.toInt()}fps")
+            } catch (e: Exception) {
+                diagLog("Operating-rate config failed: ${e.message}")
+                codec.reset()
+                codec.setCallback(callback, decoderHandler)
+            }
+        }
+
+        // Attempt 3: Without KEY_LOW_LATENCY or an operating rate
         if (!configured) {
             try {
                 val basicFormat = videoFormat(maxInputSize)
@@ -292,7 +320,7 @@ class VideoDecoder(
             }
         }
 
-        // Attempt 3: Minimal config (resolution + input size)
+        // Attempt 4: Minimal config (resolution + input size)
         if (!configured) {
             try {
                 codec.configure(videoFormat(maxInputSize), targetSurface, null, 0)
@@ -319,7 +347,8 @@ class VideoDecoder(
             initializingCodec = null
             decoder = codec
             diagLog(
-                "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
+                "Decoder started: ${currentWidth}x$currentHeight, target=${decoderTargetRate.toInt()}fps " +
+                    "panel=${"%.1f".format(panelRefreshRate)}Hz, " +
                     "maxInputSize=$maxInputSize, wireless=$wireless, " +
                     "surface=$surface, valid=${surface.isValid}",
             )
@@ -356,9 +385,9 @@ class VideoDecoder(
             .also { it.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxInputSize) }
 
     /**
-     * Find the best decoder for [mime] at the given resolution.
-     * Prefers hardware decoders, falls back to software if HW can't handle the resolution.
-     * Returns codec name to use with MediaCodec.createByCodecName(), or null for default.
+     * Find the best decoder for [mime] at the given resolution and target rate;
+     * see [CodecCapabilities.bestDecoderName] for the ranking. Returns a codec
+     * name for MediaCodec.createByCodecName(), or null for the default.
      */
     private fun findBestDecoder(
         width: Int,
@@ -366,14 +395,14 @@ class VideoDecoder(
     ): String? {
         val chosen =
             runCatching {
-                CodecCapabilities.bestDecoderName(mime, width, height, displayRefreshRate)
+                CodecCapabilities.bestDecoderName(mime, width, height, decoderTargetRate)
             }.getOrElse { error ->
                 diagLog("Decoder search failed: ${error.message}")
                 null
             }
         diagLog(
             if (chosen != null) {
-                "Selected decoder: $chosen for ${width}x$height @${displayRefreshRate.toInt()}fps"
+                "Selected decoder: $chosen for ${width}x$height @${decoderTargetRate.toInt()}fps"
             } else {
                 "No decoder advertises ${width}x$height — will use default"
             },

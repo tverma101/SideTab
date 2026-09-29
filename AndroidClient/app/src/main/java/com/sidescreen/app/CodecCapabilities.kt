@@ -3,6 +3,7 @@ package com.sidescreen.app
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.util.Range
 
 /**
@@ -42,6 +43,9 @@ object CodecCapabilities {
         val videoCaps: MediaCodecInfo.VideoCapabilities,
         val isHardware: Boolean,
         val isUsableForOutput: Boolean,
+        val isVendor: Boolean,
+        val isAlias: Boolean,
+        val lowLatency: Boolean,
     )
 
     private class Inventory(
@@ -70,35 +74,46 @@ object CodecCapabilities {
     private fun decodersFor(info: MediaCodecInfo): Sequence<DecoderEntry> =
         PROBED_MIMES.asSequence().mapNotNull { mime ->
             if (info.supportedTypes.none { it.equals(mime, ignoreCase = true) }) return@mapNotNull null
-            val videoCaps =
+            val caps =
                 try {
-                    info.getCapabilitiesForType(mime).videoCapabilities
+                    info.getCapabilitiesForType(mime)
                 } catch (_: Exception) {
                     null
                 } ?: return@mapNotNull null
+            val videoCaps = caps.videoCapabilities ?: return@mapNotNull null
             val name = info.name
+            val modern = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+            val isHardware = if (modern) info.isHardwareAccelerated else !isSoftwareDecoder(name)
             DecoderEntry(
                 name = name,
                 mime = mime,
                 videoCaps = videoCaps,
-                isHardware = !isSoftwareDecoder(name),
-                isUsableForOutput = isUsableHardwareDecoder(name, mime),
+                isHardware = isHardware,
+                isUsableForOutput = isHardware && !isBrokenHevc(name, mime),
+                isVendor = modern && info.isVendor,
+                isAlias = modern && info.isAlias,
+                lowLatency =
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                        runCatching {
+                            caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+                        }.getOrDefault(false),
             )
         }
 
-    /** Same hardware/software split VideoDecoder uses; see hasHevcDecoder. */
+    /**
+     * Name-based hardware/software split for Android 8/9, which have no
+     * authoritative classification API. Codec names are mixed case
+     * ("OMX.google.h264.decoder"), so the prefixes must match case-insensitively.
+     */
     private fun isSoftwareDecoder(name: String): Boolean =
-        name.startsWith("c2.android.") || name.startsWith("omx.google.")
+        name.startsWith("c2.android.", ignoreCase = true) || name.startsWith("omx.google.", ignoreCase = true)
 
-    private fun isUsableHardwareDecoder(
+    private fun isBrokenHevc(
         name: String,
         mime: String,
-    ): Boolean {
-        val isBrokenHevc =
-            mime.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, ignoreCase = true) &&
-                BROKEN_HEVC_HW_PREFIXES.any { name.startsWith(it) }
-        return !isSoftwareDecoder(name) && !isBrokenHevc
-    }
+    ): Boolean =
+        mime.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, ignoreCase = true) &&
+            BROKEN_HEVC_HW_PREFIXES.any { name.startsWith(it, ignoreCase = true) }
 
     /**
      * Resolve every cached answer ahead of time. Call from a background
@@ -188,6 +203,13 @@ object CodecCapabilities {
         }
     }
 
+    /**
+     * Rank every size-capable decoder. `areSizeAndRateSupported()` is only a
+     * codec-standard envelope, not a real-time guarantee, so on Android 10+
+     * the manufacturer's performance points and measured achievable rates are
+     * stronger evidence. Hardware stays dominant: a software codec makes no
+     * rendering-performance promise at all. The first decoder wins a tie.
+     */
     private fun probeBestDecoderName(
         mime: String,
         width: Int,
@@ -195,34 +217,46 @@ object CodecCapabilities {
         targetFrameRate: Float,
     ): String? {
         val targetRate = targetFrameRate.toDouble().coerceAtLeast(30.0)
-        var hwRateDecoder: String? = null
-        var hwSizeDecoder: String? = null
-        var swRateDecoder: String? = null
-        var swSizeDecoder: String? = null
+        val requiredPoint =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaCodecInfo.VideoCapabilities.PerformancePoint(width, height, targetRate.toInt())
+            } else {
+                null
+            }
+        var bestName: String? = null
+        var bestScore = Int.MIN_VALUE
 
         for (entry in inventory.entries) {
             if (!entry.mime.equals(mime, ignoreCase = true)) continue
-            val supported = runCatching { entry.videoCaps.isSizeSupported(width, height) }.getOrDefault(false)
-            if (!supported) continue
-            val rateSupported =
-                runCatching { entry.videoCaps.areSizeAndRateSupported(width, height, targetRate) }
-                    .getOrDefault(false)
-            if (entry.isHardware) {
-                if (rateSupported) {
-                    if (hwRateDecoder == null) hwRateDecoder = entry.name
-                } else if (hwSizeDecoder == null) {
-                    hwSizeDecoder = entry.name
+            val caps = entry.videoCaps
+            if (!runCatching { caps.isSizeSupported(width, height) }.getOrDefault(false)) continue
+
+            val standardRate = runCatching { caps.areSizeAndRateSupported(width, height, targetRate) }.getOrDefault(false)
+            val performanceGuaranteed =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && requiredPoint != null && entry.isHardware) {
+                    caps.supportedPerformancePoints?.any { it.covers(requiredPoint) }
+                } else {
+                    null
                 }
-            } else {
-                if (rateSupported) {
-                    if (swRateDecoder == null) swRateDecoder = entry.name
-                } else if (swSizeDecoder == null) {
-                    swSizeDecoder = entry.name
-                }
+            val achievable =
+                runCatching { caps.getAchievableFrameRatesFor(width, height)?.upper }
+                    .getOrNull()
+                    ?.let { it >= targetRate }
+
+            var score = if (entry.isHardware) 1_000 else 0
+            if (performanceGuaranteed == true) score += 400
+            if (achievable == true) score += 250
+            if (standardRate) score += 100
+            if (entry.lowLatency) score += 80
+            if (entry.isVendor) score += 20
+            if (entry.isAlias) score -= 5
+
+            if (score > bestScore) {
+                bestScore = score
+                bestName = entry.name
             }
         }
-
-        return hwRateDecoder ?: hwSizeDecoder ?: swRateDecoder ?: swSizeDecoder
+        return bestName
     }
 }
 

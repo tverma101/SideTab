@@ -43,6 +43,15 @@ enum FrameSkipper {
 
     /// Force the next frame through (call alongside encoder.requestKeyframe()).
     static func forceNextFrame() {
+        // One startup/reconnect keyframe is normal and merely primes the recovery
+        // pulse counter. Repeated requests in a short window are strong evidence
+        // of downstream decoder pressure, so let the USB load controller learn
+        // from the same recovery path without changing the wire protocol.
+        USBAdaptiveLoadController.shared.observeRecoveryPulse()
+
+        // The production USB adaptive pacer sits before the optional hash gate,
+        // so recovery/startup keyframes must bypass both layers.
+        USBAdaptiveFramePacer.shared.forceNextFrame()
         lock.lock(); defer { lock.unlock() }
         forceNext = true
     }

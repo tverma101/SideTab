@@ -819,11 +819,25 @@ class ScreenCapture {
             // presentation. Missing/unrecognized metadata encodes normally.
             // Synthetic pattern/dither experiments mutate pixels after capture,
             // so they deliberately bypass this gate.
+            let frameHasChanges = CaptureDirtyRectGate.frameHasChanges(sampleBuffer)
             if CaptureDirtyRectGate.shouldSkip(
-                frameHasChanges: CaptureDirtyRectGate.frameHasChanges(sampleBuffer),
+                frameHasChanges: frameHasChanges,
                 mutatesCapturedPixels: sessionFlags.mutatesCapturedPixels
             ) {
                 self.stateLock.withLock { $0.dirtyRectSkips &+= 1 }
+                return
+            }
+
+            // USB above 60 Hz: capture keeps sampling at the configured rate,
+            // but the encode cadence follows USBAdaptiveLoadController's
+            // 120 -> 90 -> 60 motion ladder under sustained pressure. Clean
+            // frames never reach this point, so the pacer only paces motion;
+            // the first changed frame after an idle spell always goes out.
+            if !sessionFlags.wireless,
+               USBAdaptiveFramePacer.shared.shouldSkip(
+                   frameHasChanges: frameHasChanges,
+                   mutatesCapturedPixels: sessionFlags.mutatesCapturedPixels
+               ) {
                 return
             }
 
