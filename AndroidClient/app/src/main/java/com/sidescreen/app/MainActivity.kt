@@ -97,6 +97,17 @@ class MainActivity : AppCompatActivity() {
      */
     @Volatile private var videoPipelineGeneration = 0L
 
+    /**
+     * Main-thread only: the parameters of the decoder build now running off
+     * the main thread, until it publishes, fails or is retired. The host sends
+     * the display config twice on connect (again once it has read the client's
+     * capabilities), and each copy reached initializeDecoderForCurrentSurface
+     * before the first build had published. The second call retired the first
+     * build, which had already taken the surface, so the second one's
+     * low-latency configure failed and it fell back to a slower config.
+     */
+    private var inFlightPipelineKey: VideoPipelineKey? = null
+
     /** Bounded wait for the Mac's codec selection on an AVC-only device. */
     @Volatile private var codecNegotiationJob: Job? = null
     private var displayConfigReceivedAtMs = 0L
@@ -1175,6 +1186,7 @@ class MainActivity : AppCompatActivity() {
     /** Release codec and post-process resources before replacing their surface. */
     private fun releaseVideoPipeline() {
         videoPipelineGeneration += 1L
+        inFlightPipelineKey = null
         codecNegotiationJob?.cancel()
         codecNegotiationJob = null
         videoDecoder?.release()
@@ -1317,10 +1329,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        releaseVideoPipeline()
-        decoderUsingTextureView = useTextureView
-
-        val generation = videoPipelineGeneration
         val request =
             VideoPipelineRequest(
                 surface = surface,
@@ -1349,6 +1357,16 @@ class MainActivity : AppCompatActivity() {
                 vsrEdgeThreshold = prefs.vsrEdgeThreshold,
                 wirelessSession = streamClient?.isWirelessSession == true,
             )
+        val key = request.key()
+        if (key == inFlightPipelineKey) {
+            mainDiag("initializeDecoder skipped — an identical decoder build is already running")
+            return
+        }
+
+        releaseVideoPipeline()
+        decoderUsingTextureView = useTextureView
+        val generation = videoPipelineGeneration
+        inFlightPipelineKey = key
 
         mainDiag(
             "initializeDecoder called, surface=$surface, valid=${request.surfaceIsValid}, " +
@@ -1365,6 +1383,7 @@ class MainActivity : AppCompatActivity() {
                     log("❌ Failed to initialize decoder: ${e.message}")
                     withContext(Dispatchers.Main) {
                         if (generation != videoPipelineGeneration) return@withContext
+                        inFlightPipelineKey = null
                         updateStatus("Video decoder failed: ${e.message}")
                     }
                     return@launch
@@ -1380,6 +1399,7 @@ class MainActivity : AppCompatActivity() {
                         mainDiag("Discarding stale decoder build (surface or connection changed)")
                         pipeline.release()
                     } else {
+                        inFlightPipelineKey = null
                         publishVideoPipeline(pipeline, request)
                     }
                     handedOver = true
@@ -1402,6 +1422,36 @@ class MainActivity : AppCompatActivity() {
         val mime: String,
         val useTextureView: Boolean,
         val gles31: Boolean,
+        val vsrEnabled: Boolean,
+        val vsrMode: String,
+        val cflStrength: Float,
+        val vsrSharpness: Float,
+        val vsrEdgeThreshold: Float,
+        val wirelessSession: Boolean,
+    ) {
+        fun key() =
+            VideoPipelineKey(
+                surface = surface,
+                width = width,
+                height = height,
+                mime = mime,
+                useTextureView = useTextureView,
+                vsrEnabled = vsrEnabled,
+                vsrMode = vsrMode,
+                cflStrength = cflStrength,
+                vsrSharpness = vsrSharpness,
+                vsrEdgeThreshold = vsrEdgeThreshold,
+                wirelessSession = wirelessSession,
+            )
+    }
+
+    /** What makes two builds interchangeable. Surface compares by identity. */
+    private data class VideoPipelineKey(
+        val surface: Surface,
+        val width: Int,
+        val height: Int,
+        val mime: String,
+        val useTextureView: Boolean,
         val vsrEnabled: Boolean,
         val vsrMode: String,
         val cflStrength: Float,
