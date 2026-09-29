@@ -8,11 +8,9 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <!-- Real panel backlight control (Settings.System.SCREEN_BRIGHTNESS).
-         Appop-granted via adb: appops set com.sidescreen.app WRITE_SETTINGS allow.
-         tools:ignore documents the intentional system-app lint hit: this
-         permission is intentionally declared so Settings.System.canWrite()
-         succeeds after the user (or an adb provisioning step) grants the
-         appop; lint's "system apps only" heuristic does not apply here. -->
+         This is a deliberate special-access capability. It is not expected to
+         be granted like a normal runtime permission; supported development
+         setups grant the corresponding app-op explicitly. -->
     <uses-permission
         android:name="android.permission.WRITE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
@@ -23,8 +21,8 @@
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
-        android:label="SideTab"
-        android:theme="@style/AppTheme.Api27Overlay"
+        android:label="@string/app_name"
+        android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
 
         <activity
