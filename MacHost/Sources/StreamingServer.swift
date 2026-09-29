@@ -1822,6 +1822,10 @@ class StreamingServer {
         // defaultMessage context: the header is incomplete and the existing
         // encoder Data completes it. batch() lets the stack coalesce both send
         // submissions while preserving the exact TCP byte stream.
+        // Category carries the stage; the frame's byte count is already reported
+        // by updateStats, so it is not repeated as a per-frame interval name.
+        let sendSignpost = FramePipelineSignpost.socketSend.beginInterval("send")
+        defer { FramePipelineSignpost.socketSend.endInterval("send", sendSignpost) }
         connection.batch {
             connection.send(
                 content: header,

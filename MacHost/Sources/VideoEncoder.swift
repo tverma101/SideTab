@@ -233,6 +233,12 @@ class VideoEncoder {
         let image = SendableImageBuffer(pixelBuffer)
         let outcome = sessionLock.withLock { handle -> EncodeOutcome in
             guard let session = handle?.session else { return .noSession }
+            // Measures the *submit* call, not the encode itself: the hardware
+            // media engine does the work asynchronously and reports through the
+            // output callback below. The gap between this interval and
+            // vtOutputCallback is the encoder's actual latency.
+            let encodeSignpost = FramePipelineSignpost.vtEncodeSubmit.beginInterval("submit")
+            defer { FramePipelineSignpost.vtEncodeSubmit.endInterval("submit", encodeSignpost) }
             let status = VTCompressionSessionEncodeFrame(
                 session,
                 imageBuffer: image.value,
@@ -599,6 +605,14 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
           let sampleBuffer = sampleBuffer else {
         return
     }
+
+    // The one stage in the whole pipeline with real managed byte work: this
+    // copies the already-compressed bitstream into the buffer that goes on the
+    // wire. Everything else on the host either hands off to a platform API or
+    // is already SIMD, so this is where any Swift-vs-C/Rust difference would
+    // actually show up if it exists at all.
+    let annexSignpost = FramePipelineSignpost.vtOutputCallback.beginInterval("annexb")
+    defer { FramePipelineSignpost.vtOutputCallback.endInterval("annexb", annexSignpost) }
 
     let timestamp = frameTimestampNanoseconds(sampleBuffer)
 
