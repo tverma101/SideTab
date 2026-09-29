@@ -54,3 +54,7 @@ jobs:
       - name: Build debug APK
         working-directory: AndroidClient
         run: ./gradlew --no-daemon assembleDebug --stacktrace
+
+      - name: Compile instrumentation APK
+        working-directory: AndroidClient
+        run: ./gradlew --no-daemon assembleDebugAndroidTest --stacktrace
