@@ -276,7 +276,23 @@ First-time setup still needs a screen once to grant Screen Recording permission;
 | Quality | Ultra Low, Low, Medium, High | Ultra Low |
 | HiDPI (Retina) | On/Off | Off |
 | Gaming Boost | On/Off (bounded low-latency profile) | Off |
-| Touch Input | On/Off | On |
+| Touch Input | On/Off (gates touch and S Pen together) | On |
+
+### Input source (tablet)
+
+Set on the tablet under **Settings → Input Source**, and applies live without
+reconnecting:
+
+| Mode | Finger | S Pen |
+|------|--------|-------|
+| Both | Controls Mac | Draws on Mac |
+| Touch | Controls Mac | Ignored |
+| Pen | Ignored | Draws on Mac |
+| Off | Ignored | Ignored |
+
+The Mac's own **Touch Control** setting still applies and overrides this, so if
+nothing responds, check the Mac first. Changing the mode mid-gesture ends the
+current drag rather than leaving a stuck mouse button on the Mac.
 
 ---
 
