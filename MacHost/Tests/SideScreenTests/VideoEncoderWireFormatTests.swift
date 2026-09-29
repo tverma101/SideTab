@@ -28,11 +28,12 @@ final class VideoEncoderWireFormatTests: XCTestCase {
     }
 
     func testWellFormedLengthPrefixedFrameBecomesAnnexB() {
-        let input = lengthPrefixed([[0x40, 0x01], [0x42, 0x02, 0x03], [0x26, 0x04]])
-        XCTAssertEqual(
-            Array(annexB(input)),
-            startCode + [0x40, 0x01] + startCode + [0x42, 0x02, 0x03] + startCode + [0x26, 0x04]
-        )
+        let nals: [[UInt8]] = [[0x40, 0x01], [0x42, 0x02, 0x03], [0x26, 0x04]]
+        let input = lengthPrefixed(nals)
+        // Built with flatMap: a six-term `+` chain of literals is too slow for
+        // the Swift 5.10 type checker on the CI toolchain.
+        let expected = nals.flatMap { startCode + $0 }
+        XCTAssertEqual(Array(annexB(input)), expected)
     }
 
     func testEmptyFrameProducesNothing() {
