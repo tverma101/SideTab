@@ -759,7 +759,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if settings.connectionMode == .wireless {
                 server.expectedAuthToken = WirelessAuth.loadOrCreate()
                 server.onWirelessClientPaired = { [weak self] deviceName in
-                    Task { @MainActor in
+                    Task { @MainActor [weak self] in
                         guard let self = self else { return }
                         self.currentWirelessDevice = deviceName
                         self.settings.currentWirelessDevice = deviceName
@@ -793,7 +793,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // for a pen stroke that handleStylus is still driving on the main
             // thread.
             server.onClientConnected = { [weak self, weak capture] in
-                Task { @MainActor in
+                Task { @MainActor [weak self, weak capture] in
                     // If the no-client idle policy paused capture, resume it at
                     // the connection boundary instead of waiting for the next
                     // monitor tick. The cached replay/keyframe then has a live
@@ -824,7 +824,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             server.onClientDisconnected = { [weak self] in
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     guard let self = self else { return }
                     // Stylus state is main-confined and this posts a mouse-up:
                     // a disconnect in the middle of an S Pen drag otherwise left
@@ -846,7 +846,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Hopped off StreamingServer's networkQueue — stop() drains its
                 // own queues with `sync` and must never be called from one of
                 // them, and tearDown reaches main-actor state.
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     guard let self = self else { return }
                     // markDisconnected() has already run and cleared
                     // clientConnected by the time this task lands, so gate on

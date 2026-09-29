@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="AppTheme" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+    <style name="AppThemeBase" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <item name="colorPrimary">@color/ss_accent</item>
         <item name="colorPrimaryVariant">@color/ss_accent_strong</item>
         <item name="colorOnPrimary">@color/ss_on_accent</item>
@@ -19,5 +19,5 @@
         <item name="android:windowLightStatusBar">false</item>
     </style>
 
-    <style name="AppTheme.Api27Overlay" />
+    <style name="AppTheme" parent="AppThemeBase" />
 </resources>
