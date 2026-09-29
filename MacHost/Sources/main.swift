@@ -1,7 +1,7 @@
 import Foundation
 import AppKit
 
-print("🚀 Side Screen starting...")
+print("🚀 SideTab starting...")
 
 // No args needed
 
@@ -15,9 +15,9 @@ let mainMenu = NSMenu()
 let appMenu = NSMenu()
 let appMenuItem = NSMenuItem()
 appMenuItem.submenu = appMenu
-appMenu.addItem(NSMenuItem(title: "About Side Screen", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
+appMenu.addItem(NSMenuItem(title: "About SideTab", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
 appMenu.addItem(NSMenuItem.separator())
-appMenu.addItem(NSMenuItem(title: "Quit Side Screen", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+appMenu.addItem(NSMenuItem(title: "Quit SideTab", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 mainMenu.addItem(appMenuItem)
 
 // Edit menu (for standard text editing shortcuts)

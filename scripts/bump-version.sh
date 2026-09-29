@@ -19,17 +19,19 @@ esac
 
 NEW_VERSION="$MAJOR.$MINOR.$PATCH"
 
-# Only update VERSION file - everything else reads from it:
-#   - build.gradle.kts reads ../VERSION at build time
-#   - build_mac.sh reads VERSION at build time
-#   - release.yml reads VERSION at build time
-#   - README badge auto-fetches from GitHub Release API
-#   - Website auto-fetches from GitHub Release API
+# VERSION is the canonical version input. Keep the static source plist in sync
+# for tools that inspect it outside the generated app bundle.
+PLIST_BUDDY="/usr/libexec/PlistBuddy"
+if [ ! -x "$PLIST_BUDDY" ]; then
+    echo "Error: macOS PlistBuddy is required to update MacHost/Info.plist" >&2
+    exit 1
+fi
+
+"$PLIST_BUDDY" -c "Set :CFBundleVersion $NEW_VERSION" "$ROOT_DIR/MacHost/Info.plist"
+"$PLIST_BUDDY" -c "Set :CFBundleShortVersionString $NEW_VERSION" "$ROOT_DIR/MacHost/Info.plist"
 echo "$NEW_VERSION" > "$VERSION_FILE"
 
 echo ""
 echo "  $CURRENT_VERSION -> $NEW_VERSION"
 echo ""
-echo "Next steps:"
-echo "  git add VERSION && git commit -m \"chore: bump version to $NEW_VERSION\""
-echo "  git tag $NEW_VERSION && git push && git push origin $NEW_VERSION"
+echo "Review CHANGELOG.md, then inspect the version metadata diff before building."

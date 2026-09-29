@@ -14,6 +14,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -43,7 +44,7 @@ import java.util.concurrent.atomic.AtomicLong
  * (max ~1 frame), mirroring the decoder's input-buffer backpressure.
  *
  * LIMITS: expects plain 8-bit-style YUV_420_888 planes; anything else fires
- * [onPlanesUnavailable] once so MainActivity can fall back to the direct
+ * [onUnavailable] once so MainActivity can fall back to the direct
  * surface path.
  */
 class CflRenderer {
@@ -57,16 +58,17 @@ class CflRenderer {
             String.format(Locale.US, "CfL %.0ffps P%.1fms drop%d", renderedFps, cpuAvgMs, dropped)
     }
 
-    var onStats: ((Stats) -> Unit)? = null
+    @Volatile var onStats: ((Stats) -> Unit)? = null
 
-    /** Fired once when plane access fails (e.g. 10-bit PRIVATE buffers). */
-    var onPlanesUnavailable: ((String) -> Unit)? = null
+    /** Fired once when the requested CfL render path cannot be used. */
+    @Volatile var onUnavailable: ((String) -> Unit)? = null
 
     /** Color range of the decoded planes: true = full (8-bit SCK capture),
-     *  false = limited/video range (10-bit VideoRange capture). Wrong guess
-     *  = lifted blacks / washed colors. Updated from the decoder's
-     *  "color-range" MediaFormat value. */
-    @Volatile private var fullRange = true
+     *  false = limited/video range — the Mac's default capture format
+     *  (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange). Wrong guess = lifted
+     *  blacks / washed colors, so the default is the host default and the
+     *  decoder's "color-range" MediaFormat value corrects it. */
+    @Volatile private var fullRange = false
 
     fun setFullRange(full: Boolean) {
         DiagLog.log(TAG, "color range: ${if (full) "full" else "limited (video)"}")
@@ -107,13 +109,12 @@ class CflRenderer {
     private var texturesAllocated = false
 
     // --- frame source: decoder-fed images (ByteBuffer mode) ---
-    private var pendingImage: Image? = null
-    private var pendingConsumed: (() -> Unit)? = null
+    private data class PendingFrame(val image: Image, val consumed: () -> Unit)
+    private val pendingFrames = BlockingSingleSlot<PendingFrame>()
 
     // --- threading ---
     @Volatile private var running = false
-    private val frameLock = Object()
-    private var renderThread: Thread? = null
+    @Volatile private var renderThread: Thread? = null
 
     // --- stats ---
     private val procNanos = LongArray(120)
@@ -122,7 +123,7 @@ class CflRenderer {
     private var statWindowStart = 0L
     private var statWindowFrames = 0L
     private val droppedFrames = AtomicLong(0)
-    private var planesUnavailableSignalled = false
+    private val unavailableSignalled = AtomicBoolean(false)
 
     private val vertexBuffer: FloatBuffer =
         ByteBuffer.allocateDirect(4 * 4 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
@@ -151,7 +152,21 @@ class CflRenderer {
         if (streamW <= 0 || streamH <= 0) {
             throw IllegalStateException("CflRenderer: invalid stream size ${streamW}x$streamH")
         }
+        try {
+            initializeGl(targetSurface, streamW, streamH)
+        } catch (failure: Throwable) {
+            running = false
+            pendingFrames.close(::finishFrame)
+            destroyGlResources()
+            throw failure
+        }
+    }
 
+    private fun initializeGl(
+        targetSurface: Surface,
+        streamW: Int,
+        streamH: Int,
+    ) {
         eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         if (eglDisplay == EGL14.EGL_NO_DISPLAY) throw IllegalStateException("eglGetDisplay failed")
         val version = IntArray(2)
@@ -219,86 +234,82 @@ class CflRenderer {
         // not catchable. getFormat() is safe and gates the access.
         if (image.format != ImageFormat.YUV_420_888) {
             DiagLog.log(TAG, "image format 0x${Integer.toHexString(image.format)} — not plane-accessible")
-            signalPlanesUnavailable("image format 0x${Integer.toHexString(image.format)}")
-            onConsumed()
+            signalUnavailable("image format 0x${Integer.toHexString(image.format)}")
+            finishFrame(PendingFrame(image, onConsumed))
             return
         }
-        synchronized(frameLock) {
-            while (running && pendingImage != null) {
-                frameLock.wait()
-            }
-            if (!running) {
-                onConsumed()
-                return
-            }
-            pendingImage = image
-            pendingConsumed = onConsumed
-            frameLock.notify()
+        val frame = PendingFrame(image, onConsumed)
+        if (!pendingFrames.publish(frame) { running }) {
+            finishFrame(frame)
         }
     }
 
     // ===================== render loop =====================
 
     private fun renderLoop() {
-        if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
-            DiagLog.log(TAG, "render thread: eglMakeCurrent failed")
-            return
-        }
-        while (running) {
-            val image: Image?
-            val consumed: (() -> Unit)?
-            synchronized(frameLock) {
-                while (running && pendingImage == null) {
-                    frameLock.wait()
+        try {
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+                val reason = "render thread eglMakeCurrent failed: ${EGL14.eglGetError()}"
+                DiagLog.log(TAG, reason)
+                signalUnavailable(reason)
+                return
+            }
+            while (running) {
+                val frame = pendingFrames.take { running }
+                if (frame == null) {
+                    if (!running || Thread.currentThread().isInterrupted) break
+                    continue
                 }
-                image = pendingImage
-                consumed = pendingConsumed
-                pendingImage = null
-                pendingConsumed = null
-            }
-            if (image == null || !running) {
-                image?.close()
-                consumed?.invoke()
-                continue
-            }
-            val t0 = System.nanoTime()
-            try {
-                if (uploadPlanes(image)) {
-                    drawFrame()
+                if (!running) {
+                    finishFrame(frame)
+                    continue
                 }
-            } catch (e: Exception) {
-                DiagLog.log(TAG, "render error: ${e.message}")
-            } finally {
-                image.close()
-                consumed?.invoke()
-                // Wake a submitImage() blocked on backpressure.
-                synchronized(frameLock) { frameLock.notifyAll() }
+                val t0 = System.nanoTime()
+                try {
+                    if (uploadPlanes(frame.image)) drawFrame()
+                } catch (e: Exception) {
+                    val reason = "render error: ${e.message}"
+                    DiagLog.log(TAG, reason)
+                    signalUnavailable(reason)
+                    running = false
+                } finally {
+                    finishFrame(frame)
+                }
+                if (running) recordFrame(System.nanoTime() - t0)
             }
-            recordFrame(System.nanoTime() - t0)
+        } catch (e: Exception) {
+            val reason = "render loop failed: ${e.message}"
+            DiagLog.log(TAG, reason)
+            signalUnavailable(reason)
+        } finally {
+            running = false
+            pendingFrames.close(::finishFrame)
+            destroyGlResources()
+            if (renderThread === Thread.currentThread()) renderThread = null
         }
     }
 
-    /** Returns false (and fires onPlanesUnavailable once) when the buffer is
+    /** Returns false (and fires onUnavailable once) when the buffer is
      *  not plain 8-bit YUV_420_888. Callers must have verified
      *  image.format == YUV_420_888 first — .planes is fatal on PRIVATE. */
     private fun uploadPlanes(image: Image): Boolean {
         if (image.format != ImageFormat.YUV_420_888) {
-            signalPlanesUnavailable("format 0x${Integer.toHexString(image.format)}")
+            signalUnavailable("format 0x${Integer.toHexString(image.format)}")
             return false
         }
         val planes = image.planes
         if (planes.size < 3) {
-            signalPlanesUnavailable("planes=${planes.size}")
+            signalUnavailable("planes=${planes.size}")
             return false
         }
         val yP = planes[0]
         val uP = planes[1]
         if (yP.pixelStride != 1) {
-            signalPlanesUnavailable("y pixelStride=${yP.pixelStride}")
+            signalUnavailable("y pixelStride=${yP.pixelStride}")
             return false
         }
         if (uP.pixelStride != 1 && uP.pixelStride != 2) {
-            signalPlanesUnavailable("u pixelStride=${uP.pixelStride}")
+            signalUnavailable("u pixelStride=${uP.pixelStride}")
             return false
         }
 
@@ -318,6 +329,15 @@ class CflRenderer {
         GLES31.glTexSubImage2D(GLES31.GL_TEXTURE_2D, 0, 0, 0, w, h, GLES31.GL_RED, GLES31.GL_UNSIGNED_BYTE, yP.buffer)
 
         if (semiPlanar) {
+            // GL_UNPACK_ROW_LENGTH is in TEXELS, so a byte rowStride is only
+            // convertible when it is even. Image.Plane.getRowStride() promises
+            // only "> 0" — an odd stride truncated to texels addresses every row
+            // floor(stride/2)*n instead of stride*n and shears the chroma
+            // diagonally. Refuse the frame rather than upload wrong pixels.
+            if (uP.rowStride % 2 != 0) {
+                signalUnavailable("u rowStride=${uP.rowStride} is not a whole number of RG texels")
+                return false
+            }
             GLES31.glActiveTexture(GLES31.GL_TEXTURE1)
             GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, uvTex)
             GLES31.glPixelStorei(GLES31.GL_UNPACK_ROW_LENGTH, uP.rowStride / 2)
@@ -337,11 +357,11 @@ class CflRenderer {
         return true
     }
 
-    private fun signalPlanesUnavailable(reason: String) {
-        if (planesUnavailableSignalled) return
-        planesUnavailableSignalled = true
-        DiagLog.log(TAG, "planes unavailable ($reason) — CfL cannot run")
-        onPlanesUnavailable?.invoke(reason)
+    private fun signalUnavailable(reason: String) {
+        if (!unavailableSignalled.compareAndSet(false, true)) return
+        DiagLog.log(TAG, "CfL unavailable ($reason)")
+        runCatching { onUnavailable?.invoke(reason) }
+            .onFailure { DiagLog.log(TAG, "unavailable callback failed: ${it.message}") }
     }
 
     private fun allocateTextures(w: Int, h: Int, cw: Int, ch: Int, semiPlanar: Boolean) {
@@ -444,28 +464,87 @@ class CflRenderer {
 
     fun release() {
         running = false
-        synchronized(frameLock) {
-            pendingImage?.close()
-            pendingImage = null
-            pendingConsumed?.invoke()
-            pendingConsumed = null
-            frameLock.notifyAll()
+        pendingFrames.close(::finishFrame)
+        val thread = renderThread
+        when {
+            // initialize() threw before the render thread existed: no thread
+            // owns the context, so tear down here. destroyGlResources makes the
+            // context current first — without that every GL call from this
+            // thread is EGL_BAD_ACCESS and the program/textures leak.
+            thread == null -> destroyGlResources()
+
+            // Called from the render thread itself (render error path): joining
+            // would deadlock, and the loop's finally already destroys.
+            thread === Thread.currentThread() -> Unit
+
+            else -> {
+                var stopped = false
+                var waitedMs = 0L
+                for (budget in TEARDOWN_JOIN_BUDGETS_MS) {
+                    try {
+                        thread.join(budget)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                    waitedMs += budget
+                    if (!thread.isAlive) {
+                        stopped = true
+                        break
+                    }
+                }
+                if (stopped) {
+                    if (renderThread === thread) renderThread = null
+                } else {
+                    // The render thread is inside eglSwapBuffers. Its own finally
+                    // still runs destroyGlResources, so the display/context/
+                    // program are not leaked unless it never wakes at all.
+                    DiagLog.log(TAG, "render thread still stopping after ${waitedMs}ms; EGL cleanup remains on that thread")
+                }
+            }
         }
+        onStats = null
+        onUnavailable = null
+    }
+
+    private fun finishFrame(frame: PendingFrame) {
         try {
-            renderThread?.join(800)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
+            frame.image.close()
+        } catch (e: Exception) {
+            DiagLog.log(TAG, "image close failed: ${e.message}")
+        } finally {
+            try {
+                frame.consumed()
+            } catch (e: Exception) {
+                DiagLog.log(TAG, "decoded buffer release failed: ${e.message}")
+            }
         }
-        renderThread = null
+    }
+
+    /** Called by the render thread after it exits or by initialize() on failure. */
+    private fun destroyGlResources() {
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
-            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
-            if (program != 0) GLES31.glDeleteProgram(program)
-            val kill = intArrayOf(yTex, uvTex, uTex, vTex).filter { it != 0 }.toIntArray()
-            if (kill.isNotEmpty()) GLES31.glDeleteTextures(kill.size, kill, 0)
-            EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
-            if (eglSurface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(eglDisplay, eglSurface)
-            if (eglContext != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(eglDisplay, eglContext)
-            EGL14.eglTerminate(eglDisplay)
+            val contextCurrent =
+                eglContext != EGL14.EGL_NO_CONTEXT && eglSurface != EGL14.EGL_NO_SURFACE &&
+                    runCatching { EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext) }
+                        .getOrDefault(false)
+            if (contextCurrent) {
+                if (program != 0) runCatching { GLES31.glDeleteProgram(program) }
+                val kill = intArrayOf(yTex, uvTex, uTex, vTex).filter { it != 0 }.toIntArray()
+                if (kill.isNotEmpty()) runCatching { GLES31.glDeleteTextures(kill.size, kill, 0) }
+                runCatching {
+                    EGL14.eglMakeCurrent(
+                        eglDisplay,
+                        EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_CONTEXT,
+                    )
+                }
+            }
+            if (eglSurface != EGL14.EGL_NO_SURFACE) runCatching { EGL14.eglDestroySurface(eglDisplay, eglSurface) }
+            if (eglContext != EGL14.EGL_NO_CONTEXT) runCatching { EGL14.eglDestroyContext(eglDisplay, eglContext) }
+            runCatching { EGL14.eglReleaseThread() }
+            runCatching { EGL14.eglTerminate(eglDisplay) }
         }
         eglDisplay = EGL14.EGL_NO_DISPLAY
         eglContext = EGL14.EGL_NO_CONTEXT
@@ -502,7 +581,9 @@ class CflRenderer {
      * and luma over the four bilinear chroma taps, clamped to [-1, 1].
      * Co-sited (type-0) chroma assumed — chroma texel (cx,cy) represents
      * luma (2cx,2cy) — matching the hardware compositor's assumption.
-     * Output matrix: BT.709 full-range (matches the SCK 420f capture).
+     * Output matrix: BT.709, in full range for an 8-bit SCK 420f capture and
+     * studio-swing expanded first for a limited/video-range stream (uFullRange
+     * selects the branch).
      */
     private val fragmentShader =
         """
@@ -578,15 +659,19 @@ class CflRenderer {
                            Y - 0.1873 * Cb - 0.4681 * Cr,
                            Y + 1.8556 * Cb);
             } else {
-                // BT.709 limited range (10-bit VideoRange capture path):
-                // expand studio-swing then convert — reading limited as
-                // full lifts the blacks (the "washed colors" bug).
-                float y = (Y - 16.0 / 255.0) * (255.0 / 219.0);
+                // BT.709 limited range (studio swing — the Mac's default
+                // capture): expand to full swing, then convert. Reading
+                // limited as full lifts the blacks (the "washed colors" bug).
+                // `yExpanded` ALREADY carries the whole 255/219 = 1.16438 luma
+                // gain, so the matrix must use it unscaled: multiplying again
+                // gives 1.35578, renders mid grey at 0.596 instead of 0.511 and
+                // hard-clips everything above Y≈180 to white.
+                float yExpanded = (Y - 16.0 / 255.0) * (255.0 / 219.0);
                 float cb = (C.x - 16.0 / 255.0) * (255.0 / 224.0) - 0.5;
                 float cr = (C.y - 16.0 / 255.0) * (255.0 / 224.0) - 0.5;
-                rgb = vec3(1.16438 * y + 1.59603 * cr,
-                           1.16438 * y - 0.39176 * cb - 0.81297 * cr,
-                           1.16438 * y + 2.01723 * cb);
+                rgb = vec3(yExpanded + 1.59603 * cr,
+                           yExpanded - 0.39176 * cb - 0.81297 * cr,
+                           yExpanded + 2.01723 * cb);
             }
             fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
         }
@@ -632,5 +717,9 @@ class CflRenderer {
 
     private companion object {
         const val TAG = "CfL"
+
+        /** eglSwapBuffers can block past a single vsync, so escalate instead of
+         *  giving up after a single short join. */
+        val TEARDOWN_JOIN_BUDGETS_MS = longArrayOf(150, 350)
     }
 }

@@ -2,21 +2,33 @@ import Foundation
 import ServiceManagement
 import os.log
 
-@available(macOS 13.0, *)
 class DaemonManager {
     static let shared = DaemonManager()
-    
+
     private var appService: SMAppService {
         return SMAppService.mainApp
     }
     
+    /// A registered login item from our point of view.
+    ///
+    /// SMAppService.Status.requiresApproval is documented as "the service has
+    /// been successfully registered, but the user needs to take action in
+    /// System Settings", and it is also what the framework reports after the
+    /// user revokes consent. Reading only .enabled therefore reported "off" for
+    /// a live login item: the settings toggle snapped back, register() was
+    /// repeated on every launch, and applicationDidFinishLaunching popped the
+    /// settings window on every single login.
+    static func isRegistered(status: SMAppService.Status) -> Bool {
+        return status == .enabled || status == .requiresApproval
+    }
+
     var isEnabled: Bool {
-        return appService.status == .enabled
+        return Self.isRegistered(status: appService.status)
     }
     
     func enable() throws {
         let service = appService
-        guard service.status != .enabled else { return }
+        guard !Self.isRegistered(status: service.status) else { return }
         
         do {
             try service.register()

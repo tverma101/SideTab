@@ -2,22 +2,21 @@ package com.sidescreen.app
 
 import kotlin.math.abs
 
-/** Pure refresh-rate policy so odd panel mode tables can be tested without Android hardware. */
+/**
+ * Pure refresh-rate helpers so odd panel mode tables can be tested without
+ * Android hardware. [PowerPolicy] decides *which* rate SideTab asks for; this
+ * only maps that request onto what a given panel can accept.
+ */
 internal object DisplayRefreshPolicy {
+    /** The highest rate the host streams at, and the decoder's provisioning target. */
     const val STREAM_INTENT_HZ = 120f
 
     /**
-     * Android 14+ accepts the app's intended frame rate even when it is not an
-     * exact advertised display mode. Tell the scheduler SideScreen intends to
-     * produce up to 120 FPS and let Android choose the compatible panel mode.
-     */
-    fun modernPreferredRate(): Float = STREAM_INTENT_HZ
-
-    /**
      * Before API 34, WindowManager.LayoutParams.preferredRefreshRate must equal
-     * an advertised refresh rate. Choose the same-resolution mode closest to
-     * SideScreen's 120-FPS intent. On an equal-distance tie prefer the higher
-     * rate so presentation is not unnecessarily capped below the stream rate.
+     * an advertised refresh rate (Android 14+ accepts any intended rate).
+     * Choose the same-resolution mode closest to the intended rate. On an
+     * equal-distance tie prefer the higher rate so presentation is not
+     * unnecessarily capped below the stream rate.
      *
      * Examples:
      *   60/90/120/144 -> 120

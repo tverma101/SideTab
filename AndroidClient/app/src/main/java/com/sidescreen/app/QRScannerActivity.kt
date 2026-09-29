@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.util.Log
 import android.widget.Button
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
@@ -18,16 +19,28 @@ import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
+@OptIn(markerClass = [ExperimentalGetImage::class])
 class QRScannerActivity : AppCompatActivity() {
-    private val scanner by lazy {
-        BarcodeScanning.getClient(
-            BarcodeScannerOptions.Builder()
-                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-                .build(),
-        )
-    }
-    private var alreadyDelivered = false
+    private val scannerDelegate =
+        lazy {
+            BarcodeScanning.getClient(
+                BarcodeScannerOptions.Builder()
+                    .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                    .build(),
+            )
+        }
+    private val scanner by scannerDelegate
+    private val analyzerExecutor =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "SideScreenQrAnalyzer").apply { isDaemon = true }
+        }
+    private val alreadyDelivered = AtomicBoolean(false)
+
+    // Touched only from main-executor callbacks, so it needs no synchronization.
+    private var lastRejectedQr: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -40,6 +53,7 @@ class QRScannerActivity : AppCompatActivity() {
         val previewView = findViewById<PreviewView>(R.id.preview)
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
+            if (isFinishing || isDestroyed) return@addListener
             try {
                 val provider = providerFuture.get()
                 val preview =
@@ -50,7 +64,9 @@ class QRScannerActivity : AppCompatActivity() {
                     ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build()
-                analyzer.setAnalyzer(ContextCompat.getMainExecutor(this), this::analyze)
+                // Camera/ML analysis is not UI work. Keep it off the main thread so
+                // pairing cannot compete with lifecycle and rendering callbacks.
+                analyzer.setAnalyzer(analyzerExecutor, this::analyze)
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analyzer)
             } catch (e: Exception) {
@@ -61,33 +77,55 @@ class QRScannerActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @ExperimentalGetImage
     private fun analyze(proxy: ImageProxy) {
         val mediaImage = proxy.image
-        if (mediaImage == null || alreadyDelivered) {
+        if (mediaImage == null || alreadyDelivered.get()) {
             proxy.close()
             return
         }
-        val input = InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees)
-        scanner.process(input)
-            .addOnSuccessListener { barcodes ->
+
+        val mainExecutor = ContextCompat.getMainExecutor(this)
+        val scanTask =
+            try {
+                scanner.process(InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees))
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not start ML Kit scan", e)
+                proxy.close()
+                return
+            }
+        scanTask
+            .addOnSuccessListener(mainExecutor) { barcodes ->
+                if (isFinishing || isDestroyed) return@addOnSuccessListener
                 val raw = barcodes.firstOrNull { it.rawValue?.startsWith("sidescreen://") == true }?.rawValue
-                if (raw != null && !alreadyDelivered) {
-                    alreadyDelivered = true
+                if (raw != null && alreadyDelivered.compareAndSet(false, true)) {
                     val parsed = PairingURL.parse(raw)
                     if (parsed == null) {
-                        Toast.makeText(this, "Invalid QR, expected SideScreen pairing code", Toast.LENGTH_SHORT).show()
-                        alreadyDelivered = false
+                        if (lastRejectedQr != raw) {
+                            lastRejectedQr = raw
+                            Toast.makeText(this, "Invalid QR, expected SideTab pairing code", Toast.LENGTH_SHORT).show()
+                        }
+                        alreadyDelivered.set(false)
                     } else {
                         setResult(RESULT_OK, Intent().putExtra(EXTRA_URL, raw))
                         finish()
                     }
                 }
             }
-            .addOnFailureListener { e ->
-                Log.e(TAG, "ML Kit scan error", e)
+            .addOnFailureListener(mainExecutor) { e ->
+                if (!isDestroyed) {
+                    Log.e(TAG, "ML Kit scan error", e)
+                }
             }
             .addOnCompleteListener { proxy.close() }
+    }
+
+    override fun onDestroy() {
+        analyzerExecutor.shutdownNow()
+        if (scannerDelegate.isInitialized()) {
+            runCatching { scanner.close() }
+                .onFailure { Log.w(TAG, "ML Kit scanner close failed", it) }
+        }
+        super.onDestroy()
     }
 
     private fun finishCanceled() {

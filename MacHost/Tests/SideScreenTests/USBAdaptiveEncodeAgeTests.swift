@@ -11,7 +11,10 @@ final class USBAdaptiveEncodeAgeTests: XCTestCase {
         controller.observeEncodedFrameAge(ageNs: 30 * ms, nowNs: 100 * ms)
 
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 100 * ms), 120)
-        XCTAssertEqual(controller.snapshotForTest().mildPressureStrikes, 1)
+        // Host encode pressure keeps its own streak; it must not spend a
+        // transport strike (e3dacc1 separated the two).
+        XCTAssertEqual(controller.snapshotForTest().encodeAgeStrikes, 1)
+        XCTAssertEqual(controller.snapshotForTest().mildPressureStrikes, 0)
     }
 
     func testTwoOverBudgetEncodeAgesDownshift120To90() {
@@ -32,7 +35,7 @@ final class USBAdaptiveEncodeAgeTests: XCTestCase {
         controller.observeEncodedFrameAge(ageNs: 24 * ms, nowNs: 110 * ms)
 
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 110 * ms), 120)
-        XCTAssertEqual(controller.snapshotForTest().mildPressureStrikes, 0)
+        XCTAssertEqual(controller.snapshotForTest().encodeAgeStrikes, 0)
     }
 
     func testNinetyTierUsesThreeFrameIntervalsAsThreshold() {
@@ -63,7 +66,7 @@ final class USBAdaptiveEncodeAgeTests: XCTestCase {
         controller.observeEncodedFrameAge(ageNs: 100 * ms, nowNs: 200 * ms)
 
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 200 * ms), 120)
-        XCTAssertEqual(controller.snapshotForTest().mildPressureStrikes, 0)
+        XCTAssertEqual(controller.snapshotForTest().encodeAgeStrikes, 0)
 
         // Once the 250ms recovery grace expires, the same host-side slippage
         // becomes real pressure again.
@@ -80,6 +83,6 @@ final class USBAdaptiveEncodeAgeTests: XCTestCase {
         controller.observeEncodedFrameAge(ageNs: 500 * ms, nowNs: 200 * ms)
 
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 60, nowNs: 200 * ms), 60)
-        XCTAssertEqual(controller.snapshotForTest().mildPressureStrikes, 0)
+        XCTAssertEqual(controller.snapshotForTest().encodeAgeStrikes, 0)
     }
 }

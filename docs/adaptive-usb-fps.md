@@ -1,12 +1,22 @@
 # Adaptive USB FPS
 
-Branch/PR experiment for high-refresh wired SideScreen sessions.
+Branch/PR experiment for high-refresh wired SideTab sessions.
+
+## Integration notes (2026-09-29)
+
+This work was written against an older `main` and merged onto the SideTab consolidation stack, which had independently changed three of the areas it touches. Where the two disagreed, the stack's behaviour was kept and this design was fitted around it:
+
+- **Clean frames.** The stack's `CaptureDirtyRectGate` (formerly `WirelessDirtyRectGate`) already drops every frame ScreenCaptureKit reports as unchanged, on *both* transports, and the frame sender has its own keepalive. So the static-content tiers below (60/30/1 FPS) and the 1 FPS deep-idle keepalive are not in effect. `USBAdaptiveFramePacer` runs *after* that gate on USB and only paces changed frames through the motion ladder. The wake-from-idle punch-through still works, because the pacer measures idle time from changed frames only.
+- **Android refresh rate.** `PowerPolicy` owns the panel request, because it is newer and power-aware: 120 Hz only on external power, 60 Hz on battery, seamless 60 Hz on wireless, cleared when idle. `SideScreenApplication`, which asked for 120 Hz unconditionally, was removed so the two would not fight over the same surface. `DisplayRefreshPolicy.chooseLegacyPreferredRate` now snaps the power policy's window request to an advertised mode below API 34, and `preferMinimalPostProcessing` is set by `MainActivity`.
+- **Decoder.** The stack's hardened `VideoDecoder` and cached `CodecCapabilities` inventory were kept. This branch's 120-FPS provisioning (USB only; wireless stays 60), the operating-rate-without-low-latency configure attempt, and the performance-point ranking were ported onto them.
 
 ## Goal
 
 Keep the capture source hot at up to 120 Hz for immediate interaction response, while adapting the expensive encode/send/decode cadence to actual content, host encode pressure, sender pressure, downstream recovery behavior, and the Android decoder's published capabilities.
 
 ## Static-content policy
+
+> Superseded on integration by the stack's all-transport dirty-rect gate; see the notes at the top.
 
 ScreenCaptureKit dirty-rect metadata is used before VideoToolbox:
 
@@ -104,6 +114,8 @@ A one-second USB keyframe-duration limit conflicts with 1-FPS deep idle: it can 
 This is isolated in `EncoderGOPPolicy` with deterministic tests.
 
 ## Android display policy
+
+> Superseded on integration: see the notes at the top. The original design is kept below for reference.
 
 SideScreen expresses a 120-FPS display intent when MainActivity starts and requests minimal post-processing on Android 11+.
 

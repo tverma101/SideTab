@@ -1,0 +1,25 @@
+Side Screen local validation package
+version=0.11.2
+source_commit=8cc49e8eda25
+source_branch=fix/android-apk-hardening
+source_tree=dirty
+built_utc=2026-09-24T15:54:15Z
+
+[android]
+file=SideScreen-0.11.2-android-debug.apk
+variant=debug
+application_id=com.sidescreen.app
+version_code=1102
+version_name=0.11.2
+sha256=088caa36d6b656cb83d006bd1a3058277a3d5eb7837558693fbeea5ec342778d
+
+[macos]
+file=SideScreen-0.11.2-mac-universal.dmg
+bundle_id=com.sidescreen.app
+version=0.11.2
+architectures=x86_64 arm64
+sha256=80e499a29a8b58bde30170581bdc7ae9fbc5604072866ad1c8083087c2f148e9
+validation=hdiutil verify; codesign and architecture validation passed
+
+The Mac installer is the DMG above. The Android source APK is
+AndroidClient/app/build/outputs/apk/debug/app-debug.apk.

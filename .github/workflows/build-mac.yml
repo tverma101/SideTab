@@ -21,6 +21,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Verify repository version metadata
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' MacHost/Info.plist)"
+          short_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' MacHost/Info.plist)"
+
+          test "$bundle_version" = "$version" || {
+            echo "CFBundleVersion ($bundle_version) does not match VERSION ($version)" >&2
+            exit 1
+          }
+          test "$short_version" = "$version" || {
+            echo "CFBundleShortVersionString ($short_version) does not match VERSION ($version)" >&2
+            exit 1
+          }
+
       - name: Swift unit tests
         working-directory: MacHost
         run: swift test
