@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="AppTheme" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+    <style name="AppThemeBase" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <item name="colorPrimary">@color/ss_accent</item>
         <item name="colorPrimaryVariant">@color/ss_accent_strong</item>
         <item name="colorOnPrimary">@color/ss_on_accent</item>
@@ -16,8 +16,8 @@
         <item name="android:windowBackground">@color/ss_background</item>
         <item name="android:statusBarColor">@color/ss_background</item>
         <item name="android:navigationBarColor">@color/ss_background</item>
-        <item name="android:navigationBarDividerColor">@color/ss_background</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:windowLightNavigationBar">false</item>
     </style>
+
+    <style name="AppTheme" parent="AppThemeBase" />
 </resources>

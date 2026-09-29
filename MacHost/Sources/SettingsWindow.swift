@@ -104,7 +104,7 @@ struct SettingsView: View {
                     .onHover { headerHovered = $0 }
 
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Side Screen")
+                        Text("SideTab")
                             .font(.system(size: 20, weight: .bold, design: .rounded))
                         Text("Turn your tablet into a second display")
                             .font(.system(size: 12, weight: .medium))
@@ -128,7 +128,7 @@ struct SettingsView: View {
                         Button("Cancel", role: .cancel) { }
                         Button("Reset", role: .destructive) {
                             settings.resetToDefaults()
-                            if let window = NSApp.windows.first(where: { $0.title == "Side Screen" }) {
+                            if let window = NSApp.windows.first(where: { $0.title == "SideTab" }) {
                                 window.center()
                             }
                         }
@@ -419,7 +419,7 @@ struct SettingsView: View {
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text("Launch at Login")
                                                 .font(.system(size: 12, weight: .medium))
-                                            Text("Run SideScreen in the background automatically after you log in.")
+                                            Text("Run SideTab in the background automatically after you log in.")
                                                 .font(.system(size: 10))
                                                 .foregroundColor(.secondary)
                                         }
@@ -645,7 +645,7 @@ struct SettingsView: View {
                                 if settings.isRunning {
                                     StatusRow(title: "Capture Method",
                                               status: settings.captureMethod,
-                                              color: settings.captureMethod.contains("fallback") ? .orange : .green,
+                                              color: captureMethodColor(settings.captureMethod),
                                               hint: "Which macOS API is currently capturing the virtual display. SCStream is the modern path; CGDisplayStream fallback activates if SCStream fails (e.g. on certain virtual display configs).")
                                 }
 
@@ -655,7 +655,7 @@ struct SettingsView: View {
                                     StatusRow(title: "ADB installed",
                                               status: settings.adbInstalled ? "Installed" : "Missing",
                                               color: settings.adbInstalled ? .green : .red,
-                                              hint: "USB mode tunnels the TCP stream through the cable using `adb reverse`. Requires the `adb` command on the Mac. Searched paths: Homebrew, /usr/local/bin, ~/Library/Android/sdk/platform-tools, and PATH (`which adb`).")
+                                              hint: "USB mode tunnels the TCP stream through the cable using `adb reverse`. The Android SDK platform-tools copy is preferred, then Homebrew, /usr/local/bin, and PATH.")
                                     if !settings.adbInstalled {
                                         Text("brew install android-platform-tools")
                                             .font(.system(size: 10, design: .monospaced))
@@ -670,18 +670,18 @@ struct SettingsView: View {
                                               color: settings.adbReverseConfigured ? .green : .orange,
                                               hint: "Whether `adb reverse tcp:\(settings.port) tcp:\(settings.port)` is currently configured. The Mac app sets this up automatically when you click Start. Goes green within ~2 seconds after the tablet is plugged in and authorized.")
                                     StatusRow(title: "USB device",
-                                              status: settings.usbDeviceConnected ? "Detected" : "Not detected",
-                                              color: settings.usbDeviceConnected ? .green : .red,
-                                              hint: "An Android device authorized for ADB and visible to your Mac. Plug in via USB-C and tap Allow on the device's USB debugging prompt.")
+                                              status: settings.usbDeviceStatus.label,
+                                              color: settings.usbDeviceStatus.isConnected ? .green : (settings.usbDeviceStatus.needsAction ? .orange : .red),
+                                              hint: settings.usbDeviceStatus.hint)
                                 } else {
                                     StatusRow(title: "WiFi",
                                               status: settings.wifiConnected ? "Connected" : "Disconnected",
                                               color: settings.wifiConnected ? .green : .red,
-                                              hint: "Whether the Mac currently has a working internet route. Wireless mode requires the Mac to be on a WiFi (or Ethernet) network — the same network the tablet is on.")
+                                              hint: "Whether the Mac has an active local-network address. This does not prove that the access point allows peer-to-peer TCP or Bonjour; wireless mode still requires the tablet to reach the listening address.")
                                     StatusRow(title: "Listening on",
-                                              status: settings.listeningAddress.map { "\($0):\(settings.port)" } ?? "—",
+                                              status: settings.listeningAddress.map { LANAddressResolver.endpoint(host: $0, port: settings.port) } ?? "—",
                                               color: settings.listeningAddress != nil ? .green : .secondary,
-                                              hint: "The LAN address the tablet must reach. The QR code embeds this exact host:port — if it changes (e.g. you switch WiFi), re-scan the new QR on the tablet.")
+                                              hint: "The QR includes the preferred local address plus compatible fallbacks. If the Mac changes networks, refresh the QR before pairing a new tablet.")
                                 }
 
                                 if !settings.hasScreenRecordingPermission {
@@ -868,7 +868,7 @@ struct SettingsView: View {
                                 }
                         }
                         .buttonStyle(.plain)
-                        .help("Quit Side Screen (⌘Q)")
+                        .help("Quit SideTab (⌘Q)")
                     }
                     .padding(.horizontal, 20)
                     .padding(.vertical, 14)
@@ -877,6 +877,16 @@ struct SettingsView: View {
             }
         }
         .frame(width: 480, height: 780)
+    }
+
+    /// Only two capture methods are ever reported: "SCStream" and
+    /// "CGDisplayStream (fallback)". Anything else — the initial
+    /// "Initializing…", or a method a future build adds — is an unknown state
+    /// and must not be drawn in the success colour.
+    private func captureMethodColor(_ method: String) -> Color {
+        if method.contains("fallback") { return .orange }
+        if method.contains("SCStream") { return .green }
+        return .secondary
     }
 
     /// Restart the app by launching a new instance and terminating current one
@@ -1035,17 +1045,39 @@ class DisplaySettings: ObservableObject {
     private let defaults = UserDefaults.standard
     private let keyPrefix = "SideScreen_"
 
+    // Defaults, in one place. The refresh rate is 60 because that is balanced for
+    // most tablets; 120 may saturate high-res panel pipelines, so it is a
+    // deliberate choice rather than "the highest FPS available".
+    static let defaultPort: UInt16 = 54321  // was 8888 in <=0.7.1; 8888 collides with jupyter/splunk/HP printers
+    static let defaultRefreshRate = 60
+    static let defaultBitrate = 1000
+    static let defaultQuality = "ultralow"  // fastest encoding
+
+    /// The domain the settings panel can actually represent. Persisted values are
+    /// user-writable through `defaults`, so anything outside these is a state
+    /// the backend has no handling for: a bound value outside its own control's
+    /// domain, a rotation with no matching button, or a value the encoder clamps
+    /// differently from the label above it.
+    static let portRange: ClosedRange<UInt16> = 1...UInt16.max
+    static let bitrateRange: ClosedRange<Int> = 20...5000
+    static let refreshRateChoices = [30, 60, 90, 120]
+    static let rotationChoices = [0, 90, 180, 270]
+
     @Published var resolution: String {
         didSet { save("resolution", resolution) }
     }
     @Published var refreshRate: Int {
-        didSet { save("refreshRate", refreshRate) }
+        didSet {
+            normalised("refreshRate", refreshRate, Self.sanitizedRefreshRate(refreshRate)) { refreshRate = $0 }
+        }
     }
     @Published var hiDPI: Bool {
         didSet { save("hiDPI", hiDPI) }
     }
     @Published var bitrate: Int {
-        didSet { save("bitrate", bitrate) }
+        didSet {
+            normalised("bitrate", bitrate, Self.sanitizedBitrate(bitrate)) { bitrate = $0 }
+        }
     }
     @Published var quality: String {
         didSet { save("quality", quality) }
@@ -1054,16 +1086,28 @@ class DisplaySettings: ObservableObject {
         didSet { save("gamingBoost", gamingBoost) }
     }
     @Published var port: UInt16 {
-        didSet { save("port", Int(port)) }
+        didSet {
+            let current = Int(port)
+            normalised("port", current, Int(Self.sanitizedPort(current))) { port = UInt16($0) }
+        }
     }
     @Published var rotation: Int {
-        didSet { save("rotation", rotation) }
+        didSet {
+            normalised("rotation", rotation, Self.sanitizedRotation(rotation)) { rotation = $0 }
+            syncTransform()
+        }
     }
     @Published var flipHorizontal: Bool {
-        didSet { save("flipHorizontal", flipHorizontal) }
+        didSet {
+            save("flipHorizontal", flipHorizontal)
+            syncTransform()
+        }
     }
     @Published var flipVertical: Bool {
-        didSet { save("flipVertical", flipVertical) }
+        didSet {
+            save("flipVertical", flipVertical)
+            syncTransform()
+        }
     }
     @Published var touchEnabled: Bool {
         didSet { save("touchEnabled", touchEnabled) }
@@ -1089,6 +1133,7 @@ class DisplaySettings: ObservableObject {
     @Published var adbInstalled = false
     @Published var adbReverseConfigured = false
     @Published var usbDeviceConnected = false
+    @Published var usbDeviceStatus: ADBUSBDeviceStatus = .notDetected
     @Published var wifiConnected = false
     @Published var listeningAddress: String?
     @Published var isRunning = false
@@ -1106,15 +1151,19 @@ class DisplaySettings: ObservableObject {
         // profile fixed at 1400×876 HiDPI so stale or accidental preferences
         // cannot create a mismatched virtual display.
         self.resolution = Self.fixedResolution
-        self.refreshRate = defaults.object(forKey: keyPrefix + "refreshRate") as? Int ?? 60  // Default: 60 — balanced for most tablets. 120 may saturate high-res panel pipelines.
+        self.refreshRate = Self.sanitizedRefreshRate(
+            defaults.object(forKey: keyPrefix + "refreshRate") as? Int ?? Self.defaultRefreshRate
+        )
         self.hiDPI = true
-        self.bitrate = defaults.object(forKey: keyPrefix + "bitrate") as? Int ?? 1000  // Default: 1000 Mbps
-        self.quality = defaults.string(forKey: keyPrefix + "quality") ?? "ultralow"  // Default: fastest encoding
+        self.bitrate = Self.sanitizedBitrate(
+            defaults.object(forKey: keyPrefix + "bitrate") as? Int ?? Self.defaultBitrate
+        )
+        self.quality = defaults.string(forKey: keyPrefix + "quality") ?? Self.defaultQuality
         self.gamingBoost = defaults.bool(forKey: keyPrefix + "gamingBoost")
-        // Default port 54321 (was 8888 in <=0.7.1; 8888 collides with jupyter/splunk/HP printers).
-        // Existing users keep their saved value.
-        self.port = UInt16(defaults.object(forKey: keyPrefix + "port") as? Int ?? 54321)
-        self.rotation = defaults.object(forKey: keyPrefix + "rotation") as? Int ?? 0
+        self.port = Self.sanitizedPort(
+            defaults.object(forKey: keyPrefix + "port") as? Int ?? Int(Self.defaultPort)
+        )
+        self.rotation = Self.sanitizedRotation(defaults.object(forKey: keyPrefix + "rotation") as? Int ?? 0)
         self.flipHorizontal = defaults.bool(forKey: keyPrefix + "flipHorizontal")
         self.flipVertical = defaults.bool(forKey: keyPrefix + "flipVertical")
         self.touchEnabled = defaults.object(forKey: keyPrefix + "touchEnabled") as? Bool ?? true
@@ -1126,11 +1175,82 @@ class DisplaySettings: ObservableObject {
 
         defaults.set(Self.fixedResolution, forKey: keyPrefix + "resolution")
         defaults.set(true, forKey: keyPrefix + "hiDPI")
+        syncTransform()
         print("Loaded fixed settings: \(resolution) @ \(refreshRate)Hz HiDPI, bitrate=\(bitrate), quality=\(quality)")
+    }
+
+    /// A corrupt or hand-edited plist must never produce a value the UI cannot
+    /// render, and must never trap. `UInt16.init(_: Int)` is the *checked*
+    /// conversion and SIGTRAPs above 65535, and this init runs on the main
+    /// thread while AppDelegate's properties are still being set up — before any
+    /// window, menu bar item, or error can be shown.
+    static func sanitizedPort(_ raw: Int) -> UInt16 {
+        UInt16(clamping: min(max(raw, Int(portRange.lowerBound)), Int(portRange.upperBound)))
+    }
+
+    static func sanitizedBitrate(_ raw: Int) -> Int {
+        min(max(raw, bitrateRange.lowerBound), bitrateRange.upperBound)
+    }
+
+    /// Snapped to a rate the panel offers. A rate in between would show nothing
+    /// selected, which reads as a broken control rather than a stored preference.
+    static func sanitizedRefreshRate(_ raw: Int) -> Int {
+        nearestChoice(raw, to: refreshRateChoices)
+    }
+
+    /// Snapped to a rotation the tablet's transform message understands, using
+    /// circular distance: 359° is one degree from 0°, not 89 degrees from 270°.
+    static func sanitizedRotation(_ raw: Int) -> Int {
+        guard let choice = rotationChoices.min(by: { circularDistance($0, raw) < circularDistance($1, raw) }) else {
+            return rotationChoices[0]
+        }
+        return choice
+    }
+
+    private static func circularDistance(_ lhs: Int, _ rhs: Int) -> Int {
+        let delta = (((lhs - rhs) % 360) + 360) % 360
+        return min(delta, 360 - delta)
+    }
+
+    private static func nearestChoice(_ raw: Int, to choices: [Int]) -> Int {
+        choices.min { lhs, rhs in
+            let lhsDelta = abs(lhs - raw)
+            let rhsDelta = abs(rhs - raw)
+            return lhsDelta == rhsDelta ? lhs < rhs : lhsDelta < rhsDelta
+        } ?? choices[0]
+    }
+
+    /// Rotation and flips for readers that cannot be on the main thread.
+    /// `@Published` storage is a plain `var`, so three separate reads can pair a
+    /// new rotation with a stale flip — or race the write outright.
+    var transformSnapshot: DisplayTransformStore.Transform {
+        transformStore.snapshot
+    }
+
+    private let transformStore = DisplayTransformStore()
+
+    private func syncTransform() {
+        transformStore.update(rotation: rotation, flipHorizontal: flipHorizontal, flipVertical: flipVertical)
     }
 
     private func save(_ key: String, _ value: Any) {
         defaults.set(value, forKey: keyPrefix + key)
+    }
+
+    /// Latch for the write-back below. Unlike a plain stored property, a
+    /// `@Published` one that assigns to itself inside its own `didSet` runs the
+    /// observer again, and each pass makes it worse rather than converging — the
+    /// recursion never bottoms out. The inner pass must only apply the value.
+    private var isNormalising = false
+
+    private func normalised<T: Equatable>(_ key: String, _ value: T, _ sanitised: T, assign: (T) -> Void) {
+        guard !isNormalising else { return }
+        if value != sanitised {
+            isNormalising = true
+            assign(sanitised)
+            isNormalising = false
+        }
+        save(key, sanitised)
     }
 
     var effectiveBitrate: Int {
@@ -1154,24 +1274,28 @@ class DisplaySettings: ObservableObject {
     }
 
     func resetToDefaults() {
+        // `connectionMode` belongs here: the alert promises every setting goes
+        // back to its default, and leaving one key out means the stored value
+        // and the value in memory disagree after a reset.
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
                     "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical",
-                    "touchEnabled", "autoStartStreamingOnLaunch", "startupMode"]
+                    "touchEnabled", "connectionMode", "autoStartStreamingOnLaunch", "startupMode"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
 
         resolution = Self.fixedResolution
-        refreshRate = 120  // Default: highest FPS
+        refreshRate = Self.defaultRefreshRate
         hiDPI = true
-        bitrate = 1000  // Default: 1000 Mbps
-        quality = "ultralow"  // Default: fastest encoding
+        bitrate = Self.defaultBitrate
+        quality = Self.defaultQuality
         gamingBoost = false
-        port = 54321
+        port = Self.defaultPort
         rotation = 0
         flipHorizontal = false
         flipVertical = false
         touchEnabled = true
+        connectionMode = .usb
         autoStartStreamingOnLaunch = false
         startupMode = .usb
 
@@ -1182,6 +1306,7 @@ class DisplaySettings: ObservableObject {
         let parts = resolution.split(separator: "x")
         let baseWidth = Int(parts[0]) ?? 1920
         let baseHeight = Int(parts[1]) ?? 1200
+        let rotation = transformSnapshot.rotation
         if rotation == 90 || rotation == 270 {
             return (baseHeight, baseWidth)
         }
@@ -1201,7 +1326,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             defer: false
         )
 
-        window.title = "Side Screen"
+        window.title = "SideTab"
         window.titlebarAppearsTransparent = true
         window.backgroundColor = .windowBackgroundColor
         window.isMovableByWindowBackground = true
@@ -1273,12 +1398,29 @@ struct WirelessSection: View {
     @ObservedObject var settings: DisplaySettings
     let pairedDeviceStore: PairedDeviceStore
     @State private var qrImage: NSImage?
+    /// Last payload actually rasterised. A tick that produces the same string
+    /// skips the render entirely instead of handing SwiftUI a new image every
+    /// five seconds forever.
+    @State private var renderedPayload: String?
+    /// Why there is no QR, when there is none.
+    @State private var qrBlockedReason: String?
+    /// Monotonic request id: a slow pass can finish after a newer one, and its
+    /// result must not overwrite the current one.
+    @State private var qrRequest = 0
     @State private var pairedDevices: [PairedDevice] = []
     @State private var showResetConfirm = false
+    /// A token minted while the server was running only becomes the one the
+    /// listener accepts after the next Start.
+    @State private var tokenResetPending = false
+    /// `Host.current()` is a per-session constant, and reading it is main-thread
+    /// work by Apple's account, so it is resolved once here rather than per tick.
+    @State private var macName: String?
     /// Used to force the relative-time labels to recompute every tick even when
     /// the underlying lastConnected timestamp hasn't changed (e.g. while a
     /// device is disconnected and we still want "5 minutes ago" to count up).
     @State private var nowTick: Date = Date()
+
+    static let qrSize: CGFloat = 180
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1295,6 +1437,19 @@ struct WirelessSection: View {
                 .background(Color.orange.opacity(0.12))
                 .cornerRadius(6)
             }
+            if tokenResetPending && settings.isRunning {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text("New pairing token saved. Stop the server and start it again to put the new QR into effect.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.12))
+                .cornerRadius(6)
+            }
             FrostedGroupBox(title: "Pair Device", icon: "qrcode") {
                 VStack(spacing: 8) {
                     if let qr = qrImage {
@@ -1302,18 +1457,39 @@ struct WirelessSection: View {
                             .interpolation(.none)
                             .resizable()
                             .scaledToFit()
-                            .frame(width: 180, height: 180)
+                            .frame(width: Self.qrSize, height: Self.qrSize)
                             .padding(8)
                             .background(Color.white)
                             .cornerRadius(8)
                     } else {
-                        Text("Generating QR…").foregroundColor(.secondary)
+                        // A QR encoding an address the tablet cannot reach looks
+                        // identical to one that works, so an unusable pairing
+                        // payload is not rendered at all — the empty state says
+                        // what is wrong instead.
+                        VStack(spacing: 6) {
+                            Image(systemName: "wifi.slash")
+                                .font(.system(size: 22))
+                                .foregroundColor(.secondary)
+                            Text(qrBlockedReason ?? "Generating QR…")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: Self.qrSize)
+                        .padding(8)
                     }
-                    Text("Scan this QR from Side Screen Android (Wireless tab)")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                    Text(LANAddressResolver.primaryIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
+                    if qrImage != nil {
+                        Text("Scan this QR from SideTab Android (Wireless tab)")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    // Reads the address the status refresh already resolved.
+                    // Querying the resolver here would run getifaddrs() plus a
+                    // getnameinfo() per address on every objectWillChange —
+                    // including the ones a mouse-move over this panel produces.
+                    Text(settings.listeningAddress.map { "Listening: \(LANAddressResolver.endpoint(host: $0, port: settings.port))" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
@@ -1331,7 +1507,7 @@ struct WirelessSection: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
                     VStack(spacing: 6) {
-                        ForEach(pairedDevices, id: \.name) { device in
+                        ForEach(pairedDevices) { device in
                             let isLive = settings.currentWirelessDevice == device.name
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -1347,7 +1523,7 @@ struct WirelessSection: View {
                                 }
                                 Spacer()
                                 Button("Forget") {
-                                    pairedDeviceStore.forget(name: device.name)
+                                    pairedDeviceStore.forget(id: device.id)
                                     refreshPaired()
                                 }
                                 .buttonStyle(.bordered)
@@ -1380,37 +1556,118 @@ struct WirelessSection: View {
             })
         }
         .onAppear {
+            if macName == nil {
+                // An empty `name=` is not the same as an absent one to the
+                // client, so fall back rather than send a blank.
+                let host = Host.current().localizedName ?? ""
+                macName = host.isEmpty ? "Mac" : host
+            }
             refreshQR()
             refreshPaired()
             nowTick = Date()
+        }
+        // A fresh listener snapshots the Keychain at start, which is the moment
+        // a token reset becomes the token in effect.
+        .onChange(of: settings.isRunning) { running in
+            if running { tokenResetPending = false }
         }
         // One-parameter onChange(of:perform:) works on macOS 13+. The
         // two-parameter form requires macOS 14 and would block Ventura.
         // Deprecation is a compile-time warning only on Xcode 15+ SDKs.
         .onChange(of: settings.port) { _ in refreshQR() }
-        .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { now in
+        // Default mode, not .common: in the common modes this also fires while
+        // the window is being dragged or a menu is being tracked — the two
+        // moments a main-thread stall is most visible — and the refresh below
+        // is the expensive work.
+        .onReceive(Timer.publish(every: 5, on: .main, in: .default).autoconnect()) { now in
             nowTick = now
+            // Refresh the address list while the window remains open so a
+            // Wi-Fi roam updates both the preferred host and its fallbacks.
+            refreshQR()
             refreshPaired()
         }
         .alert("Reset Token?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) { }
-            Button("Reset", role: .destructive) {
-                _ = WirelessAuth.reset()
-                pairedDeviceStore.clear()
-                refreshQR()
-                refreshPaired()
-            }
+            Button("Reset", role: .destructive) { resetToken() }
         } message: {
-            Text("This will disconnect all paired devices. They will need to scan the new QR to connect again.")
+            Text(settings.isRunning
+                 ? "This forgets every paired device and mints a new pairing token. The listener that is running right now keeps accepting the current token, so stop the server and start it again before anyone scans the new QR."
+                 : "This will disconnect all paired devices. They will need to scan the new QR to connect again.")
         }
     }
 
+    /// Rebuilds the QR off the main thread and publishes only when the payload
+    /// actually changed.
     private func refreshQR() {
-        let token = WirelessAuth.loadOrCreate()
-        let host = LANAddressResolver.primaryIPv4() ?? "0.0.0.0"
-        let name = Host.current().localizedName ?? "Mac"
-        let url = PairingURL.build(host: host, port: settings.port, token: token, name: name)
-        qrImage = QRRenderer.render(url: url, size: 180)
+        let port = settings.port
+        let name = macName ?? "Mac"
+        // The running listener owns the token: StreamingServer snapshots it
+        // once at start and never re-reads the Keychain, so a QR built from a
+        // fresh loadOrCreate() can encode a token that server rejects. Reading
+        // its snapshot also means a failed Keychain read cannot silently
+        // switch the QR mid-session — `loadOrCreate` mints a replacement on any
+        // read failure, and the mint is a ~9 ms synchronous securityd IPC.
+        let liveToken = (NSApp.delegate as? AppDelegate)?.streamingServer?.expectedAuthToken
+        qrRequest += 1
+        let request = qrRequest
+        DispatchQueue.global(qos: .userInitiated).async {
+            let token = liveToken ?? WirelessAuth.load() ?? WirelessAuth.loadOrCreate()
+            let hosts = LANAddressResolver.preferredHosts()
+            let payload = hosts.first.flatMap {
+                PairingURL.build(
+                    host: $0,
+                    port: port,
+                    token: token,
+                    name: name,
+                    alternateHosts: Array(hosts.dropFirst())
+                )
+            }
+            // CoreImage work and the raster both belong off the main thread; the
+            // NSImage itself is created there too, since it is only a cheap
+            // wrapper around the already-rasterised bitmap.
+            let raster = payload.flatMap { QRRenderer.renderCGImage(url: $0, size: Self.qrSize) }
+            DispatchQueue.main.async {
+                guard qrRequest == request else { return }
+                guard let payload, let raster else {
+                    self.renderedPayload = nil
+                    self.qrImage = nil
+                    self.qrBlockedReason = payload == nil ? Self.noAddressReason : Self.renderFailedReason
+                    return
+                }
+                guard payload != self.renderedPayload else { return }
+                self.renderedPayload = payload
+                self.qrImage = NSImage(cgImage: raster, size: NSSize(width: Self.qrSize, height: Self.qrSize))
+                self.qrBlockedReason = nil
+            }
+        }
+    }
+
+    private static let noAddressReason = "No LAN address on this Mac. Connect to Wi-Fi or Ethernet, then scan the QR — a pairing code needs an address the tablet can reach."
+    private static let renderFailedReason = "Could not render the pairing QR. Try refreshing."
+
+    /// Mints a new token and forgets every paired device.
+    private func resetToken() {
+        // Nothing is pending when no listener is running: the next start reads
+        // the freshly persisted token itself.
+        tokenResetPending = settings.isRunning
+        DispatchQueue.global(qos: .userInitiated).async {
+            // SecItemDelete + SecItemAdd is one synchronous securityd round trip
+            // that measured ~9 ms on the main thread — 56% of a 60 Hz frame.
+            _ = WirelessAuth.reset()
+            DispatchQueue.main.async {
+                pairedDeviceStore.clear()
+                // The running listener holds a snapshot taken at start, so a
+                // freshly minted token would be rejected. Push the new token
+                // into it, or the alert's promise to re-scan is a lie.
+                (NSApp.delegate as? AppDelegate)?.adoptPairingToken(WirelessAuth.loadOrCreate())
+                tokenResetPending = false
+                // Re-derives from the listener's snapshot while a server is
+                // running, so the QR on screen never advertises a token the
+                // running listener would reject.
+                refreshQR()
+                refreshPaired()
+            }
+        }
     }
 
     private func refreshPaired() {

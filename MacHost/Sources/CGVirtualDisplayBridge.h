@@ -11,6 +11,8 @@
 
 // Forward declarations for CGVirtualDisplay private API
 
+@class CGVirtualDisplay;
+
 NS_ASSUME_NONNULL_BEGIN
 
 @interface CGVirtualDisplayDescriptor : NSObject
@@ -26,7 +28,15 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) CGPoint bluePrimary;
 @property (nonatomic, assign) CGPoint whitePoint;
 @property (nonatomic, retain, nullable) dispatch_queue_t queue;
-@property (nonatomic, copy, nullable) void (^terminationHandler)(void);
+// The real block takes the display: void (^)(id, CGVirtualDisplay *) — both
+// parameters encode as an object pointer, and an ObjC block parameter of an
+// interface type is always spelled as a pointer. Leave this UNSET. Two reasons:
+// (1) the property's type encoding is opaque, so a wrong signature cannot be
+// caught at compile time and only crashes at call time; (2) measured on
+// macOS 26, installing a handler crashes when the window server invokes it
+// during process exit. Nothing in SideScreen needs it — the manager observes
+// NSApplication.didChangeScreenParametersNotification instead.
+@property (nonatomic, copy, nullable) void (^terminationHandler)(id, CGVirtualDisplay *);
 
 - (instancetype)init;
 @end

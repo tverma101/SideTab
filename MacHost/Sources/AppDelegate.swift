@@ -43,6 +43,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var screenCapture: ScreenCapture?
     var virtualDisplayManager: VirtualDisplayManager?
     var brightnessMonitor: BrightnessMonitor?
+    var nativeBrightness: NativeBrightnessController?
     var idleSleepMonitor: IdleSleepMonitor?
     var settings = DisplaySettings()
     var settingsWindow: SettingsWindowController?
@@ -53,14 +54,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentWirelessDevice: String?
     private var cancellables = Set<AnyCancellable>()
     private var statusRefreshTimer: Timer?
-    /// Reentrancy latch for startServer() — a second Start (double-clicked menu
-    /// item, auto-start racing a manual click) must not build a second virtual
-    /// display / server. Main-actor confined.
-    private var isStartingServer = false
-    var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
+    private var lastBackgroundStatusRefreshNs: UInt64 = 0
+    /// Prevent overlapping adb subprocess probes when a device or adb server
+    /// is slow to answer. The status UI is best-effort; it must never queue
+    /// work faster than the connection backend can finish it. The start time
+    /// is kept so a probe that never returns cannot latch the flag forever.
+    private var statusRefreshInFlight = false
+    private var statusRefreshStartedAt: Date?
+    /// A replug can leave adb reverse unavailable for several retry intervals.
+    /// Serialize the self-healing repair so status ticks cannot start a second
+    /// repair while the first one is still retrying.
+    private var adbReverseRepairInFlight = false
+    private var adbReverseRepairStartedAt: Date?
+    /// Cancellation token for startServer(), which runs on the Swift
+    /// cooperative pool while stopServer() runs on the main thread. Also owns
+    /// the "already starting" reentrancy latch.
+    private let startGeneration = StartGeneration()
+    /// Display transform published for StreamingServer's network queue.
+    private let displayTransformStore = DisplayTransformStore()
+    private var isStartingServer: Bool { startGeneration.hasInFlightStart }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
+
+        nativeBrightness = NativeBrightnessController()
+        nativeBrightness?.onBrightness = { [weak self] level in
+            self?.streamingServer?.sendBrightness(level)
+        }
 
         // Create menu bar item
         setupMenuBar()
@@ -87,14 +107,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             refreshStatusIndicators()
         }
 
-        if #available(macOS 13.0, *) {
-            if DaemonManager.shared.isEnabled {
-                print("🚀 Launch at Login is enabled - starting silently in background")
-                // Do not show settings window automatically.
-                // applicationShouldHandleReopen will show it if the user manually launched the app.
-            } else {
-                showSettings()
-            }
+        if DaemonManager.shared.isEnabled {
+            print("🚀 Launch at Login is enabled - starting silently in background")
+            // Do not show settings window automatically.
+            // applicationShouldHandleReopen will show it if the user manually launched the app.
         } else {
             showSettings()
         }
@@ -132,6 +148,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func refreshStatusIndicators() {
+        let settingsVisible = settingsWindow?.window?.isVisible == true
+        guard settingsVisible || settings.isRunning else { return }
+
+        // A hidden, disconnected service still checks for a replug so it can
+        // repair adb reverse, but it does not need the visible checklist's
+        // two-second cadence. Skip completed live sessions entirely; the
+        // disconnect callback re-enables the background probe on the next tick.
+        if !settingsVisible {
+            if settings.clientConnected { return }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if lastBackgroundStatusRefreshNs > 0,
+               now >= lastBackgroundStatusRefreshNs,
+               now - lastBackgroundStatusRefreshNs < 10_000_000_000 {
+                return
+            }
+            lastBackgroundStatusRefreshNs = now
+        }
+
         // Keep the inline permission state current after the user returns from
         // System Settings, without generating another native prompt.
         settings.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
@@ -139,7 +173,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // LANAddressResolver already does the interface walk needed by both
         // wireless status fields. Resolve once instead of running getifaddrs()
         // twice every two seconds.
-        let lanAddress = LANAddressResolver.primaryIPv4()
+        let lanAddress = LANAddressResolver.primaryHost()
         settings.wifiConnected = lanAddress != nil
         settings.listeningAddress = lanAddress
 
@@ -152,24 +186,63 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard settings.connectionMode == .usb else {
             settings.adbInstalled = false
             settings.usbDeviceConnected = false
+            settings.usbDeviceStatus = .notDetected
             settings.adbReverseConfigured = false
             return
         }
 
-        settings.adbInstalled = StatusDetector.adbInstalled()
+        // Once the loopback stream is live, it is already proof that the
+        // selected USB reverse mapping works. Do not keep spawning adb while
+        // the latency-sensitive capture/send path is active. If the cable or
+        // reverse socket actually disappears, the Network.framework terminal
+        // callback clears clientConnected and the next tick resumes repair.
+        if settings.isRunning && settings.clientConnected {
+            settings.adbInstalled = true
+            settings.usbDeviceConnected = true
+            settings.usbDeviceStatus = .connected(serial: nil)
+            settings.adbReverseConfigured = true
+            return
+        }
+
         let port = Int(settings.port)
-        let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
-        let controlPort = controlOverride > 0 ? controlOverride : port + 1
+        // Same resolver the server uses: reading the override raw built
+        // `adb reverse tcp:100000` for a control port the server cannot bind.
+        let controlPort = Int(ControlPortResolver.effective(videoPort: settings.port))
+
+        if statusRefreshInFlight,
+           !BackgroundProbeWatchdog.isStale(startedAt: statusRefreshStartedAt, now: Date()) {
+            return
+        }
+        if statusRefreshInFlight {
+            debugLog("⏱️ USB status watchdog fired — the previous adb probe never returned")
+        }
+        statusRefreshInFlight = true
+        statusRefreshStartedAt = Date()
+
         Task.detached { [weak self] in
-            let devices = StatusDetector.usbDevices()
-            let reverseOK = StatusDetector.adbReverseConfigured(port: port)
-                && StatusDetector.adbReverseConfigured(port: controlPort)
+            // All adb/path/process work stays off the main actor. A stuck adb
+            // server must not make the settings window or touch path hitch.
+            let adbInstalled = StatusDetector.adbInstalled()
+            let usbDeviceStatus = StatusDetector.usbDeviceStatus()
+            let usbSerial = usbDeviceStatus.readySerial
+            let isConnected = usbDeviceStatus.isConnected
+            let reverseOK = usbSerial.map { serial in
+                StatusDetector.adbReverseConfigured(serial: serial, port: port)
+                    && StatusDetector.adbReverseConfigured(serial: serial, port: controlPort)
+            } ?? false
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
-                
-                let isConnected = !devices.isEmpty
+                self.statusRefreshInFlight = false
+                self.statusRefreshStartedAt = nil
 
-                self.settings.usbDeviceConnected = isConnected
+                // Ignore a stale USB probe that completed after a mode/port
+                // change. The next timer tick will probe the new state.
+                guard self.settings.connectionMode == .usb,
+                      Int(self.settings.port) == port else { return }
+
+                self.settings.adbInstalled = adbInstalled
+                self.settings.usbDeviceStatus = usbDeviceStatus
+                self.settings.usbDeviceConnected = usbDeviceStatus.isConnected
                 self.settings.adbReverseConfigured = reverseOK
 
                 // Self-healing USB bridge (level-triggered, not edge-triggered):
@@ -178,13 +251,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Covers replug, adb-server restart, etc. The server lifecycle
                 // is NOT tied to device events — it stays up and the tablet
                 // reconnects via its own connect button.
-                if self.settings.connectionMode == .usb
-                    && isConnected
-                    && self.settings.isRunning
-                    && !reverseOK {
-                    debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse")
-                    Task { await self.setupADBReverse() }
+                // `.connected(serial: nil)` is a valid status, so the serial is
+                // bound here instead of force-unwrapped.
+                if let serial = usbSerial,
+                   self.settings.connectionMode == .usb,
+                   isConnected,
+                   self.settings.isRunning,
+                   !reverseOK {
+                    self.scheduleADBReverseRepair(serial: serial)
                 }
+            }
+        }
+    }
+
+    @MainActor
+    private func scheduleADBReverseRepair(serial: String) {
+        if adbReverseRepairInFlight {
+            // A wedged adb can never clear this latch by itself, and this latch
+            // is the only thing that gates the self-healing repair.
+            guard !BackgroundProbeWatchdog.isStale(
+                startedAt: adbReverseRepairStartedAt,
+                now: Date()
+            ) else {
+                debugLog("⏱️ USB bridge repair watchdog fired — the previous repair never returned")
+                adbReverseRepairInFlight = false
+                adbReverseRepairStartedAt = nil
+                return
+            }
+            return
+        }
+        adbReverseRepairInFlight = true
+        adbReverseRepairStartedAt = Date()
+        debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse for \(serial)")
+
+        Task { [weak self] in
+            guard let self = self else { return }
+            await self.setupADBReverse(serial: serial)
+            await MainActor.run {
+                self.adbReverseRepairInFlight = false
+                self.adbReverseRepairStartedAt = nil
             }
         }
     }
@@ -193,7 +298,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleConnectionModeChange(to mode: ConnectionMode) async {
         debugLog("Connection mode changed to: \(mode.rawValue)")
         // Disconnect any active client immediately (per spec §6 / fix #2).
-        let wasRunning = settings.isRunning
+        // A start that is still in flight is not running yet but is about to
+        // be: reading settings.isRunning alone silently discarded the mode
+        // change while the ~55 s display-creation window was open.
+        let wasRunning = settings.isRunning || isStartingServer
         if wasRunning {
             stopServer()
         }
@@ -244,8 +352,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         Publishers.CombineLatest3(settings.$rotation, settings.$flipHorizontal, settings.$flipVertical)
             .dropFirst()
+            .receive(on: DispatchQueue.main)
             .sink { [weak self] rotation, flipHorizontal, flipVertical in
-                guard let self = self, self.settings.isRunning else { return }
+                guard let self = self else { return }
+                // Published for StreamingServer's network queue, which reads it
+                // in onCodecNegotiated and cannot hop to the main actor.
+                self.displayTransformStore.update(
+                    rotation: rotation,
+                    flipHorizontal: flipHorizontal,
+                    flipVertical: flipVertical
+                )
+                guard self.settings.isRunning else { return }
                 print("🔄 Display transform changed: \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
                 self.streamingServer?.updateDisplayTransform(rotation: rotation, flipHorizontal: flipHorizontal, flipVertical: flipVertical)
             }
@@ -255,6 +372,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // incoming touch frames from the client are dropped early when off.
         settings.$touchEnabled
             .dropFirst()
+            .receive(on: DispatchQueue.main)
             .sink { [weak self] enabled in
                 self?.streamingServer?.touchEnabled = enabled
             }
@@ -270,31 +388,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             .store(in: &cancellables)
-
-        // Observer cho resolution changes — the virtual display is created at
-        // server start, so a new resolution (list row or custom Apply) needs a
-        // stop/start cycle to take effect, same as a connection-mode change.
-        // Without this, changing resolution mid-run silently did nothing.
-        settings.$resolution
-            .dropFirst()
-            .removeDuplicates()
-            .sink { [weak self] resolution in
-                guard let self = self else { return }
-                Task { @MainActor in
-                    guard self.settings.isRunning else { return }
-                    debugLog("Resolution changed to \(resolution) — restarting server to rebuild virtual display")
-                    self.stopServer()
-                    await self.startServer()
-                }
-            }
-            .store(in: &cancellables)
     }
 
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Side Screen")
+            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "SideTab")
         }
 
         // Items are rebuilt on every open (menuNeedsUpdate) so the menu always
@@ -314,6 +414,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
     }
 
+    @MainActor
     @objc private func toggleServerFromMenu() {
         if settings.isRunning {
             stopServer()
@@ -338,19 +439,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow = SettingsWindowController(settings: settings)
 
         settings.onToggleServer = { [weak self] in
-            guard let self else { return }
-            if self.settings.isRunning {
-                self.stopServer()
-            } else {
-                Task { [weak self] in
-                    guard let self else { return }
+            // The `self` binding must not outlive the hop: a `guard let self`
+            // in the closure body promotes a strong local and makes
+            // AppDelegate → settings → onToggleServer → AppDelegate a cycle
+            // that no release can break.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.settings.isRunning {
+                    self.stopServer()
+                } else {
                     await self.checkPermissions()
                     if self.settings.hasScreenRecordingPermission {
                         await self.startServer()
                     } else {
-                        await MainActor.run {
-                            self.showSettings()
-                        }
+                        self.showSettings()
                     }
                 }
             }
@@ -363,9 +465,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @MainActor
     @objc func showSettings() {
         settingsWindow?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+        Task { @MainActor [weak self] in
+            self?.refreshStatusIndicators()
+        }
+    }
+
+    /// Adopt a freshly minted pairing token on a listener that is already up.
+    /// Without this the settings window can only show the new QR after a full
+    /// Stop/Start, because the listener snapshots the token at start.
+    @MainActor
+    func adoptPairingToken(_ token: Data) {
+        streamingServer?.expectedAuthToken = token
     }
 
     /// Refresh permission state without opening a system prompt. Screen capture
@@ -443,61 +557,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Setup ADB reverse port forwarding for USB connection
-    func setupADBReverse() async {
+    func setupADBReverse(serial requestedSerial: String? = nil) async {
         let port = settings.port
-        let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
-        let controlPort = controlOverride > 0 ? UInt16(controlOverride) : port + 1
+        let controlPort = ControlPortResolver.effective(videoPort: port)
         let ports = [port, controlPort]
         print("🔌 Setting up ADB reverse for ports \(ports)...")
-        debugLog("🔌 setupADBReverse() invoked for ports \(ports)...")
+        debugLog(
+            "🔌 setupADBReverse() invoked for ports \(ports)" +
+                (requestedSerial.map { " on USB serial \($0)" } ?? "") + "..."
+        )
 
         await Task.detached(priority: .utility) {
-            // Try common adb paths
-            let adbPaths = [
-                "/usr/local/bin/adb",
-                "/opt/homebrew/bin/adb",
-                "~/Library/Android/sdk/platform-tools/adb",
-                "/Users/\(NSUserName())/Library/Android/sdk/platform-tools/adb"
-            ]
-
-            var adbPath: String?
-            for path in adbPaths {
-                let expandedPath = NSString(string: path).expandingTildeInPath
-                if FileManager.default.fileExists(atPath: expandedPath) {
-                    adbPath = expandedPath
-                    break
-                }
-            }
-
-            // Also try 'which adb' to find it in PATH
-            if adbPath == nil {
-                let whichProcess = Process()
-                whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-                whichProcess.arguments = ["adb"]
-                let whichPipe = Pipe()
-                whichProcess.standardOutput = whichPipe
-                whichProcess.standardError = FileHandle.nullDevice
-
-                do {
-                    try whichProcess.run()
-                    whichProcess.waitUntilExit()
-                    let data = whichPipe.fileHandleForReading.readDataToEndOfFile()
-                    if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !path.isEmpty {
-                        adbPath = path
-                    }
-                } catch {
-                    // Ignore
-                }
-            }
-
-            guard let finalAdbPath = adbPath else {
+            guard let finalAdbPath = StatusDetector.adbExecutablePath() else {
                 print("⚠️  ADB not found - USB connection may not work")
                 print("💡 Install Android SDK or run manually: adb reverse tcp:\(port) tcp:\(port)")
                 return
             }
 
+            let deviceStatus = StatusDetector.usbDeviceStatus()
+            let serial = requestedSerial ?? deviceStatus.readySerial
+            guard let serial, !serial.isEmpty else {
+                print("⚠️  USB ADB unavailable: \(deviceStatus.label) — \(deviceStatus.hint)")
+                debugLog("USB ADB unavailable: \(deviceStatus.label)")
+                return
+            }
+
             print("📱 Found ADB at: \(finalAdbPath)")
+            print("📱 Targeting USB device: \(serial)")
 
             // Configure both bulk video and the dedicated control channel.
             // Retry each mapping up to 3 times so USB cannot be left in a
@@ -505,29 +591,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             for reversePort in ports {
                 var configured = false
                 for attempt in 1...3 {
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: finalAdbPath)
-                    process.arguments = ["reverse", "tcp:\(reversePort)", "tcp:\(reversePort)"]
-
-                    let pipe = Pipe()
-                    process.standardOutput = pipe
-                    process.standardError = pipe
-
-                    do {
-                        try process.run()
-                        process.waitUntilExit()
-
-                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                        let output = String(data: data, encoding: .utf8) ?? ""
-
-                        if process.terminationStatus == 0 {
-                            print("✅ ADB reverse setup successful: tcp:\(reversePort) -> tcp:\(reversePort)")
-                            configured = true
-                            break
-                        }
-                        print("⚠️  ADB reverse tcp:\(reversePort) attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
-                    } catch {
-                        print("⚠️  Failed to configure adb reverse tcp:\(reversePort) (attempt \(attempt)/3): \(error.localizedDescription)")
+                    let result = ADBCommandRunner.run(
+                        finalAdbPath,
+                        arguments: ["-s", serial, "reverse", "tcp:\(reversePort)", "tcp:\(reversePort)"]
+                    )
+                    let output = result?.output.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if let result, result.succeeded {
+                        print("✅ ADB reverse setup successful for \(serial): tcp:\(reversePort) -> tcp:\(reversePort)")
+                        configured = true
+                        break
+                    }
+                    if let result, result.timedOut {
+                        print("⚠️  ADB reverse tcp:\(reversePort) attempt \(attempt)/3 timed out: \(output)")
+                    } else {
+                        print("⚠️  ADB reverse tcp:\(reversePort) attempt \(attempt)/3 failed: \(output)")
                     }
 
                     if attempt < 3 {
@@ -543,19 +620,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }.value
     }
 
+    /// NOT @MainActor: NSApplicationDelegate carries no NS_SWIFT_MAIN_ACTOR, so
+    /// SE-0316 does not infer isolation for this class and the whole function
+    /// below runs on the Swift cooperative pool. That is deliberate — the
+    /// blocking `createDisplay` retry loop can take ~55 s — so every shared
+    /// property is published through MainActor.run and guarded by
+    /// `startGeneration` against the main-actor `stopServer()`.
     func startServer() async {
-        let canStart = await MainActor.run { () -> Bool in
-            guard !isStartingServer, !settings.isRunning else { return false }
-            isStartingServer = true
-            return true
-        }
-        guard canStart else {
+        guard let token = await beginStart() else {
             debugLog("startServer() ignored — already starting or already running")
             return
         }
-        defer {
-            Task { @MainActor [weak self] in self?.isStartingServer = false }
-        }
+        let attempt = StartAttempt()
         let hasScreenCapture = CGPreflightScreenCaptureAccess()
         await MainActor.run {
             settings.hasScreenRecordingPermission = hasScreenCapture
@@ -563,6 +639,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         debugLog("🚀 startServer() invoked. Screen Recording permission: \(hasScreenCapture)")
         guard hasScreenCapture else {
             debugLog("❌ startServer aborted: Missing Screen Recording permission")
+            startGeneration.finish(token)
             await MainActor.run {
                 showSettings()
             }
@@ -570,25 +647,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
+            let sessionMode = settings.connectionMode
+            let sessionFrameRate = WirelessSessionProfile.frameRate(
+                for: sessionMode,
+                requested: settings.effectiveRefreshRate
+            )
+            let sessionBitrateCap = WirelessSessionProfile.bitrateCap(for: sessionMode)
+            debugLog(
+                "Session profile: mode=\(sessionMode.rawValue) " +
+                    "frameRate=\(sessionFrameRate)" +
+                    (sessionBitrateCap.map { " bitrateCap=\($0)Mbps" } ?? "")
+            )
+
             // Create virtual display and run ADB setup in parallel
-            virtualDisplayManager = VirtualDisplayManager()
+            let vdm = VirtualDisplayManager()
+            attempt.virtualDisplayManager = vdm
             let size = settings.resolutionSize
-            try virtualDisplayManager?.createDisplay(
+            try vdm.createDisplay(
                 width: size.width,
                 height: size.height,
-                refreshRate: settings.refreshRate,
+                refreshRate: sessionFrameRate,
                 hiDPI: settings.hiDPI,
-                name: "SideScreen"
+                name: "SideTab"
             )
 
             // Disable mirror mode (may fail if already in extend mode)
             do {
-                try virtualDisplayManager?.disableMirrorMode()
+                try vdm.disableMirrorMode()
             } catch {
                 // Not critical - continue anyway
             }
 
             await MainActor.run {
+                self.virtualDisplayManager = vdm
                 settings.displayCreated = true
             }
 
@@ -603,40 +694,73 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 group.addTask { try? await Task.sleep(nanoseconds: 500_000_000) }
             }
 
-            virtualDisplayManager?.restoreDisplayPosition()
+            // Everything above this point can be waited out by a user who
+            // pressed Cmd-Q or switched connection mode. stopServer() bumps the
+            // generation, so continuing here would resurrect the display, the
+            // server, the capture pipeline and the idle-sleep assertion.
+            guard startGeneration.isCurrent(token) else {
+                await rollbackStart(token: token, attempt: attempt, reason: "cancelled while the display was being created")
+                return
+            }
+
+            vdm.restoreDisplayPosition()
 
             // Verify display is registered in the system
-            if let vdm = virtualDisplayManager {
-                let registered = vdm.verifyDisplayRegistered()
-                if !registered {
-                    debugLog("WARNING: Virtual display not found in online display list — capture may fail")
-                }
+            if !vdm.verifyDisplayRegistered() {
+                debugLog("WARNING: Virtual display not found in online display list — capture may fail")
             }
 
             // Setup capture
-            guard let displayID = virtualDisplayManager?.displayID else { return }
-            screenCapture = try await ScreenCapture()
-            screenCapture?.onCaptureMethodChanged = { [weak self] method in
+            guard let displayID = vdm.displayID else {
+                debugLog("❌ startServer aborted: virtual display reported no display ID")
+                await rollbackStart(token: token, attempt: attempt, reason: "virtual display reported no display ID")
+                return
+            }
+            let capture = try await ScreenCapture()
+            attempt.screenCapture = capture
+            await MainActor.run {
+                self.screenCapture = capture
+            }
+            guard startGeneration.isCurrent(token) else {
+                await rollbackStart(token: token, attempt: attempt, reason: "cancelled while capture was being set up")
+                return
+            }
+            capture.onCaptureMethodChanged = { [weak self] method in
                 guard let self = self else { return }
                 debugLog("Capture method: \(method)")
                 Task { @MainActor in
                     self.settings.captureMethod = method
                 }
             }
-            try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            try await capture.setupForVirtualDisplay(
+                displayID,
+                refreshRate: sessionFrameRate,
+                frameRateCap: sessionMode == .wireless ? WirelessFreshnessPolicy.targetFrameRate : nil,
+                connectionMode: sessionMode
+            )
+            guard startGeneration.isCurrent(token) else {
+                await rollbackStart(token: token, attempt: attempt, reason: "cancelled after capture setup")
+                return
+            }
 
             // Setup server. Control channel (out-of-band ping/pong + keyframe
             // requests) runs on its own port: settings.port + 1, overridable
             // via `defaults write com.sidescreen.app SideScreen_controlPort -int N`.
-            let controlOverride = UserDefaults.standard.integer(forKey: "SideScreen_controlPort")
-            let controlPort: UInt16 = controlOverride > 0 ? UInt16(controlOverride) : settings.port + 1
-            streamingServer = StreamingServer(port: settings.port, controlPort: controlPort)
-            streamingServer?.touchEnabled = settings.touchEnabled
+            // The resolver rejects anything a `defaults write` can produce that
+            // would trap (UInt16(Int) traps above 65535, port + 1 traps at
+            // 65535) or silently disable the control channel.
+            let videoPort = settings.port
+            let server = StreamingServer(
+                port: videoPort,
+                controlPort: ControlPortResolver.effective(videoPort: videoPort)
+            )
+            attempt.streamingServer = server
+            server.touchEnabled = await MainActor.run { self.settings.touchEnabled }
             if settings.connectionMode == .wireless {
-                streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
-                streamingServer?.onWirelessClientPaired = { [weak self] deviceName in
-                    guard let self = self else { return }
-                    Task { @MainActor in
+                server.expectedAuthToken = WirelessAuth.loadOrCreate()
+                server.onWirelessClientPaired = { [weak self] deviceName in
+                    Task { @MainActor [weak self] in
+                        guard let self = self else { return }
                         self.currentWirelessDevice = deviceName
                         self.settings.currentWirelessDevice = deviceName
                         self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
@@ -647,49 +771,103 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // replaces this with the exact encoded dimensions before the config is
             // sent, so Android configures MediaCodec and its render surface for the
             // pixels actually carried by the stream.
-            streamingServer?.setDisplaySize(width: size.width, height: size.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
-            streamingServer?.onClientConnected = { [weak self] in
-                guard let self = self else { return }
-                self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
-                Task { @MainActor in
-                    self.settings.clientConnected = true
+            let transform = await MainActor.run { () -> DisplayTransformStore.Transform in
+                let current = DisplayTransformStore.Transform(
+                    rotation: self.settings.rotation,
+                    flipHorizontal: self.settings.flipHorizontal,
+                    flipVertical: self.settings.flipVertical
+                )
+                self.displayTransformStore.update(current)
+                return current
+            }
+            server.setDisplaySize(width: size.width, height: size.height, rotation: transform.rotation, flipHorizontal: transform.flipHorizontal, flipVertical: transform.flipVertical)
+            await MainActor.run {
+                self.streamingServer = server
+            }
+            guard startGeneration.isCurrent(token) else {
+                await rollbackStart(token: token, attempt: attempt, reason: "cancelled after the server was created")
+                return
+            }
+            // Main-actor hop: these callbacks are invoked from StreamingServer's
+            // networkQueue, where releaseStylusIfNeeded() would post a mouse-up
+            // for a pen stroke that handleStylus is still driving on the main
+            // thread.
+            server.onClientConnected = { [weak self, weak capture] in
+                Task { @MainActor [weak self, weak capture] in
+                    // If the no-client idle policy paused capture, resume it at
+                    // the connection boundary instead of waiting for the next
+                    // monitor tick. The cached replay/keyframe then has a live
+                    // pipeline.
+                    capture?.resumeFromIdle()
+                    capture?.requestKeyframeOrReplayCachedFrame(force: true)
+                    // Re-apply the persisted menu-bar value after the Android
+                    // client has joined; StreamingServer queues it until BRIGHT
+                    // capability negotiation completes.
+                    self?.nativeBrightness?.pushCurrent()
+                    self?.settings.clientConnected = true
                 }
             }
             // Runs synchronously on the server's network queue BEFORE the
             // display config is sent, so the config below carries the right
-            // dimensions for the negotiated codec.
-            streamingServer?.onCodecNegotiated = { [weak self] codec in
-                guard let self = self, let capture = self.screenCapture else { return }
-                capture.negotiate(codec: codec, clientLimit: self.streamingServer?.clientDecodeLimits)
+            // dimensions for the negotiated codec. Nothing here may hop to the
+            // main actor: the transform comes from the lock-guarded store
+            // instead of `settings`, which the rotation sink writes on main.
+            server.onCodecNegotiated = { [weak self, weak capture, weak server] codec in
+                guard let self = self, let capture = capture, let server = server else { return }
+                capture.negotiate(codec: codec, clientLimit: server.clientDecodeLimits)
                 let enc = capture.encodeSize(for: codec)
-                self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
+                let transform = self.displayTransformStore.snapshot
+                server.setDisplaySize(width: enc.width, height: enc.height, rotation: transform.rotation, flipHorizontal: transform.flipHorizontal, flipVertical: transform.flipVertical)
             }
-            streamingServer?.onKeyframeRequested = { [weak self] force in
-                self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
+            server.onKeyframeRequested = { [weak capture] force in
+                capture?.requestKeyframeOrReplayCachedFrame(force: force)
             }
 
-            streamingServer?.onClientDisconnected = { [weak self] in
-                guard let self = self else { return }
-                self.releaseStylusIfNeeded()
-                Task { @MainActor in
+            server.onClientDisconnected = { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    // Stylus state is main-confined and this posts a mouse-up:
+                    // a disconnect in the middle of an S Pen drag otherwise left
+                    // the button logically down until the user clicked again.
+                    self.releaseStylusIfNeeded()
                     self.settings.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment.
-                    if let name = self.currentWirelessDevice {
-                        self.pairedDeviceStore.upsert(name: name, lastConnected: Date())
-                        self.currentWirelessDevice = nil
-                        self.settings.currentWirelessDevice = nil
-                    }
+                    self.persistWirelessDeviceDisconnect()
                 }
             }
 
-            streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
+            server.onSessionTimeout = { [weak self] in
+                // A session that stayed silent for the full five-minute budget
+                // is indistinguishable from one whose client is gone, so the
+                // host does the only honest thing left: end the whole session
+                // rather than hold a "Connected" state, a running encoder and
+                // a virtual display for a client that will never come back.
+                //
+                // Hopped off StreamingServer's networkQueue — stop() drains its
+                // own queues with `sync` and must never be called from one of
+                // them, and tearDown reaches main-actor state.
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    // markDisconnected() has already run and cleared
+                    // clientConnected by the time this task lands, so gate on
+                    // the session still being live rather than on the client
+                    // flag. If the user stopped the server in the meantime,
+                    // tearDown is unnecessary and would only destroy a display
+                    // a newer start has already published.
+                    guard self.settings.isRunning else { return }
+                    print("⏱️ No tablet activity for 5 minutes — stopping stream")
+                    self.stopServer()
+                }
+            }
+
+            server.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
                 self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
             }
-            streamingServer?.onStylusEvent = { [weak self] event in
+            server.onStylusEvent = { [weak self] event in
                 self?.handleStylus(event)
             }
 
-            streamingServer?.onStats = { [weak self] fps, mbps in
+            server.onStats = { [weak self] fps, mbps in
                 let captured = self
                 Task { @MainActor in
                     captured?.settings.currentFPS = fps
@@ -701,54 +879,89 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // software-brightness intent for this virtual display into BRIGHT
             // commands on the control channel (client applies real backlight).
             if UserDefaults.standard.bool(forKey: "SideScreen_exp_brightness") {
-                let monitor = BrightnessMonitor()
-                monitor.onBrightness = { [weak self] level in
-                    self?.streamingServer?.sendBrightness(level)
+                await MainActor.run {
+                    let monitor = BrightnessMonitor()
+                    monitor.onBrightness = { [weak server] level in
+                        server?.sendBrightness(level)
+                    }
+                    // start() adds a 3 Hz timer to the main run loop, which is
+                    // not thread-safe and does not wake the loop by itself.
+                    monitor.start()
+                    self.brightnessMonitor = monitor
+                    attempt.brightnessMonitor = monitor
                 }
-                monitor.start()
-                brightnessMonitor = monitor
                 debugLog("Brightness bridge ENABLED (SideScreen_exp_brightness)")
             } else {
                 debugLog("Brightness bridge disabled (knob unset)")
             }
 
-            // Idle sleep (experiment-gated): when no client is connected for
-            // the grace window, pause capture+encode (CPU -> ~0). Resume is
-            // instant: onClientConnected forces a keyframe/replays the cached
-            // frame, and resumeFromIdle restarts the SCStream underneath.
-            if UserDefaults.standard.bool(forKey: "SideScreen_exp_idleSleep") {
+            // Idle sleep: when no client is connected for the grace window,
+            // pause capture+encode in either transport mode. Resume on client
+            // connect and replay the cached frame while SCStream wakes up.
+            let idleSleepKey = "SideScreen_exp_idleSleep"
+            let idleSleepEnabled = UserDefaults.standard.object(forKey: idleSleepKey) == nil
+                || UserDefaults.standard.bool(forKey: idleSleepKey)
+            if idleSleepEnabled {
                 let secs = UserDefaults.standard.integer(forKey: "SideScreen_exp_idleSleepSecs")
                 let grace = secs > 0 ? Double(secs) : 15.0
-                let monitor = IdleSleepMonitor(
-                    isClientConnected: { [weak self] in self?.settings.clientConnected ?? false },
-                    pause: { [weak self] in self?.screenCapture?.pauseForIdle() },
-                    resume: { [weak self] in
-                        self?.screenCapture?.resumeFromIdle()
-                        self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
-                    },
-                    graceSecs: grace
-                )
-                monitor.start()
-                idleSleepMonitor = monitor
-                debugLog("Idle-sleep monitor ENABLED (grace \(grace)s)")
+                let pause: () -> Void = { [weak capture] in capture?.pauseForIdle() }
+                let resume: () -> Void = { [weak capture] in
+                    capture?.resumeFromIdle()
+                    capture?.requestKeyframeOrReplayCachedFrame(force: true)
+                }
+                await MainActor.run {
+                    let monitor = IdleSleepMonitor(
+                        isClientConnected: { [weak self] in self?.settings.clientConnected ?? false },
+                        pause: pause,
+                        resume: resume,
+                        graceSecs: grace
+                    )
+                    monitor.start()
+                    self.idleSleepMonitor = monitor
+                    attempt.idleSleepMonitor = monitor
+                }
+                debugLog("Idle-sleep monitor ENABLED (grace \(grace)s, all transports)")
             } else {
-                debugLog("Idle-sleep monitor disabled (knob unset)")
+                debugLog("Idle-sleep monitor disabled (SideScreen_exp_idleSleep=false)")
             }
 
-            streamingServer?.start()
-            screenCapture?.startStreaming(
-                to: streamingServer,
+            guard startGeneration.isCurrent(token) else {
+                await rollbackStart(token: token, attempt: attempt, reason: "cancelled before the session went live")
+                return
+            }
+
+            server.start(wireless: sessionMode == .wireless)
+            capture.startStreaming(
+                to: server,
                 bitrateMbps: settings.effectiveBitrate,
                 quality: settings.effectiveQuality,
                 gamingBoost: settings.gamingBoost,
-                frameRate: settings.effectiveRefreshRate
+                frameRate: sessionFrameRate,
+                bitrateCapMbps: sessionBitrateCap,
+                frameRateCap: sessionMode == .wireless ? WirelessFreshnessPolicy.targetFrameRate : nil,
+                connectionMode: sessionMode
             )
 
-            await MainActor.run {
+            // Commit in one main-actor step: a stop that landed while the
+            // session was being wired is detected here instead of publishing
+            // isRunning for a pipeline that was just torn down.
+            let committed = await MainActor.run { () -> Bool in
+                guard self.startGeneration.isCurrent(token) else { return false }
                 settings.isRunning = true
+                // Release the latch in the same step that publishes isRunning.
+                // An unstructured reset task is enqueued after the caller's
+                // continuation, and a connection-mode change landing in that
+                // window ran stopServer() and was then rejected as "already
+                // starting" — leaving the app stopped with no error.
+                self.startGeneration.finish(token)
+                return true
+            }
+            guard committed else {
+                await rollbackStart(token: token, attempt: attempt, reason: "stopped while the session was going live")
+                return
             }
 
-            print("✅ Server started on port \(settings.port)")
+            print("✅ Server started on port \(videoPort)")
         } catch {
             print("❌ Failed to start: \(error)")
             let errorDescription = error.localizedDescription
@@ -757,8 +970,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 || errorDescription.localizedCaseInsensitiveContains("declined")
                 || errorDescription.localizedCaseInsensitiveContains("not authorized")
             await MainActor.run {
-                settings.isRunning = false
-                settings.displayCreated = false
+                // A throw after the display was created used to leave the
+                // VirtualDisplayManager live and registered, the capture object
+                // half-built, and the stale manager's screen-parameters observer
+                // still re-arranging display origins.
+                self.tearDown(attempt)
+                self.startGeneration.finish(token)
 
                 if permissionDenied {
                     // TCC denial belongs in the existing inline permission card.
@@ -776,21 +993,86 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func stopServer() {
-        // Save display position before destroying
-        virtualDisplayManager?.saveDisplayPosition()
+    /// Claim the start latch. Main-actor: the latch and `settings.isRunning`
+    /// have to be read together.
+    @MainActor
+    private func beginStart() -> StartGeneration.Token? {
+        guard !isStartingServer, !settings.isRunning else { return nil }
+        return startGeneration.begin()
+    }
 
+    /// Undo one start attempt and release the latch in a single main-actor
+    /// step. A cancelled token is already owned by nobody, so `finish` is a
+    /// no-op for it and the rollback cannot release a newer start's latch.
+    private func rollbackStart(token: StartGeneration.Token, attempt: StartAttempt, reason: String) async {
+        debugLog("⚠️ startServer() rolling back: \(reason)")
+        // A newer attempt that has already gone live owns the running state now:
+        // this attempt tears down only what it built, and must not report the
+        // app as stopped.
+        let stillOwnsState = !startGeneration.isSuperseded(token)
+        await MainActor.run {
+            self.tearDown(attempt, clearingSettings: stillOwnsState)
+            self.startGeneration.finish(token)
+        }
+    }
+
+    /// Idempotent teardown of a single start attempt, on the main actor
+    /// (StreamingServer.stop() drains its own queues with `sync` and must never
+    /// be called from one of them). An AppDelegate property is only cleared
+    /// while it still holds THIS attempt's object, so a late rollback cannot
+    /// destroy a session a newer start already published.
+    @MainActor
+    private func tearDown(_ attempt: StartAttempt, clearingSettings: Bool = true) {
+        attempt.idleSleepMonitor?.stop()
+        attempt.brightnessMonitor?.stop()
+        attempt.screenCapture?.stopStreaming()
+        attempt.streamingServer?.stop()
+        attempt.virtualDisplayManager?.destroyDisplay()
+
+        if idleSleepMonitor === attempt.idleSleepMonitor { idleSleepMonitor = nil }
+        if brightnessMonitor === attempt.brightnessMonitor { brightnessMonitor = nil }
+        if screenCapture === attempt.screenCapture { screenCapture = nil }
+        if streamingServer === attempt.streamingServer { streamingServer = nil }
+        if virtualDisplayManager === attempt.virtualDisplayManager { virtualDisplayManager = nil }
+
+        guard clearingSettings else { return }
         releaseStylusIfNeeded()
-
-        screenCapture?.stopStreaming()
-        streamingServer?.stop()
-        virtualDisplayManager?.destroyDisplay()
-
         settings.isRunning = false
         settings.displayCreated = false
         settings.clientConnected = false
         settings.currentFPS = 0
         settings.currentBitrate = 0
+        persistWirelessDeviceDisconnect()
+    }
+
+    /// StreamingServer.stop() does not report onClientDisconnected, so a quit,
+    /// a connection-mode switch or a failed start has to take the final
+    /// lastConnected snapshot itself.
+    @MainActor
+    private func persistWirelessDeviceDisconnect() {
+        guard let name = currentWirelessDevice else { return }
+        pairedDeviceStore.upsert(name: name, lastConnected: Date())
+        currentWirelessDevice = nil
+        settings.currentWirelessDevice = nil
+    }
+
+    /// Main actor: StreamingServer.stop() `sync`s onto networkQueue,
+    /// controlQueue, frameQueue and receiveQueue, so it must not be called from
+    /// inside one of them, and the run-loop monitors it stops are main-owned.
+    @MainActor
+    func stopServer() {
+        // Cancel an in-flight start (its display-creation window is ~55 s) and
+        // free the latch so the next Start click is accepted immediately.
+        startGeneration.cancel()
+        // Save display position before destroying
+        virtualDisplayManager?.saveDisplayPosition()
+        tearDown(StartAttempt(
+            virtualDisplayManager: virtualDisplayManager,
+            screenCapture: screenCapture,
+            streamingServer: streamingServer,
+            idleSleepMonitor: idleSleepMonitor,
+            brightnessMonitor: brightnessMonitor
+        ))
 
         print("⏹️ Server stopped")
     }
@@ -962,6 +1244,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let stylusSecondaryButtonMask: UInt32 = 1 << 6 // Android BUTTON_STYLUS_SECONDARY
 
+    /// Main actor: it mutates the stylus fields that handleStylus drives and
+    /// posts a mouse-up for the pending stroke.
+    @MainActor
     private func releaseStylusIfNeeded() {
         guard stylusIsDown else { return }
         injectStylusMouseUp(at: stylusLastPosition)
@@ -1344,6 +1629,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Stop momentum scrolling
         stopMomentumScroll()
 
+        // The 2 s checklist timer is scheduled on the main run loop and is not
+        // tied to cancellables: left alone it kept firing (and could spawn adb)
+        // for the whole termination sequence.
+        statusRefreshTimer?.invalidate()
+        statusRefreshTimer = nil
+
         // Stop server and cleanup
         stopServer()
 
@@ -1386,9 +1677,11 @@ extension AppDelegate: NSMenuDelegate {
             keyEquivalent: "t"
         )
         toggle.target = self
-        // Mirror the settings-window Start button: starting needs the Screen
-        // Recording permission, stopping is always allowed.
-        toggle.isEnabled = settings.isRunning || settings.hasScreenRecordingPermission
+        // Always enabled: gating Start on hasScreenRecordingPermission made the
+        // item unreachable for a user who had never granted it, and
+        // CGRequestScreenCaptureAccess() is only reachable from the settings
+        // window. startServer() already handles the not-granted case.
+        toggle.isEnabled = true
         menu.addItem(toggle)
 
         // Connection mode (switching while running restarts the server, same
@@ -1407,6 +1700,16 @@ extension AppDelegate: NSMenuDelegate {
         modeItem.submenu = modeMenu
         menu.addItem(modeItem)
 
+        let brightnessItem = NSMenuItem()
+        let brightnessView = BrightnessMenuItemView(
+            level: nativeBrightness?.level ?? UInt8(NativeBrightnessController.persistedLevel)
+        )
+        brightnessView.onChange = { [weak self] level in
+            self?.nativeBrightness?.setLevel(level)
+        }
+        brightnessItem.view = brightnessView
+        menu.addItem(brightnessItem)
+
         menu.addItem(.separator())
 
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: "s")
@@ -1414,6 +1717,167 @@ extension AppDelegate: NSMenuDelegate {
         menu.addItem(settingsItem)
 
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit Side Screen", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit SideTab", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+}
+
+// MARK: - Start/stop coordination
+
+/// Cancellation token and reentrancy latch for startServer().
+///
+/// startServer() runs on the Swift cooperative pool (AppDelegate is not
+/// @MainActor-inferred) while stopServer() runs on the main thread, so the two
+/// touch the same properties with no scheduler relationship. The generation is
+/// captured at the start of an attempt and re-checked after every await;
+/// stopServer() bumps it and the in-flight attempt rolls itself back instead of
+/// resurrecting the display, server, capture pipeline and idle-sleep assertion.
+///
+/// `begin`/`finish` are lock-guarded rather than actor-hopped on purpose: the
+/// latch has to be released synchronously with the exit path. Resetting it from
+/// an unstructured `Task { @MainActor in }` enqueued it after the caller's
+/// continuation, and a connection-mode change landing in that window already ran
+/// stopServer() — so the restart was rejected as "already starting" and the app
+/// was left stopped with no error shown.
+final class StartGeneration: @unchecked Sendable {
+    struct Token: Equatable {
+        let value: UInt64
+    }
+
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+    private var newestAttempt: UInt64 = 0
+    private var inFlight: UInt64?
+
+    var hasInFlightStart: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return inFlight != nil
+    }
+
+    /// nil when a start attempt already holds the latch.
+    func begin() -> Token? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard inFlight == nil else { return nil }
+        generation &+= 1
+        newestAttempt = generation
+        inFlight = generation
+        return Token(value: generation)
+    }
+
+    /// Release the latch, but only for the attempt that still owns it.
+    func finish(_ token: Token) {
+        lock.lock()
+        defer { lock.unlock() }
+        if inFlight == token.value {
+            inFlight = nil
+        }
+    }
+
+    /// stopServer(): every in-flight attempt is stale from here on.
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        generation &+= 1
+        inFlight = nil
+    }
+
+    func isCurrent(_ token: Token) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return inFlight == token.value
+    }
+
+    /// True once a LATER attempt has claimed the pipeline, so a stale rollback
+    /// must not clear the running state that now belongs to that session. Note
+    /// that `cancel()` alone does not supersede an attempt: a start that is
+    /// merely cancelled still owns the state its own teardown must reset.
+    func isSuperseded(_ token: Token) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return newestAttempt > token.value
+    }
+}
+
+/// The pipeline objects one startServer() attempt created.
+///
+/// They are published into the AppDelegate properties so the touch, menu and
+/// brightness paths can see them, but kept per attempt so a cancelled or failed
+/// attempt tears down only what it built and never a session a newer start has
+/// already published.
+final class StartAttempt {
+    var virtualDisplayManager: VirtualDisplayManager?
+    var screenCapture: ScreenCapture?
+    var streamingServer: StreamingServer?
+    var idleSleepMonitor: IdleSleepMonitor?
+    var brightnessMonitor: BrightnessMonitor?
+
+    init(
+        virtualDisplayManager: VirtualDisplayManager? = nil,
+        screenCapture: ScreenCapture? = nil,
+        streamingServer: StreamingServer? = nil,
+        idleSleepMonitor: IdleSleepMonitor? = nil,
+        brightnessMonitor: BrightnessMonitor? = nil
+    ) {
+        self.virtualDisplayManager = virtualDisplayManager
+        self.screenCapture = screenCapture
+        self.streamingServer = streamingServer
+        self.idleSleepMonitor = idleSleepMonitor
+        self.brightnessMonitor = brightnessMonitor
+    }
+}
+
+/// Lock-guarded copy of the display transform for StreamingServer's network
+/// queue. `onCodecNegotiated` runs synchronously on that queue immediately
+/// before the display config is sent, so it cannot hop to the main actor, and
+/// reading the published `settings` transform from there races the rotation sink.
+final class DisplayTransformStore: @unchecked Sendable {
+    struct Transform: Equatable {
+        var rotation = 0
+        var flipHorizontal = false
+        var flipVertical = false
+    }
+
+    private let lock = NSLock()
+    private var current = Transform()
+
+    var snapshot: Transform {
+        lock.lock()
+        defer { lock.unlock() }
+        return current
+    }
+
+    func update(_ transform: Transform) {
+        lock.lock()
+        current = transform
+        lock.unlock()
+    }
+
+    func update(rotation: Int, flipHorizontal: Bool, flipVertical: Bool) {
+        update(Transform(
+            rotation: rotation,
+            flipHorizontal: flipHorizontal,
+            flipVertical: flipVertical
+        ))
+    }
+}
+
+/// A wedged adb subprocess must not latch a "probe in progress" flag for the
+/// life of the process: both the USB checklist and the self-healing reverse
+/// repair skip all work while their flag is set, so one hang would disable them
+/// permanently. Every flag set by a detached probe records its start time and is
+/// force-cleared once this deadline passes.
+enum BackgroundProbeWatchdog {
+    /// Longest a probe may hold its flag: three sequential adb calls at
+    /// ADBCommandRunner.defaultTimeout plus slack.
+    static let defaultStaleAfter: TimeInterval = 20
+
+    static func isStale(
+        startedAt: Date?,
+        now: Date,
+        staleAfter: TimeInterval = defaultStaleAfter
+    ) -> Bool {
+        guard let startedAt else { return false }
+        return now.timeIntervalSince(startedAt) >= staleAfter
     }
 }

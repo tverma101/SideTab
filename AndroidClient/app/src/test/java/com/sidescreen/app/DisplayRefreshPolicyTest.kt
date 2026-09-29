@@ -5,8 +5,8 @@ import org.junit.Test
 
 class DisplayRefreshPolicyTest {
     @Test
-    fun modernAndroidExpresses120IntentDirectly() {
-        assertEquals(120f, DisplayRefreshPolicy.modernPreferredRate(), 0.001f)
+    fun streamIntentIsTheHost120FpsCeiling() {
+        assertEquals(120f, DisplayRefreshPolicy.STREAM_INTENT_HZ, 0.001f)
     }
 
     @Test

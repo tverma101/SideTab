@@ -1,19 +1,25 @@
+import CoreGraphics
 import CoreVideo
 import Foundation
+import ImageIO
 
-/// In-sender test-pattern injection (fork experiment harness) — RIG VALIDATION
-/// ONLY. The offline harness (probes/offline_enc/) is the primary measurement
-/// path; this exists so the one rig validation run shows known pixels.
+/// In-sender test-pattern injection — RIG VALIDATION ONLY. This exists so a
+/// validation run shows known pixels.
 ///
 /// Enabled by `SideScreen_exp_pattern` = "gradient" | "lowramp" | "stepped" |
 /// "text" | "color". ONE static pattern per sender run (NOT a wall-clock
 /// cycle): SCStream freezes when the display is idle and the keepalive
 /// re-encodes the last frame, so the tablet shows a stable pattern the whole
-/// run. Pattern math MUST stay in lockstep with harness fillY8/renderPatternSource
-/// in probes/offline_enc/main.swift (they produce the reference source PNGs).
+/// run.
 ///
-/// Format guard: only 420YpCbCr8BiPlanarFullRange (2 planes, interleaved
-/// CbCr) is supported — 10-bit biplanar buffers no-op with a log line.
+/// This file is the single source of truth for the pattern math. An earlier
+/// revision pointed at a "probes/offline_enc/main.swift" harness that never
+/// existed in any commit on any branch, so nothing could drift out of lockstep
+/// with it — the cross-reference was pure rot and has been removed.
+///
+/// Format guard: 8-bit full/video-range biplanar buffers (2 planes,
+/// interleaved CbCr) are supported — 10-bit biplanar buffers no-op with a log
+/// line.
 enum PatternInjector {
     static func isActive() -> Bool {
         UserDefaults.standard.string(forKey: "SideScreen_exp_pattern") != nil
@@ -25,10 +31,11 @@ enum PatternInjector {
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
         guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return }
         let fmt = CVPixelBufferGetPixelFormatType(buffer)
-        guard fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
+        guard VideoColorProfile.isSupportedEightBit420(fmt) else {
             debugLog("PatternInjector: format 0x\(String(fmt, radix: 16)) unsupported — skipping (10-bit path not supported on rig)")
             return
         }
+        let fullRange = VideoColorProfile.isFullRange(fmt)
 
         // "file" mode: load a PNG (SideScreen_exp_patternFile) and blit it 1:1.
         // Used for the native-vs-stream chart A/B (2026-08-15).
@@ -38,11 +45,11 @@ enum PatternInjector {
                 debugLog("PatternInjector: file mode but no loadable PNG at '\(path)'")
                 return
             }
-            fillFromRGB(rgb, into: buffer)
+            fillFromRGB(rgb, into: buffer, fullRange: fullRange)
             debugLog("PatternInjector: injected file \(path) (\(rgb.width)x\(rgb.height))")
             return
         }
-        fillPattern(kind, buffer: buffer, base: base)
+        fillPattern(kind, buffer: buffer, base: base, fullRange: fullRange)
     }
 
     struct RGBImage { let width: Int; let height: Int; let pixels: [UInt8] } // RGBA
@@ -61,16 +68,20 @@ enum PatternInjector {
         return RGBImage(width: w, height: h, pixels: pixels)
     }
 
-    /// Blit an RGBA image into the 420f buffer (Y + interleaved CbCr), 1:1 at
-    /// the buffer's top-left; un-covered area stays as-is.
-    static func fillFromRGB(_ rgb: RGBImage, into buffer: CVPixelBuffer) {
+    /// Blit an RGBA image into an 8-bit 420 buffer (Y + interleaved CbCr), 1:1
+    /// at the buffer's top-left; un-covered area stays as-is. Encode samples
+    /// in the same range as the destination buffer.
+    static func fillFromRGB(
+        _ rgb: RGBImage,
+        into buffer: CVPixelBuffer,
+        fullRange: Bool = true
+    ) {
         let bw = CVPixelBufferGetWidth(buffer)
         let bh = CVPixelBufferGetHeight(buffer)
         let yRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
         guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
               let cbCr = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return }
         let cRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
-        let cw = CVPixelBufferGetWidthOfPlane(buffer, 1)
         let w = min(rgb.width, bw), h = min(rgb.height, bh)
         for y in 0..<h {
             let yp = yBase + y * yRow
@@ -78,7 +89,7 @@ enum PatternInjector {
             for x in 0..<w {
                 let o = (y * rgb.width + x) * 4
                 let r = rgb.pixels[o], g = rgb.pixels[o + 1], b = rgb.pixels[o + 2]
-                let (yv, cb, cr) = ycbcr(r, g, b)
+                let (yv, cb, cr) = ycbcr(r, g, b, fullRange: fullRange)
                 yp.advanced(by: x).storeBytes(of: yv, as: UInt8.self)
                 let cx = x / 2
                 cp.advanced(by: cx * 2).storeBytes(of: cb, as: UInt8.self)
@@ -87,7 +98,12 @@ enum PatternInjector {
         }
     }
 
-    static func fillPattern(_ kind: String, buffer: CVPixelBuffer, base: UnsafeMutableRawPointer) {
+    static func fillPattern(
+        _ kind: String,
+        buffer: CVPixelBuffer,
+        base: UnsafeMutableRawPointer,
+        fullRange: Bool = true
+    ) {
         let w = CVPixelBufferGetWidth(buffer)
         let h = CVPixelBufferGetHeight(buffer)
         let yRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
@@ -101,17 +117,25 @@ enum PatternInjector {
         case "gradient":
             for y in 0..<h {
                 let v = UInt8(min(255, y * 255 / max(h - 1, 1)))
-                memset(base + y * yRow, Int32(v), w)
+                memset(
+                    base + y * yRow,
+                    Int32(VideoColorProfile.encodeLuma(Double(v), fullRange: fullRange)),
+                    w
+                )
             }
         case "lowramp":
             for y in 0..<h {
                 let v = UInt8(min(64, y * 64 / max(h - 1, 1)))
-                memset(base + y * yRow, Int32(v), w)
+                memset(
+                    base + y * yRow,
+                    Int32(VideoColorProfile.encodeLuma(Double(v), fullRange: fullRange)),
+                    w
+                )
             }
         case "stepped":
             let patches = 17, ph = h / patches
             for i in 0..<patches {
-                let v = UInt8(i * 8)
+                let v = VideoColorProfile.encodeLuma(Double(i * 8), fullRange: fullRange)
                 for y in (i * ph)..<min((i + 1) * ph, h) {
                     memset(base + y * yRow, Int32(v), w)
                 }
@@ -130,14 +154,22 @@ enum PatternInjector {
                     default: if xb < 8 { v = 0 }
                     }
                     if x % 7 == 0 && y % 7 == 0 { v = 0 }
-                    row.advanced(by: x).storeBytes(of: v, as: UInt8.self)
+                    row.advanced(by: x).storeBytes(
+                        of: VideoColorProfile.encodeLuma(Double(v), fullRange: fullRange),
+                        as: UInt8.self
+                    )
                 }
             }
         case "color":
             let cols = 6, rows = 4
             let pw = w / cols, ph = h / rows
             for i in 0..<colorPatches.count {
-                let (y, _, _) = ycbcr(colorPatches[i].0, colorPatches[i].1, colorPatches[i].2)
+                let (y, _, _) = ycbcr(
+                    colorPatches[i].0,
+                    colorPatches[i].1,
+                    colorPatches[i].2,
+                    fullRange: fullRange
+                )
                 let cx = i % cols, cy = i / cols
                 for yy in (cy * ph)..<min((cy + 1) * ph, h) {
                     memset(base + yy * yRow + cx * pw, Int32(y), pw)
@@ -151,10 +183,14 @@ enum PatternInjector {
         // ---- CbCr plane (interleaved, 4:2:0: 1 pair per 2x2 luma) ----
         if kind == "color" {
             let cols = 6, rows = 4
-            let ph = h / rows
             let cpw = cw / cols, cph = cH / rows
             for i in 0..<colorPatches.count {
-                let (_, cb, cr) = ycbcr(colorPatches[i].0, colorPatches[i].1, colorPatches[i].2)
+                let (_, cb, cr) = ycbcr(
+                    colorPatches[i].0,
+                    colorPatches[i].1,
+                    colorPatches[i].2,
+                    fullRange: fullRange
+                )
                 let cx = i % cols, cy = i / cols
                 for yy in (cy * cph)..<min((cy + 1) * cph, cH) {
                     let row = cbCr + yy * cRow
@@ -178,12 +214,19 @@ enum PatternInjector {
         (255,182,193),(255,228,196),(176,224,230),(238,130,238),(255,160,122),(128,0,128),
     ]
 
-    /// sRGB -> BT.709 YCbCr (full-range 0-255, matching harness).
-    static func ycbcr(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> (UInt8, UInt8, UInt8) {
-        let rf = Double(r), gf = Double(g), bf = Double(b)
-        let y = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf
-        let cb = -0.1146 * rf - 0.3854 * gf + 0.5 * bf + 128.0
-        let cr = 0.5 * rf - 0.4542 * gf - 0.0458 * bf + 128.0
-        return (UInt8(min(max(y, 0), 255)), UInt8(min(max(cb, 0), 255)), UInt8(min(max(cr, 0), 255)))
+    /// sRGB -> BT.709 YCbCr in the selected 8-bit range.
+    static func ycbcr(
+        _ r: UInt8,
+        _ g: UInt8,
+        _ b: UInt8,
+        fullRange: Bool = true
+    ) -> (UInt8, UInt8, UInt8) {
+        let result = VideoColorProfile.ycbcr(
+            red: r,
+            green: g,
+            blue: b,
+            fullRange: fullRange
+        )
+        return (result.y, result.cb, result.cr)
     }
 }

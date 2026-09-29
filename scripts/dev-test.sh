@@ -4,11 +4,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/android_ports.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/resolve_adb.sh"
+ADB_BIN="$(sidescreen_resolve_adb 2>/dev/null || true)"
+ADB_SERIAL=""
 VERSION=$(cat "$ROOT_DIR/VERSION" | tr -d '[:space:]')
 APP_DIR="$ROOT_DIR/SideScreen.app"
 
 echo "======================================="
-echo "  Side Screen - Dev Test (v$VERSION)"
+echo "  SideTab - Dev Test (v$VERSION)"
 echo "======================================="
 echo ""
 
@@ -41,6 +45,8 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <string>com.sidescreen.app</string>
     <key>CFBundleName</key>
     <string>Side Screen</string>
+    <key>CFBundleDisplayName</key>
+    <string>SideTab</string>
     <key>CFBundleVersion</key>
     <string>$VERSION</string>
     <key>CFBundleShortVersionString</key>
@@ -54,7 +60,7 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Side Screen needs screen recording access to capture your virtual display.</string>
+    <string>SideTab needs screen recording access to capture your virtual display.</string>
 </dict>
 </plist>
 EOF
@@ -85,9 +91,12 @@ echo "  OK"
 
 # 4. Install APK on device
 echo "[4/5] Installing APK..."
-if adb devices | grep -q "device$"; then
-    "$SCRIPT_DIR/backup_android_apks.sh"
-    adb install -r "$APK" 2>&1 | tail -1
+if [ -n "$ADB_BIN" ]; then
+    ADB_SERIAL="$(sidescreen_resolve_usb_serial "$ADB_BIN")"
+fi
+if [ -n "${ADB_SERIAL:-}" ]; then
+    ADB="$ADB_BIN" SIDESCREEN_ADB_SERIAL="$ADB_SERIAL" "$SCRIPT_DIR/backup_android_apks.sh" >/dev/null
+    "$ADB_BIN" -s "$ADB_SERIAL" install -r "$APK" 2>&1 | tail -1
 else
     echo "  No device connected, skipping install"
 fi
@@ -97,15 +106,17 @@ echo "[5/5] Starting macOS app..."
 pkill -x SideScreen 2>/dev/null || true
 sleep 0.5
 
-adb reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
-adb reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
+if [ -n "${ADB_SERIAL:-}" ]; then
+    "$ADB_BIN" -s "$ADB_SERIAL" reverse tcp:"$ANDROID_USB_VIDEO_PORT" tcp:"$ANDROID_USB_VIDEO_PORT" 2>/dev/null || true
+    "$ADB_BIN" -s "$ADB_SERIAL" reverse tcp:"$ANDROID_USB_CONTROL_PORT" tcp:"$ANDROID_USB_CONTROL_PORT" 2>/dev/null || true
+fi
 open "$APP_DIR"
 
 echo ""
 echo "======================================="
 echo "  Ready to test!"
 echo "  App: $APP_DIR"
-echo "  Open Side Screen on your tablet"
+echo "  Open SideTab on your tablet"
 echo "======================================="
 echo ""
 read -p "Test result? [y=OK / n=failed]: " RESULT
