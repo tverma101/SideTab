@@ -17,7 +17,12 @@ final class DitherPassTests: XCTestCase {
         }
         UserDefaults.standard.set(2, forKey: "SideScreen_exp_dither")      // ampMax 2 LSB
         UserDefaults.standard.set(5.5, forKey: "SideScreen_exp_ditherK")
-        UserDefaults.standard.set(4000, forKey: "SideScreen_exp_ditherBudget")
+        // These tests pin the amplitude contract, not the time box. At the
+        // production 4 ms an unoptimised build on a CI VM stops at the row-32
+        // budget check and leaves exactly half of the steep-ramp fixture
+        // untouched (3136 of the 6272 pixels a full pass changes), which
+        // reads as "not dithered". One second cannot truncate a 256x64 frame.
+        UserDefaults.standard.set(1_000_000, forKey: "SideScreen_exp_ditherBudget")
     }
 
     override func tearDown() {
