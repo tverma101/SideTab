@@ -123,6 +123,14 @@ class StreamingServer {
     private let controlQueue = DispatchQueue(label: "controlQueue", qos: .userInteractive)
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
+    /// Fired when a live session is ended because the client went silent past
+    /// `SessionLifetimePolicy.defaultDisconnectTimeout` — as opposed to a
+    /// socket that actually reported a terminal state. Kept separate from
+    /// `onClientDisconnected` because the host tears the whole session down
+    /// (server stopped, virtual display destroyed) on a timeout, whereas an
+    /// observed disconnect only clears per-client state and leaves the
+    /// listener up so the tablet can reconnect on its own.
+    var onSessionTimeout: (() -> Void)?
     /// Fired once per connection during protocol startup, BEFORE the display
     /// config is sent, for every outcome (.hevc or .h264) — so the capture
     /// pipeline can also revert to HEVC after an AVC-only client goes away.
@@ -178,6 +186,16 @@ class StreamingServer {
         var startupPublished = false
         var publishedMetadataSupport: Bool?
         var publishedDecodeLimits: (width: Int, height: Int)?
+        /// Last instant the *client* sent us a byte on either socket. Seeded
+        /// when the session goes live so a client that authenticates and then
+        /// goes quiet is still ended on schedule. Read by the session watchdog
+        /// on networkQueue, written by the video parser on receiveQueue and the
+        /// control parser on controlQueue, so it lives in this leaf lock.
+        var lastInboundActivity: ContinuousClock.Instant?
+        /// Incremented every time a session is installed or ended, so a
+        /// watchdog tick that was already queued cannot act on a session it no
+        /// longer describes.
+        var sessionGeneration: UInt64 = 0
         var displayWidth = 1920
         var displayHeight = 1080
         var rotation = 0
@@ -248,6 +266,15 @@ class StreamingServer {
             // Optimize TCP for low-latency streaming
             if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
                 tcpOptions.noDelay = true  // Disable Nagle's algorithm
+                // Kernel-level backstop for a half-open socket. A peer whose
+                // Wi-Fi association drops sends no FIN or RST, so the
+                // application only learns about it once the kernel's own
+                // keepalive probes fail. Set well inside the session watchdog's
+                // budget so the socket dies before the five-minute deadline.
+                tcpOptions.enableKeepalive = true
+                tcpOptions.keepaliveIdle = 20
+                tcpOptions.keepaliveCount = 4
+                tcpOptions.keepaliveInterval = 10
             }
 
             listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
@@ -310,6 +337,13 @@ class StreamingServer {
             params.serviceClass = .responsiveData
             if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
                 tcpOptions.noDelay = true
+                // Same half-open backstop as the video socket, tuned shorter
+                // because control is the channel that proves the client is
+                // still there.
+                tcpOptions.enableKeepalive = true
+                tcpOptions.keepaliveIdle = 20
+                tcpOptions.keepaliveCount = 4
+                tcpOptions.keepaliveInterval = 10
             }
             controlListener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: controlPort))
             controlListener?.newConnectionHandler = { [weak self] newConnection in
@@ -530,10 +564,9 @@ class StreamingServer {
                 self.startReceivingControl()
             case .failed(let error):
                 debugLog("Control connection failed: \(error)")
-                self.controlConnection = nil
-                newConnection.cancel()
+                self.markControlDisconnected(newConnection)
             case .cancelled:
-                self.controlConnection = nil
+                self.markControlDisconnected(newConnection)
             default:
                 break
             }
@@ -566,17 +599,16 @@ class StreamingServer {
             }
             if let error = error {
                 debugLog("Control receive error: \(error) — closing")
-                self.controlConnection = nil
-                connection.cancel()
+                self.markControlDisconnected(connection)
                 return
             }
             if isComplete {
                 debugLog("Control receive EOF — closing")
-                self.controlConnection = nil
-                connection.cancel()
+                self.markControlDisconnected(connection)
                 return
             }
             if let data = data, !data.isEmpty {
+                self.noteInboundActivity()
                 self.controlInputBuffer.append(data)
                 self.processControlBuffer(connection: connection)
             }
@@ -760,6 +792,13 @@ class StreamingServer {
     private static let contenderProofWindow: TimeInterval = 1.5
     private static let authenticatedContenderWindow: TimeInterval = 5.0
     private static let loopbackControlProbeMaxBytes = 64
+
+    /// Repeating session watchdog. Armed when a session goes live, stopped on
+    /// any terminal path. It exists because a half-open socket is invisible:
+    /// Network.framework delivers no `.failed`/`.cancelled` when a peer simply
+    /// stops reading, so without a deadline the host would hold a "Connected"
+    /// session for the life of the process.
+    private var sessionWatchdog: DispatchSourceTimer?
 
     private func handleConnection(_ newConnection: NWConnection) {
         debugLog("New connection incoming...")
@@ -1011,15 +1050,112 @@ class StreamingServer {
     /// pipeline stops pushing frames into a corpse (the dropped-frame plateau
     /// after "Connection reset by peer"), and report the disconnect once.
     private func markDisconnected() {
+        stopSessionWatchdog()
         let disconnectedConnection = connection
         sessionState.withLock { state in
             state.connectionReady = false
             state.receiving = false
+            state.sessionGeneration &+= 1
         }
         retireFrameTransport(disconnectedConnection)
         connection = nil
         inputBuffer.removeAll(keepingCapacity: true)
         onClientDisconnected?()
+    }
+
+    // MARK: - Session lifetime
+
+    /// The out-of-band control socket went away. Control carries pings, touch,
+    /// stylus and brightness, but video is the primary path, so losing control
+    /// alone must NOT end a live stream — the client legitimately drops and
+    /// re-establishes control on Wi-Fi transitions. Only when video is not
+    /// live either is the client genuinely gone, and then the session ends
+    /// through the same path as a video-side failure.
+    ///
+    /// Previously all four control terminal exits just nil'd the socket, so a
+    /// client whose control channel died silently kept a stale connected state
+    /// with no way back to the accurate one.
+    private func markControlDisconnected(_ c: NWConnection) {
+        guard controlConnection === c else { return }
+        controlConnection = nil
+        controlAuthenticated = false
+        c.cancel()
+        let videoLive = sessionState.withLock { $0.connectionReady }
+        if !videoLive {
+            debugLog("Control socket closed with no live video — ending session")
+            markDisconnected()
+        } else {
+            debugLog("Control socket closed; video still live — session continues")
+        }
+    }
+
+    /// Records that the client sent us something. Called on every inbound byte
+    /// on either socket — video or control, any message type — because a live
+    /// control pinger is just as good proof of life as a video frame, and the
+    /// client deliberately goes quiet on *both* sockets while backgrounded.
+    private func noteInboundActivity() {
+        sessionState.withLock { $0.lastInboundActivity = .now }
+    }
+
+    /// Marks the session live and starts the deadline that ends it. Called only
+    /// on the first publish for a generation, so a capability re-advertisement
+    /// cannot restart the client's budget indefinitely.
+    private func beginSessionLifetime() {
+        let generation: UInt64 = sessionState.withLock { state in
+            state.sessionGeneration &+= 1
+            state.lastInboundActivity = .now
+            return state.sessionGeneration
+        }
+        startSessionWatchdog(generation: generation)
+    }
+
+    private func startSessionWatchdog(generation: UInt64) {
+        stopSessionWatchdog()
+        let tick = SessionLifetimePolicy.watchdogTickSeconds
+        let timer = DispatchSource.makeTimerSource(queue: networkQueue)
+        timer.schedule(
+            deadline: .now() + tick,
+            repeating: tick,
+            leeway: .milliseconds(250)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.checkSessionLifetime(generation: generation)
+        }
+        timer.resume()
+        sessionWatchdog = timer
+    }
+
+    private func stopSessionWatchdog() {
+        sessionWatchdog?.cancel()
+        sessionWatchdog = nil
+    }
+
+    /// Ends a session that has been silent past the deadline. A generation
+    /// fence means a tick queued before a reconnect cannot act on the client
+    /// that replaced it.
+    private func checkSessionLifetime(generation: UInt64) {
+        let (live, lastInbound, currentGeneration) = sessionState.withLock {
+            ($0.connectionReady, $0.lastInboundActivity, $0.sessionGeneration)
+        }
+        // A session with no stamped activity is not being judged, it is waiting
+        // on its install. Ending it here would be a false positive.
+        guard generation == currentGeneration, let lastInbound else { return }
+        let silence = .now - lastInbound
+        guard SessionLifetimePolicy.shouldEndSession(
+            sessionLive: live,
+            hasInboundActivity: true,
+            silence: silence
+        ) else { return }
+
+        debugLog(
+            "Session silent for \(Int(silence / .seconds(1)))s — timing out and tearing down"
+        )
+        // Report the disconnect through the normal path first so per-client
+        // state (stylus release, connected flag, lastConnected snapshot) is
+        // cleared exactly as it is for an observed socket error, then escalate
+        // to the host so the server and virtual display are released too.
+        markDisconnected()
+        onSessionTimeout?()
     }
 
     private func onConnectionReady(_ conn: NWConnection, alreadyAuthenticated: Bool = false) {
@@ -1152,6 +1288,10 @@ class StreamingServer {
         if plan.firstPublish {
             let metadata = sessionState.withLock { $0.clientSupportsFrameMetadata }
             debugLog("Connection ready for frames (metadata=\(metadata ? "on" : "off"), codec=\(plan.codec))")
+            // Start the disconnect deadline only on the first publish: a later
+            // capability re-advertisement must not hand the client a fresh
+            // five-minute budget.
+            beginSessionLifetime()
             onClientConnected?()
         }
     }
@@ -1380,12 +1520,22 @@ class StreamingServer {
             guard let self = self, self.isReceiving, !self.isStopped, self.connection === connection else { return }
 
             if error != nil || isComplete {
+                // A peer that closed cleanly reports isComplete, and a reset
+                // socket reports an error. Neither reaches the stateUpdateHandler
+                // as .failed/.cancelled reliably, so the disconnect used to go
+                // unreported here and the host kept a "Connected" session for a
+                // socket nobody was on.
                 self.sessionState.withLock { $0.receiving = false }
                 self.inputBuffer.removeAll(keepingCapacity: true)
+                self.markDisconnected()
                 return
             }
 
             if let data = data, !data.isEmpty {
+                // Any byte counts as proof of life, not just video frames: the
+                // video path's own message types (display config, codec
+                // selection, capability advertisements) are as good as a frame.
+                self.noteInboundActivity()
                 self.inputBuffer.append(data)
                 self.processInputBuffer(connection: connection)
             }
@@ -1823,6 +1973,7 @@ class StreamingServer {
         // networkQueue first is what makes the latch above authoritative: a
         // connection installed after it would otherwise leak its socket.
         networkQueue.sync {
+            stopSessionWatchdog()
             connection?.cancel()
             listener?.cancel()
             if let c = contender { clearContender(c, cancelSocket: true) }

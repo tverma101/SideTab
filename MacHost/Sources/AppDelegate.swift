@@ -836,6 +836,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
+            server.onSessionTimeout = { [weak self] in
+                // A session that stayed silent for the full five-minute budget
+                // is indistinguishable from one whose client is gone, so the
+                // host does the only honest thing left: end the whole session
+                // rather than hold a "Connected" state, a running encoder and
+                // a virtual display for a client that will never come back.
+                //
+                // Hopped off StreamingServer's networkQueue — stop() drains its
+                // own queues with `sync` and must never be called from one of
+                // them, and tearDown reaches main-actor state.
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    // markDisconnected() has already run and cleared
+                    // clientConnected by the time this task lands, so gate on
+                    // the session still being live rather than on the client
+                    // flag. If the user stopped the server in the meantime,
+                    // tearDown is unnecessary and would only destroy a display
+                    // a newer start has already published.
+                    guard self.settings.isRunning else { return }
+                    print("⏱️ No tablet activity for 5 minutes — stopping stream")
+                    self.stopServer()
+                }
+            }
+
             server.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
                 self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
             }

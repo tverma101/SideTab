@@ -243,6 +243,13 @@ resumes it on Connect. When ScreenCaptureKit confirms the desktop has not
 changed, the Mac skips re-encoding that frame; Android's video and control
 pings keep quiet sessions alive without sending duplicate frames.
 
+A session that receives nothing from the tablet for five minutes — a Wi-Fi
+association that dropped without a clean close, a tablet that went to sleep —
+is timed out by the Mac, which stops streaming and releases the virtual
+display instead of holding a stale "Connected" state. The deadline is measured
+from bytes the tablet sends, never from frames the Mac pushes, so a socket that
+is accepted-but-never-read cannot keep a session alive on its own.
+
 ### Wireless mode (no cable)
 
 1. Launch **SideTab** on Mac → toggle to the **Wireless** tab → a QR code appears
