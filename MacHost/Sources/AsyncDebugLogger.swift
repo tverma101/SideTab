@@ -16,12 +16,27 @@ final class AsyncDebugLogger {
 
     private let lock = NSLock()
     private let writerQueue = DispatchQueue(label: "com.sidescreen.debuglog", qos: .utility)
-    private let directoryURL: URL = {
+    private let directoryURL = AsyncDebugLogger.logDirectory(isTestProcess: AsyncDebugLogger.isTestProcess)
+    var logURL: URL { directoryURL.appendingPathComponent("sidescreen.log") }
+
+    /// The live host logs to `~/Library/Logs/SideScreen`. A test process logs to
+    /// a scratch directory instead: `swift test` runs as the same user, and its
+    /// lines used to interleave with a real session's in the one file that is
+    /// read as evidence when diagnosing a tablet.
+    static func logDirectory(isTestProcess: Bool) -> URL {
+        if isTestProcess {
+            return FileManager.default.temporaryDirectory
+                .appendingPathComponent("SideScreenTests/Logs", isDirectory: true)
+        }
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library", isDirectory: true)
         return library.appendingPathComponent("Logs/SideScreen", isDirectory: true)
-    }()
-    private var logURL: URL { directoryURL.appendingPathComponent("sidescreen.log") }
+    }
+
+    /// XCTest is loaded into the test runner before any test bundle, and never
+    /// into the app.
+    static let isTestProcess: Bool = NSClassFromString("XCTestCase") != nil
+        || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     private let maxPendingEntries = 1_024
     private static let maxLogBytes = 4 * 1024 * 1024
     private static let archivedGenerations = 2
