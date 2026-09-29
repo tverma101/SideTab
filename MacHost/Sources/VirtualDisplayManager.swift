@@ -27,13 +27,6 @@ class VirtualDisplayManager {
     /// even when it survives, the WindowServer may already have retired the ID.
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    /// The one divisor for both HiDPI and non-HiDPI. The old code switched
-    /// between 220 and 110 PPI, but the HiDPI branch also doubled the pixel
-    /// count, so both branches emitted an identical rect. Note that Retina-ness
-    /// comes from maxPixelsWide versus the POINTS in the mode list, not from
-    /// this physical size.
-    private static let millimetersPerPixel = 25.4 / 110.0
-
     /// Releasing the display object is the only teardown this API offers (there
     /// is no destroy()), and it is not sufficient once the display has entered
     /// a configuration transaction: on macOS 26+ a display whose mode changed
@@ -82,10 +75,7 @@ class VirtualDisplayManager {
         descriptor.name = name
         descriptor.maxPixelsWide = UInt32(geometry.pixelsWide)
         descriptor.maxPixelsHigh = UInt32(geometry.pixelsHigh)
-        descriptor.sizeInMillimeters = CGSize(
-            width: Double(geometry.pixelsWide) * Self.millimetersPerPixel,
-            height: Double(geometry.pixelsHigh) * Self.millimetersPerPixel
-        )
+        descriptor.sizeInMillimeters = geometry.sizeInMillimeters
 
         let productID = VirtualDisplayLimits.productID(
             pixelsWide: geometry.pixelsWide,
@@ -100,7 +90,8 @@ class VirtualDisplayManager {
                 pixelsWide: geometry.pixelsWide,
                 pixelsHigh: geometry.pixelsHigh,
                 refreshRate: refreshRate,
-                hiDPI: hiDPI
+                hiDPI: hiDPI,
+                pixelsPerInch: Int(geometry.pixelsPerInch)
             )
         )
 
@@ -108,14 +99,12 @@ class VirtualDisplayManager {
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = hiDPI ? 1 : 0
 
-        // Two modes under HiDPI: the physical-size anchor (tells macOS the
-        // panel is high-density, which is what unlocks HiDPI for the logical
-        // mode) and the logical mode we actually want selected. Measured live
-        // on macOS 27: the system picks the second and reports a backing scale
-        // of 2.0 (1400x876 points / 2800x1752 pixels). Chromium passes a single
-        // mode and lets macOS synthesise the variants, which is a reasonable
-        // alternative, but this pair is the configuration verified working, so
-        // it stays.
+        // Two modes under HiDPI: the full-pixel mode and the logical mode we
+        // want. Which one macOS selects for a display it has not seen before
+        // is decided by the descriptor's density, not by this list: measured
+        // live on macOS 27, the same pair opens at 1400x876 Retina at 220 PPI
+        // and at 2800x1752 1x at 110 PPI. For a display it has seen, macOS
+        // restores the mode it saved, whatever the density.
         var modes: [CGVirtualDisplayMode] = []
         if hiDPI {
             modes.append(CGVirtualDisplayMode(
@@ -153,7 +142,7 @@ class VirtualDisplayManager {
         let modeDesc = hiDPI
             ? "\(geometry.pointsWide)x\(geometry.pointsHigh) HiDPI (physical \(geometry.pixelsWide)x\(geometry.pixelsHigh))"
             : "\(geometry.pointsWide)x\(geometry.pointsHigh)"
-        print("✅ Virtual display created: \(modeDesc) @ \(geometry.refreshRate)Hz (ID: \(display.displayID), serial \(descriptor.serialNum))")
+        debugLog("✅ Virtual display created: \(modeDesc) @ \(geometry.refreshRate)Hz, \(Int(geometry.pixelsPerInch)) PPI (ID: \(display.displayID), serial \(descriptor.serialNum))")
 
         registerScreenParamsObserver()
     }
@@ -524,6 +513,11 @@ class VirtualDisplayManager {
 
         let found = ids.contains(displayID)
         debugLog("verifyDisplayRegistered: displayID \(displayID) \(found ? "FOUND" : "NOT FOUND") in online displays \(ids)")
+        if found, let mode = CGDisplayCopyDisplayMode(displayID) {
+            // The requested geometry is only what was offered; this is what
+            // macOS picked. A saved choice from System Settings wins here.
+            debugLog("Virtual display mode selected: \(mode.width)x\(mode.height) points, \(mode.pixelWidth)x\(mode.pixelHeight) pixels")
+        }
         return found
     }
 
@@ -711,12 +705,31 @@ enum VirtualDisplayLimits {
     static let minRefreshRate = 1.0
     static let maxRefreshRate = 960.0
 
+    /// The descriptor's physical size is the logical desktop at this many
+    /// points per inch, and HiDPI packs twice the pixels into the same size.
+    /// macOS picks the default mode of a new display from its pixel density: a
+    /// 2800x1752 panel opens at 1400x876 Retina at 220 PPI, but at 2800x1752
+    /// 1x at 110 PPI.
+    static let pointsPerInch = 110.0
+
     struct Geometry: Equatable {
         let pointsWide: Int
         let pointsHigh: Int
         let pixelsWide: Int
         let pixelsHigh: Int
         let refreshRate: Double
+
+        var pixelsPerInch: Double {
+            VirtualDisplayLimits.pointsPerInch * Double(pixelsWide) / Double(pointsWide)
+        }
+
+        var sizeInMillimeters: CGSize {
+            let millimetersPerPoint = 25.4 / VirtualDisplayLimits.pointsPerInch
+            return CGSize(
+                width: Double(pointsWide) * millimetersPerPoint,
+                height: Double(pointsHigh) * millimetersPerPoint
+            )
+        }
     }
 
     static func resolve(width: Int, height: Int, refreshRate: Int, hiDPI: Bool) throws -> Geometry {
@@ -760,6 +773,10 @@ enum VirtualDisplayLimits {
 /// to have different serial numbers". The value must be stable across runs
 /// (that is what makes the system remember a mode) and distinct per distinct
 /// configuration, so it is a pure hash of the configuration.
+///
+/// Density is part of it because a remembered mode outlives a density fix:
+/// HiDPI displays shipped for a while at 110 PPI, macOS saved 1x for them, and
+/// restored 1x even after the density went back to 220 PPI.
 enum VirtualDisplaySerial {
     struct Seed: Equatable {
         let vendorID: UInt32
@@ -768,6 +785,7 @@ enum VirtualDisplaySerial {
         let pixelsHigh: Int
         let refreshRate: Int
         let hiDPI: Bool
+        let pixelsPerInch: Int
     }
 
     static func number(for seed: Seed) -> UInt32 {
@@ -788,6 +806,7 @@ enum VirtualDisplaySerial {
         encoded.append(contentsOf: bigEndian(UInt32(truncatingIfNeeded: seed.pixelsHigh)))
         encoded.append(contentsOf: bigEndian(UInt32(truncatingIfNeeded: seed.refreshRate)))
         encoded.append(seed.hiDPI ? 1 : 0)
+        encoded.append(contentsOf: bigEndian(UInt32(truncatingIfNeeded: seed.pixelsPerInch)))
         return encoded
     }
 
