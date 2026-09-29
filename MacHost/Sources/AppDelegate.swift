@@ -846,7 +846,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Hopped off StreamingServer's networkQueue — stop() drains its
                 // own queues with `sync` and must never be called from one of
                 // them, and tearDown reaches main-actor state.
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     guard let self = self else { return }
                     // markDisconnected() has already run and cleared
                     // clientConnected by the time this task lands, so gate on
