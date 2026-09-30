@@ -27,7 +27,9 @@ object WirelessFreshnessPolicy {
      *
      * Over budget now always means drop, on every transport. USB keeps a looser
      * ceiling because its larger frames and slower pipeline make a higher age
-     * budget intentional, not an oversight.
+     * budget intentional, not an oversight — but a *looser bound* is still a
+     * bound. An age that cannot be compared to the clock at all is not
+     * demonstrably inside any budget, so it is dropped on both transports.
      *
      * @param maxReasonableLatencyNs the decoder's own ceiling beyond which a
      *   presentation timestamp is not comparable to the current clock.
@@ -48,6 +50,12 @@ object WirelessFreshnessPolicy {
             val effective = if (hasValidLatency) decodedLatencyNs else Long.MAX_VALUE
             return shouldRender(effective, isFirstFrame = false)
         }
-        return !hasValidLatency || decodedLatencyNs <= maxRenderLatencyNs
+        // Looser, but still a bound. The previous form here was
+        // `!hasValidLatency || ...`, which rendered exactly the frames whose age
+        // could not be established at all — the opposite of what its own KDoc
+        // claimed, and reachable on USB after any stall past the decoder's
+        // ceiling.
+        if (!hasValidLatency) return false
+        return decodedLatencyNs <= maxRenderLatencyNs
     }
 }
