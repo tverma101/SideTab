@@ -132,4 +132,41 @@ class WirelessFreshnessPolicyTest {
             ),
         )
     }
+
+    /**
+     * Regression, found by reviewing the first implementation of this policy:
+     * the USB arm read `!hasValidLatency || decodedLatencyNs <= maxRenderLatencyNs`,
+     * so an uninterpretable age — one that cannot be compared to the clock at
+     * all — was rendered. That is the exact opposite of the arm's own KDoc, and
+     * it is reachable on USB after any stall past the decoder's ceiling. A
+     * looser bound is still a bound.
+     */
+    @Test
+    fun usbAlsoDropsAnUninterpretableLatency() {
+        assertFalse(
+            WirelessFreshnessPolicy.shouldRenderOutput(
+                decodedLatencyNs = reasonable + 1,
+                hasValidLatency = false,
+                isFirstOutput = false,
+                wireless = false,
+                maxReasonableLatencyNs = reasonable,
+                maxRenderLatencyNs = usbRender,
+            ),
+        )
+    }
+
+    /** A clock reading behind the presentation timestamp is not interpretable. */
+    @Test
+    fun negativeLatencyIsNotInterpretable() {
+        assertFalse(
+            WirelessFreshnessPolicy.shouldRenderOutput(
+                decodedLatencyNs = -1L,
+                hasValidLatency = false,
+                isFirstOutput = false,
+                wireless = true,
+                maxReasonableLatencyNs = reasonable,
+                maxRenderLatencyNs = usbRender,
+            ),
+        )
+    }
 }
