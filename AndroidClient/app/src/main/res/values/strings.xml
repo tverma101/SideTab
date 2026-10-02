@@ -9,6 +9,10 @@
     <string name="connecting_status">Connecting…</string>
     <string name="usb_host_invalid">Enter a valid host name or IP address.</string>
     <string name="usb_port_invalid">Enter a video port number from 1 to 65534.</string>
+    <string name="usb_fail_mac_server_not_running">Mac server is not running.\n\nPlease start the Mac app first, then tap Connect.</string>
+    <string name="usb_fail_cannot_reach_mac">Cannot reach Mac over USB.\n\nKeep the cable plugged in — the Mac app re-establishes the USB bridge automatically within a few seconds — then tap Connect again.</string>
+    <string name="usb_fail_timed_out">Connection timed out.\n\nCheck if the Mac firewall is blocking port %1$d, then tap Connect again.</string>
+    <string name="usb_fail_generic">Connection failed: %1$s\n\nMake sure the Mac app is running and the cable is plugged in, then tap Connect. If USB debugging crashed on the Mac, use Repair USB Bridge in the Mac app.</string>
     <string name="vsr_cfl_fallback">cfl fallback</string>
     <string name="vsr_fallback">fallback</string>
     <string name="vsr_not_available">n/a</string>
