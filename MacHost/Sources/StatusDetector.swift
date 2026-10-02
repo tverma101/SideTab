@@ -5,6 +5,10 @@ enum ADBUSBDeviceStatus: Equatable {
     case connected(serial: String?)
     case authorizationRequired(serial: String)
     case offline(serial: String)
+    /// ADB is installed but the `adb devices` probe itself failed or timed
+    /// out. This is a *Mac-side* failure (wedged ADB server, squatted port
+    /// 5037) and must not be reported as a missing tablet.
+    case serverUnreachable
 
     var readySerial: String? {
         guard case let .connected(serial) = self else { return nil }
@@ -18,7 +22,7 @@ enum ADBUSBDeviceStatus: Equatable {
 
     var needsAction: Bool {
         switch self {
-        case .authorizationRequired(_), .offline(_):
+        case .authorizationRequired(_), .offline(_), .serverUnreachable:
             return true
         case .notDetected, .connected(_):
             return false
@@ -35,6 +39,8 @@ enum ADBUSBDeviceStatus: Equatable {
             return "Authorize tablet"
         case .offline:
             return "Tablet offline"
+        case .serverUnreachable:
+            return "ADB not responding"
         }
     }
 
@@ -48,6 +54,8 @@ enum ADBUSBDeviceStatus: Equatable {
             return "ADB sees \(serial), but the tablet has not authorized this Mac. Unlock the tablet and tap Allow USB debugging (choose Always allow if offered)."
         case let .offline(serial):
             return "ADB sees \(serial) as offline. Reconnect the cable, unlock the tablet, and check for a USB debugging prompt."
+        case .serverUnreachable:
+            return "ADB is installed, but the ADB server on this Mac did not answer. Click Repair USB Bridge — it restarts ADB and re-establishes the reverse tunnel. The tablet is not necessarily at fault."
         }
     }
 }
@@ -76,11 +84,16 @@ enum StatusDetector {
     }
 
     /// Preserve unauthorized/offline states so the Mac UI can tell the user
-    /// why USB reverse forwarding cannot be configured.
+    /// why USB reverse forwarding cannot be configured. A probe that ran but
+    /// got no answer is reported as `.serverUnreachable` instead of being
+    /// collapsed into "no device visible": a wedged ADB server and an
+    /// unplugged tablet need different fixes.
     static func usbDeviceStatus() -> ADBUSBDeviceStatus {
         guard !wirelessModeActive else { return .notDetected }
-        guard let output = adbDevicesOutput() else { return .notDetected }
-        return usbDeviceStatus(from: output)
+        guard let adbPath = adbExecutablePath() else { return .notDetected }
+        guard let result = ADBCommandRunner.run(adbPath, arguments: ["devices", "-l"]),
+              result.succeeded else { return .serverUnreachable }
+        return usbDeviceStatus(from: result.output)
     }
 
     static func usbDeviceStatus(from output: String) -> ADBUSBDeviceStatus {

@@ -2030,26 +2030,25 @@ class MainActivity : AppCompatActivity() {
                 client.connect()
             } catch (e: Exception) {
                 if (activeConnectionGeneration != generation) return@launch
+                // The Mac app owns adb reverse and repairs the bridge on its
+                // own; these messages must never send a tablet user to a
+                // Mac Terminal.
                 val errorMessage =
-                    when {
-                        e is java.net.ConnectException -> {
-                            "Mac server is not running.\n\nPlease start the Mac app first."
-                        }
+                    when (UsbConnectFailure.from(e)) {
+                        UsbConnectFailure.MAC_SERVER_NOT_RUNNING ->
+                            getString(R.string.usb_fail_mac_server_not_running)
 
-                        e is java.net.NoRouteToHostException || e is java.net.UnknownHostException -> {
-                            "Cannot reach Mac.\n\n" +
-                                "Make sure both devices are connected via USB cable and ADB reverse is configured."
-                        }
+                        UsbConnectFailure.CANNOT_REACH_MAC ->
+                            getString(R.string.usb_fail_cannot_reach_mac)
 
-                        e is java.net.SocketTimeoutException -> {
-                            "Connection timeout.\n\nCheck if Mac firewall is blocking port $port."
-                        }
+                        UsbConnectFailure.TIMED_OUT ->
+                            getString(R.string.usb_fail_timed_out, port)
 
-                        else -> {
-                            "Connection failed: ${e.message}\n\n" +
-                                "Try:\n• Start the Mac app\n" +
-                                "• Check USB connection\n• Run: adb reverse tcp:$port tcp:$port"
-                        }
+                        UsbConnectFailure.OTHER ->
+                            getString(
+                                R.string.usb_fail_generic,
+                                e.message ?: e.javaClass.simpleName,
+                            )
                     }
                 runOnUiThread {
                     if (activeConnectionGeneration != generation) return@runOnUiThread
