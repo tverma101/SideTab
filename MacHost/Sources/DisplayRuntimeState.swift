@@ -18,6 +18,10 @@ final class DisplayRuntimeState: ObservableObject {
     @Published var adbReverseConfigured = false
     @Published var usbDeviceConnected = false
     @Published var usbDeviceStatus: ADBUSBDeviceStatus = .notDetected
+    /// Manual USB bridge repair: in-flight latch and the last outcome shown
+    /// next to the Repair USB Bridge button.
+    @Published var usbRepairInFlight = false
+    @Published var usbRepairResult: String?
     @Published var wifiConnected = false
     @Published var listeningAddress: String?
     @Published var isRunning = false

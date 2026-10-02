@@ -68,6 +68,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// repair while the first one is still retrying.
     private var adbReverseRepairInFlight = false
     private var adbReverseRepairStartedAt: Date?
+    /// The manual USB bridge repair has the same latch discipline: a user
+    /// click must not queue a second kill-server while one is still running,
+    /// but a wedged repair must also not disable the button forever.
+    private var usbRepairStartedAt: Date?
     /// Cancellation token for startServer(), which runs on the Swift
     /// cooperative pool while stopServer() runs on the main thread. Also owns
     /// the "already starting" reentrancy latch.
@@ -296,6 +300,71 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Manual USB bridge repair (Repair USB Bridge button / menu item).
+    ///
+    /// The automatic checklist cannot recover a wedged ADB server: its repair
+    /// gate needs a *successful* `adb devices` probe, so a dead server spins
+    /// on "Not detected" forever. This is the only path that runs
+    /// `adb kill-server`. Automatic behavior stays untouched — no timer ever
+    /// restarts the ADB server, because other tooling on this Mac shares it.
+    @MainActor
+    @objc func repairUSBBridge() {
+        guard settings.connectionMode == .usb else { return }
+        if runtime.usbRepairInFlight {
+            guard BackgroundProbeWatchdog.isStale(
+                startedAt: usbRepairStartedAt,
+                now: Date()
+            ) else { return }
+            debugLog("⏱️ Manual USB bridge repair watchdog fired — the previous repair never returned")
+            runtime.usbRepairInFlight = false
+            usbRepairStartedAt = nil
+        }
+        // A live session is itself proof the bridge works; restarting the ADB
+        // server now would tear down the stream for no reason.
+        if runtime.isRunning && runtime.clientConnected {
+            runtime.usbRepairResult = "The USB bridge is working — the tablet is streaming. Nothing to repair."
+            return
+        }
+        runtime.usbRepairInFlight = true
+        usbRepairStartedAt = Date()
+        runtime.usbRepairResult = nil
+        debugLog("🛠 Manual USB bridge repair requested")
+
+        Task.detached { [weak self] in
+            // kill-server + probe stay off the main actor; both are bounded
+            // subprocess calls (ADBCommandRunner timeout + SIGKILL grace).
+            let adbPath = StatusDetector.adbExecutablePath()
+            let status: ADBUSBDeviceStatus
+            if let adbPath {
+                status = USBBridgeRepair.restartServerAndProbe(adbPath: adbPath)
+            } else {
+                // Nothing to restart. The checklist's "ADB installed: Missing"
+                // row already explains the fix; say so in the result too.
+                status = .notDetected
+            }
+            await MainActor.run { [weak self] in
+                guard let self = self else { return }
+                self.usbRepairStartedAt = nil
+                self.runtime.usbRepairInFlight = false
+
+                // A probe that completed after a mode switch must not publish
+                // USB state into the wireless checklist. The next tick will
+                // probe the new mode instead.
+                guard self.settings.connectionMode == .usb else { return }
+
+                self.runtime.adbInstalled = adbPath != nil
+                self.runtime.usbDeviceStatus = status
+                self.runtime.usbDeviceConnected = status.isConnected
+                if let serial = status.readySerial {
+                    // The self-healing repair is the same path a replug takes:
+                    // reuse it instead of duplicating the reverse setup here.
+                    self.scheduleADBReverseRepair(serial: serial)
+                }
+                self.runtime.usbRepairResult = USBBridgeRepair.resultMessage(for: status)
+            }
+        }
+    }
+
     @MainActor
     private func handleConnectionModeChange(to mode: ConnectionMode) async {
         debugLog("Connection mode changed to: \(mode.rawValue)")
@@ -463,6 +532,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.onRequestScreenRecordingPermission = { [weak self] in
             Task { @MainActor [weak self] in
                 await self?.requestScreenRecordingPermission()
+            }
+        }
+
+        settings.onRepairUSBBridge = { [weak self] in
+            // Same self-binding discipline as onToggleServer: hop to the main
+            // actor without capturing a strong self in the stored closure.
+            Task { @MainActor [weak self] in
+                self?.repairUSBBridge()
             }
         }
     }
@@ -1701,6 +1778,19 @@ extension AppDelegate: NSMenuDelegate {
         let modeItem = NSMenuItem(title: "Connection Mode", action: nil, keyEquivalent: "")
         modeItem.submenu = modeMenu
         menu.addItem(modeItem)
+
+        // Manual recovery for a wedged ADB server. The automatic checklist
+        // never runs `adb kill-server` on purpose, so this is the only
+        // in-app way out of a stuck USB bridge.
+        let repairUSB = NSMenuItem(
+            title: "Repair USB Bridge",
+            action: #selector(repairUSBBridge),
+            keyEquivalent: ""
+        )
+        repairUSB.target = self
+        repairUSB.isEnabled = settings.connectionMode == .usb
+            && !(runtime.isRunning && runtime.clientConnected)
+        menu.addItem(repairUSB)
 
         let brightnessItem = NSMenuItem()
         let brightnessView = BrightnessMenuItemView(

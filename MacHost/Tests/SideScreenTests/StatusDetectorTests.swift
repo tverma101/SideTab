@@ -66,4 +66,15 @@ final class StatusDetectorTests: XCTestCase {
             )
         )
     }
+
+    func testServerUnreachableIsActionableAndBlamesTheServerNotTheCable() {
+        let status = ADBUSBDeviceStatus.serverUnreachable
+
+        XCTAssertTrue(status.needsAction)
+        XCTAssertFalse(status.isConnected)
+        XCTAssertNil(status.readySerial)
+        XCTAssertEqual(status.label, "ADB not responding")
+        XCTAssertTrue(status.hint.contains("Repair USB Bridge"))
+        XCTAssertFalse(status.hint.contains("cable"))
+    }
 }
