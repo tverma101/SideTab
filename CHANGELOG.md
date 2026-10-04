@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `analyzeNALUnits`, the only Annex-B *reader* in the repository, is preserved as `HEVCNALInspector` in `MacHost/Sources` where it is linted and covered by tests. It also fixes an out-of-bounds trap on short input and names the AUD/EOS/EOB/FD unit types the harness omitted.
 
 ### Fixed
+- Live streams without a verified USB serial no longer claim physical USB detection.
+- Failed Android decoders release rejected input slots and rebuild within a finite budget, with a visible terminal error.
+- Previously live foreground USB sessions resume after transient drops within four attempts and 60 seconds.
+- Mac session events and capture rebuilds reject stale callbacks and clean up superseded streams.
+- VideoToolbox settings rebuilds retain the working encoder if replacement allocation fails.
+- Long-running host logs rotate while the file handle stays open and tolerate unavailable storage.
+- Android builds select a compatible JDK instead of a newer unsupported system Java.
+- Socket write deadlines release blocked writers, fence stale deadlines, and preserve live video during control-channel recovery.
 - **A wedged ADB server was reported as a missing tablet.** The USB status collapsed three different failures — binary missing, nonzero exit, probe timeout — into one `notDetected` state whose hint blamed the cable and USB debugging, while the actual fault was on the Mac. A probe that ran but got no answer now has its own "ADB not responding" state that names the real problem.
 - **USB connection failures sent the user to a Mac Terminal.** The tablet's error dialog ended with `Run: adb reverse tcp:$port tcp:$port` — a shell command, shown on a tablet — and its "ADB reverse is configured" advice predated the Mac-side self-heal. USB failures are now classified by exception type into tested messages (server not running / cannot reach the Mac over USB / timed out / other) that end in "tap Connect again" and name the Mac's Repair USB Bridge where relevant.
 - **No video reached the tablet.** The host decided whether an encoded frame was a keyframe by demanding an explicit `NotSync=false` sample attachment, but VideoToolbox never sets one: CoreMedia defines a *missing* `NotSync` key as a sync sample, and every IDR arrives that way. Each keyframe was read as a P-frame, the server's wait-for-first-keyframe gate dropped the entire stream, and the tablet stayed black while the session looked connected. Keyframe detection now follows the CoreMedia contract, and a test drives a real VideoToolbox session to pin it.

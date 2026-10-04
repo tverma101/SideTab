@@ -196,4 +196,56 @@ final class StreamingServerWireTests: XCTestCase {
         let server = StreamingServer(port: 54_321, controlPort: 55_123)
         XCTAssertEqual(server.controlPortNumber, 55_123)
     }
+
+    // MARK: - Callback identity snapshots
+
+    /// The host fences every MainActor callback on a snapshot read here, on the
+    /// server's own queue, at callback-invocation time. It must therefore
+    /// report THIS server's identity and the generation the session flags are
+    /// currently under — not a value the caller supplies.
+    func testSessionSnapshotIdentifiesTheServerThatProducedIt() {
+        let server = StreamingServer(port: 54_321)
+        let other = StreamingServer(port: 54_322)
+
+        let snapshot = server.currentSessionSnapshot()
+
+        XCTAssertEqual(snapshot.serverID, ObjectIdentifier(server))
+        XCTAssertNotEqual(snapshot.serverID, ObjectIdentifier(other))
+        XCTAssertFalse(snapshot.live, "a server that never published a session has no live client")
+    }
+
+    func testSessionEventMatchesTheSnapshotItWasBuiltFrom() {
+        let server = StreamingServer(port: 54_321)
+
+        let snapshot = server.currentSessionSnapshot()
+        let event = server.currentSessionEvent()
+
+        XCTAssertEqual(event.serverID, snapshot.serverID)
+        XCTAssertEqual(event.sessionGeneration, snapshot.generation)
+    }
+
+    func testSessionEventIsEquatableForGateComparison() {
+        let server = StreamingServer(port: 54_321)
+
+        XCTAssertEqual(server.currentSessionEvent(), server.currentSessionEvent())
+        XCTAssertNotEqual(
+            server.currentSessionEvent(),
+            StreamingServer(port: 54_321).currentSessionEvent()
+        )
+    }
+
+    /// Ending a session has to move the generation, including on stop(). The
+    /// host revalidates each callback against the server's CURRENT generation
+    /// after its main-actor hop, so an event captured before a stop would
+    /// otherwise still describe the generation the server appears to hold.
+    func testStopAdvancesTheSessionGeneration() {
+        let server = StreamingServer(port: 0, controlPort: 0)
+        let before = server.currentSessionEvent()
+
+        server.stop()
+
+        XCTAssertNotEqual(before.sessionGeneration, server.currentSessionSnapshot().generation)
+        XCTAssertNotEqual(before, server.currentSessionEvent())
+        XCTAssertFalse(server.currentSessionSnapshot().live)
+    }
 }

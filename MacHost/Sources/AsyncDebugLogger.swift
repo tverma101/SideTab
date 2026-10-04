@@ -16,7 +16,7 @@ final class AsyncDebugLogger {
 
     private let lock = NSLock()
     private let writerQueue = DispatchQueue(label: "com.sidescreen.debuglog", qos: .utility)
-    private let directoryURL = AsyncDebugLogger.logDirectory(isTestProcess: AsyncDebugLogger.isTestProcess)
+    private let directoryURL: URL
     var logURL: URL { directoryURL.appendingPathComponent("sidescreen.log") }
 
     /// The live host logs to `~/Library/Logs/SideScreen`. A test process logs to
@@ -38,15 +38,27 @@ final class AsyncDebugLogger {
     static let isTestProcess: Bool = NSClassFromString("XCTestCase") != nil
         || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     private let maxPendingEntries = 1_024
-    private static let maxLogBytes = 4 * 1024 * 1024
+    private let maxLogBytes: Int
     private static let archivedGenerations = 2
 
     private var pending: [Entry] = []
     private var drainScheduled = false
     private var droppedEntries = 0
     private var fileHandle: FileHandle?
+    private var fileBytes = 0
 
-    private init() {}
+    init(
+        directoryURL: URL = AsyncDebugLogger.logDirectory(isTestProcess: AsyncDebugLogger.isTestProcess),
+        maxLogBytes: Int = 4 * 1024 * 1024
+    ) {
+        self.directoryURL = directoryURL
+        self.maxLogBytes = max(1, maxLogBytes)
+    }
+
+    /// Wait for queued diagnostics, without involving the capture/network queues.
+    func flush() {
+        writerQueue.sync {}
+    }
 
     func log(_ message: String) {
         lock.lock()
@@ -96,17 +108,36 @@ final class AsyncDebugLogger {
             }
 
             guard let data = output.data(using: .utf8) else { continue }
-            let handle = ensureFileHandle()
-            handle?.write(data)
+            guard let handle = ensureFileHandle(nextWriteBytes: data.count) else { continue }
+            do {
+                try handle.write(contentsOf: data)
+                fileBytes += data.count
+            } catch {
+                // Disk-full and other diagnostic failures must not terminate
+                // the host. Retry opening on the next batch, keeping the queue
+                // bounded even when storage remains unavailable.
+                try? handle.close()
+                fileHandle = nil
+                fileBytes = 0
+            }
         }
     }
 
-    private func ensureFileHandle() -> FileHandle? {
-        if let fileHandle { return fileHandle }
+    private func ensureFileHandle(nextWriteBytes: Int) -> FileHandle? {
+        if let fileHandle {
+            if fileBytes > 0 && nextWriteBytes > maxLogBytes - min(fileBytes, maxLogBytes) {
+                try? fileHandle.close()
+                self.fileHandle = nil
+                fileBytes = 0
+                rotate()
+            } else {
+                return fileHandle
+            }
+        }
 
         let fileManager = FileManager.default
         try? fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        if let size = currentLogSize(), size >= Self.maxLogBytes {
+        if let size = currentLogSize(), size >= maxLogBytes {
             rotate()
         }
         // O_NOFOLLOW without O_EXCL: an existing log is reopened and appended
@@ -119,6 +150,8 @@ final class AsyncDebugLogger {
         guard descriptor >= 0 else { return nil }
         // O_APPEND already positions every write at the end.
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var attributes = stat()
+        fileBytes = fstat(descriptor, &attributes) == 0 ? Int(attributes.st_size) : 0
         fileHandle = handle
         return handle
     }

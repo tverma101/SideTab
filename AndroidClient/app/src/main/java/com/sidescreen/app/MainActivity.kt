@@ -20,6 +20,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Display
 import android.view.MotionEvent
@@ -65,6 +66,14 @@ private const val LEGACY_E3_PORT = 54326
  * negotiation the host never sends cannot hold the screen black.
  */
 private const val CODEC_NEGOTIATION_GRACE_MS = 1_500L
+
+/**
+ * Grace before a bounded wired resume. One known host-side cause of a dropped
+ * wired session is the Mac repairing its own crashed ADB server / torn-down
+ * `adb reverse` bridge, which takes about two seconds; dialing sooner can just
+ * reproduce the same failure.
+ */
+private const val USB_RESUME_GRACE_MS = 2_500L
 
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
@@ -113,6 +122,47 @@ class MainActivity : AppCompatActivity() {
     /** Bounded wait for the Mac's codec selection on an AVC-only device. */
     @Volatile private var codecNegotiationJob: Job? = null
     private var displayConfigReceivedAtMs = 0L
+
+    /**
+     * Decoder-pipeline recovery. A published pipeline reports its own fatal
+     * failures (codec error, oversized frames, no output) through a callback
+     * captured against the exact [VideoDecoder] instance it was published with.
+     * Retired decoders keep firing their callbacks after release, so every
+     * recovery decision is identity- and generation-fenced; without that fence a
+     * late callback from a dead pipeline tears down the healthy replacement.
+     */
+    private val videoRecoveryPolicy = VideoPipelineRecoveryPolicy()
+    private var videoRecoveryJob: Job? = null
+
+    /**
+     * One-shot-per-pipeline toast guard so a flapping codec cannot spam the UI.
+     * Written from the UI thread (see [handleDecoderFailure]).
+     */
+    private var videoFailureNotified = false
+
+    /**
+     * USB sessions are terminal in [StreamClient] by design, so a dropped wired
+     * session that the tablet itself did not end has no in-app path back. This
+     * resumes only a previously live, foreground, interactive session, and only
+     * within a finite budget, so an unplugged tablet stops instead of retrying
+     * forever and a user Disconnect never fights the retry.
+     */
+    private val usbReconnectPolicy = USBReconnectPolicy()
+    private var usbReconnectJob: Job? = null
+
+    /**
+     * Identity of a wired session plus whether it actually reached "connected".
+     * A connect that never established has nothing to resume.
+     */
+    private data class UsbSession(
+        val host: String,
+        val port: Int,
+        val controlHost: String,
+        val controlPort: Int,
+        var everConnected: Boolean = false,
+    )
+
+    private var lastUsbSession: UsbSession? = null
 
     // For dragging stats overlay
     private var isDraggingOverlay = false
@@ -245,6 +295,14 @@ class MainActivity : AppCompatActivity() {
     private fun applyModeVisibility(mode: ConnectionMode) {
         binding.usbModeContent.visibility = if (mode == ConnectionMode.USB) View.VISIBLE else View.GONE
         binding.wirelessModeContent.visibility = if (mode == ConnectionMode.WIRELESS) View.VISIBLE else View.GONE
+        if (mode == ConnectionMode.WIRELESS) {
+            // Wired recovery must never outlive the mode it belongs to: the
+            // resume target is a wired endpoint, and switching to Wireless means
+            // the user is no longer asking for a USB session.
+            usbReconnectJob?.cancel()
+            usbReconnectJob = null
+            usbReconnectPolicy.onSessionEnded()
+        }
         // USB checklist polls 127.0.0.1:port every 2s via adb-reverse to verify Mac
         // server reachability. While in Wireless mode that probe creates loopback
         // connections that fight the wireless session for the Mac's single client
@@ -677,7 +735,20 @@ class MainActivity : AppCompatActivity() {
                 .setTitle("Connection Error")
                 .setMessage(message)
                 .setPositiveButton("OK", null)
-                .show()
+                    .show()
+        }
+    }
+
+    /** Short, non-blocking feedback that renders above the streaming SurfaceView. */
+    private fun toast(message: String) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            android.widget.Toast
+                .makeText(
+                    this,
+                    message,
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
         }
     }
 
@@ -1317,6 +1388,8 @@ class MainActivity : AppCompatActivity() {
 
     /** Release codec and post-process resources before replacing their surface. */
     private fun releaseVideoPipeline() {
+        videoRecoveryJob?.cancel()
+        videoRecoveryJob = null
         videoPipelineGeneration += 1L
         inFlightPipelineKey = null
         codecNegotiationJob?.cancel()
@@ -1592,6 +1665,14 @@ class MainActivity : AppCompatActivity() {
         val wirelessSession: Boolean,
     )
 
+    /**
+     * One-shot latch for the "a rendered output proves this pipeline works"
+     * signal. Set from the codec callback thread on the first output of each
+     * published decoder and cleared when a new pipeline is published, so the
+     * policy is reset once per healthy pipeline rather than once per frame.
+     */
+    @Volatile private var outputProgressPosted = false
+
     private class VideoPipeline(
         val decoder: VideoDecoder,
         val sgsr: SgsrRenderer?,
@@ -1704,15 +1785,24 @@ class MainActivity : AppCompatActivity() {
     ) {
         val decoder = pipeline.decoder
         videoDecoder = decoder
+        // A fresh pipeline gets its own chance to prove output progression.
+        outputProgressPosted = false
         sgsrRenderer = pipeline.sgsr
         cflRenderer = pipeline.cfl
 
         streamClient?.let { client -> bindDecoderCallbacks(client, activeConnectionGeneration) }
         pipeline.cfl?.let { renderer ->
+            // Every renderer-bound callback below is identity-gated. MediaCodec
+            // and EGL callbacks can both arrive after release(), and an ungated
+            // late callback would push frames into, or resize, the *replacement*
+            // pipeline using the retired codec's state.
             decoder.onDecodedImage = { img, done -> renderer.submitImage(img, done) }
-            decoder.onColorRange = { range -> renderer.setFullRange(range == MediaFormat.COLOR_RANGE_FULL) }
+            decoder.onColorRange = { range ->
+                if (videoDecoder === decoder) renderer.setFullRange(range == MediaFormat.COLOR_RANGE_FULL)
+            }
             decoder.onImageOutputUnavailable = {
                 runOnUiThread {
+                    if (videoDecoder !== decoder) return@runOnUiThread
                     prefs.vsrEnabled = false
                     binding.streamStatusBarBinding.vsrText.text = getString(R.string.vsr_cfl_fallback)
                     restartVideoPath()
@@ -1726,34 +1816,117 @@ class MainActivity : AppCompatActivity() {
             mainDiag("decoder output format ${w}x$h crop=$cl,$cr,$ct,$cb")
             if (DisplayConfig.fromWire(w, h, 0) == null) {
                 mainDiag("ignored unsafe decoder output size ${w}x$h")
-            } else {
+            } else if (videoDecoder === decoder) {
                 // CfL self-sizes from each Image; SGSR needs the coded output size.
                 sgsrRenderer?.resizeStream(w, h)
             }
         }
-        decoder.onDecoderStalled = {
-            // Black screen with live stats: tell the user why instead of
-            // staying silent (issue #41). Toast renders above the (black)
-            // SurfaceView; the settings panel is hidden while streaming.
-            val cap = CodecCapabilities.maxDecodeSize(request.mime)
+        decoder.onFrameRendered = rendered@{
+            // A real rendered output is the only proof that a pipeline works, and
+            // it is only returned ONCE per published decoder: this fires on the
+            // codec's own callback thread for every output frame, so mutating the
+            // policy from it would race the UI thread and touching views would
+            // churn the UI on every frame. Post a single guarded reset.
+            if (videoDecoder !== decoder || outputProgressPosted) return@rendered
+            outputProgressPosted = true
             runOnUiThread {
-                val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
-                android.widget.Toast
-                    .makeText(
-                        this,
-                        "No video output — the stream resolution may exceed " +
-                            "this tablet's decoder limit$capText. " +
-                            "Lower the resolution or disable HiDPI on the Mac.",
-                        android.widget.Toast.LENGTH_LONG,
-                    ).show()
+                if (videoDecoder !== decoder) return@runOnUiThread
+                videoRecoveryPolicy.onOutputProgress()
+                videoFailureNotified = false
+                if (isConnected && streamClient?.isWirelessSession == false) {
+                    lastUsbSession?.everConnected = true
+                    usbReconnectPolicy.onConnected()
+                }
             }
         }
+        decoder.onDecoderStalled = {
+            // Superseded by the decoder's own 4s output-progress watchdog, which
+            // reports through onDecoderFailure with a stable reason prefix. Keep
+            // this as a diagnostic-only breadcrumb so a stall is still visible in
+            // logs even though recovery is driven from the newer signal.
+            mainDiag("decoder reported stall (recovery is driven by onDecoderFailure)")
+        }
+        decoder.onDecoderFailure = { reason -> handleDecoderFailure(decoder, reason) }
         streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
         mainDiag("Decoder initialized OK ${request.width}x${request.height} mime=${request.mime}, texture=${request.useTextureView}")
         log(
             "✅ Decoder initialized ${request.width}x${request.height} ${request.mime} " +
                 "(${request.display?.refreshRate ?: 60f}Hz)",
         )
+    }
+
+    /**
+     * One entry point for every fatal video-pipeline signal: codec onError,
+     * oversized frames the codec cannot accept, and the no-output watchdog.
+     *
+     * [decoder] must be the instance the callback was captured on. A released
+     * decoder can still deliver queued callbacks; without the identity check a
+     * late failure from a retired pipeline would tear down its healthy
+     * replacement and start a rebuild loop that never terminates.
+     */
+    private fun handleDecoderFailure(
+        decoder: VideoDecoder,
+        reason: String,
+    ) {
+        runOnUiThread {
+            if (videoDecoder !== decoder) return@runOnUiThread
+            if (!videoRecoveryPolicy.shouldRecover()) {
+                mainDiag("Video pipeline failed permanently: $reason (attempts=${videoRecoveryPolicy.attemptCount})")
+                val cap = CodecCapabilities.maxDecodeSize(decoder.mime)
+                // Tear the whole session down, not just the codec. While
+                // isConnected stays true the connection card stays hidden, so a
+                // terminal decoder failure would leave the user staring at a
+                // black screen with no visible Connect action. disconnect()
+                // restores the UI (Connect re-enabled, status/indicator reset),
+                // releases the dead pipeline, and ends any wired recovery.
+                disconnect()
+                showTerminalVideoFailure(reason, cap)
+                return@runOnUiThread
+            }
+            videoRecoveryJob?.cancel()
+            // Capture the attempt number *before* recording, or the first
+            // failure would be labelled attempt 2 and the backoff would be off
+            // by one step.
+            val attempt = videoRecoveryPolicy.nextAttemptNumber()
+            videoRecoveryPolicy.recordFailure()
+            val delayMs = videoRecoveryPolicy.delayForAttempt(attempt)
+            mainDiag("Video pipeline failure '$reason' — rebuild #$attempt in ${delayMs}ms")
+            if (!videoFailureNotified) {
+                videoFailureNotified = true
+                toast("Video decoder stopped — recovering")
+            }
+            videoRecoveryJob =
+                lifecycleScope.launch {
+                    delay(delayMs)
+                    // Surface, session, and connection can all change during the
+                    // backoff; only rebuild the still-current, still-live one.
+                    if (videoDecoder === decoder && isConnected) restartVideoPath()
+                }
+        }
+    }
+
+    /**
+     * The bounded rebuild budget is spent. Tell the user what to do instead of
+     * leaving the tablet a black SurfaceView with a green "connected" status.
+     */
+    private fun showTerminalVideoFailure(
+        reason: String,
+        cap: Pair<Int, Int>?,
+    ) {
+        val capText = cap?.let { " (max ~${it.first}x${it.second})" } ?: ""
+        // An oversize stream is a resolution problem, so name it explicitly
+        // instead of telling the user a generic decoder "stopped".
+        val hint =
+            if (reason.startsWith(DecoderRecoveryPolicy.REASON_INPUT_TOO_LARGE)) {
+                "This tablet cannot decode the Mac's current stream resolution. " +
+                    "Lower the Mac's display resolution or disable HiDPI, then tap Connect."
+            } else {
+                "Lower the Mac's resolution or disable HiDPI, then tap Connect to try again."
+            }
+        toast(
+            "Video stopped and did not recover$capText. $hint",
+        )
+        updateStatus("Video decoder failed — reconnect to retry")
     }
 
     /**
@@ -1832,6 +2005,10 @@ class MainActivity : AppCompatActivity() {
                     if (connected) android.R.color.holo_green_light else android.R.color.holo_red_light,
                 )
                 if (connected) {
+                    // TCP acceptance alone does not prove video works. Keep
+                    // outage budgets until this session renders real output.
+                    usbReconnectJob?.cancel()
+                    usbReconnectJob = null
                     val isForeground =
                         lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
                     client.setLivenessPaused(!isForeground)
@@ -1860,6 +2037,11 @@ class MainActivity : AppCompatActivity() {
                     }
                 } else {
                     applyPowerPolicy()
+                    // Captured before the field is cleared: the resume path has to
+                    // prove this drop belongs to the client that just died, and
+                    // isCurrentConnection only holds while the field still
+                    // points at that client.
+                    val dropBelongsToCurrentSession = isCurrentConnection(client, generation)
                     streamClient = null
                     stopPingTimer()
                     releaseVideoPipeline()
@@ -1880,7 +2062,8 @@ class MainActivity : AppCompatActivity() {
                         wirelessController.onStreamDisconnected()
                     } else {
                         startChecklistUpdates()
-                        log("Connection lost — tap Connect to retry")
+                        handleUsbSessionDropped(generation, dropBelongsToCurrentSession)
+                        log("Connection lost — resuming the USB session if the Mac bridge recovers")
                     }
                 }
             }
@@ -1935,6 +2118,134 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * A previously live USB session dropped. Wired recovery inside
+     * [StreamClient] is terminal by design. One known host-side cause is the Mac
+     * repairing its own crashed ADB server / torn-down `adb reverse` bridge,
+     * which takes about two seconds, so a resume can recover a transient fault
+     * the tablet itself cannot fix. Resume only a session that actually reached
+     * "connected", only while the app is foreground and the screen interactive,
+     * and only inside a finite budget. A user Disconnect, a background
+     * transition, and a screen-off each end recovery, so an unplugged tablet
+     * stops retrying instead of looping forever.
+     *
+     * [dropBelongsToCurrentSession] is computed before the status callback
+     * nulls `streamClient`; that capture is the only point where the fence can
+     * still prove the drop belongs to the session that just died.
+     */
+    private fun handleUsbSessionDropped(
+        droppedGeneration: Long,
+        dropBelongsToCurrentSession: Boolean,
+    ) {
+        val session = lastUsbSession?.takeIf { it.everConnected } ?: return
+        val now = SystemClock.elapsedRealtime()
+        usbReconnectPolicy.onSessionDropped(now)
+        val eligible =
+            // [dropBelongsToCurrentSession] is computed before streamClient is
+            // cleared; a newer connect/disconnect would have advanced the
+            // generation, so the drop belongs to a session the user replaced.
+            dropBelongsToCurrentSession &&
+                activeConnectionGeneration == droppedGeneration &&
+                activityInForeground &&
+                (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive &&
+                prefs.connectionMode == ConnectionMode.USB
+        if (!usbReconnectPolicy.shouldAttemptResume(eligible, now)) {
+            // Only a genuinely eligible drop that ran out of budget earns a
+            // prompt; a user Disconnect, background, or screen-off stays silent.
+            if (eligible && usbReconnectPolicy.spent()) {
+                usbReconnectPolicy.onSessionEnded()
+                session.everConnected = false
+                showError(getString(R.string.usb_fail_mac_server_not_running))
+            }
+            return
+        }
+
+        usbReconnectJob?.cancel()
+        scheduleUsbResumeAttempt(droppedGeneration, dropBelongsToCurrentSession)
+    }
+
+    /**
+     * Arm one resume attempt after the grace period. Each armed attempt consumes
+     * exactly one unit of the finite budget, whether it succeeds or fails, so a
+     * Mac that never returns exhausts the budget and then stops.
+     */
+    private fun scheduleUsbResumeAttempt(
+        expectedGeneration: Long,
+        dropBelongsToCurrentSession: Boolean,
+    ) {
+        val session = lastUsbSession?.takeIf { it.everConnected } ?: return
+        usbReconnectJob =
+            lifecycleScope.launch {
+                // Let the Mac finish repairing adb reverse before dialing again.
+                delay(USB_RESUME_GRACE_MS)
+                if (!usbReconnectPolicy.recordAttempt(SystemClock.elapsedRealtime())) return@launch
+                val stillEligible =
+                    dropBelongsToCurrentSession &&
+                        activeConnectionGeneration == expectedGeneration &&
+                        activityInForeground &&
+                        (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive &&
+                        prefs.connectionMode == ConnectionMode.USB &&
+                        streamClient == null
+                if (!stillEligible) return@launch
+                mainDiag(
+                    "USB session resume attempt ${usbReconnectPolicy.attemptCount} " +
+                        "(grace ${USB_RESUME_GRACE_MS}ms)",
+                )
+                updateStatus("Connection lost — reconnecting to the Mac…")
+                connectUsb(session)
+            }
+    }
+
+    /**
+     * Rebuild the wired client for one automatic resume. Mirrors [connect]'s
+     * teardown so every attempt starts from exactly the state a user-initiated
+     * Connect would. A failure here schedules another bounded attempt until the
+     * policy's finite window closes, then prompts the user.
+     */
+    private fun connectUsb(
+        session: UsbSession,
+    ) {
+        val generation = activeConnectionGeneration + 1
+        activeConnectionGeneration = generation
+        // session.everConnected stays true on purpose: this IS the resume of a
+        // previously live session, so if this attempt also fails to establish, the
+        // resulting status(false) drop must still be eligible for the next
+        // bounded attempt. The recovery budget is intentionally not reset here.
+        streamClient?.disconnect()
+        streamClient = null
+        releaseVideoPipeline()
+        isConnected = false
+        displayWidth = 0
+        displayHeight = 0
+        displayFlipHorizontal = false
+        displayFlipVertical = false
+        displayConfigReceivedAtMs = 0L
+        val client =
+            StreamClient(
+                session.host,
+                session.port,
+                applicationContext,
+                controlHost = session.controlHost,
+                controlPort = session.controlPort,
+            )
+        streamClient = client
+        setupStreamClientCallbacks(client, generation, session.host)
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                log("Resuming USB session to ${session.host}:${session.port}...")
+                client.connect()
+            } catch (e: Exception) {
+                // Recovery is owned by the onConnectionStatus(false) callback
+                // above, which StreamClient emits from its `finally` even for a
+                // never-established attempt. Doing anything here would race that
+                // callback: clearing streamClient first would make the status
+                // handler's drop fence fail and silently skip the next attempt.
+                log("USB resume attempt did not establish: ${e.message}")
+            }
+        }
+    }
+
     private fun connectWireless(
         host: String,
         port: Int,
@@ -1943,8 +2254,16 @@ class MainActivity : AppCompatActivity() {
         controlPort: Int? = null,
         alternateHosts: List<String> = emptyList(),
     ) {
+        videoRecoveryPolicy.reset()
+        videoFailureNotified = false
         val generation = activeConnectionGeneration + 1
         activeConnectionGeneration = generation
+        // Switching to a wireless session retires the remembered wired endpoint
+        // so a later wireless drop can never resume a stale USB session.
+        lastUsbSession?.everConnected = false
+        usbReconnectJob?.cancel()
+        usbReconnectJob = null
+        usbReconnectPolicy.onSessionEnded()
         streamClient?.disconnect()
         streamClient = null
         releaseVideoPipeline()
@@ -1997,6 +2316,11 @@ class MainActivity : AppCompatActivity() {
     ) {
         // Invalidate and close the previous client before creating its
         // replacement. Older callbacks are fenced by this generation.
+        usbReconnectJob?.cancel()
+        usbReconnectJob = null
+        usbReconnectPolicy.onSessionEnded()
+        videoRecoveryPolicy.reset()
+        videoFailureNotified = false
         val generation = activeConnectionGeneration + 1
         activeConnectionGeneration = generation
         streamClient?.disconnect()
@@ -2013,15 +2337,21 @@ class MainActivity : AppCompatActivity() {
         // latency/control packets on their dedicated adb-reverse port
         // so they cannot sit behind raw video frames in the E3 pipe.
         val usesE3VideoPath = host == LEGACY_E3_HOST && port == LEGACY_E3_PORT
+        val controlHost = if (usesE3VideoPath) "127.0.0.1" else host
+        val controlPort = if (usesE3VideoPath) 54322 else port + 1
         val client =
             StreamClient(
                 host,
                 port,
                 applicationContext,
-                controlHost = if (usesE3VideoPath) "127.0.0.1" else host,
-                controlPort = if (usesE3VideoPath) 54322 else port + 1,
+                controlHost = controlHost,
+                controlPort = controlPort,
             )
         streamClient = client
+        // Remember the wired endpoint while the user is asking for it, so a drop
+        // of a session that actually reached "connected" can be resumed without
+        // requiring the connection card to be visible again.
+        lastUsbSession = UsbSession(host, port, controlHost, controlPort)
         setupStreamClientCallbacks(client, generation, host)
 
         lifecycleScope.launch(Dispatchers.IO) {
@@ -2066,6 +2396,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun disconnect(restoreUi: Boolean = true) {
         activeConnectionGeneration += 1
+        // An explicit Disconnect (or teardown) ends automatic USB recovery. The
+        // generation bump below makes the dropped client's status callback inert,
+        // so this is the single place that has to cancel the pending resume.
+        usbReconnectJob?.cancel()
+        usbReconnectJob = null
+        usbReconnectPolicy.onSessionEnded()
+        // The remembered endpoint must not auto-resume later: recovery is for a
+        // drop the user did not ask for, and an explicit Disconnect must not be
+        // undone by a backgrounded status callback from the dead client.
+        lastUsbSession?.everConnected = false
         stopPingTimer()
         streamClient?.disconnect()
         streamClient = null
@@ -2576,6 +2916,12 @@ class MainActivity : AppCompatActivity() {
         // multi-second latency after the next foreground transition.
         streamClient?.setLivenessPaused(true)
         stopPingTimer()
+        // Backgrounding ends automatic USB recovery: a resume that lands while
+        // the tablet is away is exactly the unattended session the auto-disconnect
+        // timer exists to tear down.
+        usbReconnectJob?.cancel()
+        usbReconnectJob = null
+        usbReconnectPolicy.onSessionEnded()
         // Backgrounded while streaming: arm the auto-disconnect timer.
         if (!isConnected) return
         scheduleAutoDisconnect("backgrounded")
