@@ -49,7 +49,7 @@ Built entirely open-source, SideTab is designed to be fast, lightweight, and sea
 
 The repository and product were renamed from Side Screen. Existing macOS and Android identifiers and the `sidescreen://` pairing scheme remain stable for compatibility.
 
-For full details, features, and documentation, please visit **[sidescreen.dev](https://sidescreen.dev)**
+For the current implementation, release gates, and open PR map, see [project status](docs/PROJECT_STATUS.md).
 
 <p align="right"><a href="#readme-top">↑ Back to top</a></p>
 
@@ -177,7 +177,7 @@ cd SideTab
 # Optional: install exactly one user-facing copy under ~/Applications
 ./scripts/install_mac.sh --launch
 
-# Android debug APK
+# Android debug APK (JDK 17–21; Android Studio runtime or JAVA_HOME)
 ./scripts/build_android.sh
 
 # Put the current Mac DMG and Android APK in one versioned folder
@@ -327,9 +327,19 @@ The Mac app sets up `adb reverse` automatically when streaming starts. If it sti
 <details>
 <summary><strong>Android keeps trying to reconnect</strong></summary>
 
-Current Android builds only connect after you tap **Connect** or **Reconnect**. They do not resume a saved session or retry a dropped connection by themselves. Reinstall the current APK if an older build is still running, then launch the app again.
+Fresh sessions start when you tap **Connect** or **Reconnect**. A previously live USB session may resume automatically after a short bridge outage, with a 2.5-second grace and at most four attempts within 60 seconds. Disconnect, backgrounding, screen-off, or switching connection mode ends automatic recovery. Wireless recovery uses the saved pairing. Reinstall the current APK if an older build is still running.
 
-The connection checklist checks tablet-local prerequisites while idle; it does not open a Mac socket until you explicitly connect.
+The idle connection checklist checks tablet-local prerequisites. It does not resume a saved session by itself.
+</details>
+
+<details>
+<summary><strong>Black screen or a session that stops after running for a while</strong></summary>
+
+Check the Mac’s USB status first. **Tablet offline** means ADB can see the device but cannot communicate with it; unlock the tablet, reconnect the data cable, and accept any USB debugging prompt. **Repair USB Bridge** can restart a wedged Mac ADB server, but a tablet that remains offline still needs its transport restored.
+
+For development diagnostics, an already paired wireless ADB connection can restart the same tablet’s daemon in USB mode. Verify `adb -s <paired-endpoint> shell getprop ro.serialno` matches the affected USB serial, then run `adb -s <paired-endpoint> usb` and check `adb devices -l` for that physical serial in `device` state. This interrupts the debugging connection; do not enable or pair wireless debugging just for this step. The app does not perform this daemon restart automatically. See the [ADB command reference](https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/docs/user/adb.1.md).
+
+The client rebuilds a failed decoder up to five times without output, then returns to a visible connection/error state. Real decoded output resets that budget. Socket writes have an independent deadline so a blocked writer cannot freeze recovery; active inbound video prevents a quiet desktop from being mistaken for a dead transport. The Mac labels a live connection without a verified physical ADB serial “Stream active”; this also covers externally configured Wi-Fi ADB tunnels. These checks do not prove multi-day stability—see the exact branch’s validation receipts before treating a recurring outage as resolved.
 </details>
 
 <details>

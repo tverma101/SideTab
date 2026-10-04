@@ -2,6 +2,14 @@ import XCTest
 @testable import SideScreen
 
 final class StatusDetectorTests: XCTestCase {
+    func testLiveStreamWithoutPhysicalSerialDoesNotClaimUsbDetection() {
+        let live = ADBUSBDeviceStatus.connected(serial: nil)
+        XCTAssertEqual(live.label, "Stream active")
+        XCTAssertTrue(live.hint.contains("does not verify"))
+        XCTAssertNil(live.readySerial)
+        XCTAssertEqual(ADBUSBDeviceStatus.connected(serial: "USB_SERIAL").label, "Detected")
+    }
+
     func testUsbSerialsIgnoreReadyWifiTransport() {
         let output = """
         List of devices attached
