@@ -8,6 +8,7 @@ import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
 
 /**
@@ -96,6 +97,78 @@ class ControlChannel(
 
     private val sendLock = Any()
     private val connectLock = Any()
+
+    /**
+     * Control writes serialize on [sendLock], so one wedged write otherwise
+     * parks every later ping, touch, stylus and keyframe request behind it, and
+     * the pong watchdog in [connectionLoop] with it. A blocked socket write is
+     * not interruptible, so the deadline lives on its own scheduler thread and
+     * closes the exact socket it captured — which is what unblocks the writer
+     * and lets the channel rebuild. Control loss is deliberately not fatal to a
+     * live video session: the video path keeps running and in-band fallback
+     * takes over until this reconnects.
+     */
+    private val controlWriteWatchdog =
+        SocketWriteWatchdog(
+            budgetMs = TimeUnit.NANOSECONDS.toMillis(CONTROL_WRITE_BLOCK_BUDGET_NS),
+            pollIntervalMs = CONTROL_WRITE_POLL_INTERVAL_MS,
+        ) { socket, _ ->
+            val (installed, pending) =
+                synchronized(connectLock) {
+                    (socket === this.socket) to (socket === pendingSocket)
+                }
+            when {
+                installed -> {
+                    DiagLog.log(
+                        "CC",
+                        "Control write blocked past ${CONTROL_WRITE_BLOCK_BUDGET_NS / 1_000_000}ms — " +
+                            "closing the control socket to release the writer",
+                    )
+                    // Closes the socket, clears the transport state and wakes the
+                    // connection loop. Video is untouched.
+                    markTcpInactive(socket)
+                }
+
+                pending -> {
+                    DiagLog.log(
+                        "CC",
+                        "Control connect write blocked past ${CONTROL_WRITE_BLOCK_BUDGET_NS / 1_000_000}ms — " +
+                            "dropping the candidate socket",
+                    )
+                    synchronized(connectLock) {
+                        if (pendingSocket === socket) pendingSocket = null
+                        connecting = false
+                    }
+                    try {
+                        socket.close()
+                    } catch (_: Exception) {
+                    }
+                    wakeConnectionLoop()
+                }
+
+                else -> Unit
+            }
+            false
+        }
+
+    /**
+     * Single write path for every control byte, so the bounded-write contract
+     * cannot be forgotten by a future message type. Callers must hold
+     * [sendLock], so at most one control write is ever in flight.
+     */
+    private fun writeControlLocked(
+        transport: ActiveTransport,
+        bytes: ByteArray,
+        offset: Int,
+        length: Int,
+    ) {
+        val writeToken = controlWriteWatchdog.arm(transport.socket)
+        try {
+            transport.output.write(bytes, offset, length)
+        } finally {
+            controlWriteWatchdog.disarm(writeToken)
+        }
+    }
 
     // Steady-state control traffic is high-frequency but tiny. These buffers
     // are reused under sendLock so 120 Hz touch/S Pen input does not create a
@@ -261,7 +334,7 @@ class ControlChannel(
                         "from ${candidate.localAddress?.hostAddress}:${candidate.localPort}",
                 )
                 val controlOutput = DataOutputStream(candidate.getOutputStream())
-                writeAuthenticationPreamble(controlOutput)
+                writeAuthenticationPreamble(candidate, controlOutput)
                 candidate.soTimeout = 0
 
                 val installedGeneration =
@@ -475,13 +548,25 @@ class ControlChannel(
         }
     }
 
-    private fun writeAuthenticationPreamble(out: DataOutputStream) {
+    private fun writeAuthenticationPreamble(
+        candidate: Socket,
+        out: DataOutputStream,
+    ) {
         val token = controlAuthToken ?: return
         require(token.size == 32) { "Control auth token must be 32 bytes" }
         synchronized(sendLock) {
-            out.write(authPreamble)
-            out.write(token)
-            out.flush()
+            // The candidate has no connection generation yet, so the watchdog
+            // recovers it by socket identity. One armed window covers the magic,
+            // the token and the flush: a host that accepted TCP and then stopped
+            // reading must not park the connection loop here forever.
+            val writeToken = controlWriteWatchdog.arm(candidate)
+            try {
+                out.write(authPreamble)
+                out.write(token)
+                out.flush()
+            } finally {
+                controlWriteWatchdog.disarm(writeToken)
+            }
         }
     }
 
@@ -514,7 +599,7 @@ class ControlChannel(
         synchronized(sendLock) {
             if (!isTransportCurrent(transport)) return
             try {
-                transport.output.write(BRIGHTNESS_CAPABILITY)
+                writeControlLocked(transport, BRIGHTNESS_CAPABILITY, 0, BRIGHTNESS_CAPABILITY.size)
                 DiagLog.log("CC", "Declared brightness support")
             } catch (e: Exception) {
                 DiagLog.log("CC", "Brightness declaration failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -534,7 +619,7 @@ class ControlChannel(
         synchronized(sendLock) {
             if (!isTransportCurrent(transport)) return
             try {
-                transport.output.write(STYLUS_CAPABILITY)
+                writeControlLocked(transport, STYLUS_CAPABILITY, 0, STYLUS_CAPABILITY.size)
                 DiagLog.log("CC", "Declared stylus support")
             } catch (e: Exception) {
                 DiagLog.log("CC", "Stylus declaration failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -575,7 +660,7 @@ class ControlChannel(
                 // start when the bytes left us — otherwise a write that blocks
                 // on a full send buffer is mistaken for a lost pong the moment
                 // it completes.
-                transport.output.write(pingPacketScratch)
+                writeControlLocked(transport, pingPacketScratch, 0, pingPacketScratch.size)
                 outstandingPing =
                     ControlPingProbe(
                         connectionGeneration = transport.generation,
@@ -611,7 +696,7 @@ class ControlChannel(
             return try {
                 keyframePacketScratch[0] = MESSAGE_KEYFRAME_REQUEST.toByte()
                 keyframePacketScratch[1] = if (force) 1 else 0
-                transport.output.write(keyframePacketScratch)
+                writeControlLocked(transport, keyframePacketScratch, 0, keyframePacketScratch.size)
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control keyframe write failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -650,7 +735,7 @@ class ControlChannel(
             val packetSize = 6 + count * 8
 
             return try {
-                transport.output.write(touchPacketScratch, 0, packetSize)
+                writeControlLocked(transport, touchPacketScratch, 0, packetSize)
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control touch write failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -670,7 +755,7 @@ class ControlChannel(
             if (!isTransportCurrent(transport)) return false
             return try {
                 val size = StylusProtocol.encodeInto(event, stylusPacketScratch)
-                transport.output.write(stylusPacketScratch, 0, size)
+                writeControlLocked(transport, stylusPacketScratch, 0, size)
                 true
             } catch (e: Exception) {
                 DiagLog.log("CC", "Control stylus write failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -724,6 +809,9 @@ class ControlChannel(
                 }
                 connectionThread
             }
+        // Terminal for this channel: stop the write deadline. A writer still
+        // parked inside a blocked write is released by the socket close above.
+        controlWriteWatchdog.shutdown()
         if (thread != null && thread !== Thread.currentThread()) {
             thread.interrupt()
         }
@@ -799,6 +887,18 @@ class ControlChannel(
          * detected promptly by something.
          */
         const val PONG_TIMEOUT_NS = 15_000_000_000L
+
+        /**
+         * A control write that has not drained for this long is treated as a
+         * wedged socket. Same order of magnitude as the video write budget: a
+         * control packet is tens of bytes, so anything approaching this is the
+         * transport, not congestion. Closing only the control socket keeps a
+         * live video session intact.
+         */
+        const val CONTROL_WRITE_BLOCK_BUDGET_NS = 10_000_000_000L
+
+        /** How often an armed deadline is checked. Bounds detection overshoot. */
+        const val CONTROL_WRITE_POLL_INTERVAL_MS = 500L
     }
 }
 

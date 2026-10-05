@@ -160,7 +160,15 @@ class VideoEncoder {
                 frameRate: state.config.frameRate
             )
         }
-        let created = makeConfiguredSession()
+        // A failed allocation must not take the working session down with it.
+        // Publishing nil would make every later encode() take the `.noSession`
+        // path and drop frames silently — one transient VideoToolbox allocation
+        // failure would leave the tablet black until the app restarted, with no
+        // retry path back to a live session.
+        guard let created = makeConfiguredSession() else {
+            debugLog("VideoToolbox session rebuild failed — keeping the current session")
+            return
+        }
         // Swap first, drain second: any encode that is already inside
         // VTCompressionSessionEncodeFrame has finished by the time this returns,
         // so the outgoing session can be completed and invalidated without
@@ -340,9 +348,26 @@ class VideoEncoder {
 
     // MARK: - Session configuration
 
+    /// Test seam: the next `makeConfiguredSession()` fails when set, so the
+    /// "a rebuild could not be built" path is testable on machines where a
+    /// real allocation failure cannot be provoked. False in normal use.
+    /// Consume-once: each call that observes it clears it, so a test can fail
+    /// exactly one rebuild and watch the next one succeed.
+    static var failNextSessionCreation = false
+
+    /// Test-only observability: whether a compression session is currently
+    /// published. A read-only view of existing state — nothing in the app
+    /// depends on it.
+    var hasLiveSession: Bool { sessionLock.withLock { $0 != nil } }
+
     /// Builds a fully configured session without publishing it, so a rebuild can
     /// swap atomically and tear the old session down afterwards.
     private func makeConfiguredSession() -> SessionHandle? {
+        if Self.failNextSessionCreation {
+            Self.failNextSessionCreation = false
+            debugLog("Injected VideoToolbox session creation failure (test seam)")
+            return nil
+        }
         let config = stateLock.withLock { $0.config }
         var session: VTCompressionSession?
 

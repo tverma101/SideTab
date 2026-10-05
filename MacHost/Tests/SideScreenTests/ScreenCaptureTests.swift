@@ -1,6 +1,7 @@
 import CoreMedia
 import CoreVideo
 import ScreenCaptureKit
+import os
 import XCTest
 @testable import SideScreen
 
@@ -220,5 +221,83 @@ final class ScreenCaptureTests: XCTestCase {
         capture.pauseForIdle()
         capture.resumeFromIdle()
         XCTAssertFalse(capture.idlePaused)
+    }
+
+    // MARK: - Restart latch (stale publication / serialization)
+
+    /// A restart request that arrives while a rebuild is already running used to
+    /// start a SECOND rebuild concurrently. Whichever finished last won, so a
+    /// slower superseded attempt could publish its half-built SCStream over a
+    /// newer generation's live one — leaking a started stream every time it
+    /// raced. The latch must run at most one attempt at a time and still apply
+    /// the newest request, not drop it.
+    func testConcurrentRestartRequestsAreSerializedAndTheNewestStillRuns() async throws {
+        let capture = try await ScreenCapture()
+        capture.markSessionLiveForTests()
+
+        let attemptStarted = expectation(description: "first rebuild entered")
+        let releaseFirstAttempt = ManualGate()
+        let coalesced = expectation(description: "coalesced attempt ran")
+        let invocations = OSAllocatedUnfairLock(initialState: 0)
+        capture.restartTestGate = {
+            let invocation = invocations.withLock { value -> Int in
+                value += 1
+                return value
+            }
+            if invocation == 1 {
+                attemptStarted.fulfill()
+                try? await releaseFirstAttempt.wait()
+            } else {
+                coalesced.fulfill()
+            }
+        }
+        defer { capture.restartTestGate = nil }
+
+        capture.requestRestartForTests(reason: "first")
+        await fulfillment(of: [attemptStarted], timeout: 5)
+        capture.requestRestartForTests(reason: "second")
+        capture.requestRestartForTests(reason: "third")
+        XCTAssertEqual(capture.restartDebugState.attempts, 1)
+
+        releaseFirstAttempt.open()
+        await fulfillment(of: [coalesced], timeout: 5)
+        for _ in 0..<100 where capture.restartDebugState.inFlight {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(capture.restartDebugState.attempts, 2)
+        XCTAssertFalse(capture.restartDebugState.inFlight)
+        XCTAssertFalse(capture.restartDebugState.pending)
+
+        capture.stopStreaming()
+    }
+
+    /// stopStreaming() bumps the generation, so an in-flight rebuild must not
+    /// resurrect capture afterwards. The worker also has to release its latch,
+    /// or the next session's first restart would be folded into a dead worker.
+    func testStopSupersedesAnInFlightRebuildAndReleasesTheLatch() async throws {
+        let capture = try await ScreenCapture()
+        capture.markSessionLiveForTests()
+
+        let attemptStarted = expectation(description: "rebuild entered")
+        let releaseAttempt = ManualGate()
+        let attemptLeft = expectation(description: "rebuild left")
+        capture.restartTestGate = {
+            attemptStarted.fulfill()
+            try? await releaseAttempt.wait()
+            attemptLeft.fulfill()
+        }
+        defer { capture.restartTestGate = nil }
+
+        capture.requestRestartForTests(reason: "in flight")
+        await fulfillment(of: [attemptStarted], timeout: 5)
+        capture.stopStreaming()
+        releaseAttempt.open()
+        await fulfillment(of: [attemptLeft], timeout: 5)
+
+        // The abandoned attempt must not restart the worker, and nothing may be
+        // left in flight for the next session.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertFalse(capture.restartDebugState.inFlight)
+        XCTAssertFalse(capture.restartDebugState.pending)
     }
 }

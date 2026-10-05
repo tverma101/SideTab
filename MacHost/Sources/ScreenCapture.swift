@@ -88,8 +88,6 @@ struct EncodeBackpressure: @unchecked Sendable {
 // MARK: - ScreenCapture
 
 class ScreenCapture {
-    private var streamOutput: StreamOutput?
-    private var streamDelegate: StreamDelegate?
     private var encoder: VideoEncoder?
     private var virtualDisplayID: CGDirectDisplayID?
     private var refreshRate: Int = 60
@@ -117,10 +115,28 @@ class ScreenCapture {
         var idleGeneration: UInt64 = 0
         var stream: SCStream?
         var display: SCDisplay?
+        /// Owned by the session rather than by bare properties: setup,
+        /// teardown, the fallback path, the frame handler and stopStreaming
+        /// all reach these from the capture queue, a restart Task, the
+        /// network queue and main. The delegate in particular is also the only
+        /// thing that promotes a capture error into recovery, so losing a
+        /// reference to it strands the stream silently.
+        var streamOutput: StreamOutput?
+        var streamDelegate: StreamDelegate?
         var cgDisplayStream: CGDisplayStream?
         /// Set once CGDisplayStream.stop() has been called and stays set until
         /// the kCGDisplayStreamFrameStatusStopped callback has been observed.
         var cgDisplayStreamStopPending = false
+        /// True while a restart worker is running an attempt. A request that
+        /// arrives while one is in flight still bumps `generation` (so the
+        /// in-flight attempt aborts at its next fence) and parks its reason
+        /// here; the worker runs it next, which is what keeps the newest
+        /// codec and encode dimensions from being lost.
+        var restartInFlight = false
+        var restartPendingReason: String?
+        /// Restart attempts run for this session. Diagnostics and regression
+        /// tests; a session that needs many of them is a real failure signal.
+        var restartAttempts: UInt64 = 0
     }
     private let sessionLock = OSAllocatedUnfairLock(initialState: SessionState())
 
@@ -128,11 +144,39 @@ class ScreenCapture {
     private var isStreaming: Bool { sessionLock.withLock { $0.isStreaming } }
     var idlePaused: Bool { sessionLock.withLock { $0.idlePaused } }
     private var currentStream: SCStream? { sessionLock.withLock { $0.stream } }
+    private var currentStreamOutput: StreamOutput? { sessionLock.withLock { $0.streamOutput } }
 
     /// Generation + isStreaming fence in a single lock acquisition so callers
     /// never nest sessionLock.
     private func isCurrentGeneration(_ gen: UInt64) -> Bool {
-        sessionLock.withLock { $0.isStreaming && $0.generation == gen }
+        sessionLock.withLock { $0.isStreaming && !$0.idlePaused && $0.generation == gen }
+    }
+
+    /// Restart bookkeeping, read-only. Used by the log and by the regression
+    /// tests that drive the real restart latch through an injected async gate.
+    var restartDebugState: (generation: UInt64, inFlight: Bool, pending: Bool, attempts: UInt64) {
+        sessionLock.withLock { ($0.generation, $0.restartInFlight, $0.restartPendingReason != nil, $0.restartAttempts) }
+    }
+
+    /// Test seam for the restart worker: awaited after the old stream has been
+    /// stopped and before the replacement is published, so a regression test
+    /// can hold a rebuild in flight and drive a competing request through the
+    /// same latch production uses. Always nil in the app.
+    var restartTestGate: (@Sendable () async -> Void)?
+
+    /// Marks the session live without a real capture source. A unit test
+    /// cannot create a CGVirtualDisplay, so this is the only way to exercise
+    /// the restart latch itself; every restart it triggers then fails fast on
+    /// the missing display ID, which is exactly the path the latch must
+    /// survive. Internal for tests only.
+    func markSessionLiveForTests() {
+        sessionLock.withLock { $0.isStreaming = true }
+    }
+
+    /// Requests one restart through the production latch. Test-only entry to
+    /// the same path wake, codec negotiation and the stall monitor use.
+    func requestRestartForTests(reason: String) {
+        restartStream(reason: reason)
     }
 
     /// Drops the stream reference, but only when `gen` still owns it: a
@@ -140,32 +184,20 @@ class ScreenCapture {
     /// stream that generation built.
     @discardableResult
     private func clearStream(forGeneration gen: UInt64, includingDisplay: Bool = true) -> Bool {
-        let cleared = sessionLock.withLock { state -> Bool in
+        sessionLock.withLock { state -> Bool in
             guard state.generation == gen else { return false }
             state.stream = nil
+            state.streamOutput = nil
+            state.streamDelegate = nil
             if includingDisplay { state.display = nil }
             return true
         }
-        guard cleared else { return false }
-        streamOutput = nil
-        streamDelegate = nil
-        return true
     }
 
     /// True while no newer session has taken over and nothing is streaming, so
     /// a stop's cleanup still owns the resources it is about to release.
     private func isStoppedGeneration(_ gen: UInt64) -> Bool {
         sessionLock.withLock { !$0.isStreaming && $0.generation == gen }
-    }
-
-    /// The stream reference, but only if `gen` still owns it. A teardown that
-    /// lost the race to a newer generation must never reach into (and stop) the
-    /// stream that generation built.
-    private func takeStream(forGeneration gen: UInt64) -> SCStream? {
-        sessionLock.withLock { state in
-            guard state.generation == gen else { return nil }
-            return state.stream
-        }
     }
 
     /// Hard wall-clock bound for an async API that is known to hang.
@@ -253,6 +285,10 @@ class ScreenCapture {
     )
 
     private struct FrameMonitorState {
+        /// Last `.complete` callback — the only status that carries final
+        /// pixels. Silence here is normal: ScreenCaptureKit stops delivering
+        /// callbacks on an unchanged display, and macOS does not send one even
+        /// then, so the monitor must not read it as a failure on its own.
         var lastFrameTime: DispatchTime?
         var hasReceivedFirstFrame = false
         var acceptingFrames = false
@@ -281,6 +317,15 @@ class ScreenCapture {
         let missingImageBufferCallbacks: UInt64
         let misSizedHdrFrames: UInt64
         let encodeSubmissions: UInt64
+    }
+
+    /// A built-but-unpublished capture source. The caller owns it until it
+    /// either publishes it under its generation or tears it down; nothing
+    /// shared can observe a half-built stream.
+    private struct PreparedStream {
+        let stream: SCStream
+        let output: StreamOutput
+        let delegate: StreamDelegate
     }
 
     private struct KeyframeRequestState {
@@ -504,8 +549,17 @@ class ScreenCapture {
         self.refreshRate = refreshRate
         self.frameRateCap = frameRateCap
         self.connectionMode = connectionMode
-        try await setupDisplay()
-        try await setupStream()
+        let display = try await setupDisplay()
+        // Initial setup runs before any generation exists, so this publication
+        // is unconditional. Every later rebuild goes through restartStream(),
+        // which owns the generation fence.
+        let prepared = try await prepareStream(display: display)
+        sessionLock.withLock { state in
+            state.display = display
+            state.stream = prepared.stream
+            state.streamOutput = prepared.output
+            state.streamDelegate = prepared.delegate
+        }
         await MainActor.run { registerWakeObservers() }
     }
 
@@ -560,7 +614,7 @@ class ScreenCapture {
             if self.stateLock.withLock({ $0.fallbackActive }) {
                 debugLog("Wake restart: leaving CGDisplayStream fallback, retrying SCStream")
             }
-            self.restartStream()
+            self.restartStream(reason: "display wake")
             // A wake-triggered restart must not consume the one-shot budget
             // the frame monitor uses for stall recovery.
             self.setRestartAttempted(false)
@@ -588,7 +642,11 @@ class ScreenCapture {
 
     // MARK: - Display setup
 
-    private func setupDisplay() async throws {
+    /// Resolves the capture target. Returns the display instead of publishing
+    /// it: a rebuild can spend tens of seconds in here, and a caller whose
+    /// generation was superseded in the meantime must be able to drop the
+    /// result rather than overwrite the state a newer stream owns.
+    private func setupDisplay() async throws -> SCDisplay {
         guard let virtualDisplayID = virtualDisplayID else {
             throw NSError(domain: "ScreenCapture", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "Virtual display ID not set"])
@@ -610,9 +668,8 @@ class ScreenCapture {
             debugLog("SCShareableContent returned \(content.displays.count) displays: \(content.displays.map { $0.displayID })")
 
             if let virtualDisplay = content.displays.first(where: { $0.displayID == virtualDisplayID }) {
-                sessionLock.withLock { $0.display = virtualDisplay }
                 debugLog("Capturing virtual display: \(virtualDisplay.width)x\(virtualDisplay.height) (ID: \(virtualDisplayID))")
-                return
+                return virtualDisplay
             }
 
             if attempt < 5 {
@@ -627,12 +684,15 @@ class ScreenCapture {
 
     // MARK: - Stream setup
 
-    private func setupStream() async throws {
-        guard let display = sessionLock.withLock({ $0.display }), virtualDisplayID != nil else {
+    /// Builds a fully wired stream and hands ownership to the caller. Nothing
+    /// is published here, so a caller that loses its generation race can
+    /// explicitly tear the result down instead of leaving a live
+    /// ScreenCaptureKit stream and its IOSurfaces unreachable.
+    private func prepareStream(display: SCDisplay) async throws -> PreparedStream {
+        guard virtualDisplayID != nil else {
             throw NSError(domain: "ScreenCapture", code: 2,
                 userInfo: [NSLocalizedDescriptionKey: "Display not initialized"])
         }
-
         // Physical pixels for full Retina sharpness, clamped when H.264 (SCStream scales)
         let (width, height) = encodeSize(for: codec)
         // EXP-FORK: HDR mode — the converter's buffer pool is sized by the
@@ -648,18 +708,18 @@ class ScreenCapture {
         let requestedFps = expFps > 0 ? expFps : refreshRate
         let fps = min(max(1, requestedFps), frameRateCap ?? Int.max)
 
-        streamOutput = StreamOutput()
+        let output = StreamOutput()
 
         let delegate = StreamDelegate()
-        delegate.onStreamError = { [weak self] _ in
-            guard let self = self else { return }
+        delegate.onStreamError = { [weak self, weak delegate] _ in
+            guard let self, let delegate,
+                  self.sessionLock.withLock({ $0.isStreaming && !$0.idlePaused && $0.streamDelegate === delegate }) else { return }
             debugLog("StreamDelegate error callback — attempting fallback")
             let alreadyActive = self.stateLock.withLock { $0.fallbackActive }
             if !alreadyActive {
                 self.attemptFallbackCapture()
             }
         }
-        streamDelegate = delegate
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
 
@@ -697,15 +757,23 @@ class ScreenCapture {
         config.scalesToFit = false
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: delegate)
-        try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: sampleHandlerQueue)
+        do {
+            try scStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: sampleHandlerQueue)
+        } catch {
+            // addStreamOutput is the last thing that can throw; the stream was
+            // never published, so drop it here rather than letting it go out
+            // of scope with an output installed.
+            debugLog("SCStream addStreamOutput failed: \(error)")
+            throw error
+        }
 
-        sessionLock.withLock { $0.stream = scStream }
         debugLog("Stream configured: \(width)x\(height) @ \(fps)fps (with delegate)")
+        return PreparedStream(stream: scStream, output: output, delegate: delegate)
     }
 
     // MARK: - Shared frame handler (used by both startStreaming and restartStream)
 
-    private func configureFrameHandler(label: String) {
+    private func configureFrameHandler(label: String, output: StreamOutput) {
         let queue = DispatchQueue(label: "encodeQueue.\(label)", qos: .userInteractive)
         // A fresh counter per session: the previous encode queue can still be
         // draining blocks that decrement the old counter, so sharing one
@@ -717,8 +785,8 @@ class ScreenCapture {
         let sessionFlags = pipelineFlags
         let sessionSize = encodeSize(for: codec)
 
-        streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
-            guard let self = self else { return }
+        output.onFrameReceived = { [weak self, weak output] sampleBuffer in
+            guard let self, let output, self.currentStreamOutput === output else { return }
             // Spans the whole ScreenCaptureKit callback, which is the only stage
             // this file owns. See FramePipelineSignpost for why. The category is
             // fixed; the complete/idle distinction this callback already
@@ -854,8 +922,8 @@ class ScreenCapture {
             }
             // FrameSkipper (efficiency Lever 1, Entry U) — skip
             // pixel-identical frames (SideScreen_exp_skipFrames=1).
-            // lastFrameTime was already updated above, so the early return
-            // cannot false-trigger the stall monitor.
+            // Liveness was already updated above, so the early return cannot
+            // false-trigger the stall monitor.
             if sessionFlags.skipsIdenticalFrames {
                 let decision = FrameSkipper.decide(imageBuffer)
                 if decision.skip {
@@ -918,6 +986,13 @@ class ScreenCapture {
         frameRateCap: Int? = nil,
         connectionMode: ConnectionMode = .usb
     ) {
+        // Read the built stream's output before publishing a live session: a
+        // start without one would otherwise leave isStreaming = true with no
+        // way to ever deliver a frame.
+        guard let initialOutput = currentStreamOutput, let initialStream = currentStream else {
+            debugLog("startStreaming skipped — capture was never set up")
+            return
+        }
         let sessionGeneration: UInt64 = sessionLock.withLock { state -> UInt64 in
             state.generation &+= 1
             state.isStreaming = true
@@ -977,9 +1052,9 @@ class ScreenCapture {
             state.acceptingFrames = true
         }
 
-        configureFrameHandler(label: "initial")
+        configureFrameHandler(label: "initial", output: initialOutput)
 
-        let streamToStart = currentStream
+        let streamToStart = initialStream
         Task {
             // startCapture can take seconds. A Stop (or a restart) in that
             // window must not let this Task arm the monitor or engage the
@@ -987,6 +1062,7 @@ class ScreenCapture {
             let started = await self.startCapture(streamToStart, label: "initial")
             guard isCurrentGeneration(sessionGeneration) else {
                 debugLog("startStreaming(gen \(sessionGeneration)) superseded — monitor and fallback skipped")
+                await self.stopCapture(streamToStart, label: "initial-abort")
                 return
             }
             if started {
@@ -1012,6 +1088,7 @@ class ScreenCapture {
     }
 
     private func armFrameMonitor() {
+        guard isStreaming, !idlePaused else { return }
         // Idempotent swap: an arm that arrives while a timer is live cancels
         // the old one first, so exactly one timer can ever be live.
         stopFrameMonitor()
@@ -1043,33 +1120,43 @@ class ScreenCapture {
             stopFrameMonitor()
             return
         }
+        // The monitor is armed from a Task that has no thread affinity and
+        // re-armed after every restart, so it must be fenced: an idle pause
+        // stops the capture on purpose, and a torn-down session must not have
+        // its "no frames yet" grace spent on recovery.
+        guard isStreaming, !idlePaused else { return }
 
+        // Only the initial grace is a failure signal: SCK never delivered a
+        // complete frame after `startCapture` succeeded. Silence *after* a
+        // frame is normal — ScreenCaptureKit stops delivering on an unchanged
+        // display and macOS does not even send a callback then — so a quiet
+        // desktop must never restart a 2.6-13s stream setup.
+        let (hasHadFrames, hasCachedFrame, lastFrame) = stateLock.withLock {
+            ($0.hasReceivedFirstFrame, $0.lastPixelBuffer != nil, $0.lastFrameTime)
+        }
         let stalled: Bool
-        let lastTime = stateLock.withLock { $0.lastFrameTime }
-        if let last = lastTime {
-            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - last.uptimeNanoseconds) / 1_000_000_000
+        if let lastFrame {
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - lastFrame.uptimeNanoseconds) / 1_000_000_000
             stalled = elapsed > 5.0
         } else {
             stalled = true
-            debugLog("Frame flow stalled — no frames ever received after 5s, triggering fallback")
         }
-
         guard stalled else { return }
 
-        let (hasHadFrames, hasCachedFrame) = stateLock.withLock { ($0.hasReceivedFirstFrame, $0.lastPixelBuffer != nil) }
-        stopFrameMonitor()
         if hasHadFrames, hasCachedFrame {
-            // A quiet display is valid on USB as well as Wi-Fi. Android
-            // probes the video socket during frame silence, so periodic
-            // cached-frame encodes only consume CPU and send duplicate
-            // pixels. Real capture failures still reach StreamDelegate.
+            // Quiet after a healthy stream: leave the monitor armed (it costs one
+            // timer tick per 3s and stays correct if the display wakes) and do
+            // not spend the restart budget. Real capture failures still arrive
+            // through StreamDelegate.
             return
         }
+        debugLog("Frame flow stalled — no frames received after 5s, triggering recovery")
         if !restartAttempted {
             debugLog("Attempting SCStream restart...")
-            restartStream()
+            restartStream(reason: "no frames after start")
         } else {
             debugLog("Restart already attempted — falling back to CGDisplayStream")
+            stopFrameMonitor()
             attemptFallbackCapture()
         }
     }
@@ -1100,6 +1187,8 @@ class ScreenCapture {
         let gen: UInt64? = sessionLock.withLock { state -> UInt64? in
             guard !state.idlePaused, state.isStreaming, state.stream != nil else { return nil }
             state.idlePaused = true
+            state.generation &+= 1
+            state.restartPendingReason = nil
             state.idleGeneration &+= 1
             return state.idleGeneration
         }
@@ -1150,7 +1239,7 @@ class ScreenCapture {
         // SCStream cannot be restarted once stopped (-3807), so a resume has
         // to build a fresh stream rather than call startCapture again.
         debugLog("IDLE: resuming capture (client connected) — rebuilding SCStream")
-        restartStream()
+        restartStream(reason: "resume from idle")
         // An idle resume is not a stall, so it must not consume the one-shot
         // restart budget the frame monitor spends on recovery.
         setRestartAttempted(false)
@@ -1158,11 +1247,83 @@ class ScreenCapture {
 
     // MARK: - Stream restart
 
-    private func restartStream() {
-        guard isStreaming else {
-            debugLog("restartStream skipped — not streaming")
-            return
+    /// Requests one rebuild of the capture source.
+    ///
+    /// Restart triggers genuinely overlap: display wake and the frame monitor
+    /// arrive on main, `onCodecNegotiated` arrives on StreamingServer's network
+    /// queue, and the idle resume arrives on main. Running them concurrently
+    /// let a slower, already-superseded attempt publish its half-built
+    /// `SCStream` over a newer generation's live one — leaking a started
+    /// ScreenCaptureKit stream every time it raced, and leaving `currentStream`
+    /// pointing at an object nothing ever stops.
+    ///
+    /// So requests are latched rather than run concurrently: each one bumps
+    /// `generation` (which makes the in-flight attempt abort at its next
+    /// fence) and records its reason; a single worker builds and publishes,
+    /// then loops for the newest request if one arrived while it worked. The
+    /// newest codec and encode dimensions therefore win — a coalesced request
+    /// is never dropped, just applied later.
+    private func restartStream(reason: String) {
+        enum Latch {
+            case start
+            case fold
+            case notStreaming
         }
+        let latch: Latch = sessionLock.withLock { state -> Latch in
+            guard state.isStreaming, !state.idlePaused else { return .notStreaming }
+            state.generation &+= 1
+            state.restartPendingReason = reason
+            guard !state.restartInFlight else { return .fold }
+            state.restartInFlight = true
+            return .start
+        }
+        switch latch {
+        case .notStreaming:
+            debugLog("restartStream(\(reason)) skipped — not streaming")
+            return
+        case .fold:
+            debugLog("restartStream(\(reason)) folded into the in-flight rebuild")
+            return
+        case .start:
+            break
+        }
+        setRestartAttempted(true)
+        Task { await self.runRestartWorker() }
+    }
+
+    private func runRestartWorker() async {
+        while true {
+            let request: (reason: String, gen: UInt64)? = sessionLock.withLock { state in
+                guard state.isStreaming, !state.idlePaused else {
+                    state.restartPendingReason = nil
+                    return nil
+                }
+                guard let reason = state.restartPendingReason else { return nil }
+                state.restartPendingReason = nil
+                state.restartAttempts &+= 1
+                return (reason, state.generation)
+            }
+            guard let request else {
+                // Release the latch only while no newer request is parked, so a
+                // request that lands between this check and the clear cannot be
+                // left with nothing running it.
+                let drained: Bool = sessionLock.withLock { state in
+                    guard state.restartPendingReason == nil else { return false }
+                    state.restartInFlight = false
+                    return true
+                }
+                if drained { return }
+                continue
+            }
+            await performRestart(reason: request.reason, gen: request.gen)
+        }
+    }
+
+    /// One rebuild attempt. Owns every object it creates until either
+    /// publication succeeds under `gen` or the object is explicitly stopped.
+    private func performRestart(reason: String, gen: UInt64) async {
+        guard isCurrentGeneration(gen) else { return }
+        debugLog("restartStream(gen \(gen)) — \(reason)")
 
         // A live CGDisplayStream would keep encoding into the encoder being
         // rebuilt at the old dimensions while the new SCStream comes up.
@@ -1172,67 +1333,84 @@ class ScreenCapture {
             stateLock.withLock { $0.fallbackActive = false }
         }
 
-        let gen: UInt64 = sessionLock.withLock { state in
-            state.generation &+= 1
-            return state.generation
+        // Every liveness signal belongs to the stream being replaced.
+        stateLock.withLock { state in
+            state.hasReceivedFirstFrame = false
+            state.lastFrameTime = nil
         }
-        setRestartAttempted(true)
-        stateLock.withLock { $0.hasReceivedFirstFrame = false }
-        // Captured before the Task starts: reading the live reference after an
-        // await could stop a stream a newer generation has already built.
+        // Captured before the await: reading the live reference afterwards could
+        // stop a stream a newer generation has already built.
         let streamToStop = currentStream
+        await stopCapture(streamToStop, label: "restart(gen \(gen))")
 
-        Task {
-            do {
-                // Stop existing stream
-                await stopCapture(streamToStop, label: "restart(gen \(gen))")
-                // A stopStreaming() or a newer restart superseded this one — do
-                // NOT bring capture back up (would resurrect a stopped stream).
-                guard isCurrentGeneration(gen) else {
-                    debugLog("restartStream(gen \(gen)) superseded after stopCapture — aborting")
-                    return
-                }
+        // A stopStreaming() or a newer restart superseded this one — do NOT
+        // bring capture back up (would resurrect a stopped stream).
+        guard isCurrentGeneration(gen) else {
+            debugLog("restartStream(gen \(gen)) superseded after stopCapture — aborting")
+            return
+        }
 
-                clearStream(forGeneration: gen)
+        clearStream(forGeneration: gen)
 
-                // Re-setup
-                try await setupDisplay()
-                try await setupStream()
-                guard isCurrentGeneration(gen) else {
-                    debugLog("restartStream(gen \(gen)) superseded during setup — aborting")
-                    await stopCapture(takeStream(forGeneration: gen), label: "restart-abort(gen \(gen))")
-                    clearStream(forGeneration: gen)
-                    return
-                }
+        if let gate = restartTestGate {
+            await gate()
+        }
 
-                // Re-attach encoding pipeline using shared handler
-                configureFrameHandler(label: "restart")
-                guard isCurrentGeneration(gen), let target = takeStream(forGeneration: gen) else {
-                    debugLog("restartStream(gen \(gen)) superseded before start — aborting")
-                    return
-                }
+        do {
+            let display = try await setupDisplay()
+            let prepared = try await prepareStream(display: display)
+            // Single fenced publication. Everything the stream needs lands in
+            // one lock acquisition, so no observer can ever see a stream
+            // without its output/delegate or vice versa, and a superseded
+            // attempt cannot overwrite the state a newer generation owns.
+            let published = sessionLock.withLock { state -> Bool in
+                guard state.isStreaming, state.generation == gen else { return false }
+                state.display = display
+                state.stream = prepared.stream
+                state.streamOutput = prepared.output
+                state.streamDelegate = prepared.delegate
+                return true
+            }
+            guard published else {
+                debugLog("restartStream(gen \(gen)) superseded before publication — stopping the unstarted stream")
+                await stopCapture(prepared.stream, label: "restart-abort(gen \(gen))")
+                return
+            }
 
-                let started = await startCapture(target, label: "restart(gen \(gen))")
-                guard isCurrentGeneration(gen) else {
-                    debugLog("restartStream(gen \(gen)) superseded after startCapture — aborting")
-                    await stopCapture(takeStream(forGeneration: gen), label: "restart-abort(gen \(gen))")
-                    return
-                }
-                guard started else {
-                    debugLog("restartStream(gen \(gen)) could not start — falling back to CGDisplayStream")
-                    attemptFallbackCapture()
-                    return
-                }
+            // Re-attach the encoding pipeline to the stream that was just
+            // published (the previous output belonged to the replaced stream).
+            configureFrameHandler(label: "restart", output: prepared.output)
+            // Aborts stop the object this attempt owns, not a lookup by
+            // generation: once a newer generation exists the lookup returns
+            // nil by design, which used to leave this freshly built stream
+            // running forever. A newer attempt may already have stopped it,
+            // in which case stopCapture logs SCK's -3808 and moves on.
+            guard isCurrentGeneration(gen) else {
+                debugLog("restartStream(gen \(gen)) superseded before start — aborting")
+                await stopCapture(prepared.stream, label: "restart-abort(gen \(gen))")
+                return
+            }
 
-                debugLog("SCStream restarted — starting frame flow monitor")
-                startFrameMonitor()
-            } catch {
-                debugLog("SCStream restart failed: \(error) — falling back to CGDisplayStream")
-                if isCurrentGeneration(gen) {
-                    attemptFallbackCapture()
-                } else {
-                    debugLog("restartStream(gen \(gen)) superseded before fallback — aborted")
-                }
+            let started = await startCapture(prepared.stream, label: "restart(gen \(gen))")
+            guard isCurrentGeneration(gen) else {
+                debugLog("restartStream(gen \(gen)) superseded after startCapture — aborting")
+                await stopCapture(prepared.stream, label: "restart-abort(gen \(gen))")
+                return
+            }
+            guard started else {
+                debugLog("restartStream(gen \(gen)) could not start — falling back to CGDisplayStream")
+                attemptFallbackCapture()
+                return
+            }
+
+            debugLog("SCStream restarted — starting frame flow monitor")
+            startFrameMonitor()
+        } catch {
+            debugLog("SCStream restart failed: \(error) — falling back to CGDisplayStream")
+            if isCurrentGeneration(gen) {
+                attemptFallbackCapture()
+            } else {
+                debugLog("restartStream(gen \(gen)) superseded before fallback — aborted")
             }
         }
     }
@@ -1302,7 +1480,7 @@ class ScreenCapture {
 
         // Stop SCStream (nil out output first to prevent new frames)
         let gen = streamGeneration
-        streamOutput?.onFrameReceived = nil
+        currentStreamOutput?.onFrameReceived = nil
         let streamToStop = currentStream
         Task {
             await stopCapture(streamToStop, label: "fallback-teardown(gen \(gen))")
@@ -1466,7 +1644,7 @@ class ScreenCapture {
         newEncoder.requestKeyframe()
         encoder = newEncoder
 
-        restartStream()
+        restartStream(reason: "codec/limit changed")
     }
 
     // MARK: - Stop streaming
@@ -1476,6 +1654,7 @@ class ScreenCapture {
         // it cannot resurrect capture after this stop.
         let stoppedGeneration: UInt64 = sessionLock.withLock { state -> UInt64 in
             state.isStreaming = false
+            state.restartPendingReason = nil
             state.generation &+= 1
             state.idlePaused = false
             state.idleGeneration &+= 1
@@ -1487,7 +1666,7 @@ class ScreenCapture {
 
         let streamToStop = currentStream
         let queueToDrain = encodeQueue
-        streamOutput?.onFrameReceived = nil
+        currentStreamOutput?.onFrameReceived = nil
         stateLock.withLock { state in
             state.acceptingFrames = false
             state.lastFrameTime = nil

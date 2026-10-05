@@ -76,6 +76,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// cooperative pool while stopServer() runs on the main thread. Also owns
     /// the "already starting" reentrancy latch.
     private let startGeneration = StartGeneration()
+    /// Main-actor fence for every server-originated callback. Callbacks run on
+    /// StreamingServer's own queues and then hop to @MainActor, so the hop can
+    /// land after the session that produced them ended — or after a newer
+    /// server was published. Every callback revalidates the exact server
+    /// instance, the session generation captured synchronously at invocation,
+    /// AND that generation against the live server's current snapshot before
+    /// it is allowed to touch runtime state.
+    private var serverEventGate = ServerEventGate()
     /// Display transform published for StreamingServer's network queue.
     private let displayTransformStore = DisplayTransformStore()
     private var isStartingServer: Bool { startGeneration.hasInFlightStart }
@@ -837,9 +845,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             server.touchEnabled = await MainActor.run { self.settings.touchEnabled }
             if settings.connectionMode == .wireless {
                 server.expectedAuthToken = WirelessAuth.loadOrCreate()
-                server.onWirelessClientPaired = { [weak self] deviceName in
+                server.onWirelessClientPaired = { [weak self, weak server] deviceName in
+                    // Identity is read on the server's own queue, while the
+                    // handshake that produced it is still the live session.
+                    guard let server else { return }
+                    let event = server.currentSessionEvent()
                     Task { @MainActor [weak self] in
                         guard let self = self else { return }
+                        // Pairing is reported BEFORE the session is installed,
+                        // so the handshake completing bumps the generation
+                        // underneath this hop. The device really did pair, so
+                        // the gate must not compare generations here — only
+                        // prove the event came from the server still on air.
+                        guard self.serverEventGate.acceptsFromActiveServer(event) else { return }
                         self.currentWirelessDevice = deviceName
                         self.runtime.currentWirelessDevice = deviceName
                         self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
@@ -860,10 +878,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return current
             }
             server.setDisplaySize(width: size.width, height: size.height, rotation: transform.rotation, flipHorizontal: transform.flipHorizontal, flipVertical: transform.flipVertical)
-            await MainActor.run {
+            // Publish the server AND its callback authority in one main-actor
+            // step, and only while this attempt still owns the start latch.
+            // Publishing first and checking afterwards let a cancelled attempt
+            // overwrite a newer start's server, after which its own rollback
+            // cleared the live session's pointer and retired its gate.
+            let published = await MainActor.run { () -> Bool in
+                guard self.startGeneration.isCurrent(token) else { return false }
                 self.streamingServer = server
+                self.serverEventGate.adopt(server)
+                return true
             }
-            guard startGeneration.isCurrent(token) else {
+            guard published else {
                 await rollbackStart(token: token, attempt: attempt, reason: "cancelled after the server was created")
                 return
             }
@@ -871,19 +897,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // networkQueue, where releaseStylusIfNeeded() would post a mouse-up
             // for a pen stroke that handleStylus is still driving on the main
             // thread.
-            server.onClientConnected = { [weak self, weak capture] in
+            server.onClientConnected = { [weak self, weak capture] event in
                 Task { @MainActor [weak self, weak capture] in
+                    guard let self = self else { return }
+                    guard self.serverEventGate.accepts(event, liveServer: self.streamingServer) else { return }
                     // If the no-client idle policy paused capture, resume it at
                     // the connection boundary instead of waiting for the next
                     // monitor tick. The cached replay/keyframe then has a live
                     // pipeline.
-                    capture?.resumeFromIdle()
-                    capture?.requestKeyframeOrReplayCachedFrame(force: true)
+                    if let capture, self.screenCapture === capture {
+                        capture.resumeFromIdle()
+                        capture.requestKeyframeOrReplayCachedFrame(force: true)
+                    }
                     // Re-apply the persisted menu-bar value after the Android
                     // client has joined; StreamingServer queues it until BRIGHT
                     // capability negotiation completes.
-                    self?.nativeBrightness?.pushCurrent()
-                    self?.runtime.clientConnected = true
+                    self.nativeBrightness?.pushCurrent()
+                    self.runtime.clientConnected = true
                 }
             }
             // Runs synchronously on the server's network queue BEFORE the
@@ -902,9 +932,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 capture?.requestKeyframeOrReplayCachedFrame(force: force)
             }
 
-            server.onClientDisconnected = { [weak self] in
+            server.onClientDisconnected = { [weak self] event in
                 Task { @MainActor [weak self] in
                     guard let self = self else { return }
+                    guard self.serverEventGate.accepts(event, liveServer: self.streamingServer) else { return }
                     // Stylus state is main-confined and this posts a mouse-up:
                     // a disconnect in the middle of an S Pen drag otherwise left
                     // the button logically down until the user clicked again.
@@ -915,7 +946,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            server.onSessionTimeout = { [weak self] in
+            server.onSessionTimeout = { [weak self] event in
                 // A session that stayed silent for the full five-minute budget
                 // is indistinguishable from one whose client is gone, so the
                 // host does the only honest thing left: end the whole session
@@ -927,6 +958,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // them, and tearDown reaches main-actor state.
                 Task { @MainActor [weak self] in
                     guard let self = self else { return }
+                    // A watchdog tick queued before a Stop/Start can land here
+                    // after the replacement server is live, and a tick queued
+                    // for the previous session can land after the next one was
+                    // installed. Either way accepting it would tear down a
+                    // session that never went silent, so the gate has to agree
+                    // this event still describes the server AND the session it
+                    // currently holds.
+                    guard self.serverEventGate.accepts(event, liveServer: self.streamingServer) else { return }
                     // markDisconnected() has already run and cleared
                     // clientConnected by the time this task lands, so gate on
                     // the session still being live rather than on the client
@@ -946,11 +985,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.handleStylus(event)
             }
 
-            server.onStats = { [weak self] fps, mbps in
-                let captured = self
-                Task { @MainActor in
-                    captured?.performance.currentFPS = fps
-                    captured?.performance.currentBitrate = mbps
+            server.onStats = { [weak self] event, fps, mbps in
+                // Metrics are per-session. A sample already counted for a
+                // retired server — or for the session that has since ended or
+                // been replaced — must not overwrite the live numbers.
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    guard self.serverEventGate.accepts(event, liveServer: self.streamingServer) else { return }
+                    self.performance.currentFPS = fps
+                    self.performance.currentBitrate = mbps
                 }
             }
 
@@ -1111,7 +1154,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if idleSleepMonitor === attempt.idleSleepMonitor { idleSleepMonitor = nil }
         if brightnessMonitor === attempt.brightnessMonitor { brightnessMonitor = nil }
         if screenCapture === attempt.screenCapture { screenCapture = nil }
-        if streamingServer === attempt.streamingServer { streamingServer = nil }
+        if streamingServer === attempt.streamingServer {
+            streamingServer = nil
+            // Retire this server's callback authority. A frame-queue stat
+            // sample or a network-queue timeout already enqueued for it must
+            // not be able to publish into whatever starts next.
+            serverEventGate.retire(attempt.streamingServer)
+        }
         if virtualDisplayManager === attempt.virtualDisplayManager { virtualDisplayManager = nil }
 
         guard clearingSettings else { return }
@@ -1888,6 +1937,89 @@ final class StartGeneration: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return newestAttempt > token.value
+    }
+}
+
+/// Main-actor fence for StreamingServer's callbacks.
+///
+/// Every server callback runs on one of StreamingServer's own queues and then
+/// hops to `@MainActor`. That hop can land after the session which produced it
+/// ended, and — because the callbacks are the ONLY thing that publishes
+/// `runtime.clientConnected` or decides to stop the host on a session timeout —
+/// an un-fenced late callback silently resurrects a green "Connected" UI or
+/// tears down a newer, healthy server.
+///
+/// Three independent fences apply, and all are required:
+///
+/// 1. **Server identity.** `adopt(_:)` records the exact server instance the
+///    host published. A callback from a retired server is rejected forever,
+///    even if that server is still draining its queues.
+/// 2. **The server's own current session.** A callback carries the generation
+///    that was current on the server's queue at invocation, and it is only
+///    accepted while that is STILL the generation the server holds. This is
+///    the fence the gate's own bookkeeping cannot provide: if a new session
+///    (gen 12) is installed while the host's hop for the previous session's
+///    timeout (gen 11) is still queued, gen 11 is newer than anything the gate
+///    has applied, yet it would tear down a session that never went silent.
+/// 3. **Monotonic application.** Within one server, `accepts` also rejects any
+///    event older than the newest one already applied, so a connect that was
+///    queued *before* a disconnect cannot publish after it.
+///
+/// `StartGeneration` cannot serve this purpose: `isCurrent(_:)` means "this
+/// start attempt still holds the in-flight latch", which `finish(_:)` clears
+/// the moment the server goes live. It answers a startup question, not a
+/// "which session is this callback about" question.
+struct ServerEventGate {
+    private var activeServerID: ObjectIdentifier?
+    private var newestGeneration: UInt64 = 0
+    private(set) var acceptedEventCount = 0
+    private(set) var rejectedEventCount = 0
+
+    mutating func adopt(_ server: StreamingServer) {
+        activeServerID = ObjectIdentifier(server)
+        newestGeneration = 0
+    }
+
+    mutating func retire(_ server: StreamingServer?) {
+        guard let server else { return }
+        guard activeServerID == ObjectIdentifier(server) else { return }
+        activeServerID = nil
+    }
+
+    /// True when a session-scoped event (connect, disconnect, timeout, stats)
+    /// may still mutate host runtime state. `liveServer` is the server the host
+    /// currently publishes; its session snapshot is read here, on the main
+    /// actor, so an event is judged against the server's present truth and not
+    /// only against what the host has already applied.
+    mutating func accepts(
+        _ event: StreamingServer.SessionEvent,
+        liveServer: StreamingServer?
+    ) -> Bool {
+        guard let liveServer,
+              event.serverID == activeServerID,
+              ObjectIdentifier(liveServer) == event.serverID else { return reject() }
+        guard event.sessionGeneration == liveServer.currentSessionSnapshot().generation else {
+            return reject()
+        }
+        guard event.sessionGeneration >= newestGeneration else { return reject() }
+        newestGeneration = event.sessionGeneration
+        acceptedEventCount &+= 1
+        return true
+    }
+
+    /// For events that are NOT scoped to a session — currently wireless
+    /// pairing, which is reported before the session is installed. Only server
+    /// identity applies: the device genuinely paired, and the handshake
+    /// completing underneath the hop must not throw that away.
+    mutating func acceptsFromActiveServer(_ event: StreamingServer.SessionEvent) -> Bool {
+        guard event.serverID == activeServerID else { return reject() }
+        acceptedEventCount &+= 1
+        return true
+    }
+
+    private mutating func reject() -> Bool {
+        rejectedEventCount &+= 1
+        return false
     }
 }
 
