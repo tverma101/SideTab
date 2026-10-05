@@ -121,8 +121,19 @@ class StreamingServer {
     /// the short connection-startup race.
     private var lastBrightness: UInt8?
     private let controlQueue = DispatchQueue(label: "controlQueue", qos: .userInteractive)
-    var onClientConnected: (() -> Void)?
-    var onClientDisconnected: (() -> Void)?
+    /// Immutable event payload captured synchronously on the callback queue.
+    /// The host validates BOTH the server identity and the session generation
+    /// after its MainActor hop. A queued connect must not publish after a later
+    /// disconnect from the same server, and a callback from a retired server
+    /// must never publish into or stop a newer session. `serverID` is an
+    /// ObjectIdentifier rather than a strong reference so the event never keeps
+    /// a retired server alive.
+    struct SessionEvent: Equatable {
+        let serverID: ObjectIdentifier
+        let sessionGeneration: UInt64
+    }
+    var onClientConnected: ((SessionEvent) -> Void)?
+    var onClientDisconnected: ((SessionEvent) -> Void)?
     /// Fired when a live session is ended because the client went silent past
     /// `SessionLifetimePolicy.defaultDisconnectTimeout` — as opposed to a
     /// socket that actually reported a terminal state. Kept separate from
@@ -130,7 +141,7 @@ class StreamingServer {
     /// (server stopped, virtual display destroyed) on a timeout, whereas an
     /// observed disconnect only clears per-client state and leaves the
     /// listener up so the tablet can reconnect on its own.
-    var onSessionTimeout: (() -> Void)?
+    var onSessionTimeout: ((SessionEvent) -> Void)?
     /// Fired once per connection during protocol startup, BEFORE the display
     /// config is sent, for every outcome (.hevc or .h264) — so the capture
     /// pipeline can also revert to HEVC after an AVC-only client goes away.
@@ -140,7 +151,10 @@ class StreamingServer {
     /// Direct S Pen callback. Stylus contact bypasses the touch gesture
     /// state-machine so drawing starts on the first pen move.
     var onStylusEvent: ((StylusEvent) -> Void)?
-    var onStats: ((Double, Double) -> Void)?
+    /// Carries the same SessionEvent as the lifecycle callbacks: a stat sample
+    /// counted while an older session was live must not be published over the
+    /// numbers of the session that replaced it.
+    var onStats: ((SessionEvent, Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
     // handled regardless. When false, incoming touch frames are dropped
@@ -236,6 +250,29 @@ class StreamingServer {
     private var isReceiving: Bool { sessionState.withLock { $0.receiving } }
     private var connectionReady: Bool { sessionState.withLock { $0.connectionReady } }
     private var clientSupportsStylus: Bool { sessionState.withLock { $0.clientSupportsStylus } }
+
+    /// Identity + generation of the session that is live RIGHT NOW, read under
+    /// the same leaf lock the session flags use. The host captures one of
+    /// these synchronously at every callback invocation (while the callback
+    /// queue still owns the truth) and revalidates it after hopping to the
+    /// main actor, so a queued event can never publish into or tear down a
+    /// newer session. `connectionReady` says whether a client is streaming
+    /// under that generation right now.
+    func currentSessionSnapshot() -> (serverID: ObjectIdentifier, generation: UInt64, live: Bool) {
+        sessionState.withLock {
+            (ObjectIdentifier(self), $0.sessionGeneration, $0.connectionReady)
+        }
+    }
+
+    /// The snapshot form the host callbacks carry. Read on the server's own
+    /// queue at callback-invocation time, BEFORE the hop to the main actor.
+    func currentSessionEvent() -> SessionEvent {
+        let snapshot = currentSessionSnapshot()
+        return SessionEvent(
+            serverID: snapshot.serverID,
+            sessionGeneration: snapshot.generation
+        )
+    }
 
     init(port: UInt16, controlPort: UInt16? = nil) {
         self.port = port
@@ -1060,7 +1097,10 @@ class StreamingServer {
         retireFrameTransport(disconnectedConnection)
         connection = nil
         inputBuffer.removeAll(keepingCapacity: true)
-        onClientDisconnected?()
+        let sessionGeneration = sessionState.withLock { $0.sessionGeneration }
+        onClientDisconnected?(
+            SessionEvent(serverID: ObjectIdentifier(self), sessionGeneration: sessionGeneration)
+        )
     }
 
     // MARK: - Session lifetime
@@ -1100,13 +1140,15 @@ class StreamingServer {
     /// Marks the session live and starts the deadline that ends it. Called only
     /// on the first publish for a generation, so a capability re-advertisement
     /// cannot restart the client's budget indefinitely.
-    private func beginSessionLifetime() {
+    @discardableResult
+    private func beginSessionLifetime() -> UInt64 {
         let generation: UInt64 = sessionState.withLock { state in
             state.sessionGeneration &+= 1
             state.lastInboundActivity = .now
             return state.sessionGeneration
         }
         startSessionWatchdog(generation: generation)
+        return generation
     }
 
     private func startSessionWatchdog(generation: UInt64) {
@@ -1155,7 +1197,10 @@ class StreamingServer {
         // cleared exactly as it is for an observed socket error, then escalate
         // to the host so the server and virtual display are released too.
         markDisconnected()
-        onSessionTimeout?()
+        let sessionGeneration = sessionState.withLock { $0.sessionGeneration }
+        onSessionTimeout?(
+            SessionEvent(serverID: ObjectIdentifier(self), sessionGeneration: sessionGeneration)
+        )
     }
 
     private func onConnectionReady(_ conn: NWConnection, alreadyAuthenticated: Bool = false) {
@@ -1290,9 +1335,13 @@ class StreamingServer {
             debugLog("Connection ready for frames (metadata=\(metadata ? "on" : "off"), codec=\(plan.codec))")
             // Start the disconnect deadline only on the first publish: a later
             // capability re-advertisement must not hand the client a fresh
-            // five-minute budget.
-            beginSessionLifetime()
-            onClientConnected?()
+            // five-minute budget. beginSessionLifetime installs the generation
+            // the host validates, so the connect event can never be stamped
+            // with the pre-bump value a disconnect would also carry.
+            let sessionGeneration = beginSessionLifetime()
+            onClientConnected?(
+                SessionEvent(serverID: ObjectIdentifier(self), sessionGeneration: sessionGeneration)
+            )
         }
     }
 
@@ -1940,7 +1989,7 @@ class StreamingServer {
         if elapsed >= 1.0 {
             let mbps = Double(bytesSent * 8) / elapsed / 1_000_000
             let fps = Double(frameCount) / elapsed
-            onStats?(fps, mbps)
+            onStats?(currentSessionEvent(), fps, mbps)
 
             // Log pipeline latency profile
             if profiledFrameCount > 0 {
@@ -1970,6 +2019,12 @@ class StreamingServer {
             state.receiving = false
             state.connectionReady = false
             state.clientSupportsStylus = false
+            // stop() ENDS the live session, so it advances the generation like
+            // every other end does. Any callback captured before this point
+            // now describes a generation the server itself no longer holds,
+            // which is what lets the host reject it after its MainActor hop
+            // without having to reason about the stop/hop interleaving.
+            state.sessionGeneration &+= 1
         }
 
         // Every remaining field has exactly one owning queue, so teardown runs

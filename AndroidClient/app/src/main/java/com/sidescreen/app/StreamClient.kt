@@ -273,6 +273,87 @@ class StreamClient(
     private val inBandKeyframePacket = ByteArray(2)
     private val inBandPingPacket = ByteArray(9)
 
+    /**
+     * A video-socket write blocks until the peer drains it and cannot be
+     * interrupted, so the watchdog — not the writer — has to notice. It runs on
+     * its own scheduler thread and closes the exact socket it captured, which is
+     * what releases the writer parked inside [touchExecutor] and, through it,
+     * every later touch, stylus, keyframe and liveness packet.
+     *
+     * A blocked write is only half the evidence, though: an actively receiving
+     * socket means the host is still talking to us and the peer has merely gone
+     * quiet in the other direction. Inbound bytes outrank the timer, so that
+     * case keeps the transport and is re-checked instead of torn down.
+     */
+    private val videoWriteWatchdog =
+        SocketWriteWatchdog(
+            budgetMs = TimeUnit.NANOSECONDS.toMillis(VideoLivenessPolicy.WRITE_BLOCKED_NS),
+        ) { socket, _ ->
+            val generation = currentVideoGeneration(socket)
+            if (generation < 0L) {
+                // Retired or replaced while the write was blocked. Whatever
+                // retired it already closed this socket, which is what released
+                // the writer; nothing here may touch the newer generation.
+                false
+            } else {
+                val readPathAlive =
+                    VideoLivenessPolicy.isReadPathAlive(
+                        lastReadNs = lastVideoReadNs,
+                        nowNs = System.nanoTime(),
+                        staleAfterNs = VIDEO_PROBE_INTERVAL_NS,
+                    )
+                if (readPathAlive) {
+                    diagLog(
+                        "Video write blocked but inbound bytes are still arriving on generation=" +
+                            "$generation — holding the transport and re-checking",
+                    )
+                    true
+                } else {
+                    diagLog(
+                        "Video write blocked with no inbound bytes on generation=$generation — " +
+                            "closing the socket to release the writer",
+                    )
+                    try {
+                        socket.close()
+                    } catch (_: Exception) {
+                    }
+                    false
+                }
+            }
+        }
+
+    /**
+     * Identity check for the watchdog callback. Deliberately does not require
+     * `isConnected`: the capability preamble writes before the transport is
+     * published as connected and must be covered too.
+     *
+     * Returns the transport's current generation when [socket] is the live one,
+     * or -1 when it has been retired or replaced.
+     */
+    private fun currentVideoGeneration(socket: Socket): Long =
+        synchronized(transportLock) {
+            if (this.socket === socket) transportGeneration else -1L
+        }
+
+    /**
+     * Every in-band write goes through here so the deadline is armed before the
+     * bytes can block and cleared the moment they drain. Callers keep their own
+     * failure policy; this only owns the bounded-write contract.
+     */
+    private fun writeInBand(
+        transport: TransportSnapshot,
+        bytes: ByteArray,
+        offset: Int,
+        length: Int,
+    ) {
+        val writeToken = videoWriteWatchdog.arm(transport.socket)
+        try {
+            transport.output.write(bytes, offset, length)
+        } finally {
+            videoWriteWatchdog.disarm(writeToken)
+        }
+    }
+
     /** USB/E3 connection. A dropped session remains terminal for this client. */
     suspend fun connect() =
         withContext(Dispatchers.IO) {
@@ -734,7 +815,15 @@ class StreamClient(
         framesReceived = 0L
         lastStatsTime = System.currentTimeMillis()
 
-        advertiseCapabilities(output)
+        // Covered by the same bounded-write contract as steady-state traffic: a
+        // host that has accepted the TCP connection but stopped reading would
+        // otherwise park this connect coroutine inside the preamble forever.
+        val preambleWriteToken = videoWriteWatchdog.arm(s)
+        try {
+            advertiseCapabilities(output)
+        } finally {
+            videoWriteWatchdog.disarm(preambleWriteToken)
+        }
 
         synchronized(transportLock) {
             if (transportGeneration != generation || socket !== s || connectionAttemptCancelled) {
@@ -1005,7 +1094,7 @@ class StreamClient(
                 offset += 8
             }
             putIntLE(inBandTouchPacket, offset, write.action)
-            transport.output.write(inBandTouchPacket, 0, 6 + count * 8)
+            writeInBand(transport, inBandTouchPacket, 0, 6 + count * 8)
         } catch (e: Exception) {
             failVideoTransportIfReadPathDead(transport, "in-band touch write failed", e)
         }
@@ -1055,7 +1144,7 @@ class StreamClient(
 
         try {
             val size = StylusProtocol.encodeInto(write.event, inBandStylusPacket)
-            transport.output.write(inBandStylusPacket, 0, size)
+            writeInBand(transport, inBandStylusPacket, 0, size)
         } catch (e: Exception) {
             failVideoTransportIfReadPathDead(transport, "in-band stylus write failed", e)
         }
@@ -1099,7 +1188,7 @@ class StreamClient(
             try {
                 inBandKeyframePacket[0] = MESSAGE_KEYFRAME_REQUEST.toByte()
                 inBandKeyframePacket[1] = flags.toByte()
-                transport.output.write(inBandKeyframePacket)
+                writeInBand(transport, inBandKeyframePacket, 0, inBandKeyframePacket.size)
             } catch (e: Exception) {
                 failVideoTransportIfReadPathDead(transport, "in-band keyframe request failed", e)
             }
@@ -1212,7 +1301,7 @@ class StreamClient(
                 diagLog(String.format(Locale.US, "VIDEO PING dispatch=%.2fms", (writeTime - queuedAt) / 1e6))
                 inBandPingPacket[0] = MESSAGE_PING.toByte()
                 putLongLE(inBandPingPacket, 1, writeTime)
-                transport.output.write(inBandPingPacket)
+                writeInBand(transport, inBandPingPacket, 0, inBandPingPacket.size)
                 // A write that blocks this long means the send buffer is wedged.
                 // That is a transport fault in its own right, not an ambiguity
                 // the silence counter has to resolve.
@@ -1221,7 +1310,10 @@ class StreamClient(
                     synchronized(videoProbeLock) {
                         videoProbeOutstanding = null
                     }
-                    failVideoTransport(transport, "video-path ping write blocked", null)
+                    // Same rule as the watchdog: a write that returned after a
+                    // long block is only evidence of a dead transport when the
+                    // read path has gone quiet as well. Inbound bytes outrank it.
+                    failVideoTransportIfReadPathDead(transport, "video-path ping write blocked", null)
                 }
             } catch (e: Exception) {
                 synchronized(videoProbeLock) {
@@ -1571,6 +1663,10 @@ class StreamClient(
     }
 
     private fun shutdownTouchExecutor() {
+        // This client is terminal, so stop the write deadline. Any writer still
+        // parked inside a blocked write has already been released by the socket
+        // close in cleanupTransport(); the watchdog must not outlive the client.
+        videoWriteWatchdog.shutdown()
         if (touchExecutor.isShutdown) return
         touchExecutor.shutdown()
         try {

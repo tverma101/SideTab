@@ -33,7 +33,9 @@ enum ADBUSBDeviceStatus: Equatable {
         switch self {
         case .notDetected:
             return "Not detected"
-        case .connected(_):
+        case .connected(nil):
+            return "Stream active"
+        case .connected(.some):
             return "Detected"
         case .authorizationRequired:
             return "Authorize tablet"
@@ -48,7 +50,9 @@ enum ADBUSBDeviceStatus: Equatable {
         switch self {
         case .notDetected:
             return "No USB device is visible to ADB. Use a data-capable cable, unlock the tablet, and enable USB debugging."
-        case .connected(_):
+        case .connected(nil):
+            return "The tablet is streaming. A live connection alone does not verify the physical USB cable; ADB can also forward over Wi-Fi."
+        case .connected(.some):
             return "An authorized Android tablet is visible to ADB. SideTab sets up the USB reverse tunnel automatically."
         case let .authorizationRequired(serial):
             return "ADB sees \(serial), but the tablet has not authorized this Mac. Unlock the tablet and tap Allow USB debugging (choose Always allow if offered)."

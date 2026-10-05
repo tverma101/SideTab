@@ -167,6 +167,64 @@ final class VideoEncoderWireFormatTests: XCTestCase {
         return buffer
     }
 
+    // MARK: - Session rebuild failure keeps the working session
+
+    /// A settings change rebuilds the compression session. When that rebuild
+    /// could not be allocated, the old code published nil over the working
+    /// session and then invalidated it, so every later encode took the
+    /// `.noSession` path and dropped frames silently — one transient allocation
+    /// failure left the tablet black until the app restarted, with no way back.
+    /// The live session must survive, and the next rebuild must still work.
+    func testFailedSessionRebuildKeepsTheWorkingSession() throws {
+        let width = 320
+        let height = 192
+        try XCTSkipUnless(
+            Self.hasHardwareEncoder(width: width, height: height),
+            "no hardware H.264 encoder on this machine"
+        )
+        let encoder = VideoEncoder(width: width, height: height, codec: .h264, frameRate: 30)
+        let output = OSAllocatedUnfairLock<(data: Data, isKeyframe: Bool)?>(initialState: nil)
+        let delivered = expectation(description: "frame after failed rebuild")
+        encoder.onEncodedFrame = { data, _, isKeyframe in
+            let isFirst = output.withLock { state -> Bool in
+                guard state == nil else { return false }
+                state = (data, isKeyframe)
+                return true
+            }
+            if isFirst { delivered.fulfill() }
+        }
+        defer { encoder.onEncodedFrame = nil }
+
+        XCTAssertTrue(encoder.hasLiveSession, "init must publish a session")
+        VideoEncoder.failNextSessionCreation = true
+        encoder.updateSettings(bitrateMbps: 8, quality: "low", gamingBoost: false)
+
+        XCTAssertTrue(
+            encoder.hasLiveSession,
+            "a failed rebuild must not tear down the session that is still working"
+        )
+
+        // Real end-to-end proof that the surviving session still encodes: a
+        // torn-down one would drop this frame at the `.noSession` branch and
+        // never call back.
+        guard let pixelBuffer = Self.makePixelBuffer(width: width, height: height) else {
+            return XCTFail("could not create a pixel buffer")
+        }
+        encoder.encode(
+            pixelBuffer: pixelBuffer,
+            presentationTimeStamp: CMTime(
+                value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
+                timescale: 1_000_000
+            )
+        )
+        wait(for: [delivered], timeout: 5)
+        XCTAssertNotNil(output.withLock { $0 })
+
+        // A later rebuild recovers normally rather than staying wedged.
+        encoder.updateSettings(bitrateMbps: 9, quality: "low", gamingBoost: false)
+        XCTAssertTrue(encoder.hasLiveSession, "the next rebuild must succeed")
+    }
+
     private func isSyncSample(attachments: [[CFString: Any]]?) -> Bool {
         VideoEncoder.isSyncSample(attachments: attachments)
     }

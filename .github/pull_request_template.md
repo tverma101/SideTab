@@ -23,25 +23,47 @@ Fixes #(issue number)
 
 ## Testing
 
-Describe how you tested your changes:
+Check every state you actually reached. Leave the rest unchecked; a lower state
+never implies a higher one.
 
-- [ ] Tested on macOS [version]
-- [ ] Tested on Android [device/version]
-- [ ] Tested USB connection
-- [ ] Tested streaming performance
+- [ ] **Implemented** — builds locally in the dev checkout.
+- [ ] **Unit-tested** — deterministic tests exercise the changed behavior and pass (`swift test`, `./gradlew testDebugUnitTest`).
+- [ ] **CI-green** — hosted Android and macOS build/test/lint lanes pass at this exact head.
+- [ ] **Installed** — the built artifact was installed on the target device.
+- [ ] **Live-verified** — observed on the target Mac + tablet in a real session; say what was observed.
+- [ ] **User-confirmed** — the reporting user says the symptom is gone in normal use.
+
+Subsystem specifics, if they apply:
+
+- [ ] macOS `[version]`
+- [ ] Android `[device / version]`
+- [ ] USB connection
+- [ ] Wireless connection
+- [ ] Streaming performance measured (before/after, not impression)
+
+If a state is unchecked, say why in **Notes**. Hosted CI proves code contracts
+only; it cannot prove CGVirtualDisplay, VideoToolbox, MediaCodec, panel
+refresh, USB, brightness, or sleep/wake behavior on the target hardware.
 
 ## Screenshots (if applicable)
 
-Add screenshots for UI changes.
+Required before merge for any UI, diagnostic-state, or hardware-recovery
+change. Recovery work should show the failing state and the recovered state.
+Name the device and app revision in the caption, and redact tokens, addresses,
+and MAC identifiers.
+
+- [ ] Screenshots attached for UI / state / recovery changes
 
 ## Checklist
 
 - [ ] My code follows the project's coding standards
-- [ ] I have tested my changes thoroughly
+- [ ] I have not claimed a higher evidence state than I reached
 - [ ] I have updated documentation if needed
 - [ ] My changes don't introduce new warnings
+- [ ] My changes don't add secret-bearing logs
 - [ ] I have added comments for complex logic
 
 ## Additional Notes
 
-Any additional information for reviewers.
+Anything a reviewer needs to judge risk: what is still unverified, which claim
+depends on target hardware, and what is out of scope.

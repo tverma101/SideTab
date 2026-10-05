@@ -5,11 +5,13 @@ import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import android.view.Surface
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 private fun diagLog(msg: String) = DiagLog.log("VD", msg)
 
@@ -133,6 +135,115 @@ class VideoDecoder(
     private var stallReported = false
     private var queuedInputCount = 0L
 
+    /**
+     * Fired at most once per decoder generation for a condition this instance
+     * cannot recover from by itself: an internal codec error, a frame the codec
+     * cannot accept at the negotiated size, or a fed decoder that has stopped
+     * producing output. Readiness is invalidated *before* this fires, so no
+     * further frame can be handed to the failed codec.
+     *
+     * The callback is the hand-off to the owner, which owns rebuilding the
+     * pipeline; nothing in here retries on its own. Reasons are
+     * `DecoderRecoveryPolicy.REASON_*` prefixes followed by detail — match on
+     * the prefix.
+     *
+     * The pipeline is built on a background thread and the owner attaches this
+     * callback a moment later, so a failure raised during construction is held
+     * and delivered on attach rather than dropped. Without that, a decoder that
+     * died before the owner was listening would sit there permanently dead and
+     * unreported — the same black screen this path exists to end.
+     */
+    var onDecoderFailure: ((String) -> Unit)?
+        get() = failureSink.boundSink
+        set(value) = failureSink.bind(value)
+
+    /**
+     * One-shot, hold-until-bound delivery for [onDecoderFailure]. Failures are
+     * observed from the socket thread (oversize input, watchdog) and the codec
+     * callback handler (onError), so the latch has to be atomic rather than a
+     * plain flag.
+     */
+    private val failureSink = DecoderRecoveryPolicy.FailureSink()
+
+    /**
+     * Monotonic clock for the watchdog. `currentTimeMillis` can jump backwards
+     * when NTP steps the wall clock, which would either suppress a real wedge
+     * (a negative age never reaches the budget) or trip it instantly on a
+     * forward jump — and a tablet left plugged in for days is exactly where a
+     * clock step shows up.
+     */
+    private val watchdogNowMs = { @Suppress("SystemClockNow") SystemClock.elapsedRealtime() }
+
+    /**
+     * Feed pressure and last output progress, the watchdog's entire evidence
+     * base. A wedged codec is only provable when the app *tried* to feed it and
+     * nothing came back; both are touched by the socket thread and the codec
+     * callback thread, so they are atomic.
+     */
+    private val feedPressure = FeedPressure()
+
+    /**
+     * Frame counter and timestamps for the no-output watchdog. Extracted so the
+     * policy above can stay a total function over plain values and so the
+     * same accounting runs on a JVM in the unit tests.
+     */
+    private class FeedPressure {
+        /** Frames the codec actually accepted since the last decoded output. */
+        val fedSinceOutput = AtomicLong(0L)
+
+        /**
+         * Frames offered to the codec since the last output, accepted or not.
+         *
+         * `fedSinceOutput` alone cannot prove a wedge on a codec with only a
+         * handful of input buffers: it absorbs four frames, produces nothing,
+         * and then every later `queueInputBuffer` is impossible, so the accepted
+         * count freezes below any threshold while the screen is black. Attempts
+         * are what keeps that case provable, and the accepted count stays in
+         * the rule too so a pure stream of empty offers without a single
+         * accepted frame still cannot trip it.
+         */
+        val attemptsSinceOutput = AtomicLong(0L)
+
+        /** Input-wait timeouts since the last output: the codec offered nothing. */
+        val inputWaitTimeouts = AtomicLong(0L)
+
+        /** Monotonic time of the last decoded output, 0 before the first one. */
+        val lastOutputAtMs = AtomicLong(0L)
+
+        /** Monotonic time of the first frame offered since the last output. */
+        val firstFedAtMs = AtomicLong(0L)
+
+        fun reset() {
+            fedSinceOutput.set(0L)
+            attemptsSinceOutput.set(0L)
+            inputWaitTimeouts.set(0L)
+            lastOutputAtMs.set(0L)
+            firstFedAtMs.set(0L)
+        }
+
+        fun onFeedAttempt(nowMs: Long) {
+            attemptsSinceOutput.incrementAndGet()
+            firstFedAtMs.compareAndSet(0L, nowMs)
+        }
+
+        fun onInputWaitTimeout() {
+            inputWaitTimeouts.incrementAndGet()
+        }
+
+        fun onFrameFed(nowMs: Long) {
+            fedSinceOutput.incrementAndGet()
+            firstFedAtMs.compareAndSet(0L, nowMs)
+        }
+
+        fun onOutputDecoded(nowMs: Long) {
+            fedSinceOutput.set(0L)
+            attemptsSinceOutput.set(0L)
+            inputWaitTimeouts.set(0L)
+            lastOutputAtMs.set(nowMs)
+            firstFedAtMs.set(0L)
+        }
+    }
+
     // The callback is asynchronous and can finish after release() starts. Keep
     // the codec generation with every index so a recreated decoder can never
     // consume a stale index from its predecessor.
@@ -178,6 +289,10 @@ class VideoDecoder(
     private fun setupDecoder() {
         val generation = decoderGeneration + 1L
         decoderGeneration = generation
+        // A rebuild starts a fresh one-shot failure report and a fresh watchdog;
+        // neither may carry over from the codec this one replaces.
+        failureSink.reset()
+        feedPressure.reset()
         val thread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY)
         decoderThread = thread
         try {
@@ -222,8 +337,14 @@ class VideoDecoder(
                     if (decoderGeneration != generation || decoder !== codec) return
                     diagLog("Codec error: ${e.diagnosticInfo}")
                     Log.e(TAG, "Codec error: ${e.diagnosticInfo}", e)
-                    needsKeyframe = true
-                    requestKeyframe("codec error", force = true)
+                    // A codec that reports an internal error does not resume on
+                    // its own: the framework moves it out of Executing (back to
+                    // Configured for a recoverable error, Uninitialized
+                    // otherwise) and every later queueInputBuffer then fails
+                    // with a sticky CodecException. Asking for a keyframe cannot
+                    // revive it, so report the failure and let the owner build a
+                    // replacement instead of feeding a dead codec forever.
+                    signalFailure(DecoderRecoveryPolicy.codecErrorReason(e.diagnosticInfo))
                 }
 
                 override fun onOutputFormatChanged(
@@ -424,6 +545,15 @@ class VideoDecoder(
                 "waiting for keyframe",
                 waitForKeyframe = true,
             )
+            // Waiting for an IDR looks like silence but is a normal state: the
+            // host may take a few hundred ms to answer a forced keyframe, and
+            // the host may also legitimately send nothing at all. Only a
+            // decoder that was actually fed and has now stopped answering is a
+            // wedge, so the watchdog runs here too — it is inert until real
+            // feed pressure has accumulated, which is what stops a decoder that
+            // is merely waiting for its next keyframe from being torn down.
+            feedPressure.onFeedAttempt(watchdogNowMs())
+            evaluateNoOutputWatchdog()
             return
         }
 
@@ -452,6 +582,14 @@ class VideoDecoder(
                 )
             }
             requestKeyframe("no input buffer", force = true)
+            // A missing input buffer is the only signal a codec that has
+            // already exhausted its slots can still produce: every queue
+            // attempt from here on fails the same way, so the watchdog has to be
+            // evaluated here as well. With no prior feed pressure this is inert,
+            // which is what keeps an idle or still-warming decoder healthy.
+            feedPressure.onFeedAttempt(watchdogNowMs())
+            feedPressure.onInputWaitTimeout()
+            evaluateNoOutputWatchdog()
             onFrameDecoded?.invoke(frameData)
             return
         }
@@ -496,20 +634,51 @@ class VideoDecoder(
         isKeyframe: Boolean,
     ) {
         try {
-            val inputBuffer =
-                codec.getInputBuffer(index)
-                    ?: throw IllegalStateException("Input buffer $index is null")
+            val inputBuffer = codec.getInputBuffer(index)
+            if (inputBuffer == null) {
+                // The index is still client-owned: the framework dequeues it
+                // natively before onInputBufferAvailable fires, so a null
+                // ByteBuffer means the buffer is unreachable to us, not that it
+                // went back to the pool. Give the slot back the same way an
+                // oversize frame does. This is a dropped frame plus a keyframe
+                // request, not a pipeline failure: a null buffer says the
+                // surface is unreachable, not that the codec is wedged.
+                diagLog("Input buffer $index came back null")
+                returnInputSlot(codec, index, frameTimestamp)
+                needsKeyframe = true
+                requestKeyframe("input buffer unavailable", force = true)
+                return
+            }
             // A frame larger than the configured input buffer would throw
             // BufferOverflowException on the copy below, whose recovery path
             // requests another keyframe that overflows too. Report the real
             // cause instead of looping on it.
-            if (frameSize < 0 || frameSize > inputBuffer.capacity()) {
+            val capacity = inputBuffer.capacity()
+            feedPressure.onFeedAttempt(watchdogNowMs())
+            if (DecoderRecoveryPolicy.inputFrameAction(frameSize, capacity) ==
+                DecoderRecoveryPolicy.InputFrameAction.REJECT
+            ) {
                 diagLog(
                     "Frame exceeds the codec input buffer: frame=$frameSize " +
-                        "capacity=${inputBuffer.capacity()} ${currentWidth}x$currentHeight",
+                        "capacity=$capacity ${currentWidth}x$currentHeight",
                 )
+                // getInputBuffer() took ownership of this index: the framework
+                // marks it client-owned and only queueInputBuffer gives it back.
+                // Simply returning here would burn one of the codec's handful of
+                // input slots per rejected frame until nothing can be fed at
+                // all — a permanent black screen that no keyframe request can
+                // clear. Hand the slot back as an empty access unit first.
                 needsKeyframe = true
                 requestKeyframe("frame exceeds input buffer", force = true)
+                signalFailure(
+                    DecoderRecoveryPolicy.rejectOversizeInput(
+                        frameSize = frameSize,
+                        capacity = capacity,
+                        width = currentWidth,
+                        height = currentHeight,
+                        returnSlot = { returnInputSlot(codec, index, frameTimestamp) },
+                    ),
+                )
                 return
             }
             inputBuffer.clear()
@@ -524,12 +693,117 @@ class VideoDecoder(
             if (isKeyframe) {
                 needsKeyframe = false
             }
+            // Pressure the codec actually absorbed. The same accounting is
+            // evaluated from the input-wait timeout path, so a codec that stops
+            // accepting input is still caught once it has no slots left to queue
+            // into.
+            feedPressure.onFrameFed(watchdogNowMs())
+            evaluateNoOutputWatchdog()
         } catch (e: Exception) {
             needsKeyframe = true
             requestKeyframe("queue input failed")
             Log.e(TAG, "decode direct feed error", e)
+            // IllegalStateException (and its CodecException subclass) is how the
+            // framework reports a codec that is no longer Executing or has a
+            // sticky error. That is unrecoverable for this instance; a dropped
+            // frame would otherwise repeat until the stream is black forever.
+            if (e is IllegalStateException) {
+                signalFailure(DecoderRecoveryPolicy.codecErrorReason(e.message))
+            }
         } finally {
             onFrameDecoded?.invoke(frameData)
+        }
+    }
+
+    /**
+     * Hand a client-owned input index back to the codec without giving it any
+     * data.
+     *
+     * The framework only ever returns an index to its input pool from
+     * queueInputBuffer(), so a rejected frame still has to be submitted as an
+     * empty access unit. An empty (offset 0, size 0) submission passes the
+     * framework's own capacity guard and carries no codec-config or
+     * end-of-stream flag, so it cannot start or end a stream. This runs on the
+     * caller's thread, never holds the codec's buffer lock, and never touches
+     * the input-buffer hand-off queue.
+     */
+    private fun returnInputSlot(
+        codec: MediaCodec,
+        index: Int,
+        frameTimestampNs: Long,
+    ) {
+        try {
+            codec.queueInputBuffer(index, 0, 0, frameTimestampNs / 1000, 0)
+        } catch (e: Exception) {
+            // The codec is already refusing work. The failure report that
+            // follows tears the instance down, which reclaims the slot with it.
+            Log.w(TAG, "could not return rejected input slot $index: ${e.message}")
+        }
+    }
+
+    /**
+     * Invalidate readiness and report an unrecoverable decoder condition
+     * exactly once for this generation.
+     *
+     * Readiness is cleared *before* the callback so a frame already in flight
+     * on another thread cannot be handed to a codec that is already dead, and
+     * the generation is bumped so callbacks already queued for this codec are
+     * ignored from here on.
+     *
+     * The codec is deliberately not released here. This can run on the codec's
+     * own callback handler (onError), and both stop() and release() block
+     * waiting for a reply from the codec's looper; the owner tears it down from
+     * its own thread in response to the callback instead.
+     *
+     * The one-shot and the hold-until-bound behaviour both live in
+     * [failureSink], so a failure raised before the owner attached
+     * [onDecoderFailure] is delivered as soon as it attaches rather than being
+     * consumed with nowhere to go.
+     */
+    private fun signalFailure(reason: String) {
+        if (failureSink.hasReported) return
+        codecStarted = false
+        isRunning = false
+        decoderGeneration += 1L
+        availableInputBuffers.clear()
+        diagLog("Decoder failure: $reason")
+        runCatching { failureSink.report(reason) }
+            .onFailure { Log.e(TAG, "decoder failure callback failed", it) }
+    }
+
+    /**
+     * Report a wedged decoder when the evidence is unambiguous: the codec was
+     * fed real frames, produced nothing since, and enough time has passed that
+     * this is no longer cold-start backpressure.
+     *
+     * Evaluated from the successful-feed path and the input-wait timeout path
+     * alike, because a codec that has spent its input slots never reaches the
+     * success path again.
+     */
+    private fun evaluateNoOutputWatchdog() {
+        if (failureSink.hasReported) return
+        val fed = feedPressure.fedSinceOutput.get()
+        val attempts = feedPressure.attemptsSinceOutput.get()
+        val timeouts = feedPressure.inputWaitTimeouts.get()
+        val lastOutput = feedPressure.lastOutputAtMs.get()
+        val firstDemand = feedPressure.firstFedAtMs.get()
+        if (firstDemand <= 0L) return
+        val msSinceOutput = DecoderRecoveryPolicy.outputSilenceMs(watchdogNowMs(), lastOutput, firstDemand)
+        if (DecoderRecoveryPolicy.shouldReportNoOutput(
+                inputFramesSinceOutput = fed,
+                feedAttemptsSinceOutput = attempts,
+                inputWaitTimeoutsSinceOutput = timeouts,
+                msSinceLastOutput = msSinceOutput,
+                alreadyReported = false,
+            )
+        ) {
+            diagLog(
+                "No output: fed=$fed attempts=$attempts timeouts=$timeouts " +
+                    "idle=${msSinceOutput}ms",
+            )
+            if (feedPressure.lastOutputAtMs.get() == lastOutput) {
+                signalFailure(DecoderRecoveryPolicy.noOutputReason(fed, msSinceOutput))
+            }
         }
     }
 
@@ -620,6 +894,13 @@ class VideoDecoder(
                 updateStats()
                 return
             }
+
+            // The codec produced a frame, so it is demonstrably making
+            // progress: rearm the output-progress watchdog. This happens for
+            // every accepted output, before the CfL hand-off and the surface
+            // render, because the buffer being available is the proof that
+            // matters.
+            feedPressure.onOutputDecoded(watchdogNowMs())
 
             // ByteBuffer mode (CfL): hand the plane-accessible Image to the
             // renderer; it releases the buffer from its render thread via
@@ -748,6 +1029,13 @@ class VideoDecoder(
         decoderThread?.quitSafely()
         decoderThread = null
         decoderHandler = null
+        // Detach last. A failure already delivered reached the owner
+        // synchronously, and a late signal from the retiring codec is now
+        // discarded rather than reporting against a pipeline the owner has
+        // already replaced. A held-but-undelivered failure cannot exist here:
+        // it is only held before the owner ever attached, and an unattached
+        // pipeline cannot be released.
+        failureSink.detach()
     }
 
     companion object {
