@@ -3,7 +3,11 @@ import Foundation
 /// Crosses the Network.framework -> VideoToolbox boundary without dropping
 /// already-encoded reference frames. StreamingServer records shallow local
 /// send pressure and samples TCP send-buffer headroom; VideoEncoder consults
-/// the gate before submitting routine captures. Forced keyframes bypass it.
+/// the Wi-Fi gate before submitting routine captures. Forced keyframes bypass it.
+///
+/// Despite the historical name, this type also owns the per-connection send
+/// accounting used by USBAdaptiveLoadController. USB does NOT use the binary
+/// pause gate below: it converts those same signals into 120 -> 90 -> 60 pacing.
 enum WirelessTransportPressure {
     private struct State {
         var generation: UInt64 = 0
@@ -13,6 +17,7 @@ enum WirelessTransportPressure {
         var bytesInFlight = 0
         var pauseUntilNs: UInt64 = 0
         var lastAvailableSendBuffer: UInt32?
+        var usbSendStartTimesNs: [UInt64] = []
     }
 
     private static let lock = NSLock()
@@ -22,7 +27,6 @@ enum WirelessTransportPressure {
     @discardableResult
     static func reset(wireless: Bool) -> UInt64 {
         lock.lock()
-        defer { lock.unlock() }
         state.generation &+= 1
         state.wireless = wireless
         state.ready = false
@@ -30,7 +34,19 @@ enum WirelessTransportPressure {
         state.bytesInFlight = 0
         state.pauseUntilNs = 0
         state.lastAvailableSendBuffer = nil
-        return state.generation
+        state.usbSendStartTimesNs.removeAll(keepingCapacity: true)
+        let generation = state.generation
+        lock.unlock()
+
+        if wireless {
+            USBAdaptiveLoadController.shared.retireCurrent()
+        } else {
+            USBAdaptiveLoadController.shared.reset(
+                generation: generation,
+                maxFPS: USBAdaptiveFramePacer.configuredMaxFPS()
+            )
+        }
+        return generation
     }
 
     static func setReady(generation: UInt64) {
@@ -40,32 +56,79 @@ enum WirelessTransportPressure {
         state.ready = true
     }
 
-    static func beginSend(generation: UInt64, bytes: Int = 0) {
+    static func beginSend(
+        generation: UInt64,
+        bytes: Int = 0,
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        var usbCount: Int?
         lock.lock()
-        defer { lock.unlock() }
-        guard state.generation == generation, state.ready else { return }
-        state.sendsInFlight += 1
-        state.bytesInFlight += max(0, bytes)
+        if state.generation == generation, state.ready {
+            state.sendsInFlight += 1
+            state.bytesInFlight += max(0, bytes)
+            if !state.wireless {
+                state.usbSendStartTimesNs.append(nowNs)
+                usbCount = state.sendsInFlight
+            }
+        }
+        lock.unlock()
+
+        if let usbCount {
+            USBAdaptiveLoadController.shared.observeSendsInFlight(
+                generation: generation,
+                count: usbCount,
+                nowNs: nowNs
+            )
+        }
     }
 
-    static func completeSend(generation: UInt64, bytes: Int = 0) {
+    static func completeSend(
+        generation: UInt64,
+        bytes: Int = 0,
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        var usbDurationNs: UInt64?
+        var usbInFlightAfter = 0
+
         lock.lock()
-        defer { lock.unlock() }
-        guard state.generation == generation else { return }
+        guard state.generation == generation else {
+            lock.unlock()
+            return
+        }
         state.sendsInFlight = max(0, state.sendsInFlight - 1)
         state.bytesInFlight = max(0, state.bytesInFlight - max(0, bytes))
+        if !state.wireless {
+            if !state.usbSendStartTimesNs.isEmpty {
+                let start = state.usbSendStartTimesNs.removeFirst()
+                usbDurationNs = nowNs >= start ? nowNs - start : 0
+            }
+            usbInFlightAfter = state.sendsInFlight
+        }
+        lock.unlock()
+
+        if let usbDurationNs {
+            USBAdaptiveLoadController.shared.observeSendCompletion(
+                generation: generation,
+                durationNs: usbDurationNs,
+                sendsInFlightAfter: usbInFlightAfter,
+                nowNs: nowNs
+            )
+        }
     }
 
     /// Sample real TCP sender headroom before submitting an encoded frame.
     ///
-    /// If the socket has less than a small amount of headroom, pause *future
-    /// pre-encode* routine captures for a short bounded window. Do not require
-    /// the kernel to have room for the entire encoded frame: a normal HEVC
-    /// frame can be larger than the currently available TCP window even when
-    /// the connection is healthy, and Network.framework will stream that frame
-    /// while the bounded in-flight budget prevents an unbounded queue. Using
-    /// the whole frame as the threshold self-throttles a healthy 60-Hz stream
-    /// to roughly every other frame on small Wi-Fi send buffers.
+    /// USB forwards the sample to the adaptive FPS controller instead of using
+    /// the Wi-Fi pause below.
+    ///
+    /// On Wi-Fi, if the socket has less than a small amount of headroom, pause
+    /// *future pre-encode* routine captures for a short bounded window. Do not
+    /// require the kernel to have room for the entire encoded frame: a normal
+    /// HEVC frame can be larger than the currently available TCP window even
+    /// when the connection is healthy, and Network.framework will stream that
+    /// frame while the bounded in-flight budget prevents an unbounded queue.
+    /// Using the whole frame as the threshold self-throttles a healthy 60-Hz
+    /// stream to roughly every other frame on small Wi-Fi send buffers.
     ///
     /// The deadline always expires by itself, guaranteeing that a probe frame
     /// eventually gets through and re-samples the socket.
@@ -76,15 +139,28 @@ enum WirelessTransportPressure {
         nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
         lock.lock()
-        defer { lock.unlock() }
-        guard state.generation == generation, state.wireless, state.ready else { return }
+        guard state.generation == generation, state.ready else {
+            lock.unlock()
+            return
+        }
 
         state.lastAvailableSendBuffer = availableBytes
+        guard state.wireless else {
+            lock.unlock()
+            USBAdaptiveLoadController.shared.observeSendBuffer(
+                generation: generation,
+                availableBytes: availableBytes,
+                frameBytes: frameBytes,
+                nowNs: nowNs
+            )
+            return
+        }
+        defer { lock.unlock() }
+
         // `frameBytes` is intentionally not part of this threshold. It is a
         // useful diagnostic input at call sites, but requiring one complete
         // frame of kernel headroom made the sender skip every next frame when
         // the frame was larger than the socket's advertised free window.
-        _ = frameBytes
         let required = UInt64(WirelessFreshnessPolicy.minimumSendBufferHeadroomBytes)
         // Network.framework reports zero for this metadata on some healthy
         // Wi-Fi paths (including the IPv6 route used by the live tablet). Zero
@@ -106,21 +182,31 @@ enum WirelessTransportPressure {
 
     static func retire(generation: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
-        guard state.generation == generation else { return }
+        guard state.generation == generation else {
+            lock.unlock()
+            return
+        }
+        let retireUSB = !state.wireless
         state.generation &+= 1
         state.ready = false
         state.sendsInFlight = 0
         state.bytesInFlight = 0
         state.pauseUntilNs = 0
         state.lastAvailableSendBuffer = nil
+        state.usbSendStartTimesNs.removeAll(keepingCapacity: true)
         state.wireless = false
+        lock.unlock()
+
+        if retireUSB {
+            USBAdaptiveLoadController.shared.retire(generation: generation)
+        }
     }
 
-    /// Routine captures are suppressed only before VideoToolbox sees them.
-    /// This keeps H.264/HEVC reference chains valid while preventing routine
-    /// encode work from outrunning either local Network.framework submission or
-    /// the TCP sender buffer during a transient Wi-Fi slowdown.
+    /// Routine captures are suppressed only before VideoToolbox sees them on
+    /// Wi-Fi. This keeps H.264/HEVC reference chains valid while preventing
+    /// routine encode work from outrunning either local Network.framework
+    /// submission or the TCP sender buffer during a transient Wi-Fi slowdown.
+    /// USB pressure is handled by USBAdaptiveLoadController instead.
     static var shouldPauseEncoding: Bool {
         shouldPauseEncoding(at: DispatchTime.now().uptimeNanoseconds)
     }
