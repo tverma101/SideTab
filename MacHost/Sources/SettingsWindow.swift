@@ -732,6 +732,23 @@ private struct RuntimeStatusSection: View {
                               status: runtime.usbDeviceStatus.label,
                               color: runtime.usbDeviceStatus.isConnected ? .green : (runtime.usbDeviceStatus.needsAction ? .orange : .red),
                               hint: runtime.usbDeviceStatus.hint)
+                    HStack(spacing: 8) {
+                        Button {
+                            settings.onRepairUSBBridge?()
+                        } label: {
+                            Label(
+                                runtime.usbRepairInFlight ? "Repairing…" : "Repair USB Bridge",
+                                systemImage: "wrench.and.screwdriver"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(runtime.usbRepairInFlight)
+                        if !runtime.usbRepairInFlight, let result = runtime.usbRepairResult {
+                            Text(result)
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                    }
                 } else {
                     StatusRow(title: "WiFi",
                               status: runtime.wifiConnected ? "Connected" : "Disconnected",
@@ -1168,6 +1185,7 @@ class DisplaySettings: ObservableObject {
 
     var onToggleServer: (() -> Void)?
     var onRequestScreenRecordingPermission: (() -> Void)?
+    var onRepairUSBBridge: (() -> Void)?
 
     static let fixedResolution = "1400x876"
 
