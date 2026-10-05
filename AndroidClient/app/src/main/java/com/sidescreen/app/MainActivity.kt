@@ -250,6 +250,12 @@ class MainActivity : AppCompatActivity() {
 
         registerPowerStateReceiver()
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Documented for latency-sensitive games and video conferencing.
+            // Panel behaviour is device-defined and the system may ignore it.
+            window.attributes = window.attributes.also { it.preferMinimalPostProcessing = true }
+        }
+
         // Apply fullscreen mode immediately
         enableFullscreenMode()
 
@@ -505,7 +511,12 @@ class MainActivity : AppCompatActivity() {
 
         // A window-level preference can force a non-seamless mode switch, so
         // a seamless-only request leaves it unset and relies on the surface.
-        val preferredWindowRate = if (decision.seamlessOnly) 0f else decision.requestedRefreshRateHz
+        val preferredWindowRate =
+            if (decision.seamlessOnly || decision.requestedRefreshRateHz == 0f) {
+                0f
+            } else {
+                windowRateFor(displayObj, decision.requestedRefreshRateHz)
+            }
         val attributes = window.attributes
         if (attributes.preferredRefreshRate != preferredWindowRate) {
             attributes.preferredRefreshRate = preferredWindowRate
@@ -528,6 +539,23 @@ class MainActivity : AppCompatActivity() {
                     "foreground=$activityInForeground, seamlessOnly=${decision.seamlessOnly}",
             )
         }
+    }
+
+    /**
+     * Android 14+ accepts any intended rate for the window. Before that the
+     * value must be an advertised same-resolution mode, or it is ignored.
+     */
+    private fun windowRateFor(
+        display: Display?,
+        requested: Float,
+    ): Float {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE || display == null) return requested
+        val current = display.mode
+        val sameResolutionRates =
+            display.supportedModes
+                .filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+                .map { it.refreshRate }
+        return DisplayRefreshPolicy.chooseLegacyPreferredRate(sameResolutionRates, current.refreshRate, requested)
     }
 
     private fun applyFrameRateRequest(
