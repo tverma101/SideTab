@@ -1,10 +1,14 @@
 package com.sidescreen.app
 
-import android.app.Activity
 import android.content.Intent
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 /**
  * Six-state UI machine for the Wireless tab on Android.
@@ -19,7 +23,7 @@ import android.widget.TextView
  * (token rejected) or there is no cached host.
  */
 class WirelessTabController(
-    private val activity: Activity,
+    private val activity: AppCompatActivity,
     private val views: Views,
     private val storage: PairedHostStorage,
     private val cameraPerm: CameraPermissionManager,
@@ -64,26 +68,19 @@ class WirelessTabController(
     private val discovery = SideScreenDiscovery(activity.applicationContext)
     private var discoveryRecoveryArmed = true
     private var discoveryRecoveryInFlight = false
-    // Keep the last pairing in memory for the current app session. A secure
+// Keep the last pairing in memory for the current app session. A secure
     // preference read can temporarily fail (for example while the Android
     // Keystore is recovering), but that must not turn a recoverable connection
     // error into a QR-only dead end.
     private var lastAttemptedEntry: PairedHostStorage.Entry? = null
+    private var pendingPairingSave: Job? = null
 
     fun bind() {
         views.scanButton.setOnClickListener { triggerScan() }
         views.rescanButton.setOnClickListener { triggerScan() }
         views.openSettingsButton.setOnClickListener { cameraPerm.openAppSettings() }
-        views.forgetButton.setOnClickListener {
-            storage.clear()
-            lastAttemptedEntry = null
-            transition(State.FIRST_TIME)
-        }
-        views.idleForgetButton.setOnClickListener {
-            storage.clear()
-            lastAttemptedEntry = null
-            transition(State.FIRST_TIME)
-        }
+views.forgetButton.setOnClickListener { forgetPairing() }
+        views.idleForgetButton.setOnClickListener { forgetPairing() }
         views.reconnectButton.setOnClickListener { startManualReconnect() }
         views.repairReconnectButton.setOnClickListener { startManualReconnect() }
     }
@@ -100,6 +97,17 @@ class WirelessTabController(
         discoveryRecoveryArmed = true
         showConnecting("Reconnecting to ${entry.macName}", "${entry.host}:${entry.port}")
         attemptReconnect(entry)
+    }
+
+    private fun forgetPairing() {
+        cancelPendingPairingSave()
+        // clear() is intentionally synchronous: Forget Pairing is a security
+        // boundary and must durably invalidate storage before this action returns.
+        // The in-memory session entry is dropped too: Forget Pairing must not
+        // leave a live credential the UI can silently reconnect with.
+        storage.clear()
+        lastAttemptedEntry = null
+        transition(State.FIRST_TIME)
     }
 
     /**
@@ -180,16 +188,17 @@ class WirelessTabController(
                 token = parsed.token,
                 macName = parsed.macName,
                 controlPortOverride = parsed.controlPortOverride,
-                alternateHosts = parsed.alternateHosts,
+alternateHosts = parsed.alternateHosts,
             )
         lastAttemptedEntry = copyEntry(entry)
-        try {
-            storage.save(entry)
-        } catch (e: Exception) {
-            // The in-memory entry still supports this connection attempt and
-            // its Reconnect action. A later launch can ask for a fresh QR.
-            android.util.Log.w("WirelessTabController", "Couldn't persist pairing; keeping session recovery", e)
-        }
+
+        // AndroidKeyStore initialization can involve secure hardware. Start the
+        // live connection from the QR credential immediately and persist it on
+        // IO; PairedHostStorage's mutation generation remains the final fence
+        // against stale saves after a newer scan or Forget Pairing. The
+        // in-memory entry still supports this connection attempt and its
+        // Reconnect action even if persistence fails.
+        persistPairing(entry)
         discoveryRecoveryArmed = true
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
         onConnectRequested(
@@ -273,18 +282,14 @@ class WirelessTabController(
                 return@resolve
             }
 
-            val updated =
+val updated =
                 entry.copy(
                     host = endpoint.host,
                     port = endpoint.port,
                     alternateHosts = endpoint.alternateHosts,
                 )
             lastAttemptedEntry = copyEntry(updated)
-            try {
-                storage.save(updated)
-            } catch (e: Exception) {
-                android.util.Log.w("WirelessTabController", "Couldn't persist recovered endpoint", e)
-            }
+            persistPairing(updated)
             val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
             showConnecting(
                 activity.getString(R.string.wireless_reconnecting_mac, updated.macName),
@@ -301,6 +306,28 @@ class WirelessTabController(
             )
         }
         return true
+    }
+
+    @Synchronized
+    private fun persistPairing(entry: PairedHostStorage.Entry) {
+        pendingPairingSave?.cancel()
+        pendingPairingSave =
+            activity.lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    storage.save(entry)
+                } catch (e: Exception) {
+                    DiagLog.log(
+                        "PAIR",
+                        "Pairing persistence failed before secure storage: ${e.javaClass.simpleName}",
+                    )
+                }
+            }
+    }
+
+    @Synchronized
+    private fun cancelPendingPairingSave() {
+        pendingPairingSave?.cancel()
+        pendingPairingSave = null
     }
 
     private fun showNetworkRepair(cached: PairedHostStorage.Entry?) {
