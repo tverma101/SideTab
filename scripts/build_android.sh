@@ -49,7 +49,16 @@ fi
 ./gradlew assembleDebug
 
 echo ""
-echo "✅ Build successful!"
+# The AirPlay receiver route is discontinued and disabled by default. The
+# pinned companion can still be built explicitly for archival purposes.
+if [ "${SIDESCREEN_WITH_AIRPLAY:-0}" = "1" ]; then
+    "$SCRIPT_DIR/build_airplay_receiver.sh"
+    echo ""
+    echo "✅ Android client and receiver builds successful!"
+    echo "📦 AirPlay receiver APK: $ROOT_DIR/third_party/android-airplay-server/app/build/outputs/apk/debug/app-debug.apk"
+else
+    echo "✅ Android client build successful! (AirPlay receiver discontinued; set SIDESCREEN_WITH_AIRPLAY=1 to build it)"
+fi
 echo ""
 echo "📦 APK: $ROOT_DIR/AndroidClient/app/build/outputs/apk/debug/app-debug.apk"
 echo ""

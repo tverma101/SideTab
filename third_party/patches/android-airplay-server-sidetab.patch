@@ -1,0 +1,56 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 2604452..2177c8c 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -12,7 +12,13 @@ val localProps = Properties().apply {
+     rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use(::load)
+ }
+ 
+-val allAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
++val allAbis = providers.gradleProperty("sidetabReceiverAbis")
++    .orNull
++    ?.split(",")
++    ?.map { it.trim() }
++    ?.filter { it.isNotEmpty() }
++    ?.takeIf { it.isNotEmpty() }
++    ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+ 
+ android {
+     namespace = "io.github.jqssun.airplay"
+@@ -31,7 +37,7 @@ android {
+     }
+ 
+     defaultConfig {
+-        applicationId = "io.github.jqssun.airplay"
++        applicationId = "com.sidescreen.airplayreceiver"
+         minSdk = 24
+         targetSdk = 36
+         versionCode = 31
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt b/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt
+index f4a643e..50732b3 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt
+@@ -7,9 +7,9 @@ object Prefs {
+     const val NAME = "settings"
+     const val AUTO = "auto"; const val ON = "on"; const val OFF = "off"
+ 
+-    const val SERVER_NAME = "server_name"; const val DEF_SERVER_NAME = "Android AirPlay"
++    const val SERVER_NAME = "server_name"; const val DEF_SERVER_NAME = "SideTab AirPlay"
+     const val FALLBACK_MAC_ADDRESS = "fallback_mac_address"
+     const val SERVER_PORT = "server_port"; const val DEF_SERVER_PORT = 7000
+     const val AUTO_START = "auto_start"; const val DEF_AUTO_START = true
+-    const val BOOT_AUTO_START = "boot_auto_start"; const val DEF_BOOT_AUTO_START = true
++    const val BOOT_AUTO_START = "boot_auto_start"; const val DEF_BOOT_AUTO_START = false
+     const val RUN_IN_BACKGROUND = "run_in_background"; const val DEF_RUN_IN_BACKGROUND = true
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 9a17a5d..888349e 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">AirPlay Server</string>
++    <string name="app_name">SideTab AirPlay Receiver</string>
+ 
+     <!-- Notification -->
+     <string name="notification_channel">AirPlay Service</string>

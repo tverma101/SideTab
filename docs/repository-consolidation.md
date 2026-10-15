@@ -1,6 +1,6 @@
 # Repository consolidation
 
-Updated 2026-09-29. Re-verified against GitHub 2026-10-04 (`main` = `58f5050`).
+Updated 2026-10-05. Re-verified against GitHub (`origin/main` = `544cd63`).
 
 ## Canonical repository
 
@@ -23,31 +23,31 @@ The user-facing product name is SideTab. The following existing identifiers rema
 
 The legacy website domain `sidescreen.dev` also remains in use.
 
-## Local work integration (2026-09-29, re-verified 2026-10-04)
+## Local work integration (re-verified 2026-10-05)
 
 Every branch and stash that existed only locally was either landed on the SideTab stack or given an explicit decision below. **Nothing was deleted.** Each branch is still on `origin` and both stashes are intact, so any of the no-fit items can be revisited.
 
-That stack is now fully merged. `main` is at `58f5050` and includes #75
-`codex/rename-sidestab`, #72 `fix/session-lifecycle`, #73 `feat/input-source`,
-#74 `perf/frame-signposts`, #76 `perf/settings-runtime-isolation`, and #77
-`feat/android-power-policy`.
+The previous integration stack is now fully merged. `origin/main` is at
+`544cd63` and includes the product/runtime work in #75, #72, #73, #74, #76,
+#77, plus Android recovery and pairing changes in #79, #70, #80, #56, and #71.
+The local integration branch started from that exact clean commit; its initial
+tracked and untracked worktree was clean.
 
 What is still open on top of `main`:
 
-- #79 `fix/usb-crash-recovery` → `main` (ready, green CI). This is the current
-  reliability fix for a wedged ADB server with no in-app recovery path.
-- #70 `test/android-keystore-instrumentation` → `main` (ready, green CI on Sep 9).
-- #71 `fix/pairing-save-off-main` → `main` (ready but **conflicting** with `main`;
-  reproduced with `git merge-tree origin/main <head>` in `WirelessTabController.kt`).
-- #56 `adaptive-usb-fps` still declares `feat/android-power-policy` as its base,
-  but that base merged into `main` as #77, so the base is spent and the branch
-  needs a fresh base off `main` before it can be revisited.
-- #38, #43, #52, #53 remain drafts against `eval/runtime-snapshot-2026-08-23`.
+- #53 `fix/android-session-ownership-races` (draft; stale eval base).
+- #43 `design/appliance-lifecycle` (draft; stale eval base).
+- #38 `exp/wireless-60fps-freshness` (draft; stale eval base).
 
-Nothing in the current open stack is merged, device-verified, or user-confirmed
-for the reported multi-day tablet black screen. The reliability branch in
-progress adds Android decoder/socket recovery policy and host event gating; it
-is unmerged and unverified.
+The Android session-generation and brightness-write race from #53 was verified
+against current code and adapted on the local AirPlay integration branch using
+one shared generation fence. Adversarial review identified a check/use gap in
+frame delivery and display-size callbacks; those effects are now inside the
+fence, and local Android unit tests and lint pass. Its generic SessionController
+rewrite remains unported because this runtime uses a different session model. #38's freshness
+policy is already present in evolved form on `main`; #43 remains a policy
+proposal with no runtime hooks. No open PR was merged or changed during this
+integration.
 
 ### Landed
 
@@ -65,9 +65,9 @@ The August line forks from `4467484` (2026-08-21). `eval/runtime-snapshot-2026-0
 | Branch | Decision | Reason |
 |---|---|---|
 | `exp/wireless-60fps-freshness` (draft #38) | Superseded | `WirelessFreshnessPolicy` is on both sides of the stack in an evolved form; see `docs/wireless-60fps.md`. |
-| `fix/android-foundation-hardening` (draft #52) | Superseded | `main` re-landed the same outcomes with a different implementation: Keystore AES-GCM pairing tokens with forget-pair fencing in `PairedHostStorage` (#64), backup and data-extraction exclusions, the off-main QR analyzer (#68), no debug-key release signing, fail-closed legacy migration (#69), and Android lint in CI (#65). #70 carries the instrumented test and is clean on `main`; #71 carries the off-UI-thread save but currently conflicts with `main` and needs a rebase. |
-| `fix/android-session-ownership-races` (draft #53) | Needs a decision | It is written against eval's `SessionController` and `BrightnessOwnershipController`, which the stack does not have; the stack fences callbacks with `activeConnectionGeneration` instead. Whether brightness writes still race session teardown on the stack is **not yet verified**. |
-| `design/appliance-lifecycle` = `codex/pr43-rejected-implementation` ⊃ `codex/complete-pr-43` (draft #43) | Not ported | The branch is named as a rejected implementation, and it depends on eval's `SessionController`. #72 covers the host-side session timeout; suspend/wake "appliance" behaviour is not implemented on the stack. |
+| `fix/android-foundation-hardening` (closed draft #52) | Superseded | `main` re-landed the same outcomes with a different implementation: Keystore AES-GCM pairing tokens with forget-pair fencing in `PairedHostStorage` (#64), backup and data-extraction exclusions, the off-main QR analyzer (#68), no debug-key release signing, fail-closed legacy migration (#69), and Android lint in CI (#65). The instrumented test (#70) and off-UI-thread pairing save (#71) are also merged. |
+| `fix/android-session-ownership-races` (draft #53) | Narrow fix adapted; rest deferred | Current Android now serializes generation changes, client retirement/publication, and brightness side effects through a tested fence. The larger eval-only `SessionController` and publication queue are not imported. |
+| `design/appliance-lifecycle` (draft #43) | Deferred | It defines useful lifecycle policy but its own PR description says it is not connected to Mac power notifications, ScreenCaptureKit, Android decoder ownership, or reconnect. It depends on eval's `SessionController`; no live lifecycle changes were imported. |
 | `codex/android-bridge-hardening` | Split; tooling re-homed | This is #52 and #53 (see above) plus a Mac/Android connection-mode admission handshake that would change the wire protocol. The repository-tooling half (a PR gate workflow, CodeQL, weekly stress/sanitizer jobs, Dependabot, repo-contract tests) was already re-homed into issue #67 when the old all-in-one PR #54 was closed unmerged on 2026-09-09. The protocol handshake remains undecided. |
 | `eval/runtime-snapshot-2026-08-23` (includes `fix/adaptive-refresh-governor`) | Needs a decision | The code halves to port deliberately are the Android `SessionController` / `PresentationController` / `FramePacer` / `FrameTrace` grouping, `BrightnessOwnershipController`, `ScreenRecordingPermission` TCC diagnostics, and the QualityLab and contention/smoothness lab scripts. The transport-overlap items (adaptive capture cadence vs #56 and the dirty-rect gate, `ClockSync` vs `ClockOffsetEstimator`) are already covered by evolved versions on `main` and should not be re-ported. The evaluation receipts remain as historical evidence only. |
 | `stash@{1}` (control channel WIP on `feat/sgsr1-vsr`) | Superseded, except UDP | The TCP control channel landed as `ControlPortResolver` / `ControlChannel`. The UDP variant, an experiment against TCP-over-ADB-tunnel stalls, never landed anywhere and is kept only in the stash. |
