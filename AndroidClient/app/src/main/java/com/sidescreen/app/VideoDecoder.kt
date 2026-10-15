@@ -103,6 +103,12 @@ class VideoDecoder(
 
     @Volatile private var needsKeyframe = true
 
+    /**
+     * PTS of the newest frame queued into the codec. Receive timestamps are
+     * monotonic, so an output below it has a newer frame decoding behind it.
+     */
+    @Volatile private var newestQueuedPtsUs = Long.MIN_VALUE
+
     /** True only after the codec has started and is published to frame callers. */
     val isReady: Boolean
         get() = isRunning && codecStarted && decoder != null
@@ -713,6 +719,7 @@ class VideoDecoder(
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
+            newestQueuedPtsUs = frameTimestamp / 1000
             queuedInputCount++
             if (queuedInputCount == STALL_DETECT_INPUT_FRAMES && outputFrameCount == 0L && !stallReported) {
                 stallReported = true
@@ -906,6 +913,7 @@ class VideoDecoder(
                     hasValidLatency = hasValidLatency,
                     isFirstOutput = isFirstOutput,
                     wireless = wireless,
+                    newerFrameQueued = info.presentationTimeUs < newestQueuedPtsUs,
                     maxReasonableLatencyNs = MAX_REASONABLE_LATENCY_NS,
                     maxRenderLatencyNs = MAX_RENDER_LATENCY_NS,
                 )

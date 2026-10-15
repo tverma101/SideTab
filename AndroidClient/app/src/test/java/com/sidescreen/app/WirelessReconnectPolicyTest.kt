@@ -32,6 +32,31 @@ class WirelessReconnectPolicyTest {
     }
 
     @Test
+    fun wirelessKeyframeWatchdogWaitsBeyondTheMacsLongWifiGop() {
+        assertEquals(6_000_000_000L, StreamClient.keyframeStaleIntervalNs(wireless = false))
+        // Mac: 30 s periodic fallback on Wi-Fi, plus slack.
+        assertTrue(StreamClient.keyframeStaleIntervalNs(wireless = true) > 30_000_000_000L)
+    }
+
+    /**
+     * Wi-Fi silence is routine: the Mac sends nothing for a still desktop and
+     * takes its routine keyframe when motion stops. So the "this was just an
+     * idle screen, do not touch the keyframe watchdog" verdict has to use the
+     * wireless interval. Judged against USB's 6 s, a 7 s pause would count as
+     * an idle screen and re-anchor the watchdog on every quiet stretch instead
+     * of reporting the stale keyframe it exists to catch.
+     */
+    @Test
+    fun wirelessIdleGapNeedsTheWirelessInterval() {
+        val previous = 1_000_000_000L
+        // 7 s of quiet: an idle screen on USB, still a keyframe-watchdog gap on Wi-Fi.
+        assertTrue(StreamClient.isLongVideoGap(previous, previous + 7_000_000_000L, wireless = false))
+        assertFalse(StreamClient.isLongVideoGap(previous, previous + 7_000_000_000L, wireless = true))
+        // Past even the Wi-Fi fallback GOP: nothing was sent, so no keyframe was lost.
+        assertTrue(StreamClient.isLongVideoGap(previous, previous + 40_000_000_000L, wireless = true))
+    }
+
+    @Test
     fun missingOrReversedVideoTimestampIsNeverQuietGap() {
         assertFalse(StreamClient.isLongVideoGap(0L, 7_000_000_000L))
         assertFalse(StreamClient.isLongVideoGap(7_000_000_000L, 4_000_000_000L))

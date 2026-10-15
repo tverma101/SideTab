@@ -30,17 +30,16 @@ final class USBAdaptiveLoadControllerTests: XCTestCase {
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 110 * ms), 90)
     }
 
-    func testLargeFrameDoesNotImplyCongestionWhenBufferStillHasHeadroom() {
+    func testLargeFrameDoesNotImplyCongestionWhenItIsTheOnlyThingQueued() {
         let controller = USBAdaptiveLoadController()
         controller.reset(generation: 20, maxFPS: 120)
 
-        // Frame is far larger than current TCP headroom, but Network.framework
-        // can consume it asynchronously. This must not recreate the old false
-        // "one whole frame must fit" rule.
+        // A big frame may still be draining when the next one is sampled. One
+        // frame's worth of queue is not a backlog.
         controller.observeSendBuffer(
             generation: 20,
-            availableBytes: 64 * 1024,
-            frameBytes: 1_000_000,
+            queuedBytes: 128 * 1024,
+            frameBytes: 110 * 1024,
             nowNs: 100 * ms
         )
 
@@ -48,14 +47,14 @@ final class USBAdaptiveLoadControllerTests: XCTestCase {
         XCTAssertEqual(controller.snapshotForTest().mildPressureStrikes, 0)
     }
 
-    func testCriticalHeadroomIsOnlyMildAndHealthyCompletionDecaysIt() {
+    func testQueuedBacklogIsOnlyMildAndHealthyCompletionDecaysIt() {
         let controller = USBAdaptiveLoadController()
         controller.reset(generation: 21, maxFPS: 120)
 
         controller.observeSendBuffer(
             generation: 21,
-            availableBytes: 1,
-            frameBytes: 1_000_000,
+            queuedBytes: 128 * 1024,
+            frameBytes: 16 * 1024,
             nowNs: 100 * ms
         )
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 100 * ms), 120)
@@ -69,6 +68,63 @@ final class USBAdaptiveLoadControllerTests: XCTestCase {
         )
         XCTAssertEqual(controller.snapshotForTest().mildPressureStrikes, 0)
         XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 110 * ms), 120)
+    }
+
+    /// Regression: the empty ADB loopback queue (0 bytes) used to be read as
+    /// "no send-buffer headroom", which recorded pressure before every frame
+    /// and kept the ladder pinned at 60 for the whole session.
+    func testEmptyQueueIsHealthyAndLetsTheLadderClimbBack() {
+        let controller = USBAdaptiveLoadController()
+        controller.reset(generation: 22, maxFPS: 120)
+
+        controller.observeSendsInFlight(generation: 22, count: 3, nowNs: 100 * ms)
+        controller.observeSendsInFlight(generation: 22, count: 3, nowNs: 400 * ms)
+        XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 400 * ms), 60)
+
+        var t: UInt64 = 500
+        func healthyFrames(until end: UInt64) {
+            while t < end {
+                controller.observeSendBuffer(
+                    generation: 22,
+                    queuedBytes: 0,
+                    frameBytes: 40_000,
+                    nowNs: t * ms
+                )
+                controller.observeSendCompletion(
+                    generation: 22,
+                    durationNs: 1 * ms,
+                    sendsInFlightAfter: 0,
+                    nowNs: t * ms + 500_000
+                )
+                _ = controller.motionTargetFPS(maxFPS: 120, nowNs: t * ms + 600_000)
+                t += 10
+            }
+        }
+
+        healthyFrames(until: 2_500)
+        XCTAssertEqual(controller.snapshotForTest().targetFPS, 90)
+        healthyFrames(until: 7_600)
+        XCTAssertEqual(controller.snapshotForTest().targetFPS, 120)
+    }
+
+    func testStartupGraceIgnoresConnectBurstThenArmsTheLadder() {
+        let controller = USBAdaptiveLoadController()
+        controller.reset(generation: 23, maxFPS: 120, startupGraceNs: 3_000 * ms, nowNs: 0)
+
+        // Connect keyframe + decoder request + encoder rebuild, and slow first
+        // encodes, all inside the startup window.
+        controller.observeRecoveryPulse(nowNs: 50 * ms)
+        controller.observeRecoveryPulse(nowNs: 300 * ms)
+        controller.observeRecoveryPulse(nowNs: 600 * ms)
+        for t in stride(from: UInt64(700), through: 1_000, by: 8) {
+            controller.observeEncodedFrameAge(ageNs: 60 * ms, nowNs: t * ms)
+        }
+        controller.observeSendsInFlight(generation: 23, count: 3, nowNs: 1_000 * ms)
+        XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 2_900 * ms), 120)
+        XCTAssertEqual(controller.snapshotForTest().lastPressureNs, 0)
+
+        controller.observeSendsInFlight(generation: 23, count: 3, nowNs: 3_100 * ms)
+        XCTAssertEqual(controller.motionTargetFPS(maxFPS: 120, nowNs: 3_100 * ms), 90)
     }
 
     func testHealthyPathRecovers60To90Then120Slowly() {
@@ -159,7 +215,7 @@ final class USBAdaptiveLoadControllerTests: XCTestCase {
 
         controller.observeSendBuffer(
             generation: 10,
-            availableBytes: 1,
+            queuedBytes: 1_000_000,
             frameBytes: 100_000,
             nowNs: 100 * ms
         )

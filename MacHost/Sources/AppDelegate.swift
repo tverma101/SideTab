@@ -56,6 +56,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentWirelessDevice: String?
     private var cancellables = Set<AnyCancellable>()
     private var statusRefreshTimer: Timer?
+    private var terminationSignalSource: DispatchSourceSignal?
     private var lastBackgroundStatusRefreshNs: UInt64 = 0
     /// Prevent overlapping adb subprocess probes when a device or adb server
     /// is slow to answer. The status UI is best-effort; it must never queue
@@ -90,6 +91,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
+
+        installTerminationSignalHandler()
 
         nativeBrightness = NativeBrightnessController()
         nativeBrightness?.onBrightness = { [weak self] level in
@@ -1768,6 +1771,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Cancel all combine subscriptions
         cancellables.removeAll()
+    }
+
+    /// run.sh and install_mac.sh stop the running host with SIGTERM, whose
+    /// default action ends the process before applicationWillTerminate: the
+    /// display position was never saved, and every rebuild brought the tablet
+    /// back wherever macOS put it. Route SIGTERM through the normal quit path,
+    /// bounded so a stuck teardown cannot outlast install_mac.sh's 3 s wait.
+    private func installTerminationSignalHandler() {
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler { [weak self] in
+            debugLog("⏹️ SIGTERM — quitting through the normal path")
+            self?.virtualDisplayManager?.saveDisplayPosition()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { _exit(EXIT_SUCCESS) }
+            NSApp.terminate(nil)
+        }
+        source.resume()
+        terminationSignalSource = source
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

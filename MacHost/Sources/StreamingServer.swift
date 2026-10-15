@@ -183,6 +183,9 @@ class StreamingServer {
     /// or a callback into the host.
     private struct SessionState {
         var stopped = false
+        /// Keyframe requests from the tablet. Each one is a decoder that lost
+        /// its reference chain, so the count is logged.
+        var clientKeyframeRequests: UInt64 = 0
         var receiving = false
         var connectionReady = false
         var clientSupportsFrameMetadata = false
@@ -221,6 +224,36 @@ class StreamingServer {
         var expectedAuthToken: Data?
     }
     private let sessionState = OSAllocatedUnfairLock(initialState: SessionState())
+
+    /// Wireless diagnostics: how long Network.framework takes to accept each
+    /// encoded frame. Values above one frame interval are what fill the
+    /// in-flight budget and show up as encoder pressure skips.
+    private struct SendLatencyWindow {
+        var samplesNs: [UInt64] = []
+        var bytes = 0
+        var maxFrameBytes = 0
+    }
+    private let sendLatencyWindow = OSAllocatedUnfairLock(initialState: SendLatencyWindow())
+
+    private func recordWirelessSendLatency(_ latencyNs: UInt64, bytes: Int) {
+        let summary: String? = sendLatencyWindow.withLock { window in
+            window.samplesNs.append(latencyNs)
+            window.bytes += bytes
+            window.maxFrameBytes = max(window.maxFrameBytes, bytes)
+            guard window.samplesNs.count >= 120 else { return nil }
+            let sorted = window.samplesNs.sorted()
+            func ms(_ ns: UInt64) -> String { String(format: "%.1f", Double(ns) / 1_000_000) }
+            let over1 = sorted.filter { $0 > 16_700_000 }.count
+            let over2 = sorted.filter { $0 > 33_300_000 }.count
+            let line = "Wireless send: frames=\(sorted.count) p50=\(ms(sorted[sorted.count / 2]))ms " +
+                "p95=\(ms(sorted[sorted.count * 95 / 100]))ms max=\(ms(sorted[sorted.count - 1]))ms " +
+                ">1frame=\(over1) >2frames=\(over2) avgKB=\(window.bytes / sorted.count / 1024) " +
+                "maxKB=\(window.maxFrameBytes / 1024)"
+            window = SendLatencyWindow()
+            return line
+        }
+        if let summary { debugLog(summary) }
+    }
 
     // Encoded frames are never dropped after VideoToolbox emits them: ordinary
     // H.264/HEVC P-frames may reference earlier P-frames. Instead, the pressure
@@ -753,6 +786,7 @@ class StreamingServer {
                 guard controlInputBuffer.count >= 2 else { return }
                 let flags = controlInputBuffer[controlInputBuffer.index(controlInputBuffer.startIndex, offsetBy: 1)]
                 controlInputBuffer = Data(controlInputBuffer.dropFirst(2))
+                noteClientKeyframeRequest(force: (flags & 1) != 0, channel: "control")
                 onKeyframeRequested?((flags & 1) != 0)
 
             case WireMessage.clientSupportsBrightness:
@@ -1654,6 +1688,7 @@ class StreamingServer {
 
                 let flags = inputByte(at: 1)
                 consumeInputBytes(2)
+                noteClientKeyframeRequest(force: (flags & 1) != 0, channel: "video")
                 onKeyframeRequested?((flags & 1) != 0)
 
             case WireMessage.clientSupportsFrameMetadata:
@@ -1836,6 +1871,16 @@ class StreamingServer {
     }
     static let maxFrameBytes = 5 * 1024 * 1024
 
+    private func noteClientKeyframeRequest(force: Bool, channel: String) {
+        let count = sessionState.withLock { state -> UInt64 in
+            state.clientKeyframeRequests &+= 1
+            return state.clientKeyframeRequests
+        }
+        if count <= 5 || count.isMultiple(of: 20) {
+            debugLog("Client keyframe request #\(count) (force=\(force), via \(channel))")
+        }
+    }
+
     private func sendEncodedFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool) {
         guard !isStopped,
               frameTransportReady,
@@ -1855,9 +1900,13 @@ class StreamingServer {
 
         guard let wireSize = Self.wireFrameSize(data.count) else {
             // Advertising a truncated size would desync the client's parser, so
-            // the whole frame goes instead.
+            // the whole frame goes instead. The decoder's reference chain is now
+            // broken, so hold P-frames until a fresh IDR instead of leaving the
+            // tablet on a corrupt picture until the next periodic keyframe.
             droppedFrames += 1
             debugLog("Dropping \(data.count)B frame — above the client's \(Self.maxFrameBytes)B frame limit")
+            frameWaitingForSync = true
+            onKeyframeRequested?(false)
             return
         }
 
@@ -1873,7 +1922,7 @@ class StreamingServer {
            let tcpMetadata = connection.metadata(definition: NWProtocolTCP.definition) as? NWProtocolTCP.Metadata {
             WirelessTransportPressure.observeSendBuffer(
                 generation: pressureGeneration,
-                availableBytes: tcpMetadata.availableSendBuffer,
+                queuedBytes: tcpMetadata.availableSendBuffer,
                 frameBytes: data.count
             )
         }
@@ -1881,6 +1930,9 @@ class StreamingServer {
         if pressureGeneration != 0 {
             WirelessTransportPressure.beginSend(generation: pressureGeneration, bytes: data.count)
         }
+        let wirelessSendStartNs: UInt64? = transportMode == .wireless
+            ? DispatchTime.now().uptimeNanoseconds
+            : nil
 
         // Avoid copying the entire encoded frame merely to prepend a 5/14-byte
         // protocol header. Network.framework keeps content in one logical
@@ -1914,6 +1966,12 @@ class StreamingServer {
                     // so an old callback can never reduce the replacement count.
                     if pressureGeneration != 0 {
                         WirelessTransportPressure.completeSend(generation: pressureGeneration, bytes: data.count)
+                    }
+                    if let wirelessSendStartNs, error == nil {
+                        self.recordWirelessSendLatency(
+                            DispatchTime.now().uptimeNanoseconds &- wirelessSendStartNs,
+                            bytes: data.count
+                        )
                     }
 
                     self.frameQueue.async {

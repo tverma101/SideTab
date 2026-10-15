@@ -29,6 +29,14 @@ object WirelessFreshnessPolicy {
      * ceiling because its larger frames and slower pipeline make a higher age
      * budget intentional, not an oversight.
      *
+     * The one wireless exception is the newest frame the decoder was given.
+     * Dropping it leaves an even older picture on the panel, and the Mac sends
+     * nothing more for a still desktop, so the end of a scroll or a keystroke
+     * stayed missing until something else moved. An old frame is dropped only
+     * when a newer one is already queued behind it.
+     *
+     * @param newerFrameQueued whether the decoder has been fed a frame newer
+     *   than this output.
      * @param maxReasonableLatencyNs the decoder's own ceiling beyond which a
      *   presentation timestamp is not comparable to the current clock.
      * @param maxRenderLatencyNs the looser ceiling applied to USB sessions.
@@ -38,11 +46,13 @@ object WirelessFreshnessPolicy {
         hasValidLatency: Boolean,
         isFirstOutput: Boolean,
         wireless: Boolean,
+        newerFrameQueued: Boolean,
         maxReasonableLatencyNs: Long,
         maxRenderLatencyNs: Long,
     ): Boolean {
         if (isFirstOutput) return true
         if (wireless) {
+            if (!newerFrameQueued) return true
             // An uninterpretable latency is not permission to draw a stale
             // frame. Treat it as arbitrarily old so it is dropped.
             val effective = if (hasValidLatency) decodedLatencyNs else Long.MAX_VALUE
