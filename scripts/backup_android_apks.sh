@@ -5,7 +5,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PACKAGE_NAME="${SIDESCREEN_ANDROID_PACKAGE:-com.sidescreen.app}"
 BACKUP_ROOT="${SIDESCREEN_APK_BACKUP_DIR:-$ROOT_DIR/backups/apk}"
-APK_OUTPUT_ROOT="$ROOT_DIR/AndroidClient/app/build/outputs/apk"
+APK_OUTPUT_ROOTS=(
+    "$ROOT_DIR/AndroidClient/app/build/outputs/apk"
+    "$ROOT_DIR/third_party/android-airplay-server/app/build/outputs/apk"
+)
+AIRPLAY_PACKAGE_NAME="com.sidescreen.airplayreceiver"
 ADB_BIN="${ADB:-adb}"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/resolve_adb.sh"
@@ -92,49 +96,59 @@ apk_metadata() {
     artifact_count=$((artifact_count + 1))
 }
 
-if [[ -d "$APK_OUTPUT_ROOT" ]]; then
-    while IFS= read -r -d '' apk_path; do
-        relative_path="${apk_path#"$APK_OUTPUT_ROOT"/}"
-        safe_name="${relative_path//\//__}"
-        destination="$snapshot_dir/source-${safe_name}"
-        cp -p "$apk_path" "$destination"
-        apk_metadata "source-${safe_name}" "local-build-output" "$destination"
-    done < <(find "$APK_OUTPUT_ROOT" -type f -name '*.apk' \
-        ! -path '*/androidTest/*' ! -path '*/test/*' -print0)
-fi
+for apk_output_root in "${APK_OUTPUT_ROOTS[@]}"; do
+    if [[ -d "$apk_output_root" ]]; then
+        while IFS= read -r -d '' apk_path; do
+            relative_path="${apk_output_root#"$ROOT_DIR"/}/${apk_path#"$apk_output_root"/}"
+            safe_name="${relative_path//\//__}"
+            destination="$snapshot_dir/source-${safe_name}"
+            cp -p "$apk_path" "$destination"
+            apk_metadata "source-${safe_name}" "local-build-output" "$destination"
+        done < <(find "$apk_output_root" -type f -name '*.apk' \
+            ! -path '*/androidTest/*' ! -path '*/test/*' -print0)
+    fi
+done
 
 adb_device=''
 adb_serial="${SIDESCREEN_ADB_SERIAL:-${ANDROID_SERIAL:-}}"
 if command -v "$ADB_BIN" >/dev/null 2>&1; then
     if [[ -z "$adb_serial" ]]; then
-        ready_devices="$("$ADB_BIN" devices -l 2>/dev/null | sidescreen_first_usb_serial)"
+        # USB first, then a Wi-Fi transport: the pre-install snapshot has to
+        # capture the on-device APK whether the tablet is tethered or paired.
+        ready_devices="$("$ADB_BIN" devices -l 2>/dev/null | sidescreen_first_ready_serial)"
         ready_count="$(printf '%s\n' "$ready_devices" | sed '/^$/d' | wc -l | tr -d ' ')"
         if [[ "$ready_count" -gt 1 ]]; then
-            echo "warning: multiple USB ADB devices found; backing up the first. Set SIDESCREEN_ADB_SERIAL to choose one." >&2
+            echo "warning: multiple ADB devices found; backing up the first. Set SIDESCREEN_ADB_SERIAL to choose one." >&2
         fi
         adb_serial="$(printf '%s\n' "$ready_devices" | sed '/^$/d' | head -n 1)"
     fi
 
     if [[ -n "$adb_serial" ]]; then
         adb_device=("$ADB_BIN" -s "$adb_serial")
-        installed_path="$("${adb_device[@]}" shell pm path "$PACKAGE_NAME" 2>/dev/null \
-            | sed -n 's/^package://p' | tr -d '\r' | head -n 1)"
-        if [[ -n "$installed_path" ]]; then
-            installed_destination="$snapshot_dir/installed-base.apk"
-            "${adb_device[@]}" pull "$installed_path" "$installed_destination" >/dev/null
-            apk_metadata 'installed-base.apk' 'installed-device' "$installed_destination"
+        device_model="$("${adb_device[@]}" shell getprop ro.product.model 2>/dev/null | tr -d '\r' | head -n 1)"
+        device_android="$("${adb_device[@]}" shell getprop ro.build.version.release 2>/dev/null | tr -d '\r' | head -n 1)"
+        device_sdk="$("${adb_device[@]}" shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' | head -n 1)"
+        package_names=("$PACKAGE_NAME")
+        [[ "$PACKAGE_NAME" == "$AIRPLAY_PACKAGE_NAME" ]] || package_names+=("$AIRPLAY_PACKAGE_NAME")
+        for package_name in "${package_names[@]}"; do
+            installed_path="$("${adb_device[@]}" shell pm path "$package_name" 2>/dev/null \
+                | sed -n 's/^package://p' | tr -d '\r' | head -n 1 || true)"
+            if [[ -z "$installed_path" ]]; then
+                echo "warning: package $package_name is not installed on ADB device $adb_serial; no device APK copied" >&2
+                continue
+            fi
 
-            device_model="$("${adb_device[@]}" shell getprop ro.product.model 2>/dev/null | tr -d '\r' | head -n 1)"
-            device_android="$("${adb_device[@]}" shell getprop ro.build.version.release 2>/dev/null | tr -d '\r' | head -n 1)"
-            device_sdk="$("${adb_device[@]}" shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' | head -n 1)"
-            package_state="$("${adb_device[@]}" shell dumpsys package "$PACKAGE_NAME" 2>/dev/null | tr -d '\r' \
+            safe_package_name="${package_name//./-}"
+            installed_name="installed-${safe_package_name}-base.apk"
+            installed_destination="$snapshot_dir/$installed_name"
+            "${adb_device[@]}" pull "$installed_path" "$installed_destination" >/dev/null
+            apk_metadata "$installed_name" 'installed-device' "$installed_destination"
+            package_state="$("${adb_device[@]}" shell dumpsys package "$package_name" 2>/dev/null | tr -d '\r' \
                 | rg -m 6 'versionCode=|versionName=|firstInstallTime=|lastUpdateTime=' || true)"
-            printf '\n[installed_device]\nserial=%s\nmodel=%s\nandroid_release=%s\napi=%s\npackage_path=%s\n%s\n' \
-                "$adb_serial" "${device_model:-unknown}" "${device_android:-unknown}" "${device_sdk:-unknown}" "$installed_path" "$package_state" \
+            printf '\n[installed_device]\npackage=%s\nserial=%s\nmodel=%s\nandroid_release=%s\napi=%s\npackage_path=%s\n%s\n' \
+                "$package_name" "$adb_serial" "${device_model:-unknown}" "${device_android:-unknown}" "${device_sdk:-unknown}" "$installed_path" "$package_state" \
                 >> "$manifest_path"
-        else
-            echo "warning: package $PACKAGE_NAME is not installed on ADB device $adb_serial; no device APK copied" >&2
-        fi
+        done
     else
         echo "warning: no ready ADB device found; local APK outputs were still backed up" >&2
     fi
@@ -145,8 +159,8 @@ fi
 if [[ "$artifact_count" -eq 0 ]]; then
     rm -f "$manifest_path"
     rmdir "$snapshot_dir" 2>/dev/null || true
-    echo "error: no APK artifacts were found to back up" >&2
-    exit 1
+    echo "No preexisting APK artifacts to back up (fresh install)."
+    exit 0
 fi
 
 printf '\nbackup_directory=%s\nartifact_count=%s\n' "$snapshot_dir" "$artifact_count" >> "$manifest_path"

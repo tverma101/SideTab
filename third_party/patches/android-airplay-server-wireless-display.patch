@@ -1,0 +1,654 @@
+diff --git a/app/src/main/cpp/patches/UxPlay/0007-sidetab-advertise-physical-display-size.patch b/app/src/main/cpp/patches/UxPlay/0007-sidetab-advertise-physical-display-size.patch
+new file mode 100644
+index 0000000..a560431
+--- /dev/null
++++ b/app/src/main/cpp/patches/UxPlay/0007-sidetab-advertise-physical-display-size.patch
+@@ -0,0 +1,51 @@
++diff --git a/lib/raop.c b/lib/raop.c
++index c86393f..5eae2b3 100644
++--- a/lib/raop.c
+++++ b/lib/raop.c
++@@ -71,6 +71,9 @@ struct raop_s {
++     uint8_t maxFPS;
++     uint8_t overscanned;
++     uint8_t clientFPSdata;
+++    /* panel size in millimetres; 0 = unknown, which leaves the sender to guess pixel density */
+++    uint16_t widthPhysical;
+++    uint16_t heightPhysical;
++ 
++     int audio_delay_micros;
++ 
++@@ -630,6 +633,8 @@ raop_init(raop_callbacks_t *callbacks) {
++     raop->refreshRate = 60;
++     raop->maxFPS = 30;
++     raop->overscanned = 0;
+++    raop->widthPhysical = 0;
+++    raop->heightPhysical = 0;
++ 
++     /* initialise stored pin */
++     raop->pin = 0;
++@@ -762,6 +767,12 @@ int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {
++     } else if (strcmp(plist_item, "overscanned") == 0) {
++         raop->overscanned = (uint8_t) (value ? 1 : 0);
++         if ((int) raop->overscanned  != value) retval = 1;
+++    } else if (strcmp(plist_item, "widthPhysical") == 0) {
+++        raop->widthPhysical = (uint16_t) value;
+++        if ((int) raop->widthPhysical != value) retval = 1;
+++    } else if (strcmp(plist_item, "heightPhysical") == 0) {
+++        raop->heightPhysical = (uint16_t) value;
+++        if ((int) raop->heightPhysical != value) retval = 1;
++     } else if (strcmp(plist_item, "clientFPSdata") == 0) {
++         raop->clientFPSdata = (value ? 1 : 0);
++         if ((int) raop->clientFPSdata  != value) retval = 1;
++diff --git a/lib/raop_handlers.h b/lib/raop_handlers.h
++index b779ece..53cde09 100644
++--- a/lib/raop_handlers.h
+++++ b/lib/raop_handlers.h
++@@ -214,8 +214,8 @@ raop_handler_info(raop_conn_t *conn,
++ 
++     plist_t displays_node = plist_new_array();
++     plist_t displays_0_node = plist_new_dict();
++-    plist_t displays_0_width_physical_node = plist_new_uint(0);
++-    plist_t displays_0_height_physical_node = plist_new_uint(0);
+++    plist_t displays_0_width_physical_node = plist_new_uint(raop->widthPhysical);
+++    plist_t displays_0_height_physical_node = plist_new_uint(raop->heightPhysical);
++     plist_t displays_0_uuid_node = plist_new_string("e0ff8a27-6738-3d56-8a16-cc53aacee925");
++     plist_t displays_0_width_node = plist_new_uint(raop->width);
++     plist_t displays_0_height_node = plist_new_uint(raop->height);
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoPipeline.kt b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoPipeline.kt
+index d9e1ca4..95e99ce 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoPipeline.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoPipeline.kt
+@@ -41,6 +41,8 @@ class VideoPipeline {
+     private var displayDirty = false
+     @Volatile private var videoW = 0
+     @Volatile private var videoH = 0
++    // gl-thread work the caller waits for, e.g. releasing a surface before a decoder connects to it
++    private val tasks = ArrayDeque<Runnable>()
+ 
+     fun start() = synchronized(lock) {
+         if (running) return@synchronized
+@@ -55,6 +57,39 @@ class VideoPipeline {
+         lock.notifyAll()
+     }
+ 
++    // a surface accepts one producer: returns once gl no longer holds a window on any display
++    fun detachDisplay() {
++        synchronized(lock) {
++            pendingDisplay = null
++            displayDirty = false
++        }
++        _runSync { _bindDisplay(null) }
++    }
++
++    // repaints the last frame on surface, then disconnects so a decoder can render into it
++    fun presentLastFrame(surface: Surface) {
++        synchronized(lock) {
++            pendingDisplay = null
++            displayDirty = false
++        }
++        _runSync {
++            _bindDisplay(surface)
++            _bindDisplay(null)
++        }
++    }
++
++    private fun _runSync(block: () -> Unit) {
++        val done = java.util.concurrent.CountDownLatch(1)
++        synchronized(lock) {
++            if (!running) return
++            tasks.addLast(Runnable { try { block() } finally { done.countDown() } })
++            lock.notifyAll()
++        }
++        if (!done.await(SYNC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
++            Log.w(TAG, "gl thread did not finish a surface handoff in ${SYNC_TIMEOUT_MS}ms")
++        }
++    }
++
+     fun setVideoSize(w: Int, h: Int) {
+         videoW = w
+         videoH = h
+@@ -89,8 +124,10 @@ class VideoPipeline {
+             var newDisplay: Surface? = null
+             var displayChanged = false
+             var doFrame = false
++            var task: Runnable? = null
+             synchronized(lock) {
+-                while (running && !frameAvailable && !displayDirty) lock.wait()
++                while (running && !frameAvailable && !displayDirty && tasks.isEmpty()) lock.wait()
++                task = tasks.removeFirstOrNull()
+                 if (running && displayDirty) {
+                     newDisplay = pendingDisplay
+                     displayChanged = true
+@@ -102,9 +139,14 @@ class VideoPipeline {
+                 }
+             }
+             if (!running) break
++            task?.run()
+             if (displayChanged) _bindDisplay(newDisplay)
+             if (doFrame) _consumeAndDraw()
+         }
++        synchronized(lock) {
++            tasks.forEach { it.run() }
++            tasks.clear()
++        }
+         _releaseGl()
+     }
+ 
+@@ -220,6 +262,7 @@ class VideoPipeline {
+ 
+     companion object {
+         private const val TAG = "VideoPipeline"
++        private const val SYNC_TIMEOUT_MS = 500L
+ 
+         private val POS = _fb(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
+         private val TEX = _fb(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f))
+@@ -240,7 +283,7 @@ class VideoPipeline {
+ 
+         private const val FRAG =
+             "#extension GL_OES_EGL_image_external : require\n" +
+-            "precision mediump float;\n" +
++            "precision highp float;\n" +
+             "varying vec2 vTex;\n" +
+             "uniform samplerExternalOES sTex;\n" +
+             "void main() {\n" +
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt
+index 1641aa5..50273bd 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt
+@@ -4,25 +4,39 @@ import android.content.Context
+ import android.media.MediaCodec
+ import android.media.MediaCodecInfo
+ import android.media.MediaFormat
++import android.os.Handler
++import android.os.HandlerThread
++import android.os.Process
+ import android.util.Log
+ import android.view.Surface
+ import io.github.jqssun.airplay.renderer.DecoderSelector.Companion.videoCaps
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.TimeUnit
+ 
+ class VideoRenderer(ctx: Context) {
+ 
+     private val lock = Object()
++    private val statsLock = Object()
+     private val pipeline = VideoPipeline()
+     val selector = DecoderSelector(ctx)
+     private var avcDecoder: MediaCodecInfo? = null
+     private var hevcDecoder: MediaCodecInfo? = null
+     private var maxFps = 0
+-    private var codec: MediaCodec? = null
++    @Volatile private var codec: MediaCodec? = null
+     private var displaySurface: Surface? = null
++    // surface the running codec decodes into: the display surface (direct) or the pipeline's
++    private var outputSurface: Surface? = null
+     private var currentH265 = false
+     private var videoWidth = 0
+     private var videoHeight = 0
+     private var firstFrameQueued = false
+ 
++    // async codec callbacks run here so output is released the moment it is decoded,
++    // not when the next input happens to arrive
++    private var callbackThread: HandlerThread? = null
++    private var callbackHandler: Handler? = null
++    private val freeInputs = LinkedBlockingQueue<Int>()
++
+     // stats
+     @Volatile var fps = 0; private set
+     @Volatile var bitrateBps = 0L; private set
+@@ -53,16 +67,50 @@ class VideoRenderer(ctx: Context) {
+         pipeline.setVideoSize(w, h)
+     }
+ 
+-    // doesn't restart codec; decoder renders into pipeline's own persistent surface
++    // doesn't restart codec: a running decoder is re-pointed at the new surface
+     fun setSurface(surface: Surface) = synchronized(lock) {
+         displaySurface = surface
+-        pipeline.setDisplaySurface(surface)
++        val c = codec
++        if (c == null) {
++            // between sessions the pipeline repaints the last frame it holds
++            pipeline.setDisplaySurface(surface)
++            return@synchronized
++        }
++        if (outputSurface === surface) return@synchronized
++        // an idle source sends no new frames, so paint the pipeline's last one before the decoder takes over
++        if (outputSurface === pipeline.inputSurface) pipeline.presentLastFrame(surface) else pipeline.detachDisplay()
++        _redirect(c, surface)
+     }
+ 
+     fun clearSurface(surface: Surface) = synchronized(lock) {
+         if (displaySurface !== surface) return@synchronized
+         displaySurface = null
+-        pipeline.setDisplaySurface(null)
++        pipeline.detachDisplay()
++        val c = codec ?: return@synchronized
++        // keep decoding into the pipeline so the decoder doesn't stall without a display
++        if (outputSurface === surface) pipeline.inputSurface?.let { _redirect(c, it) } ?: stopCodec()
++    }
++
++    // falls back to the gl pipeline when a decoder can't switch surfaces
++    private fun _redirect(c: MediaCodec, target: Surface) {
++        try {
++            c.setOutputSurface(target)
++            outputSurface = target
++        } catch (e: Exception) {
++            Log.w(TAG, "setOutputSurface failed, rendering through gl pipeline", e)
++            val s = pipeline.inputSurface
++            if (outputSurface !== s && s != null) {
++                try {
++                    c.setOutputSurface(s)
++                    outputSurface = s
++                } catch (e2: Exception) {
++                    Log.w(TAG, "decoder lost its surface, waiting for a keyframe", e2)
++                    stopCodec()
++                    return
++                }
++            }
++            pipeline.setDisplaySurface(displaySurface)
++        }
+     }
+ 
+     fun selectDecoders(w: Int, h: Int, fps: Int, h265: Boolean): Boolean = synchronized(lock) {
+@@ -110,10 +158,11 @@ class VideoRenderer(ctx: Context) {
+     }
+ 
+     private fun _emitBenchmarkLine() {
++        val path = if (outputSurface != null && outputSurface === displaySurface) "direct" else "gl"
+         val msg = "fps=$fps bitrate=${bitrateBps / 1000}kbps " +
+             "jitter=${framePacingJitterUs}us frames=$frameCount " +
+             "dropped=$droppedFrames codec=$codecName " +
+-            "res=${videoWidth}x${videoHeight}"
++            "res=${videoWidth}x${videoHeight} path=$path"
+         Log.i(BENCH_TAG, msg)
+         benchmarkLogCallback?.invoke(msg)
+     }
+@@ -135,7 +184,6 @@ class VideoRenderer(ctx: Context) {
+             try {
+                 if (codec == null) startCodec(isH265)
+                 _feedToCodec(data, ntpTimeNs)
+-                drainOutput()
+             } catch (e: Exception) {
+                 Log.w(TAG, "Codec error, resetting", e)
+                 stopCodec()
+@@ -146,21 +194,18 @@ class VideoRenderer(ctx: Context) {
+     private fun _feedToCodec(data: ByteArray, ntpTimeNs: Long) {
+         val c = codec ?: return
+         // dropping a frame desyncs decoder until the next keyframe, but source would only send one on (re)connect
+-        val retries = if (firstFrameQueued) FEED_RETRIES else FIRST_FEED_RETRIES
+-        repeat(retries) {
+-            val idx = c.dequeueInputBuffer(FEED_WAIT_US)
+-            if (idx >= 0) {
+-                val buf = c.getInputBuffer(idx) ?: return
+-                buf.clear()
+-                buf.put(data)
+-                c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)
+-                firstFrameQueued = true
+-                return
+-            }
+-            drainOutput()
++        val waitMs = if (firstFrameQueued) FEED_WAIT_MS else FIRST_FEED_WAIT_MS
++        val idx = freeInputs.poll(waitMs, TimeUnit.MILLISECONDS)
++        if (idx == null) {
++            droppedFrames++
++            Log.w(TAG, "Decoder input queue full; dropping frame. drops=$droppedFrames")
++            return
+         }
+-        droppedFrames++
+-        Log.w(TAG, "Decoder input queue full; dropping frame. drops=$droppedFrames")
++        val buf = c.getInputBuffer(idx) ?: return
++        buf.clear()
++        buf.put(data)
++        c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)
++        firstFrameQueued = true
+     }
+ 
+     private fun _isKeyframe(data: ByteArray, isH265: Boolean): Boolean {
+@@ -186,7 +231,10 @@ class VideoRenderer(ctx: Context) {
+     private fun startCodec(h265: Boolean) {
+         pipeline.start()
+         pipeline.setVideoSize(videoWidth, videoHeight)
+-        val s = pipeline.inputSurface ?: return
++        // decode straight into the display: no gl blit, no texture resampling, one less buffer hop
++        val s = displaySurface?.takeIf { it.isValid } ?: pipeline.inputSurface ?: return
++        // a surface takes one producer: the pipeline's idle repaint must let go first
++        if (s !== pipeline.inputSurface) pipeline.detachDisplay()
+         currentH265 = h265
+         val mime = if (h265) DecoderSelector.HEVC else DecoderSelector.AVC
+         val info = (if (h265) hevcDecoder else avcDecoder) ?: error("no decoder selected for $mime")
+@@ -200,7 +248,10 @@ class VideoRenderer(ctx: Context) {
+             Log.w(TAG, "Hardware decoder failed, trying software fallback", e)
+             _startWithLadder(sw, mime, s, h265)
+         }
+-        Log.i(TAG, "Video codec started: $mime ${videoWidth}x${videoHeight} ($codecName)")
++        outputSurface = s
++        if (s === pipeline.inputSurface) pipeline.setDisplaySurface(displaySurface)
++        val path = if (s === pipeline.inputSurface) "gl" else "direct"
++        Log.i(TAG, "Video codec started: $mime ${videoWidth}x${videoHeight} ($codecName, $path)")
+     }
+ 
+     private fun _startWithLadder(info: MediaCodecInfo, mime: String, s: Surface, h265: Boolean) {
+@@ -238,59 +289,94 @@ class VideoRenderer(ctx: Context) {
+ 
+     private fun _startDecoder(c: MediaCodec, format: MediaFormat, surface: Surface, h265: Boolean) {
+         try {
++            freeInputs.clear()
++            c.setCallback(_callback(), _callbackHandler())
+             c.configure(format, surface, null, 0)
++            // published before start: input buffers are announced as soon as it runs
++            codec = c
+             c.start()
+         } catch (e: Exception) {
++            codec = null
++            freeInputs.clear()
+             try { c.release() } catch (_: Exception) {}
+             throw e
+         }
+-        codec = c
+         codecName = (if (h265) "H.265" else "H.264") + " (${c.name})"
+     }
+ 
++    private fun _callbackHandler(): Handler = callbackHandler ?: HandlerThread(
++        "VideoDecoderCallbacks", Process.THREAD_PRIORITY_URGENT_DISPLAY
++    ).let { t ->
++        t.start()
++        callbackThread = t
++        Handler(t.looper).also { callbackHandler = it }
++    }
++
++    // callbacks from a codec that was replaced or stopped are ignored
++    private fun _callback() = object : MediaCodec.Callback() {
++        override fun onInputBufferAvailable(c: MediaCodec, index: Int) {
++            if (c === codec) freeInputs.offer(index)
++        }
++
++        override fun onOutputBufferAvailable(c: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
++            if (c !== codec) return
++            try {
++                _recordOutputFrameTime()
++                if (scheduledOutputBufferRelease) {
++                    // schedule frame at VSYNC matching its NTP presentation time
++                    val ptsUs = info.presentationTimeUs
++                    if (_ptsBaseUs == Long.MIN_VALUE) {
++                        _ptsBaseUs = ptsUs
++                        _wallBaseNs = System.nanoTime()
++                    }
++                    c.releaseOutputBuffer(index, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
++                } else {
++                    c.releaseOutputBuffer(index, true)
++                }
++            } catch (e: IllegalStateException) {
++                // codec stopped between dispatch and release
++            }
++        }
++
++        override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
++            Log.w(TAG, "Decoder error (recoverable=${e.isRecoverable}, transient=${e.isTransient})", e)
++        }
++
++        override fun onOutputFormatChanged(c: MediaCodec, format: MediaFormat) {
++            Log.i(TAG, "Decoder output format: $format")
++        }
++    }
++
+     private fun stopCodec() {
+-        _frameIntervalIdx = 0
+-        _frameIntervalCount = 0
+-        _lastOutputFrameNs = 0L
++        synchronized(statsLock) {
++            _frameIntervalIdx = 0
++            _frameIntervalCount = 0
++            _lastOutputFrameNs = 0L
++        }
+         _ptsBaseUs = Long.MIN_VALUE
+         _wallBaseNs = 0L
+-        codec?.let {
++        val c = codec
++        codec = null
++        outputSurface = null
++        freeInputs.clear()
++        c?.let {
+             try {
+                 it.stop()
+                 it.release()
+             } catch (_: Exception) {}
+         }
+-        codec = null
+-    }
+-
+-    private fun drainOutput() {
+-        val c = codec ?: return
+-        val info = MediaCodec.BufferInfo()
+-        while (true) {
+-            val idx = c.dequeueOutputBuffer(info, 0)
+-            if (idx < 0) break
+-            _recordOutputFrameTime()
+-            if (scheduledOutputBufferRelease) {
+-                // schedule frame at VSYNC matching its NTP presentation time
+-                val ptsUs = info.presentationTimeUs
+-                if (_ptsBaseUs == Long.MIN_VALUE) {
+-                    _ptsBaseUs = ptsUs
+-                    _wallBaseNs = System.nanoTime()
+-                }
+-                c.releaseOutputBuffer(idx, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
+-            } else {
+-                c.releaseOutputBuffer(idx, true)
+-            }
+-        }
+     }
+ 
+     fun release() = synchronized(lock) {
+         stopCodec()
+         pipeline.release()
++        callbackThread?.quitSafely()
++        callbackThread = null
++        callbackHandler = null
+         _resetStats()
+     }
+ 
+-    private fun _recordOutputFrameTime() {
++    private fun _recordOutputFrameTime() = synchronized(statsLock) {
+         val now = System.nanoTime()
+         if (_lastOutputFrameNs > 0) {
+             _frameIntervalsNs[_frameIntervalIdx % _frameIntervalsNs.size] = now - _lastOutputFrameNs
+@@ -300,9 +386,9 @@ class VideoRenderer(ctx: Context) {
+         _lastOutputFrameNs = now
+     }
+ 
+-    private fun _computeFramePacingJitterUs(): Long {
++    private fun _computeFramePacingJitterUs(): Long = synchronized(statsLock) {
+         val count = _frameIntervalCount.coerceAtMost(_frameIntervalsNs.size)
+-        if (count < 2) return 0
++        if (count < 2) return@synchronized 0L
+ 
+         var sum = 0.0
+         var sumSq = 0.0
+@@ -313,14 +399,13 @@ class VideoRenderer(ctx: Context) {
+         }
+         val mean = sum / count
+         val variance = (sumSq / count) - (mean * mean)
+-        return (kotlin.math.sqrt(variance.coerceAtLeast(0.0)) / 1000.0).toLong()
++        (kotlin.math.sqrt(variance.coerceAtLeast(0.0)) / 1000.0).toLong()
+     }
+ 
+     companion object {
+         private const val TAG = "VideoRenderer"
+         private const val BENCH_TAG = "BENCHMARK"
+-        private const val FEED_WAIT_US = 20_000L
+-        private const val FEED_RETRIES = 10
+-        private const val FIRST_FEED_RETRIES = 50
++        private const val FEED_WAIT_MS = 200L
++        private const val FIRST_FEED_WAIT_MS = 1000L
+     }
+ }
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt b/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
+index 9390300..adf5bc4 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
+@@ -13,6 +13,7 @@ import android.content.pm.ServiceInfo
+ import android.content.res.Configuration
+ import android.graphics.BitmapFactory
+ import android.media.AudioManager
++import android.net.wifi.WifiManager
+ import android.os.Binder
+ import android.os.Build
+ import android.os.Handler
+@@ -20,6 +21,7 @@ import android.os.IBinder
+ import android.os.Looper
+ import android.os.PowerManager
+ import android.os.SystemClock
++import android.provider.Settings
+ import android.support.v4.media.MediaMetadataCompat
+ import android.support.v4.media.session.MediaSessionCompat
+ import android.support.v4.media.session.PlaybackStateCompat
+@@ -72,6 +74,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+     private var nativeHandle = 0L
+     private var nsdManager: NsdServiceManager? = null
+     private var wakeLock: PowerManager.WakeLock? = null
++    private var wifiLock: WifiManager.WifiLock? = null
+     private var foregroundStarted = false
+     private var lastOrientation = Configuration.ORIENTATION_UNDEFINED
+ 
+@@ -353,7 +356,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+         nsdManager = NsdServiceManager(this).apply { acquireMulticastLock() }
+ 
+         val hwAddr = getHwAddr()
+-        val keyFile = filesDir.resolve("airplay.pem").absolutePath
++        val keyFile = filesDir.resolve("airplay.pem").also { f ->
++            _androidId()?.let { ReceiverIdentity.writeKeyFile(f, it) }
++        }.absolutePath
+         val nohold = prefs.getBoolean(Prefs.ALLOW_NEW_CONN, Prefs.DEF_ALLOW_NEW_CONN)
+         val requirePin = prefs.getBoolean(Prefs.REQUIRE_PIN, Prefs.DEF_REQUIRE_PIN)
+ 
+@@ -410,6 +415,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+         _videoResolution.value = "${w}x${h}"
+         _videoAspect.value = w.toFloat() / h
+         NativeBridge.nativeSetDisplaySize(nativeHandle, w, h, maxFps)
++        _setPhysicalSize(w, h)
+ 
+         val requestedPort = prefs.getInt(Prefs.SERVER_PORT, Prefs.DEF_SERVER_PORT).coerceIn(1, 65535)
+         val port = NativeBridge.nativeStart(nativeHandle, requestedPort)
+@@ -468,9 +474,39 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+         if (!_orientationFollowsDevice()) return
+         val (w, h) = _displaySize()
+         NativeBridge.nativeSetDisplaySize(nativeHandle, w, h, prefs.getInt(Prefs.MAX_FPS, Prefs.DEF_MAX_FPS))
++        _setPhysicalSize(w, h)
+         log("Advertising ${w}x${h} from next session")
+     }
+ 
++    // millimetres of panel the advertised pixels cover; senders derive density (and so Retina) from it
++    private fun _setPhysicalSize(w: Int, h: Int) {
++        val dm = resources.displayMetrics
++        val ppi = (dm.xdpi + dm.ydpi) / 2f
++        if (ppi <= 0f) return
++        NativeBridge.nativeSetPlist(nativeHandle, "widthPhysical", (w * 25.4f / ppi).roundToInt())
++        NativeBridge.nativeSetPlist(nativeHandle, "heightPhysical", (h * 25.4f / ppi).roundToInt())
++    }
++
++    // wi-fi power save holds downlink frames at the access point between beacons; mirroring can't wait for that
++    private fun _setWifiLowLatency(on: Boolean) {
++        if (!on) {
++            wifiLock?.takeIf { it.isHeld }?.release()
++            wifiLock = null
++            return
++        }
++        if (wifiLock?.isHeld == true) return
++        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
++        @Suppress("DEPRECATION")
++        val mode = if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY
++            else WifiManager.WIFI_MODE_FULL_HIGH_PERF
++        wifiLock = runCatching {
++            wifi.createWifiLock(mode, "airplay:mirror").apply { setReferenceCounted(false); acquire() }
++        }.onFailure { Log.w(TAG, "wifi lock unavailable", it) }.getOrNull()
++    }
++
++    private fun _androidId(): String? =
++        Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)?.takeIf { it.isNotBlank() }
++
+     private fun _failStart() {
+         audioRenderer.detachEngine()
+         if (nativeHandle != 0L) {
+@@ -481,6 +517,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+         nsdManager = null
+         wakeLock?.release()
+         wakeLock = null
++        _setWifiLowLatency(false)
+         _serverState.value = ServerState.ERROR
+         if (foregroundStarted) {
+             stopForeground(STOP_FOREGROUND_REMOVE)
+@@ -500,6 +537,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+         nsdManager = null
+         wakeLock?.release()
+         wakeLock = null
++        _setWifiLowLatency(false)
+         videoRenderer.release()
+         airPlayVideoPlayer.stop()
+         mediaSession?.isActive = false
+@@ -807,6 +845,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+     }
+ 
+     override fun onMirrorRunning(running: Boolean) {
++        _setWifiLowLatency(running)
+         if (running) videoRenderer.startSession() else {
+             videoRenderer.stopSession()
+             _mirroringActive.value = false
+@@ -960,6 +999,8 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+             Log.w(TAG, "Failed to get hardware address", e)
+         }
+ 
++        // derived from ANDROID_ID so the sender keeps recognising this display across reinstalls
++        _androidId()?.let { return ReceiverIdentity.mac(it) }
+         // fall back to stable per-install random address
+         return persistedRandomMac()
+             ?: byteArrayOf(0xAA.toByte(), 0xBB.toByte(), 0xCC.toByte(), 0xDD.toByte(), 0xEE.toByte(), 0xFF.toByte())
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/service/ReceiverIdentity.kt b/app/src/main/kotlin/io/github/jqssun/airplay/service/ReceiverIdentity.kt
+new file mode 100644
+index 0000000..29b828e
+--- /dev/null
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/service/ReceiverIdentity.kt
+@@ -0,0 +1,44 @@
++package io.github.jqssun.airplay.service
++
++import android.util.Base64
++import java.io.File
++import java.security.MessageDigest
++
++// macOS remembers an AirPlay display's mode and arrangement per receiver identity (device id + public key).
++// Deriving both from the app-scoped ANDROID_ID keeps that identity across reinstalls and cleared data,
++// so the display comes back the way the user left it instead of as a new device.
++object ReceiverIdentity {
++
++    private const val MAC_LABEL = "sidetab-airplay-device-id:"
++    private const val KEY_LABEL = "sidetab-airplay-ed25519-seed:"
++
++    // PKCS#8 header for a raw 32-byte Ed25519 private key (RFC 8410)
++    private val ED25519_PKCS8_PREFIX = byteArrayOf(
++        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20
++    )
++
++    fun mac(androidId: String): ByteArray {
++        val mac = _digest(MAC_LABEL, androidId).copyOf(6)
++        // locally administered unicast, AAI SLAP quadrant like the random fallback
++        mac[0] = ((mac[0].toInt() and 0xF0) or 0x0A).toByte()
++        return mac
++    }
++
++    fun privateKeyPem(androidId: String): String {
++        val der = ED25519_PKCS8_PREFIX + _digest(KEY_LABEL, androidId).copyOf(32)
++        val b64 = Base64.encodeToString(der, Base64.NO_WRAP)
++        return "-----BEGIN PRIVATE KEY-----\n$b64\n-----END PRIVATE KEY-----\n"
++    }
++
++    // rewrites the key only when it differs, so an existing derived key file is left untouched
++    fun writeKeyFile(file: File, androidId: String): Boolean = runCatching {
++        val pem = privateKeyPem(androidId)
++        if (file.exists() && file.readText() == pem) return@runCatching true
++        val tmp = File(file.parentFile, file.name + ".tmp")
++        tmp.writeText(pem)
++        tmp.renameTo(file)
++    }.getOrDefault(false)
++
++    private fun _digest(label: String, androidId: String): ByteArray =
++        MessageDigest.getInstance("SHA-256").digest((label + androidId).toByteArray(Charsets.UTF_8))
++}
