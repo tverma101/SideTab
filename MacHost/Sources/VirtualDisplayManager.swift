@@ -19,6 +19,10 @@ class VirtualDisplayManager {
         var observer: NSObjectProtocol?
         var mirroringEnabled = false
         var pointsSize: CGSize = .zero
+        /// Off until the saved position has been restored, so the spot macOS
+        /// first places a new display is never mistaken for the user's choice.
+        var tracksArrangement = false
+        var arrangement: ArrangementTracker?
     }
 
     /// createDisplay runs on a task-pool thread while the screen-parameters
@@ -162,8 +166,43 @@ class VirtualDisplayManager {
             queue: .main
         ) { [weak self] _ in
             self?.ensurePhysicalDisplayStaysMain()
+            self?.saveArrangementIfUserMoved()
         }
         state.withLock { $0.observer = token }
+    }
+
+    /// The position used to be saved only by stopServer(), so a host stopped
+    /// any other way (a rebuild script's SIGTERM, a crash, a forced logout)
+    /// lost every arrangement made since launch and came back wherever macOS
+    /// put it. Save as soon as the user moves the display instead.
+    private func saveArrangementIfUserMoved() {
+        guard let id = displayID, let origin = getDisplayPosition() else { return }
+        guard case .online(let ids) = queryDisplays() else { return }
+        let physical = Set(ids.filter { isPhysicalDisplay($0, excluding: id) })
+        // Main-slot moves belong to the #39 guard, mirrored origins are not an
+        // arrangement, and with no physical display there is nothing to adjoin.
+        let eligible = !physical.isEmpty && CGMainDisplayID() != id && !isMirroring(id)
+        let now = DispatchTime.now().uptimeNanoseconds
+
+        let userMoved = state.withLock { state -> Bool in
+            guard state.tracksArrangement else { return false }
+            guard var tracker = state.arrangement else {
+                state.arrangement = ArrangementTracker(physicalIDs: physical, origin: origin, nowNs: now)
+                return false
+            }
+            let moved = tracker.observe(physicalIDs: physical, origin: origin, nowNs: now)
+            state.arrangement = tracker
+            return moved && eligible
+        }
+        if userMoved {
+            debugLog("📍 Display arrangement changed by the user")
+            saveDisplayPosition()
+        }
+    }
+
+    private func beginArrangementTracking() {
+        state.withLock { $0.tracksArrangement = $0.display != nil }
+        saveArrangementIfUserMoved()
     }
 
     /// Clone the main display configuration
@@ -295,7 +334,7 @@ class VirtualDisplayManager {
         defaults.set(Int(position.x), forKey: "SideScreen_positionX")
         defaults.set(Int(position.y), forKey: "SideScreen_positionY")
         defaults.set(true, forKey: "SideScreen_hasPosition")
-        print("💾 Saved display position: (\(Int(position.x)), \(Int(position.y)))")
+        debugLog("💾 Saved display position: (\(Int(position.x)), \(Int(position.y)))")
     }
 
     /// Restore saved display position
@@ -303,7 +342,10 @@ class VirtualDisplayManager {
         // Run the main-display safety net on every path, including early
         // returns: WindowServer can re-adopt the virtual display as main from
         // its own remembered arrangement even when we restore nothing (#39).
-        defer { ensurePhysicalDisplayStaysMain() }
+        defer {
+            ensurePhysicalDisplayStaysMain()
+            beginArrangementTracking()
+        }
 
         let defaults = UserDefaults.standard
         guard defaults.bool(forKey: "SideScreen_hasPosition") else {
@@ -346,13 +388,13 @@ class VirtualDisplayManager {
             virtualSize: size,
             physicalBounds: physicalBounds
         ) else {
-            print("🛟 Skipping saved position (\(x), \(y)) — it no longer adjoins any attached display")
+            debugLog("🛟 Skipping saved position (\(x), \(y)) — it no longer adjoins any attached display")
             return
         }
 
         do {
             try setDisplayPosition(x: Int32(clamping: x), y: Int32(clamping: y))
-            print("📍 Restored display position: (\(x), \(y))")
+            debugLog("📍 Restored display position: (\(x), \(y))")
         } catch {
             print("⚠️  Failed to restore display position: \(error)")
         }
@@ -484,6 +526,11 @@ class VirtualDisplayManager {
         }
 
         if CGCompleteDisplayConfiguration(config, .forSession) == .success {
+            // The guard's own move is a repair, not the user's arrangement:
+            // keep the saved position for the next launch.
+            let parked = CGPoint(x: CGFloat(physicalWidth), y: 0)
+            let now = DispatchTime.now().uptimeNanoseconds
+            state.withLock { $0.arrangement?.adopt(origin: parked, nowNs: now) }
             print("🛟 Physical display restored as main — virtual display parked beside it")
         }
     }
@@ -556,6 +603,8 @@ class VirtualDisplayManager {
             state.settings = nil
             state.mirroringEnabled = false
             state.pointsSize = .zero
+            state.tracksArrangement = false
+            state.arrangement = nil
             return retired
         }
         guard let retired else { return }
@@ -869,5 +918,47 @@ enum VirtualDisplayPlacement {
         // a shared area is an overlap.
         if overlap.width > tolerance && overlap.height > tolerance { return false }
         return desktop.insetBy(dx: -tolerance, dy: -tolerance).intersects(candidate)
+    }
+}
+
+/// Tells a move the user made in Displays settings apart from one macOS made
+/// while the display topology changed. Hot-plug, wake and an AirPlay display
+/// coming or going all re-place displays over several notifications; saving
+/// those would replace the user's arrangement with whatever macOS chose.
+struct ArrangementTracker {
+    /// How long after a topology change (or a #39 repair) moves are adopted
+    /// without being saved.
+    static let settleNs: UInt64 = 3_000_000_000
+
+    private(set) var physicalIDs: Set<CGDirectDisplayID>
+    private(set) var origin: CGPoint
+    private var quietSinceNs: UInt64
+
+    init(physicalIDs: Set<CGDirectDisplayID>, origin: CGPoint, nowNs: UInt64) {
+        self.physicalIDs = physicalIDs
+        self.origin = origin
+        quietSinceNs = nowNs
+    }
+
+    /// Records the current arrangement. True when the display moved while the
+    /// set of attached displays stayed the same and had settled.
+    mutating func observe(physicalIDs ids: Set<CGDirectDisplayID>, origin newOrigin: CGPoint, nowNs: UInt64) -> Bool {
+        defer {
+            physicalIDs = ids
+            origin = newOrigin
+        }
+        if ids != physicalIDs {
+            quietSinceNs = nowNs
+            return false
+        }
+        guard newOrigin != origin else { return false }
+        return nowNs >= quietSinceNs && nowNs - quietSinceNs >= Self.settleNs
+    }
+
+    /// Takes a position that was not the user's (a repair) as the new
+    /// reference without saving it.
+    mutating func adopt(origin newOrigin: CGPoint, nowNs: UInt64) {
+        origin = newOrigin
+        quietSinceNs = nowNs
     }
 }

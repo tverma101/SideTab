@@ -98,6 +98,26 @@ class VideoEncoder {
         var encodedOutputs: UInt64 = 0
         var pressureSkips: UInt64 = 0
         var colorimetryMismatches: UInt64 = 0
+        /// Wireless only: last PTS handed to VideoToolbox. Replayed and
+        /// trailing-refresh frames are stamped with the current time on
+        /// another queue, so a capture that was taken just before one of
+        /// them could otherwise reach the encoder with an older timestamp.
+        var lastSubmittedPTS: CMTime = .invalid
+        /// Wireless only: uptime of the last IDR VideoToolbox returned, so an
+        /// idle refresh can decide whether the picture needs re-anchoring.
+        var lastKeyframeOutputNs: UInt64 = 0
+        /// Wireless only: size of the last frame VideoToolbox returned. The
+        /// settle refresh reads it to tell whether re-encoding a still frame
+        /// would still add detail (see WirelessSettleRefreshPolicy).
+        var lastOutputBytes = 0
+        /// Wireless only: VideoToolbox accepted the last frame but returned
+        /// nothing for it (a rate-control drop or an encode error).
+        var lastOutputDropped = false
+        /// USB only: when recent frames were handed to VideoToolbox, keyed by
+        /// PTS, so the output callback can tell encoder time apart from
+        /// capture delivery time. Fixed size; dropped frames just age out.
+        var submitTimes = [(pts: CMTime, ns: UInt64)](repeating: (.invalid, 0), count: 16)
+        var submitTimesNext = 0
         var config: SessionConfig
         /// The VT output callback is documented to run on another thread, so the
         /// sink is read under the same lock that publishes it.
@@ -191,6 +211,28 @@ class VideoEncoder {
         stateLock.withLock { $0.pendingForceKeyframe = true }
     }
 
+    /// Wireless only: how long ago VideoToolbox returned the last IDR, or nil
+    /// before the first one. The settle refresh uses it to land the routine
+    /// keyframe while the screen is still instead of mid-motion.
+    func keyframeAgeNs(nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> UInt64? {
+        guard wireless else { return nil }
+        return stateLock.withLock { state in
+            guard state.lastKeyframeOutputNs > 0 else { return nil }
+            return nowNs > state.lastKeyframeOutputNs ? nowNs - state.lastKeyframeOutputNs : 0
+        }
+    }
+
+    /// Wireless only: size of the last encoded frame, 0 before the first.
+    var lastOutputBytes: Int {
+        stateLock.withLock { $0.lastOutputBytes }
+    }
+
+    /// Wireless only: the last accepted frame produced no output, so the
+    /// tablet never received it.
+    var lastOutputDropped: Bool {
+        stateLock.withLock { $0.lastOutputDropped }
+    }
+
     /// Result of one submission attempt. `noSession` means the settings thread
     /// swapped the session out and the frame never reached VideoToolbox, so no
     /// output callback will run.
@@ -199,7 +241,10 @@ class VideoEncoder {
         case noSession
     }
 
-    func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
+    /// Returns true when VideoToolbox accepted the frame. False means it was
+    /// skipped for Wi-Fi pressure or rejected, and no output will follow.
+    @discardableResult
+    func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) -> Bool {
         // A pooled HDR buffer must not go back into the pool until VideoToolbox
         // is done reading it. The lease rides along as sourceFrameRefcon and is
         // released by the output callback; a skipped or failed encode has no
@@ -224,15 +269,33 @@ class VideoEncoder {
         if wireless && !shouldForceKeyframe && WirelessTransportPressure.shouldPauseEncoding {
             stateLock.withLock { $0.pressureSkips &+= 1 }
             if let leaseID { HDRConverter.release(leaseID: leaseID) }
-            return
+            return false
         }
 
         let config = stateLock.withLock { $0.config }
         let duration = CMTime(value: 1, timescale: CMTimeScale(config.frameRate))
+        let submitPTS: CMTime = wireless
+            ? stateLock.withLock { state -> CMTime in
+                var pts = presentationTimeStamp
+                if state.lastSubmittedPTS.isNumeric, CMTimeCompare(pts, state.lastSubmittedPTS) <= 0 {
+                    pts = CMTimeAdd(state.lastSubmittedPTS, CMTime(value: 1, timescale: 1_000_000))
+                }
+                state.lastSubmittedPTS = pts
+                return pts
+            }
+            : presentationTimeStamp
         let frameProperties: CFDictionary? = shouldForceKeyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             : nil
         let frameIsTenBit = Self.isTenBitBuffer(pixelBuffer)
+
+        if !wireless {
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            stateLock.withLock { state in
+                state.submitTimes[state.submitTimesNext] = (submitPTS, nowNs)
+                state.submitTimesNext = (state.submitTimesNext + 1) % state.submitTimes.count
+            }
+        }
 
         // The lock spans the submission so a concurrent swap cannot invalidate
         // the session between this read and the call. The image is wrapped so
@@ -250,7 +313,7 @@ class VideoEncoder {
             let status = VTCompressionSessionEncodeFrame(
                 session,
                 imageBuffer: image.value,
-                presentationTimeStamp: presentationTimeStamp,
+                presentationTimeStamp: submitPTS,
                 duration: duration,
                 frameProperties: frameProperties,
                 sourceFrameRefcon: hdrLeaseRefcon(leaseID),
@@ -259,10 +322,13 @@ class VideoEncoder {
             return .submitted(status)
         }
 
+        let accepted: Bool
         switch outcome {
         case .noSession:
+            accepted = false
             if let leaseID { HDRConverter.release(leaseID: leaseID) }
         case let .submitted(status) where status != noErr:
+            accepted = false
             // The forced IDR that was supposed to ride this frame is still owed:
             // a non-monotonic PTS, a session invalidated mid-flight or
             // kVTVideoEncoderMalfunctionErr all drop the request, and the client
@@ -282,7 +348,7 @@ class VideoEncoder {
                 debugLog("VideoToolbox encode rejected frame (\(wireless ? "wireless" : "usb")): status=\(status), errors=\(errorCount)")
             }
         case .submitted:
-            break
+            accepted = true
         }
 
         if sessionLock.withLock({ $0?.hdrSignalled ?? false }) != frameIsTenBit {
@@ -300,14 +366,39 @@ class VideoEncoder {
                 "colorimetryMismatches=\(stats.4), " +
                 "pressureInFlight=\(pressure.sendsInFlight), " +
                 "pressureBytes=\(pressure.bytesInFlight), " +
-                "tcpAvailable=\(pressure.availableSendBuffer.map(String.init) ?? "unknown")"
+                "tcpQueued=\(pressure.queuedSendBytes.map(String.init) ?? "unknown")"
             )
+        }
+        return accepted
+    }
+
+    /// USB only: when the frame with this PTS was submitted, or nil.
+    func takeSubmitTime(pts: CMTime) -> UInt64? {
+        guard !wireless, pts.isNumeric else { return nil }
+        return stateLock.withLock { state -> UInt64? in
+            for i in state.submitTimes.indices where state.submitTimes[i].ns != 0 && state.submitTimes[i].pts == pts {
+                let ns = state.submitTimes[i].ns
+                state.submitTimes[i].ns = 0
+                return ns
+            }
+            return nil
         }
     }
 
-    func noteEncodedOutput() {
+    func noteEncodedOutput(isKeyframe: Bool, bytes: Int) {
         guard wireless else { return }
-        stateLock.withLock { $0.encodedOutputs &+= 1 }
+        let nowNs = isKeyframe ? DispatchTime.now().uptimeNanoseconds : 0
+        stateLock.withLock { state in
+            state.encodedOutputs &+= 1
+            state.lastOutputBytes = bytes
+            state.lastOutputDropped = false
+            if isKeyframe { state.lastKeyframeOutputNs = nowNs }
+        }
+    }
+
+    func noteDroppedOutput() {
+        guard wireless else { return }
+        stateLock.withLock { $0.lastOutputDropped = true }
     }
 
     private static func isTenBitBuffer(_ buffer: CVPixelBuffer) -> Bool {
@@ -500,7 +591,8 @@ class VideoEncoder {
 
         // TCP preserves reference frames, reconnect/startup forces an IDR, and
         // Android explicitly requests one when its decoder is reset or loses
-        // input. Wi-Fi already uses a five-second periodic safety GOP. Adaptive
+        // input. Wi-Fi takes its routine IDR when motion stops (the idle
+        // refresh in ScreenCapture) and keeps a long periodic fallback. Adaptive
         // high-refresh USB now uses the same interval: at a 1-FPS clean-screen
         // keepalive, a one-second keyframe-duration limit would otherwise turn
         // essentially every idle frame into an IDR. Legacy 30/60-Hz USB keeps
@@ -592,6 +684,10 @@ private func hdrLeaseID(from refcon: UnsafeMutableRawPointer) -> UInt64 {
 /// reuse that PTS for frame-age profiling instead of heap-allocating an 8-byte
 /// sourceFrameRefcon on every frame. If a source uses another timebase,
 /// fail closed to current uptime so transport metadata remains well formed.
+/// Capture asks for frames faster than the display refreshes, and
+/// ScreenCaptureKit then stamps each one with its upcoming display time, a
+/// few ms ahead of now. Those frames take the fail-closed path too, so the
+/// "avg frame age" diagnostic reads near zero.
 ///
 /// The plausible-PTS path and the fail-closed path are different clocks'
 /// opinions about the same frame, so the raw result can step backwards from one
@@ -636,6 +732,7 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
 
     guard status == noErr,
           let sampleBuffer = sampleBuffer else {
+        encoder.noteDroppedOutput()
         return
     }
 
@@ -650,14 +747,19 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
     let timestamp = frameTimestampNanoseconds(sampleBuffer)
     let encodeCompletedNs = DispatchTime.now().uptimeNanoseconds
     if encodeCompletedNs >= timestamp {
+        let submittedNs = encoder.takeSubmitTime(pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         USBAdaptiveLoadController.shared.observeEncodedFrameAge(
             ageNs: encodeCompletedNs - timestamp,
+            encodeNs: submittedNs.map { encodeCompletedNs >= $0 ? encodeCompletedNs - $0 : 0 },
             nowNs: encodeCompletedNs
         )
     }
 
     // Extract encoded data
-    guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+    guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+        encoder.noteDroppedOutput()
+        return
+    }
 
     var lengthAtOffset: Int = 0
     var totalLength: Int = 0
@@ -673,6 +775,7 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
 
     guard statusCode == kCMBlockBufferNoErr,
           let dataPointer = dataPointer else {
+        encoder.noteDroppedOutput()
         return
     }
 
@@ -693,7 +796,7 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         into: &frameData
     )
 
-    encoder.noteEncodedOutput()
+    encoder.noteEncodedOutput(isKeyframe: isKeyframe, bytes: frameData.count)
     encoder.onEncodedFrame?(frameData, timestamp, isKeyframe)
 }
 

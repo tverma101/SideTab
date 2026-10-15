@@ -123,8 +123,10 @@ failed and it fell back to a slower configuration.
   even during sustained motion. The encode-age floor at 120 FPS (25 ms) sits
   inside this machine's normal capture-to-encode age (20–30 ms). Any pressure
   sample at the 60 tier silently resets the healthy-completion count, because a
-  step-down from 60 is impossible and so nothing is logged. Needs a design
-  decision on #56.
+  step-down from 60 is impossible and so nothing is logged. **Resolved
+  2026-10-06:** the "headroom" pressure was the send-queue metric read
+  backwards, and encode pressure now needs a VideoToolbox queue held for
+  250 ms. See [adaptive-usb-fps.md](../adaptive-usb-fps.md#live-validation--2026-10-06).
 - About 13 s passed between tapping Connect and the connection, right after an
   APK install re-established `adb reverse`. Not yet explained.
 - The audit commit `5d83719` claimed to fix "60+ defects". Two of its changes

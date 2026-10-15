@@ -38,15 +38,15 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding)
     }
 
-    func testLowTcpHeadroomCreatesOnlyBoundedPause() {
+    func testDeepTcpSendQueueCreatesOnlyBoundedPause() {
         let generation = WirelessTransportPressure.reset(wireless: true)
         WirelessTransportPressure.setReady(generation: generation)
         let now: UInt64 = 1_000_000_000
 
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
-            availableBytes: 8 * 1024,
-            frameBytes: 64 * 1024,
+            queuedBytes: UInt32(16 * 1024 + WirelessFreshnessPolicy.maxQueuedBacklogBytes + 1),
+            frameBytes: 16 * 1024,
             nowNs: now
         )
 
@@ -54,29 +54,49 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 20_000_000))
     }
 
-    func testZeroTcpHeadroomSampleDoesNotSelfThrottleHealthyRoute() {
+    /// Regression: the gate used to read this value as free headroom, so a
+    /// healthy queue holding one ordinary frame paused encoding and a full
+    /// buffer released it. An idle socket reports 0.
+    func testShallowOrEmptyTcpSendQueueNeverPausesHealthyRoute() {
         let generation = WirelessTransportPressure.reset(wireless: true)
         WirelessTransportPressure.setReady(generation: generation)
         let now: UInt64 = 1_500_000_000
 
+        for queued in [0, 16 * 1024, 16 * 1024 + WirelessFreshnessPolicy.maxQueuedBacklogBytes] {
+            WirelessTransportPressure.observeSendBuffer(
+                generation: generation,
+                queuedBytes: UInt32(queued),
+                frameBytes: 16 * 1024,
+                nowNs: now
+            )
+            XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 1), "queued=\(queued)")
+        }
+    }
+
+    /// Regression: an absolute 64 KiB limit paused on every healthy large
+    /// frame (scrolling at 0.75x encode scale: ~110 KiB frames, 22% skipped).
+    func testLargeFrameFillingTheQueueByItselfIsNotBacklog() {
+        let generation = WirelessTransportPressure.reset(wireless: true)
+        WirelessTransportPressure.setReady(generation: generation)
+        let now: UInt64 = 1_750_000_000
+
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
-            availableBytes: 0,
-            frameBytes: 64 * 1024,
+            queuedBytes: 128 * 1024,
+            frameBytes: 110 * 1024,
             nowNs: now
         )
-
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 1))
     }
 
-    func testHealthyTcpHeadroomReleasesOlderBufferPauseImmediately() {
+    func testDrainedTcpSendQueueReleasesOlderBufferPauseImmediately() {
         let generation = WirelessTransportPressure.reset(wireless: true)
         WirelessTransportPressure.setReady(generation: generation)
         let now: UInt64 = 2_000_000_000
 
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
-            availableBytes: 4 * 1024,
+            queuedBytes: 128 * 1024,
             frameBytes: 48 * 1024,
             nowNs: now
         )
@@ -84,7 +104,7 @@ final class WirelessTransportPressureTests: XCTestCase {
 
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
-            availableBytes: 256 * 1024,
+            queuedBytes: 4 * 1024,
             frameBytes: 48 * 1024,
             nowNs: now + 2
         )
@@ -99,7 +119,7 @@ final class WirelessTransportPressureTests: XCTestCase {
         WirelessTransportPressure.beginSend(generation: generation)
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
-            availableBytes: 0,
+            queuedBytes: 128 * 1024,
             frameBytes: 1_000_000,
             nowNs: 100
         )
@@ -118,7 +138,7 @@ final class WirelessTransportPressureTests: XCTestCase {
         WirelessTransportPressure.completeSend(generation: oldGeneration)
         WirelessTransportPressure.observeSendBuffer(
             generation: oldGeneration,
-            availableBytes: 0,
+            queuedBytes: 128 * 1024,
             frameBytes: 500_000,
             nowNs: 100
         )
@@ -127,7 +147,7 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertEqual(newGeneration, snapshot.generation)
         XCTAssertEqual(1, snapshot.sendsInFlight)
         XCTAssertEqual(0, snapshot.bytesInFlight)
-        XCTAssertNil(snapshot.availableSendBuffer)
+        XCTAssertNil(snapshot.queuedSendBytes)
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: 101))
     }
 

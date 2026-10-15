@@ -2,8 +2,8 @@ import Foundation
 
 /// Crosses the Network.framework -> VideoToolbox boundary without dropping
 /// already-encoded reference frames. StreamingServer records shallow local
-/// send pressure and samples TCP send-buffer headroom; VideoEncoder consults
-/// the Wi-Fi gate before submitting routine captures. Forced keyframes bypass it.
+/// send pressure and samples the TCP send queue; VideoEncoder consults the
+/// Wi-Fi gate before submitting routine captures. Forced keyframes bypass it.
 ///
 /// Despite the historical name, this type also owns the per-connection send
 /// accounting used by USBAdaptiveLoadController. USB does NOT use the binary
@@ -16,7 +16,7 @@ enum WirelessTransportPressure {
         var sendsInFlight = 0
         var bytesInFlight = 0
         var pauseUntilNs: UInt64 = 0
-        var lastAvailableSendBuffer: UInt32?
+        var lastQueuedSendBytes: UInt32?
         var usbSendStartTimesNs: [UInt64] = []
     }
 
@@ -33,7 +33,7 @@ enum WirelessTransportPressure {
         state.sendsInFlight = 0
         state.bytesInFlight = 0
         state.pauseUntilNs = 0
-        state.lastAvailableSendBuffer = nil
+        state.lastQueuedSendBytes = nil
         state.usbSendStartTimesNs.removeAll(keepingCapacity: true)
         let generation = state.generation
         lock.unlock()
@@ -43,7 +43,8 @@ enum WirelessTransportPressure {
         } else {
             USBAdaptiveLoadController.shared.reset(
                 generation: generation,
-                maxFPS: USBAdaptiveFramePacer.configuredMaxFPS()
+                maxFPS: USBAdaptiveFramePacer.configuredMaxFPS(),
+                startupGraceNs: USBAdaptiveLoadController.startupGraceNs
             )
         }
         return generation
@@ -116,25 +117,23 @@ enum WirelessTransportPressure {
         }
     }
 
-    /// Sample real TCP sender headroom before submitting an encoded frame.
+    /// Sample the TCP send queue before submitting an encoded frame.
     ///
-    /// USB forwards the sample to the adaptive FPS controller instead of using
-    /// the Wi-Fi pause below.
+    /// `queuedBytes` is `NWProtocolTCP.Metadata.availableSendBuffer`, which
+    /// counts bytes still sitting in the kernel send buffer (see
+    /// `WirelessFreshnessPolicy.maxQueuedBacklogBytes`). USB forwards the
+    /// sample, unchanged, to the adaptive FPS controller instead of using this
+    /// gate.
     ///
-    /// On Wi-Fi, if the socket has less than a small amount of headroom, pause
-    /// *future pre-encode* routine captures for a short bounded window. Do not
-    /// require the kernel to have room for the entire encoded frame: a normal
-    /// HEVC frame can be larger than the currently available TCP window even
-    /// when the connection is healthy, and Network.framework will stream that
-    /// frame while the bounded in-flight budget prevents an unbounded queue.
-    /// Using the whole frame as the threshold self-throttles a healthy 60-Hz
-    /// stream to roughly every other frame on small Wi-Fi send buffers.
-    ///
-    /// The deadline always expires by itself, guaranteeing that a probe frame
-    /// eventually gets through and re-samples the socket.
+    /// On Wi-Fi, more than the policy limit queued beyond `frameBytes` (the
+    /// frame just handed over, which is usually still queued) pauses *future
+    /// pre-encode* routine captures for a short bounded window; a sample at or
+    /// below it releases an older pause at once. An empty queue (0) is the
+    /// healthiest reading there is. The deadline always expires by itself,
+    /// so a probe frame eventually gets through and re-samples the socket.
     static func observeSendBuffer(
         generation: UInt64,
-        availableBytes: UInt32,
+        queuedBytes: UInt32,
         frameBytes: Int,
         nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
@@ -144,12 +143,12 @@ enum WirelessTransportPressure {
             return
         }
 
-        state.lastAvailableSendBuffer = availableBytes
+        state.lastQueuedSendBytes = queuedBytes
         guard state.wireless else {
             lock.unlock()
             USBAdaptiveLoadController.shared.observeSendBuffer(
                 generation: generation,
-                availableBytes: availableBytes,
+                queuedBytes: queuedBytes,
                 frameBytes: frameBytes,
                 nowNs: nowNs
             )
@@ -157,25 +156,12 @@ enum WirelessTransportPressure {
         }
         defer { lock.unlock() }
 
-        // `frameBytes` is intentionally not part of this threshold. It is a
-        // useful diagnostic input at call sites, but requiring one complete
-        // frame of kernel headroom made the sender skip every next frame when
-        // the frame was larger than the socket's advertised free window.
-        let required = UInt64(WirelessFreshnessPolicy.minimumSendBufferHeadroomBytes)
-        // Network.framework reports zero for this metadata on some healthy
-        // Wi-Fi paths (including the IPv6 route used by the live tablet). Zero
-        // is therefore not a reliable low-water mark here. The explicit
-        // in-flight frame/byte budgets remain the hard safety boundary when
-        // the kernel does not provide a usable headroom sample.
-        if availableBytes > 0 && UInt64(availableBytes) < required {
+        if Int(queuedBytes) - frameBytes > WirelessFreshnessPolicy.maxQueuedBacklogBytes {
             let deadline = nowNs &+ WirelessFreshnessPolicy.sendBufferPauseNs
             if deadline > state.pauseUntilNs {
                 state.pauseUntilNs = deadline
             }
         } else {
-            // Fresh evidence that the TCP queue has room should release an older
-            // buffer-pressure hold immediately. Local sends-in-flight pressure is
-            // still evaluated independently below.
             state.pauseUntilNs = 0
         }
     }
@@ -192,7 +178,7 @@ enum WirelessTransportPressure {
         state.sendsInFlight = 0
         state.bytesInFlight = 0
         state.pauseUntilNs = 0
-        state.lastAvailableSendBuffer = nil
+        state.lastQueuedSendBytes = nil
         state.usbSendStartTimesNs.removeAll(keepingCapacity: true)
         state.wireless = false
         lock.unlock()
@@ -228,7 +214,7 @@ enum WirelessTransportPressure {
         sendsInFlight: Int,
         bytesInFlight: Int,
         pauseUntilNs: UInt64,
-        availableSendBuffer: UInt32?
+        queuedSendBytes: UInt32?
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -236,7 +222,7 @@ enum WirelessTransportPressure {
             state.sendsInFlight,
             state.bytesInFlight,
             state.pauseUntilNs,
-            state.lastAvailableSendBuffer
+            state.lastQueuedSendBytes
         )
     }
 
@@ -248,7 +234,7 @@ enum WirelessTransportPressure {
         sendsInFlight: Int,
         bytesInFlight: Int,
         pauseUntilNs: UInt64,
-        availableSendBuffer: UInt32?
+        queuedSendBytes: UInt32?
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -259,7 +245,7 @@ enum WirelessTransportPressure {
             state.sendsInFlight,
             state.bytesInFlight,
             state.pauseUntilNs,
-            state.lastAvailableSendBuffer
+            state.lastQueuedSendBytes
         )
     }
 }

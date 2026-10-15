@@ -135,6 +135,30 @@ class PowerPolicyTest {
     }
 
     @Test
+    fun onlyAForegroundWirelessStreamHoldsTheLowLatencyWifiLock() {
+        fun input(
+            wireless: Boolean,
+            foreground: Boolean = true,
+            interactive: Boolean = true,
+            streaming: Boolean = true,
+        ) = PowerPolicyInput(
+            streaming = streaming,
+            foreground = foreground,
+            interactive = interactive,
+            externallyPowered = true,
+            powerSaveMode = false,
+            maxRefreshRateHz = 120f,
+            wireless = wireless,
+        )
+
+        assertTrue(PowerPolicy.decide(input(wireless = true)).wifiLowLatency)
+        assertFalse(PowerPolicy.decide(input(wireless = false)).wifiLowLatency)
+        assertFalse(PowerPolicy.decide(input(wireless = true, foreground = false)).wifiLowLatency)
+        assertFalse(PowerPolicy.decide(input(wireless = true, interactive = false)).wifiLowLatency)
+        assertFalse(PowerPolicy.decide(input(wireless = true, streaming = false)).wifiLowLatency)
+    }
+
+    @Test
     fun wiredRequestsMayForceAModeChange() {
         val decision =
             PowerPolicy.decide(
