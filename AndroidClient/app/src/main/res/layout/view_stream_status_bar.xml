@@ -25,6 +25,28 @@
             android:padding="12dp"
             android:gravity="center_vertical">
 
+            <!-- Link State Indicator -->
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:layout_marginEnd="16dp">
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/ui_link"
+                    android:textColor="@color/ss_text_tertiary"
+                    android:textSize="11sp" />
+                <TextView
+                    android:id="@+id/linkStateText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/ui_dash_placeholder"
+                    android:textColor="@color/ss_accent"
+                    android:textSize="16sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
             <!-- FPS Indicator -->
             <LinearLayout
                 android:layout_width="wrap_content"
