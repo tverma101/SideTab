@@ -1,0 +1,68 @@
+name: CodeQL security analysis
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/codeql.yml"
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: sidetab-codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: swift
+            os: macos-15
+          - language: java-kotlin
+            os: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: AndroidClient/**/*.gradle*
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: manual
+
+      - name: Build analyzed Swift target
+        if: matrix.language == 'swift'
+        run: swift build --package-path MacHost --jobs 4
+
+      - name: Build analyzed Android target
+        if: matrix.language == 'java-kotlin'
+        working-directory: AndroidClient
+        run: ./gradlew --no-daemon :app:compileDebugKotlin --stacktrace
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+# Run weekly and on edits to this setup rather than redundantly rebuilding
+# both targets for every ordinary source PR. Required hardware/network
+# acceptance and wireless transport encryption remain separate work.
