@@ -26,6 +26,11 @@ AndroidClient/.idea/
 *.dmg
 *.iml
 *.keystore
+# Local validation installers are created by scripts/package_current.sh,
+# but must not be committed: old debug APKs and DMGs make source clones huge.
+# Device proof under artifacts/live-proof-*/ remains tracked.
+/artifacts/SideScreen-*/
+
 # Local safety snapshots produced by scripts/backup_android_apks.sh
 backups/apk/
 
@@ -66,9 +71,6 @@ temp/
 
 # Local ktlint binary (CI downloads its own)
 AndroidClient/ktlint
-
-# Local device-install recovery backups
-backups/apk/
 
 # AirPlay level-2 test harness: a real device key, never commit it.
 scripts/airplay-level2/.tabs8_device_key
