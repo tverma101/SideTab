@@ -95,7 +95,7 @@ views.forgetButton.setOnClickListener { forgetPairing() }
             }
         lastAttemptedEntry = copyEntry(entry)
         discoveryRecoveryArmed = true
-        showConnecting("Reconnecting to ${entry.macName}", "${entry.host}:${entry.port}")
+        showConnecting("Reconnecting to ${entry.macName}", EndpointFormat.of(entry.host, entry.port))
         attemptReconnect(entry)
     }
 
@@ -125,16 +125,20 @@ views.forgetButton.setOnClickListener { forgetPairing() }
             "WirelessTabController",
             "onStreamDisconnected called, current state=$state, storage entry exists=${storage.load() != null}",
         )
-        val entry =
-            storage.load() ?: lastAttemptedEntry ?: run {
-                transition(State.FIRST_TIME)
-                return
-            }
-
-        if (tryDiscoveryRecovery(entry)) {
-            return
+        val entry = storage.load() ?: lastAttemptedEntry
+        when (WirelessDropDecision.forDrop(
+            hasPairing = entry != null,
+            recoveryArmed = discoveryRecoveryArmed,
+            recoveryInFlight = discoveryRecoveryInFlight,
+        )) {
+            WirelessDropDecision.Action.NO_PAIRING -> transition(State.FIRST_TIME)
+            // A recovery is already resolving this outage; its callback owns
+            // the next transition. Re-entering here would flash the repair
+            // panel over the "Finding your Mac" one.
+            WirelessDropDecision.Action.AWAIT_PENDING_RECOVERY -> Unit
+            WirelessDropDecision.Action.START_RECOVERY -> entry?.let { tryDiscoveryRecovery(it) }
+            WirelessDropDecision.Action.SHOW_REPAIR -> showNetworkRepair(entry)
         }
-        showNetworkRepair(entry)
     }
 
     private fun transition(next: State) {
@@ -200,7 +204,7 @@ alternateHosts = parsed.alternateHosts,
         // Reconnect action even if persistence fails.
         persistPairing(entry)
         discoveryRecoveryArmed = true
-        showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
+        showConnecting("Connecting to ${parsed.macName}", EndpointFormat.of(parsed.host, parsed.port))
         onConnectRequested(
             parsed.host,
             parsed.port,
@@ -229,10 +233,18 @@ alternateHosts = parsed.alternateHosts,
         val cached = storage.load() ?: lastAttemptedEntry
         when (error) {
             is StreamClient.WirelessConnectError.NetworkUnreachable -> {
-                if (cached != null && tryDiscoveryRecovery(cached)) {
-                    return
+                when (WirelessDropDecision.forDrop(
+                    hasPairing = cached != null,
+                    recoveryArmed = discoveryRecoveryArmed,
+                    recoveryInFlight = discoveryRecoveryInFlight,
+                )) {
+                    // A connect failure with no pairing has nothing to recover:
+                    // the network repair panel is this path's terminal UI.
+                    WirelessDropDecision.Action.NO_PAIRING -> showNetworkRepair(null)
+                    WirelessDropDecision.Action.AWAIT_PENDING_RECOVERY -> Unit
+                    WirelessDropDecision.Action.START_RECOVERY -> cached?.let { tryDiscoveryRecovery(it) }
+                    WirelessDropDecision.Action.SHOW_REPAIR -> showNetworkRepair(cached)
                 }
-                showNetworkRepair(cached)
             }
 
             is StreamClient.WirelessConnectError.TokenRejected -> {
@@ -293,7 +305,7 @@ val updated =
             val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
             showConnecting(
                 activity.getString(R.string.wireless_reconnecting_mac, updated.macName),
-                activity.getString(R.string.wireless_endpoint, updated.host, updated.port),
+                EndpointFormat.of(updated.host, updated.port),
             )
             onConnectRequested(
                 updated.host,
@@ -337,8 +349,7 @@ val updated =
                 activity.getString(
                     R.string.wireless_repair_network_cached,
                     cached.macName,
-                    cached.host,
-                    cached.port,
+                    EndpointFormat.of(cached.host, cached.port),
                 )
             } else {
                 activity.getString(R.string.wireless_repair_network)
@@ -384,7 +395,7 @@ val updated =
 
     private fun showPairedIdle(entry: PairedHostStorage.Entry) {
         views.idleMacName.text = entry.macName
-        views.idleMacIp.text = activity.getString(R.string.wireless_endpoint, entry.host, entry.port)
+        views.idleMacIp.text = EndpointFormat.of(entry.host, entry.port)
         transition(State.PAIRED_IDLE)
     }
 

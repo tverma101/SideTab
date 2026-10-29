@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- WifiManager.WifiLock: low-latency Wi-Fi while a wireless stream is on screen. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Real panel backlight control (Settings.System.SCREEN_BRIGHTNESS).
          This is a deliberate special-access capability. It is not expected to
          be granted like a normal runtime permission; supported development

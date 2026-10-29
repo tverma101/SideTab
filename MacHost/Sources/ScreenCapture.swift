@@ -298,6 +298,18 @@ class ScreenCapture {
         /// from the network and main queues: a lock-free load racing a store
         /// can release the buffer early and the next dereference faults.
         var lastPixelBuffer: CVPixelBuffer?
+        /// Bumped for every changed wireless frame; a trailing refresh only
+        /// fires while no newer change has arrived.
+        var changeSerial: UInt64 = 0
+        /// Newest change serial VideoToolbox actually accepted. A Wi-Fi
+        /// pressure skip leaves it behind `changeSerial`, which is how the
+        /// settle refresh knows the tablet never got the final frame.
+        var deliveredSerial: UInt64 = 0
+        /// Whether this session runs the Wi-Fi settle refresh at all.
+        var settleRefreshEnabled = false
+        var trailingRefreshes: UInt64 = 0
+        var settleSkips: UInt64 = 0
+        var idleKeyframes: UInt64 = 0
         var captureCallbacks: UInt64 = 0
         var idleCallbacks: UInt64 = 0
         var nonCompleteCallbacks: UInt64 = 0
@@ -317,6 +329,9 @@ class ScreenCapture {
         let missingImageBufferCallbacks: UInt64
         let misSizedHdrFrames: UInt64
         let encodeSubmissions: UInt64
+        let trailingRefreshes: UInt64
+        let settleSkips: UInt64
+        let idleKeyframes: UInt64
     }
 
     /// A built-but-unpublished capture source. The caller owns it until it
@@ -428,16 +443,108 @@ class ScreenCapture {
 
         requestKeyframe()
 
-        guard let encoder, let cached = cachedPixelBuffer() else { return }
+        guard let encoder, let queue = encodeQueue, let cached = cachedPixelBuffer() else { return }
 
         let pts = CMTime(
             value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
             timescale: 1_000_000
         )
 
-        encodeQueue?.async {
-            guard self.stateLock.withLock({ $0.acceptingFrames }) else { return }
-            encoder.encode(pixelBuffer: cached, presentationTimeStamp: pts)
+        queue.async {
+            // On Wi-Fi the replay counts as a new change: it cancels any
+            // running settle chain and starts its own, because a replayed IDR
+            // comes out softer than the refined picture it replaces.
+            let settleSerial: UInt64?? = self.stateLock.withLock { state in
+                guard state.acceptingFrames else { return nil }
+                guard state.settleRefreshEnabled else { return .some(nil) }
+                state.changeSerial &+= 1
+                return .some(state.changeSerial)
+            }
+            guard let settleSerial else { return }
+            let accepted = encoder.encode(pixelBuffer: cached, presentationTimeStamp: pts)
+            if let serial = settleSerial {
+                if accepted { self.noteDelivered(serial: serial) }
+                self.scheduleTrailingRefresh(queue: queue, serial: serial)
+            }
+        }
+    }
+
+    private func noteDelivered(serial: UInt64) {
+        stateLock.withLock { state in
+            if state.deliveredSerial < serial { state.deliveredSerial = serial }
+        }
+    }
+
+    /// Wi-Fi refresh after the screen settles. ScreenCaptureKit delivers
+    /// nothing for an unchanged display, so the last changed frame is all the
+    /// tablet sees until something moves again. Over Wi-Fi that frame may have
+    /// been skipped by transport pressure, and a large change goes out soft
+    /// and needs a few re-encodes to sharpen. Each step re-checks the serial,
+    /// so any newer change cancels the chain, and asks
+    /// WirelessSettleRefreshPolicy whether re-encoding would deliver or add
+    /// anything. It is also where Wi-Fi takes its rare routine keyframe: an
+    /// IDR sent while the screen is still costs nothing visible, unlike one
+    /// sent mid-motion.
+    private func scheduleTrailingRefresh(
+        queue: DispatchQueue,
+        serial: UInt64,
+        step: Int = 0,
+        previousStepEncoded: Bool = false,
+        resent: Bool = false
+    ) {
+        let offsets = WirelessSettleRefreshPolicy.stepOffsetsNs
+        guard step < offsets.count else { return }
+        let waitNs = offsets[step] - (step == 0 ? 0 : offsets[step - 1])
+        queue.asyncAfter(deadline: .now() + .nanoseconds(Int(waitNs))) { [weak self] in
+            guard let self, self.encodeQueue === queue, let encoder = self.encoder else { return }
+            let pending: (box: PixelBufferBox, delivered: Bool)? = self.stateLock.withLock { state in
+                guard state.acceptingFrames, state.changeSerial == serial,
+                      let buffer = state.lastPixelBuffer else { return nil }
+                return (PixelBufferBox(buffer: buffer), state.deliveredSerial >= serial)
+            }
+            guard let pending else { return }
+            let keyframeDue = step == WirelessSettleRefreshPolicy.keyframeStep &&
+                (encoder.keyframeAgeNs().map { $0 >= EncoderGOPPolicy.wirelessIdleKeyframeMinAgeNs } ?? false)
+            // Accepted is not enough: VideoToolbox can still drop the frame
+            // under rate control, and then the tablet never got it.
+            let action = WirelessSettleRefreshPolicy.action(
+                step: step,
+                delivered: pending.delivered && !encoder.lastOutputDropped,
+                lastOutputBytes: encoder.lastOutputBytes,
+                previousStepEncoded: previousStepEncoded,
+                resent: resent,
+                keyframeDue: keyframeDue
+            )
+            if action == .keyframe { encoder.requestKeyframe() }
+            let accepted = action != .none && encoder.encode(
+                pixelBuffer: pending.box.buffer,
+                presentationTimeStamp: CMTime(
+                    value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
+                    timescale: 1_000_000
+                )
+            )
+            self.stateLock.withLock { state in
+                switch action {
+                case .none: state.settleSkips &+= 1
+                case .refresh: state.trailingRefreshes &+= 1
+                case .keyframe:
+                    state.trailingRefreshes &+= 1
+                    state.idleKeyframes &+= 1
+                }
+                if accepted, state.deliveredSerial < serial { state.deliveredSerial = serial }
+            }
+            if WirelessSettleRefreshPolicy.continues(afterStep: step, action: action) {
+                // A pressure-skipped refresh still counts as encoding here: the
+                // output it was judged on is still the latest one, so the next
+                // step retries instead of giving up on the refinement.
+                self.scheduleTrailingRefresh(
+                    queue: queue,
+                    serial: serial,
+                    step: step + 1,
+                    previousStepEncoded: action != .none,
+                    resent: resent || action != .none
+                )
+            }
         }
     }
 
@@ -726,7 +833,15 @@ class ScreenCapture {
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        // Ask ScreenCaptureKit for twice the session rate. SCK drops a frame
+        // that lands sooner than minimumFrameInterval after the one before it,
+        // and an interval equal to the display period aliases against
+        // compositor jitter: on the 60 Hz wireless display a 60 fps animation
+        // delivered only ~50 complete frames/s, and USB at 120 Hz ~110. The
+        // virtual display is created at the session rate, so its refresh
+        // remains the ceiling; on USB the adaptive pacer still owns cadence.
+        let intervalFps = fps * 2
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(intervalFps))
         // The normal 8-bit SDR path is video-range so the sender agrees with
         // Android's hardware decoder conversion. `8bit` remains an explicit
         // full-range A/B control; `10bit` remains the Main10 video-range path.
@@ -781,8 +896,16 @@ class ScreenCapture {
         // the session.
         let backpressure = EncodeBackpressure()
         encodeQueue = queue
-        stateLock.withLock { $0.lastPixelBuffer = nil }
         let sessionFlags = pipelineFlags
+        // Experiments that rewrite pixels or swap in HDR buffers keep the old
+        // behaviour, because the raw capture is not what they encode.
+        let settleRefreshEnabled = sessionFlags.wireless &&
+            !sessionFlags.mutatesCapturedPixels &&
+            !HDRConverter.enabled
+        stateLock.withLock { state in
+            state.lastPixelBuffer = nil
+            state.settleRefreshEnabled = settleRefreshEnabled
+        }
         let sessionSize = encodeSize(for: codec)
 
         output.onFrameReceived = { [weak self, weak output] sampleBuffer in
@@ -818,7 +941,10 @@ class ScreenCapture {
                             pendingEncodeSkips: state.pendingEncodeSkips,
                             missingImageBufferCallbacks: state.missingImageBufferCallbacks,
                             misSizedHdrFrames: state.misSizedHdrFrames,
-                            encodeSubmissions: state.encodeSubmissions
+                            encodeSubmissions: state.encodeSubmissions,
+                            trailingRefreshes: state.trailingRefreshes,
+                            settleSkips: state.settleSkips,
+                            idleKeyframes: state.idleKeyframes
                         )
                         : nil
                 }
@@ -870,7 +996,10 @@ class ScreenCapture {
                     "pendingSkips=\(cadence.pendingEncodeSkips), " +
                     "missingImage=\(cadence.missingImageBufferCallbacks), " +
                     "misSizedHdr=\(cadence.misSizedHdrFrames), " +
-                    "encodeSubmissions=\(cadence.encodeSubmissions)"
+                    "encodeSubmissions=\(cadence.encodeSubmissions), " +
+                    "trailingRefreshes=\(cadence.trailingRefreshes), " +
+                    "settleSkips=\(cadence.settleSkips), " +
+                    "idleKeyframes=\(cadence.idleKeyframes)"
                 )
             }
 
@@ -894,6 +1023,20 @@ class ScreenCapture {
             ) {
                 self.stateLock.withLock { $0.dirtyRectSkips &+= 1 }
                 return
+            }
+
+            // Cache the newest changed frame before any gate can drop it, and
+            // arm the Wi-Fi trailing refresh (see scheduleTrailingRefresh).
+            var settleSerial: UInt64?
+            if settleRefreshEnabled {
+                let changedFrame = PixelBufferBox(buffer: imageBuffer)
+                let serial = self.stateLock.withLock { state -> UInt64 in
+                    state.lastPixelBuffer = changedFrame.buffer
+                    state.changeSerial &+= 1
+                    return state.changeSerial
+                }
+                settleSerial = serial
+                self.scheduleTrailingRefresh(queue: queue, serial: serial)
             }
 
             // USB above 60 Hz: capture keeps sampling at the configured rate,
@@ -978,8 +1121,10 @@ class ScreenCapture {
             }
             queue.async {
                 let hopSignpost = FramePipelineSignpost.encodeQueueHop.beginInterval("hop")
-                if self.stateLock.withLock({ $0.acceptingFrames }) {
-                    self.encoder?.encode(pixelBuffer: frameToEncode.buffer, presentationTimeStamp: pts)
+                if self.stateLock.withLock({ $0.acceptingFrames }),
+                   self.encoder?.encode(pixelBuffer: frameToEncode.buffer, presentationTimeStamp: pts) == true,
+                   let settleSerial {
+                    self.noteDelivered(serial: settleSerial)
                 }
                 backpressure.release()
                 FramePipelineSignpost.encodeQueueHop.endInterval("hop", hopSignpost)

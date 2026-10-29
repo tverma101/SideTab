@@ -57,6 +57,7 @@ class WirelessFreshnessPolicyTest {
                 hasValidLatency = false,
                 isFirstOutput = false,
                 wireless = true,
+                newerFrameQueued = true,
                 maxReasonableLatencyNs = reasonable,
                 maxRenderLatencyNs = usbRender,
             ),
@@ -71,6 +72,7 @@ class WirelessFreshnessPolicyTest {
                 hasValidLatency = true,
                 isFirstOutput = false,
                 wireless = true,
+                newerFrameQueued = true,
                 maxReasonableLatencyNs = reasonable,
                 maxRenderLatencyNs = usbRender,
             ),
@@ -85,6 +87,7 @@ class WirelessFreshnessPolicyTest {
                 hasValidLatency = true,
                 isFirstOutput = false,
                 wireless = true,
+                newerFrameQueued = true,
                 maxReasonableLatencyNs = reasonable,
                 maxRenderLatencyNs = usbRender,
             ),
@@ -101,6 +104,7 @@ class WirelessFreshnessPolicyTest {
                     hasValidLatency = false,
                     isFirstOutput = true,
                     wireless = wireless,
+                    newerFrameQueued = true,
                     maxReasonableLatencyNs = reasonable,
                     maxRenderLatencyNs = usbRender,
                 ),
@@ -117,6 +121,7 @@ class WirelessFreshnessPolicyTest {
                 hasValidLatency = true,
                 isFirstOutput = false,
                 wireless = false,
+                newerFrameQueued = true,
                 maxReasonableLatencyNs = reasonable,
                 maxRenderLatencyNs = usbRender,
             ),
@@ -127,6 +132,48 @@ class WirelessFreshnessPolicyTest {
                 hasValidLatency = true,
                 isFirstOutput = false,
                 wireless = false,
+                newerFrameQueued = true,
+                maxReasonableLatencyNs = reasonable,
+                maxRenderLatencyNs = usbRender,
+            ),
+        )
+    }
+
+    /**
+     * The newest decoded frame is the freshest picture the panel can have.
+     * Dropping it left the end of a scroll or keystroke missing on a still
+     * desktop, because the Mac sends nothing more until something moves.
+     */
+    @Test
+    fun wirelessNewestOutputRendersEvenWhenLate() {
+        for ((latency, valid) in listOf(
+            WirelessFreshnessPolicy.MAX_DECODED_FRAME_AGE_NS + 1 to true,
+            reasonable + 1 to false,
+        )) {
+            assertTrue(
+                WirelessFreshnessPolicy.shouldRenderOutput(
+                    decodedLatencyNs = latency,
+                    hasValidLatency = valid,
+                    isFirstOutput = false,
+                    wireless = true,
+                    newerFrameQueued = false,
+                    maxReasonableLatencyNs = reasonable,
+                    maxRenderLatencyNs = usbRender,
+                ),
+            )
+        }
+    }
+
+    /** USB is unchanged: its host keeps refreshing a still screen itself. */
+    @Test
+    fun usbLateOutputDropsEvenWhenNewest() {
+        assertFalse(
+            WirelessFreshnessPolicy.shouldRenderOutput(
+                decodedLatencyNs = usbRender + 1,
+                hasValidLatency = true,
+                isFirstOutput = false,
+                wireless = false,
+                newerFrameQueued = false,
                 maxReasonableLatencyNs = reasonable,
                 maxRenderLatencyNs = usbRender,
             ),

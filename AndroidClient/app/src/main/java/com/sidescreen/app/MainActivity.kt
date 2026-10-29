@@ -98,7 +98,9 @@ class MainActivity : AppCompatActivity() {
     // All callbacks from an old StreamClient become inert as soon as a newer
     // connect starts. Without this generation fence, a sender restart can
     // leave several clients reconnecting at once and starve the decoder.
-    @Volatile private var activeConnectionGeneration = 0L
+    private val connectionGenerationFence = ConnectionGenerationFence()
+    private val activeConnectionGeneration: Long
+        get() = connectionGenerationFence.currentGeneration
 
     /**
      * Fence for the asynchronous video-pipeline build. Every path that retires
@@ -229,6 +231,7 @@ class MainActivity : AppCompatActivity() {
     private var externallyPowered = false
     private var powerSaveMode = false
     private var lastPowerPolicySignature: String? = null
+    private val wifiLowLatencyLock by lazy { WifiLowLatencyLock(applicationContext) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -528,6 +531,10 @@ class MainActivity : AppCompatActivity() {
             currentTextureSurface?.takeIf { it.isValid },
         ).forEach { applyFrameRateRequest(it, decision) }
 
+        if (wifiLowLatencyLock.set(decision.wifiLowLatency)) {
+            mainDiag("Wi-Fi low-latency lock ${if (decision.wifiLowLatency) "acquired" else "released"}")
+        }
+
         val signature =
             "${decision.reason}:${decision.requestedRefreshRateHz}:powered=$externallyPowered," +
                 "saver=$powerSaveMode,foreground=$activityInForeground"
@@ -783,6 +790,25 @@ class MainActivity : AppCompatActivity() {
     private fun updateStatus(status: String) {
         runOnUiThread {
             binding.statusText.text = status
+        }
+    }
+
+    /**
+     * Surface an in-progress reconnect in the panel status text and the
+     * overlay's link cell. During an in-client wireless retry the tablet shows
+     * a frozen frame with no other signal, so the overlay is force-shown for
+     * the duration even when the stats overlay preference is off; the
+     * connected branch restores the preference via updateOverlayVisibility.
+     */
+    private fun showReconnectProgress(message: String, attempt: Int, maxAttempts: Int) {
+        updateStatus(message)
+        binding.streamStatusBarBinding.linkStateText.text =
+            getString(R.string.link_state_reconnecting, attempt, maxAttempts)
+        binding.streamStatusBarBinding.linkStateText.setTextColor(
+            ContextCompat.getColor(this, R.color.ss_warning),
+        )
+        if (streamClient != null) {
+            binding.streamStatusBarBinding.statusBar.visibility = View.VISIBLE
         }
     }
 
@@ -1377,23 +1403,28 @@ class MainActivity : AppCompatActivity() {
      * HEVC mime keeps consuming the H.264 stream and never outputs a frame —
      * a permanent black screen on AVC-only devices (e.g. Unisoc tablets).
      */
-    private fun onStreamCodecSelected(isHevc: Boolean) {
-        val expectedMime =
-            if (isHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
-        codecNegotiationJob?.cancel()
-        codecNegotiationJob = null
+    private fun onStreamCodecSelected(client: StreamClient, generation: Long, isHevc: Boolean) {
         runOnUiThread {
-            val dec = videoDecoder
-            when {
-                dec == null -> {
-                    mainDiag("Codec selected ($expectedMime) — initializing deferred decoder")
-                    initializeDecoderForCurrentSurface()
-                }
-                dec.mime != expectedMime -> {
-                    mainDiag("Stream codec is $expectedMime but decoder is ${dec.mime} — recreating")
-                    dec.release()
-                    videoDecoder = null
-                    initializeDecoderForCurrentSurface()
+            connectionGenerationFence.runIfCurrent(
+                generation,
+                predicate = { streamClient === client },
+            ) {
+                val expectedMime =
+                    if (isHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+                codecNegotiationJob?.cancel()
+                codecNegotiationJob = null
+                val dec = videoDecoder
+                when {
+                    dec == null -> {
+                        mainDiag("Codec selected ($expectedMime) — initializing deferred decoder")
+                        initializeDecoderForCurrentSurface()
+                    }
+                    dec.mime != expectedMime -> {
+                        mainDiag("Stream codec is $expectedMime but decoder is ${dec.mime} — recreating")
+                        dec.release()
+                        videoDecoder = null
+                        initializeDecoderForCurrentSurface()
+                    }
                 }
             }
         }
@@ -1972,22 +2003,28 @@ class MainActivity : AppCompatActivity() {
         timestamp: Long,
         isKeyframe: Boolean,
     ) {
-        if (!isCurrentConnection(client, generation)) {
-            client.releaseBuffer(frameData)
-            return
+        var decoderReady = false
+        var shouldRequestKeyframe = false
+        val current = connectionGenerationFence.runIfCurrent(
+            generation,
+            predicate = { streamClient === client },
+        ) {
+            val decoder = videoDecoder?.takeIf { it.isReady }
+            if (decoder != null) {
+                // Keep retirement from releasing this decoder between the
+                // ownership check and its non-blocking frame handoff.
+                decoder.decode(frameData, frameSize, timestamp, isKeyframe)
+                decoderReady = true
+            } else {
+                shouldRequestKeyframe = displayWidth > 0 && displayHeight > 0
+            }
         }
-
-        val decoder = videoDecoder?.takeIf { it.isReady }
-        if (decoder != null) {
-            decoder.decode(frameData, frameSize, timestamp, isKeyframe)
-            return
+        if (!current || !decoderReady) client.releaseBuffer(frameData)
+        if (!current) return
+        if (!decoderReady) {
+            if (shouldRequestKeyframe) client.requestKeyframe(reason = "decoder not ready")
+            mainDiag("FRAME DROPPED: decoder not ready; requested refresh=$isKeyframe")
         }
-
-        client.releaseBuffer(frameData)
-        if (displayWidth > 0 && displayHeight > 0) {
-            client.requestKeyframe(reason = "decoder not ready")
-        }
-        mainDiag("FRAME DROPPED: decoder not ready; requested refresh=$isKeyframe")
     }
 
     /** Wire all stream callbacks through the same client and generation fence. */
@@ -2014,7 +2051,24 @@ class MainActivity : AppCompatActivity() {
 
         // Real panel backlight from the host (BRIGHT over control channel).
         client.onBrightness = { v ->
-            if (isCurrentConnection(client, generation)) applyBacklight(v)
+            connectionGenerationFence.runIfCurrent(
+                generation,
+                predicate = { streamClient === client },
+            ) {
+                applyBacklight(v)
+            }
+        }
+
+        client.onWirelessRetry = { attempt, maxAttempts ->
+            runOnUiThread {
+                if (isCurrentConnection(client, generation)) {
+                    showReconnectProgress(
+                        getString(R.string.reconnect_wireless_progress, attempt, maxAttempts),
+                        attempt,
+                        maxAttempts,
+                    )
+                }
+            }
         }
 
         client.onConnectionStatus = { connected ->
@@ -2027,6 +2081,12 @@ class MainActivity : AppCompatActivity() {
                 isConnected = connected
                 macServerKnownAvailable = connected
                 updateStatus(if (connected) "Connected - Streaming active" else "Disconnected")
+                if (connected) {
+                    binding.streamStatusBarBinding.linkStateText.text = getString(R.string.link_state_live)
+                    binding.streamStatusBarBinding.linkStateText.setTextColor(
+                        ContextCompat.getColor(this, R.color.ss_accent),
+                    )
+                }
                 binding.connectButton.isEnabled = !connected
                 binding.disconnectButton.isEnabled = connected
                 binding.statusIndicator.setBackgroundResource(
@@ -2069,8 +2129,12 @@ class MainActivity : AppCompatActivity() {
                     // prove this drop belongs to the client that just died, and
                     // isCurrentConnection only holds while the field still
                     // points at that client.
-                    val dropBelongsToCurrentSession = isCurrentConnection(client, generation)
-                    streamClient = null
+                    val dropBelongsToCurrentSession = connectionGenerationFence.runIfCurrent(
+                        generation,
+                        predicate = { streamClient === client },
+                    ) {
+                        streamClient = null
+                    }
                     stopPingTimer()
                     releaseVideoPipeline()
                     displayWidth = 0
@@ -2098,21 +2162,32 @@ class MainActivity : AppCompatActivity() {
         }
 
         client.onCodecSelected = { isHevc ->
-            if (isCurrentConnection(client, generation)) onStreamCodecSelected(isHevc)
+            if (isCurrentConnection(client, generation)) onStreamCodecSelected(client, generation, isHevc)
         }
 
         client.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
-            if (isCurrentConnection(client, generation)) {
-                mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-                warnIfAvcOnlyWithoutNegotiation()
+            val accepted = connectionGenerationFence.runIfCurrent(
+                generation,
+                predicate = { streamClient === client },
+            ) {
+                // Commit dimensions while this client still owns the current
+                // generation, so a retired callback cannot overwrite the next
+                // session's display configuration.
                 displayWidth = width
                 displayHeight = height
                 displayRotation = rotation
                 displayFlipHorizontal = flipHorizontal
                 displayFlipVertical = flipVertical
                 displayConfigReceivedAtMs = System.currentTimeMillis()
+            }
+            if (accepted) {
+                mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
+                warnIfAvcOnlyWithoutNegotiation()
                 runOnUiThread {
-                    if (isCurrentConnection(client, generation)) {
+                    connectionGenerationFence.runIfCurrent(
+                        generation,
+                        predicate = { streamClient === client },
+                    ) {
                         binding.streamStatusBarBinding.resolutionText.text = getString(R.string.stream_resolution, width, height)
                         applyPowerPolicy()
                         applyRotation(rotation, flipHorizontal, flipVertical)
@@ -2219,7 +2294,15 @@ class MainActivity : AppCompatActivity() {
                     "USB session resume attempt ${usbReconnectPolicy.attemptCount} " +
                         "(grace ${USB_RESUME_GRACE_MS}ms)",
                 )
-                updateStatus("Connection lost — reconnecting to the Mac…")
+                showReconnectProgress(
+                    getString(
+                        R.string.reconnect_usb_progress,
+                        usbReconnectPolicy.attemptCount,
+                        usbReconnectPolicy.maxAttempts,
+                    ),
+                    usbReconnectPolicy.attemptCount,
+                    usbReconnectPolicy.maxAttempts,
+                )
                 connectUsb(session)
             }
     }
@@ -2233,14 +2316,12 @@ class MainActivity : AppCompatActivity() {
     private fun connectUsb(
         session: UsbSession,
     ) {
-        val generation = activeConnectionGeneration + 1
-        activeConnectionGeneration = generation
+        val (generation, retiredClient) = retireCurrentStreamForNewGeneration()
         // session.everConnected stays true on purpose: this IS the resume of a
         // previously live session, so if this attempt also fails to establish, the
         // resulting status(false) drop must still be eligible for the next
         // bounded attempt. The recovery budget is intentionally not reset here.
-        streamClient?.disconnect()
-        streamClient = null
+        retiredClient?.disconnect()
         releaseVideoPipeline()
         isConnected = false
         displayWidth = 0
@@ -2256,13 +2337,21 @@ class MainActivity : AppCompatActivity() {
                 controlHost = session.controlHost,
                 controlPort = session.controlPort,
             )
-        streamClient = client
+        if (!connectionGenerationFence.runIfCurrent(generation) { streamClient = client }) {
+            client.disconnect()
+            return
+        }
         setupStreamClientCallbacks(client, generation, session.host)
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                log("Resuming USB session to ${session.host}:${session.port}...")
+                log("Resuming USB session to ${EndpointFormat.of(session.host, session.port)}...")
                 client.connect()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Lifecycle teardown cancels this coroutine; swallowing the
+                // cancellation would count as a clean completion of structured
+                // concurrency work that was asked to stop.
+                throw e
             } catch (e: Exception) {
                 // Recovery is owned by the onConnectionStatus(false) callback
                 // above, which StreamClient emits from its `finally` even for a
@@ -2284,16 +2373,14 @@ class MainActivity : AppCompatActivity() {
     ) {
         videoRecoveryPolicy.reset()
         videoFailureNotified = false
-        val generation = activeConnectionGeneration + 1
-        activeConnectionGeneration = generation
+        val (generation, retiredClient) = retireCurrentStreamForNewGeneration()
         // Switching to a wireless session retires the remembered wired endpoint
         // so a later wireless drop can never resume a stale USB session.
         lastUsbSession?.everConnected = false
         usbReconnectJob?.cancel()
         usbReconnectJob = null
         usbReconnectPolicy.onSessionEnded()
-        streamClient?.disconnect()
-        streamClient = null
+        retiredClient?.disconnect()
         releaseVideoPipeline()
         isConnected = false
         displayWidth = 0
@@ -2310,12 +2397,15 @@ class MainActivity : AppCompatActivity() {
                 controlPort = controlPort ?: port + 1,
                 alternateHosts = alternateHosts,
             )
-        streamClient = client
+        if (!connectionGenerationFence.runIfCurrent(generation) { streamClient = client }) {
+            client.disconnect()
+            return
+        }
         setupStreamClientCallbacks(client, generation, host)
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                log("Connecting wirelessly to $host:$port...")
+                log("Connecting wirelessly to ${EndpointFormat.of(host, port)}...")
                 client.connectWireless(token, deviceName)
                 // NOTE: onConnectSuccess is fired from the onConnectionStatus(true)
                 // listener (above) right after handshake OK — not here. This line
@@ -2326,6 +2416,8 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     if (isCurrentConnection(client, generation)) wirelessController.onConnectError(e)
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 if (!isCurrentConnection(client, generation)) return@launch
                 log("Wireless connect failed: ${e.message}")
@@ -2349,10 +2441,8 @@ class MainActivity : AppCompatActivity() {
         usbReconnectPolicy.onSessionEnded()
         videoRecoveryPolicy.reset()
         videoFailureNotified = false
-        val generation = activeConnectionGeneration + 1
-        activeConnectionGeneration = generation
-        streamClient?.disconnect()
-        streamClient = null
+        val (generation, retiredClient) = retireCurrentStreamForNewGeneration()
+        retiredClient?.disconnect()
         releaseVideoPipeline()
         isConnected = false
         displayWidth = 0
@@ -2375,7 +2465,10 @@ class MainActivity : AppCompatActivity() {
                 controlHost = controlHost,
                 controlPort = controlPort,
             )
-        streamClient = client
+        if (!connectionGenerationFence.runIfCurrent(generation) { streamClient = client }) {
+            client.disconnect()
+            return
+        }
         // Remember the wired endpoint while the user is asking for it, so a drop
         // of a session that actually reached "connected" can be resumed without
         // requiring the connection card to be visible again.
@@ -2384,7 +2477,7 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                log("Connecting to $host:$port...")
+                log("Connecting to ${EndpointFormat.of(host, port)}...")
                 client.connect()
             } catch (e: Exception) {
                 if (activeConnectionGeneration != generation) return@launch
@@ -2420,10 +2513,24 @@ class MainActivity : AppCompatActivity() {
     private fun isCurrentConnection(
         client: StreamClient,
         generation: Long,
-    ): Boolean = activeConnectionGeneration == generation && streamClient === client
+    ): Boolean = connectionGenerationFence.runIfCurrent(
+        generation,
+        predicate = { streamClient === client },
+    ) {}
+
+    private fun retireCurrentStreamForNewGeneration(): Pair<Long, StreamClient?> =
+        connectionGenerationFence.withLock {
+            val generation = connectionGenerationFence.advance()
+            val retiredClient = streamClient
+            streamClient = null
+            generation to retiredClient
+        }
 
     private fun disconnect(restoreUi: Boolean = true) {
-        activeConnectionGeneration += 1
+        val retiredClient = connectionGenerationFence.withLock {
+            connectionGenerationFence.advance()
+            streamClient.also { streamClient = null }
+        }
         // An explicit Disconnect (or teardown) ends automatic USB recovery. The
         // generation bump below makes the dropped client's status callback inert,
         // so this is the single place that has to cancel the pending resume.
@@ -2435,8 +2542,7 @@ class MainActivity : AppCompatActivity() {
         // undone by a backgrounded status callback from the dead client.
         lastUsbSession?.everConnected = false
         stopPingTimer()
-        streamClient?.disconnect()
-        streamClient = null
+        retiredClient?.disconnect()
         releaseVideoPipeline()
         isConnected = false
         cancelAutoDisconnect()
@@ -3014,6 +3120,7 @@ class MainActivity : AppCompatActivity() {
             vsrCmdReceiver = null
         }
         wirelessController.close()
+        wifiLowLatencyLock.set(false)
         super.onDestroy()
         stopChecklistUpdates()
         cleanup()

@@ -136,6 +136,13 @@ class StreamClient(
 
     var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
+
+    /**
+     * Fires before each delay of the wireless in-client reconnect loop so the
+     * UI can say "reconnecting (attempt n/max)" instead of staying silent on a
+     * frozen frame for the whole outage. [attempt] is 1-based.
+     */
+    var onWirelessRetry: ((attempt: Int, maxAttempts: Int) -> Unit)? = null
     var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
     var onStats: ((Double, Double) -> Unit)? = null
     var onCodecSelected: ((Boolean) -> Unit)? = null
@@ -529,6 +536,7 @@ class StreamClient(
                     TAG,
                     "Wireless reconnect attempt ${reconnectAttempt + 1}/$MAX_WIRELESS_RECONNECT_ATTEMPTS in ${delayMs}ms",
                 )
+                onWirelessRetry?.invoke(reconnectAttempt, MAX_WIRELESS_RECONNECT_ATTEMPTS)
                 delay(delayMs)
             }
         } finally {
@@ -1581,7 +1589,7 @@ class StreamClient(
         // suppresses an unchanged desktop. TCP preserved the encoded reference
         // chain; the first frame after that quiet period must not be mistaken for
         // a lost-keyframe condition and trigger an unnecessary large IDR burst.
-        if (isLongVideoGap(previousFrameReceivedNs, receiveTimestamp)) {
+        if (isLongVideoGap(previousFrameReceivedNs, receiveTimestamp, isWirelessSession)) {
             lastKeyframeReceivedNs = receiveTimestamp
             return
         }
@@ -1590,7 +1598,7 @@ class StreamClient(
         if (lastKeyframeNs <= 0L) return
 
         val keyframeAgeNs = receiveTimestamp - lastKeyframeNs
-        if (keyframeAgeNs > KEYFRAME_STALE_INTERVAL_NS) {
+        if (keyframeAgeNs > keyframeStaleIntervalNs(isWirelessSession)) {
             requestKeyframe(reason = "last keyframe ${keyframeAgeNs / 1_000_000L}ms ago")
         }
     }
@@ -1740,9 +1748,18 @@ class StreamClient(
         private const val WIRELESS_RECONNECT_MAX_MS = 5_000L
         private const val VIDEO_PROBE_INTERVAL_NS = 3_000_000_000L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
-        // Five-second wireless GOP on the Mac plus one second of scheduling/
-        // decode slack. Decoder reset/error paths request keyframes directly.
+        // USB's one- or five-second GOP on the Mac plus one second of
+        // scheduling/decode slack. Decoder reset/error paths request keyframes
+        // directly. This is also the frame silence that counts as an idle screen.
         private const val KEYFRAME_STALE_INTERVAL_NS = 6_000_000_000L
+
+        // The Mac takes its Wi-Fi keyframe when motion stops and falls back to a
+        // 30-second GOP during unbroken motion. Asking sooner would bring back
+        // the ~900 KB mid-motion IDR that stalled the link every few seconds.
+        // The same interval bounds what counts as an idle screen: Wi-Fi silence
+        // routinely runs for seconds, and treating that as a lost-keyframe
+        // re-anchor would retire the very watchdog that detects one.
+        private const val WIRELESS_KEYFRAME_STALE_INTERVAL_NS = 32_000_000_000L
         private const val COALESCED_INPUT_BURST = 2
         private const val TOUCH_ACTION_MOVE = 1
 
@@ -1774,13 +1791,17 @@ class StreamClient(
             return (WIRELESS_RECONNECT_INITIAL_MS shl shift).coerceAtMost(WIRELESS_RECONNECT_MAX_MS)
         }
 
+        internal fun keyframeStaleIntervalNs(wireless: Boolean): Long =
+            if (wireless) WIRELESS_KEYFRAME_STALE_INTERVAL_NS else KEYFRAME_STALE_INTERVAL_NS
+
         internal fun isLongVideoGap(
             previousFrameNs: Long,
             currentFrameNs: Long,
+            wireless: Boolean = false,
         ): Boolean =
             previousFrameNs > 0L &&
                 currentFrameNs >= previousFrameNs &&
-                currentFrameNs - previousFrameNs > KEYFRAME_STALE_INTERVAL_NS
+                currentFrameNs - previousFrameNs > keyframeStaleIntervalNs(wireless)
 
         internal fun isSyncFrame(
             data: ByteArray,

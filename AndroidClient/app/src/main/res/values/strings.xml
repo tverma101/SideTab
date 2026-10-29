@@ -27,12 +27,11 @@
     <string name="wireless_repair_protocol_cached">Could not complete the secure handshake with %1$s. Tap Reconnect to try again, or scan a fresh QR only if the Mac was reset.</string>
     <string name="wireless_repair_protocol">Could not complete the secure handshake with the Mac. Scan the QR to pair.</string>
     <string name="wireless_repair_network_title">⚠ Could not reach Mac</string>
-    <string name="wireless_repair_network_cached">No response from %1$s at %2$s:%3$d.\n\nSideScreen also searched the local network for the paired Mac but could not resolve a working endpoint. Make sure the Mac app is running on the same WiFi, then tap Reconnect. Scan QR only if you need to pair again.</string>
+    <string name="wireless_repair_network_cached">No response from %1$s at %2$s.\n\nSideScreen also searched the local network for the paired Mac but could not resolve a working endpoint. Make sure the Mac app is running on the same WiFi, then tap Reconnect. Scan QR only if you need to pair again.</string>
     <string name="wireless_repair_network">No response from your Mac. Make sure both devices are on the same WiFi and the Mac app is running, then scan the QR to pair.</string>
     <string name="wireless_finding_mac">Finding %1$s…</string>
     <string name="wireless_checking_network">Checking the local network</string>
     <string name="wireless_reconnecting_mac">Reconnecting to %1$s</string>
-    <string name="wireless_endpoint">%1$s:%2$d</string>
 
     <string name="ui_0_031">0.031</string>
     <string name="ui_0_80">0.80</string>
@@ -68,7 +67,12 @@
     <string name="ui_edge_threshold_sgsr1" tools:ignore="Typos">Edge Threshold (SGSR1)</string>
     <string name="ui_em_dash">—</string>
     <string name="ui_forget_this_mac">Forget this Mac</string>
+    <string name="ui_link">LINK</string>
     <string name="ui_fps">FPS</string>
+    <string name="link_state_live">LIVE</string>
+    <string name="link_state_reconnecting">RETRY %1$d/%2$d</string>
+    <string name="reconnect_wireless_progress">Connection lost — reconnecting (attempt %1$d of %2$d)…</string>
+    <string name="reconnect_usb_progress">Connection lost — reconnecting to the Mac (attempt %1$d of %2$d)…</string>
     <string name="ui_fps_bitrate_resolution">FPS, bitrate, resolution</string>
     <string name="ui_gpu_postprocess_sgsr1_cas" tools:ignore="Typos">GPU postprocess (SGSR1 / CAS)</string>
     <string name="ui_hide_settings_icon">Hide Settings Icon</string>

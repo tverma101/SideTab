@@ -21,7 +21,17 @@ enum WirelessFreshnessPolicy {
     static let averageBitrateMbps = 40
     static let peakBitrateMbps = 60
 
-    static let minimumSendBufferHeadroomBytes = 32 * 1024
+    /// `NWProtocolTCP.Metadata.availableSendBuffer` is the number of bytes
+    /// still queued in the kernel send buffer, not free space: it reads 0 on
+    /// an idle socket and climbs to the 128 KiB buffer size against a stalled
+    /// peer (measured 2026-10-06). It is sampled just before a frame is sent,
+    /// so it holds earlier frames the peer has not taken yet. The frame about
+    /// to be sent stands in for one frame still draining: live 60 fps Wi-Fi
+    /// motion sat at p50 16 KiB / p90 40 KiB queued with ~20 KiB frames, while
+    /// a healthy 110 KiB frame alone fills most of the buffer. More than
+    /// 64 KiB beyond that means the link has fallen behind, and routine
+    /// encodes pause briefly.
+    static let maxQueuedBacklogBytes = 64 * 1024
     static let sendBufferPauseNs: UInt64 = 20_000_000
 
     static func shouldRender(decodedLatencyNs: UInt64, isFirstFrame: Bool) -> Bool {
