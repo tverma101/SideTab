@@ -1382,9 +1382,31 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             performance: performance
         ))
         window.isReleasedWhenClosed = false
+        // A menu-bar app's window must come to the user, not take the user to
+        // it: without this, activating the app from the status menu switched
+        // to whichever Space (or display) the window was last left on.
+        window.collectionBehavior = [.moveToActiveSpace]
 
         self.init(window: window)
         window.delegate = self
+    }
+
+    /// Show the settings window on the active Space and, when it is not
+    /// already on screen, centred on the display under the pointer, which is
+    /// the menu bar the user just clicked.
+    func present() {
+        guard let window else { return }
+        if !window.isVisible,
+           let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) {
+            let visible = screen.visibleFrame
+            let size = window.frame.size
+            let origin = NSPoint(
+                x: visible.midX - size.width / 2,
+                y: max(visible.minY, visible.midY - size.height / 2)
+            )
+            window.setFrameOrigin(origin)
+        }
+        showWindow(nil)
     }
 
     func windowDidMove(_ notification: Notification) {

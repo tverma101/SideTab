@@ -478,6 +478,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Items are rebuilt on every open (menuNeedsUpdate) so the menu always
         // reflects live server/connection state.
+        //
+        // Keep the system-presented `statusItem.menu`. A custom button action
+        // that activates the app and calls NSMenu.popUp switched Spaces on
+        // every click and could anchor the menu on the tablet's menu bar.
+        // The system path opens under the clicked icon without activating.
         let menu = NSMenu()
         menu.delegate = self
         menu.autoenablesItems = false
@@ -554,7 +559,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     @objc func showSettings() {
-        settingsWindow?.showWindow(nil)
+        settingsWindow?.present()
         NSApp.activate(ignoringOtherApps: true)
         Task { @MainActor [weak self] in
             self?.refreshStatusIndicators()

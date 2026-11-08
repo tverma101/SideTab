@@ -43,9 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `analyzeNALUnits`, the only Annex-B *reader* in the repository, is preserved as `HEVCNALInspector` in `MacHost/Sources` where it is linted and covered by tests. It also fixes an out-of-bounds trap on short input and names the AUD/EOS/EOB/FD unit types the harness omitted.
 
 ### Fixed
+- Opening Settings from the menu bar no longer switches to another Space or display. The window now joins the active Space and opens centred on the display whose menu bar was clicked.
 - Live streams without a verified USB serial no longer claim physical USB detection.
 - Failed Android decoders release rejected input slots and rebuild within a finite budget, with a visible terminal error.
-- Previously live foreground USB sessions resume after transient drops within four attempts and 60 seconds.
+- Previously live foreground USB sessions resume after transient drops within eight attempts and 60 seconds. The wait between attempts doubles from 2.5 s to a 10 s cap. While the Mac app is down, `adb reverse` still accepts the tablet's connect and closes it at once, so the old flat 2.5 s wait spent the whole budget about 10 s into a Mac relaunch and left the tablet disconnected.
 - Mac session events and capture rebuilds reject stale callbacks and clean up superseded streams.
 - VideoToolbox settings rebuilds retain the working encoder if replacement allocation fails.
 - Long-running host logs rotate while the file handle stays open and tolerate unavailable storage.

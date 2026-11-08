@@ -71,6 +71,20 @@ internal class USBReconnectPolicy(
     val attemptCount: Int get() = attempts
 
     /**
+     * Wait before the next attempt. While the Mac app is down, the tablet-side
+     * `adb reverse` listener still accepts the TCP connect and the host side
+     * then closes it at once, so every attempt fails within milliseconds. At a
+     * flat 2.5 s grace the whole budget was spent ~10 s into the outage, and a
+     * Mac app relaunch or reinstall left the tablet disconnected until the
+     * user tapped Connect. Doubling the wait up to [MAX_DELAY_MS] spreads the
+     * attempts across the whole window instead.
+     */
+    fun nextDelayMs(): Long {
+        val shift = attempts.coerceAtMost(MAX_DELAY_SHIFT)
+        return (BASE_DELAY_MS shl shift).coerceAtMost(MAX_DELAY_MS)
+    }
+
+    /**
      * A live reconnect (or any fresh user-initiated connect) proves the path
      * works, so the next unrelated drop gets a full budget. The window is left
      * unset on purpose: it must start at the first drop, not at connect time, or
@@ -91,7 +105,10 @@ internal class USBReconnectPolicy(
     }
 
     private companion object {
-        const val DEFAULT_MAX_ATTEMPTS = 4
+        const val DEFAULT_MAX_ATTEMPTS = 8
         const val DEFAULT_WINDOW_MS = 60_000L
+        const val BASE_DELAY_MS = 2_500L
+        const val MAX_DELAY_MS = 10_000L
+        const val MAX_DELAY_SHIFT = 2
     }
 }

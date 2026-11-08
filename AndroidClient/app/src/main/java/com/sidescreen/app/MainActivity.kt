@@ -67,14 +67,6 @@ private const val LEGACY_E3_PORT = 54326
  */
 private const val CODEC_NEGOTIATION_GRACE_MS = 1_500L
 
-/**
- * Grace before a bounded wired resume. One known host-side cause of a dropped
- * wired session is the Mac repairing its own crashed ADB server / torn-down
- * `adb reverse` bridge, which takes about two seconds; dialing sooner can just
- * reproduce the same failure.
- */
-private const val USB_RESUME_GRACE_MS = 2_500L
-
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
     private val pairedHostStorage by lazy { PairedHostStorage(this) }
@@ -2204,8 +2196,10 @@ class MainActivity : AppCompatActivity() {
         val session = lastUsbSession?.takeIf { it.everConnected } ?: return
         usbReconnectJob =
             lifecycleScope.launch {
-                // Let the Mac finish repairing adb reverse before dialing again.
-                delay(USB_RESUME_GRACE_MS)
+                // Let the Mac finish repairing adb reverse (or relaunching)
+                // before dialing again; the wait grows with each attempt.
+                val graceMs = usbReconnectPolicy.nextDelayMs()
+                delay(graceMs)
                 if (!usbReconnectPolicy.recordAttempt(SystemClock.elapsedRealtime())) return@launch
                 val stillEligible =
                     dropBelongsToCurrentSession &&
@@ -2217,7 +2211,7 @@ class MainActivity : AppCompatActivity() {
                 if (!stillEligible) return@launch
                 mainDiag(
                     "USB session resume attempt ${usbReconnectPolicy.attemptCount} " +
-                        "(grace ${USB_RESUME_GRACE_MS}ms)",
+                        "(grace ${graceMs}ms)",
                 )
                 updateStatus("Connection lost — reconnecting to the Mac…")
                 connectUsb(session)
