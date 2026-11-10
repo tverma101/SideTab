@@ -6,6 +6,17 @@ import XCTest
 /// tag uniqueness, display-config validation, frame-size limits, and control
 /// port resolution. Nothing here opens a socket.
 final class StreamingServerWireTests: XCTestCase {
+    func testInvalidFrameRequiresANewValidKeyframe() {
+        var gate = FrameSyncGate()
+        XCTAssertEqual(gate.decide(valid: true, isKeyframe: false), .wait)
+        XCTAssertEqual(gate.decide(valid: false, isKeyframe: true), .invalid)
+        XCTAssertEqual(gate.decide(valid: true, isKeyframe: false), .wait)
+        XCTAssertEqual(gate.decide(valid: true, isKeyframe: true), .send)
+        XCTAssertEqual(gate.decide(valid: true, isKeyframe: false), .send)
+        XCTAssertEqual(gate.decide(valid: false, isKeyframe: false), .invalid)
+        XCTAssertEqual(gate.decide(valid: true, isKeyframe: false), .wait)
+        XCTAssertEqual(gate.decide(valid: true, isKeyframe: true), .send)
+    }
     // MARK: - Tag table
 
     /// Two messages sharing one tag value cannot be told apart by a client that

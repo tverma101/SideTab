@@ -91,11 +91,9 @@ final class WirelessTransportPressureTests: XCTestCase {
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: now + 3))
     }
 
-    func testUsbIgnoresBothSubmissionAndSendBufferPressure() {
+    func testUsbPausesForOutstandingSendsButNotTcpHeadroomAlone() {
         let generation = WirelessTransportPressure.reset(wireless: false)
         WirelessTransportPressure.setReady(generation: generation)
-        WirelessTransportPressure.beginSend(generation: generation)
-        WirelessTransportPressure.beginSend(generation: generation)
         WirelessTransportPressure.beginSend(generation: generation)
         WirelessTransportPressure.observeSendBuffer(
             generation: generation,
@@ -103,6 +101,10 @@ final class WirelessTransportPressureTests: XCTestCase {
             frameBytes: 1_000_000,
             nowNs: 100
         )
+        XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: 101))
+        WirelessTransportPressure.beginSend(generation: generation)
+        XCTAssertTrue(WirelessTransportPressure.shouldPauseEncoding(at: 101))
+        WirelessTransportPressure.completeSend(generation: generation)
         XCTAssertFalse(WirelessTransportPressure.shouldPauseEncoding(at: 101))
     }
 

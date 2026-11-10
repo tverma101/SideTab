@@ -9,6 +9,8 @@ import Combine
 final class DisplayRuntimeState: ObservableObject {
     @Published var displayCreated = false
     @Published var clientConnected = false
+    /// Temporary encoder target after a USB frame exceeded the client limit.
+    @Published var usbSafetyBitrateMbps: Int?
     /// Device name of the wireless client currently streaming (nil when none).
     /// WirelessSection reads this to show a "Connected" badge on the matching row.
     @Published var currentWirelessDevice: String?

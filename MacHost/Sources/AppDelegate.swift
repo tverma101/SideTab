@@ -819,6 +819,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.runtime.captureMethod = method
                 }
             }
+            capture.onSafetyBitrateChanged = { [weak self, weak capture] bitrate in
+                Task { @MainActor [weak self, weak capture] in
+                    guard let self, let capture, self.screenCapture === capture,
+                          capture.safetyBitrateMbps == bitrate else { return }
+                    if self.runtime.usbSafetyBitrateMbps != bitrate {
+                        debugLog("USB recovery notice: target=\(bitrate.map(String.init) ?? "selected")Mbps")
+                    }
+                    self.runtime.usbSafetyBitrateMbps = bitrate
+                }
+            }
             try await capture.setupForVirtualDisplay(
                 displayID,
                 refreshRate: sessionFrameRate,
@@ -931,6 +941,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             server.onKeyframeRequested = { [weak capture] force in
                 capture?.requestKeyframeOrReplayCachedFrame(force: force)
             }
+            server.onOversizedFrame = { [weak capture] in capture?.handleOversizedFrame() }
 
             server.onClientDisconnected = { [weak self] event in
                 Task { @MainActor [weak self] in
@@ -1168,6 +1179,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         runtime.isRunning = false
         runtime.displayCreated = false
         runtime.clientConnected = false
+        runtime.usbSafetyBitrateMbps = nil
         performance.currentFPS = 0
         performance.currentBitrate = 0
         persistWirelessDeviceDisconnect()
