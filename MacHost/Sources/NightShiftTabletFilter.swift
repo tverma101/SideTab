@@ -562,7 +562,19 @@ final class NightShiftTabletFilter {
         let scopeDescription: String
         switch scope {
         case .usb:
-            candidates = transports.filter(\.isUSB)
+            let usbTransports = transports.filter(\.isUSB)
+            guard usbTransports.count == 1 else {
+                // USB streaming reaches the host through adb reverse, so the
+                // streaming device must itself be a ready USB adb transport.
+                // Eligibility is not identity: a non-Samsung client can be
+                // streaming while an idle Samsung is the only Eye-comfort
+                // device. Requiring one total ready USB transport closes that
+                // mixed-device ownership hole; extra or missing transports
+                // fail closed.
+                noteSkip("expected exactly one ready USB adb transport for the streaming client")
+                return []
+            }
+            candidates = usbTransports
             scopeDescription = "matching the USB streaming client"
         case .wireless(let deviceModel, let clientHost):
             guard let wantedModel = EyeComfortPlan.normalizedModel(deviceModel),
@@ -652,7 +664,16 @@ final class NightShiftTabletFilter {
 
     private func restore(_ serial: String, probe: EyeComfortPlan.Probe) {
         guard let current = probe.settings,
-              let saved = snapshots.snapshot(for: probe.serialNumber) else { return }
+              var saved = snapshots.snapshot(for: probe.serialNumber) else { return }
+        // Launch/retry release does not pass through saveSnapshotIfNeeded.
+        // Capture a legacy snapshot's pre-off Adaptive value now, before phase
+        // one necessarily rewrites the live key to zero. The post-off verified
+        // state cannot be a migration source.
+        if saved.adaptive == nil, let adaptive = current.adaptive {
+            saved.adaptive = adaptive
+            snapshots.save(saved, for: probe.serialNumber)
+            debugLog("NightShift -> \(serial): migrated tablet Eye comfort snapshot \(saved.dictionary)")
+        }
         guard let offCountBefore = serviceOffExecutionCount(serial) else {
             debugLog("NightShift -> \(serial): cannot observe Samsung service execution; keeping saved settings")
             return

@@ -51,7 +51,7 @@ struct NightShiftTarget: Equatable {
 /// Reads the host's live Night Shift state through CoreBrightness' private
 /// `CBBlueLightClient`, resolved at runtime and never linked. A macOS that
 /// renames or removes the API leaves the probe nil, which the monitor reports
-/// as "off" instead of guessing.
+/// as unknown instead of guessing an off state.
 ///
 /// Verified on macOS 27.2: `supportsBlueLightReduction` = 1,
 /// `getStrength:` = 0.883 and `getCCT:` = 3028 K while Night Shift is on.
@@ -304,10 +304,14 @@ final class NightShiftMirror {
     func releaseNow() {
         pendingRelease?.cancel()
         pendingRelease = nil
-        guard isMirroring else { return }
-        isMirroring = false
-        monitor.stop()
-        stopReconciliationTimer()
+        if isMirroring {
+            isMirroring = false
+            monitor.stop()
+            stopReconciliationTimer()
+        }
+        // Even when the mirror is already inactive, a stranded snapshot may
+        // still be waiting for its first successful hand-back. Stop/Quit is a
+        // direct release opportunity, not only a timer retry.
         filter.release()
         filter.setClientScope(nil)
         scheduleRestoreRetryIfNeeded()

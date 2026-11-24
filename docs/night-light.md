@@ -32,8 +32,10 @@ streamed picture stays neutral while the Mac's panels go warm.
   not flash the filter, and immediately on Stop or Quit.
 
 Control is conservatively scoped to the streaming client rather than every
-adb-visible Samsung device. USB streaming controls exactly one eligible USB
-adb device; if none or more than one matches, control is disabled. Wireless
+adb-visible Samsung device. USB streaming requires exactly one total ready
+USB adb transport before eligibility is even considered, because eligibility
+is not identity: a non-Samsung streaming client can otherwise make an idle
+Samsung the sole Eye-comfort match. Wireless
 streaming is stricter: the adb transport must be wireless (not USB), its
 `IP:port` serial must use the same host as the authenticated streaming peer,
 its normalized adb model must match the client's `Build.MODEL` (for example

@@ -474,6 +474,60 @@ final class NightShiftTabletFilterTests: XCTestCase {
         XCTAssertEqual(store.snapshot(for: "R52"), original)
     }
 
+
+    func testDirectReleaseOfLegacySnapshotRestoresPreOffAdaptiveMode() {
+        // A stranded override from the pre-Adaptive-model implementation left
+        // the live Adaptive key untouched. The legacy snapshot lacks that key.
+        let original = EyeComfortSettings(filter: 1, level: 7, scheduled: 0, type: 2, adaptive: 1)
+        let strandedMirrorState = EyeComfortSettings(filter: 1, level: 9, scheduled: 1, type: 0, adaptive: 1)
+        let tablet = FakeSamsungTablet(strandedMirrorState)
+        let store = makeStore()
+        store.save(EyeComfortSettings(filter: 1, level: 7, scheduled: 0, type: 2), for: "R52")
+        let filter = makeFilter(tablet, store)
+
+        filter.release()
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        XCTAssertEqual(tablet.settings, original)
+        XCTAssertTrue(tablet.adaptiveActive)
+        XCTAssertFalse(filter.hasPendingRestores)
+    }
+
+    func testUSBControlFailsClosedWhenNonSamsungStreamingTransportIsAlsoPresent() {
+        let samsung = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        let devices = """
+        List of devices attached
+        R52 device usb:1-1 model:SM_X800
+        PIXEL8 device usb:1-2 model:Pixel_8
+
+        """
+        let filter = NightShiftTabletFilter(
+            listDevices: { devices },
+            shell: { serial, script in
+                if serial == "PIXEL8", script == EyeComfortPlan.probeScript {
+                    return """
+                    serial=PIXEL8
+                    sidetab=1
+                    blue_light_filter=null
+                    blue_light_filter_opacity=null
+                    blue_light_filter_scheduled=null
+                    blue_light_filter_type=null
+                    blue_light_filter_adaptive_mode=null
+
+                    """
+                }
+                return samsung.run(script)
+            },
+            snapshots: makeStore(),
+            pause: { _ in }
+        )
+        filter.setClientScope(.usb)
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(samsung.writeCount, 0)
+        XCTAssertTrue(filter.needsReconciliation)
+    }
+
     func testWirelessScopeMatchesOnlyTheNormalizedClientModel() {
         let matching = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
         let other = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2), serial: "R53")
@@ -661,9 +715,9 @@ private final class FakeSamsungTablet {
     /// on hand off to Samsung's own timer, modeled as "not warm now". Type 24
     /// is deliberately not an Adaptive-mode apply path.
     private func startService(_ type: Int) {
+        if type == EyeComfortPlan.serviceOff { offExecutionCount += 1 }
         guard settings.scheduled != 0 else { return }
         if type == EyeComfortPlan.serviceOff {
-            offExecutionCount += 1
             panelLevel = nil
             adaptiveActive = false
             if changeScheduledToZeroAfterOff { settings.scheduled = 0 }
