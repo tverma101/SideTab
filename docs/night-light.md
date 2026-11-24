@@ -36,15 +36,27 @@ mirroring.
 | `blue_light_filter_scheduled` | "Set schedule" switch |
 | `blue_light_filter_type` | 0 Always on, 1 custom times, 2 sunset to sunrise |
 
-Samsung's BlueLightFilterService calls `setNightMode(on, level)` only when the
-shield is on and "Set schedule" is on. While mirroring, SideTab therefore sets
-type 0 + scheduled 1 ("Custom, Always on"), and each level write then shows
-`DDI setNightMode : true, index : <level>` in logcat. Night Shift strength
-maps linearly: `round(strength * 10)`.
+Samsung's BlueLightFilterService (`com.samsung.android.bluelightfilter`)
+calls `setNightMode(on, level)` only when "Set schedule" is on. While
+mirroring, SideTab therefore sets type 0 + scheduled 1 ("Custom, Always on").
+Night Shift strength maps linearly: `round(strength * 10)`.
 
-Restoring turns the shield off first, while it is still in that mode, then
-puts the user's keys back. Restoring `scheduled=0` first would leave the panel
-warm. The user's settings are saved in UserDefaults
+Settings writes alone are not enough. The service watches the keys only for
+10-60 s after it is started, then stops itself; with Samsung's Settings app
+closed, writes changed nothing. Like the Settings app, SideTab starts the
+exported service after each change:
+
+    am startservice -n com.samsung.android.bluelightfilter/.BlueLightFilterService \
+        --ei BLUE_LIGHT_FILTER_SERVICE_TYPE 24   # apply stored mode and level
+                                                 # 25 = panel filter off
+
+Success shows `FILTER_ON (Setting) : Always ON` and
+`DDI setNightMode : true, index : <level>` in logcat. Both types act only
+while scheduled is 1.
+
+Restoring therefore turns the panel off (filter 0 + type 25) while the mirror's
+schedule is still in place, waits 0.5 s, then puts the user's keys back, ending
+with a type-24 start if their own shield was on. The user's settings are saved in UserDefaults
 (`SideScreen_nightShiftEyeComfortSnapshots`, by `ro.serialno`) before the
 first override, so a quit or crash cannot lose them. If a release finds no
 tablet (cable already out, adb slow at quit), it is retried every 15 s and

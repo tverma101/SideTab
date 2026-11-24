@@ -33,13 +33,18 @@ struct EyeComfortSettings: Equatable {
 
 /// Pure planning for driving Eye comfort shield with `settings put`.
 ///
-/// Samsung's BlueLightFilterService only pushes a level to the panel
-/// (`SemMdnieManager.setNightMode(on, level)`) when the shield is on AND
-/// "Set schedule" is on; with type 0 that schedule reads "Always on". With
-/// `scheduled=0` a level write is stored but never applied, which is why
-/// the mirror owns all four keys while it is active. Verified on SM-X800:
-/// type 0 + scheduled 1 makes every level write log
-/// `DDI setNightMode : true, index : <level>`.
+/// Samsung's BlueLightFilterService pushes a level to the panel
+/// (`SemMdnieManager.setNightMode(on, level)`) only when "Set schedule" is
+/// on; with type 0 that schedule reads "Always on". With `scheduled=0` a
+/// level write is stored but never applied, so the mirror owns all four
+/// keys while it is active.
+///
+/// Writing settings is not enough on its own: the service watches them only
+/// for 10-60 s after something starts it, then stops itself. Samsung's
+/// Settings app starts it with an intent after every change, and so does
+/// the mirror (`serviceScript`). Verified on SM-X800 with Settings closed:
+/// writes alone did nothing; the type-24 start logged
+/// `FILTER_ON (Setting) : Always ON` and `DDI setNightMode : true, index : 9`.
 enum EyeComfortPlan {
     struct Write: Equatable {
         let key: String
@@ -52,6 +57,41 @@ enum EyeComfortPlan {
     static let keyType = "blue_light_filter_type"
     static let typeAlwaysOn = 0
     static let sideTabPackage = "com.sidescreen.app"
+
+    /// Exported, unprotected service in Samsung's BlueLightFilter.apk.
+    static let serviceComponent = "com.samsung.android.bluelightfilter/.BlueLightFilterService"
+    /// `BLUE_LIGHT_FILTER_SERVICE_TYPE` values the Settings app sends:
+    /// 24 applies the stored mode and level, 25 turns the panel filter off.
+    /// Both act only while `blue_light_filter_scheduled` is on.
+    static let serviceApply = 24
+    static let serviceOff = 25
+
+    static func serviceScript(_ type: Int) -> String {
+        "am startservice -n \(serviceComponent) --ei BLUE_LIGHT_FILTER_SERVICE_TYPE \(type) >/dev/null"
+    }
+
+    /// Settings writes, then the service start that applies them. The start
+    /// runs even when no key changed, because the panel can be off while the
+    /// keys already match (Settings closed, service stopped).
+    static func showScript(level: Int, over current: EyeComfortSettings) -> String {
+        script(for: writes(toShow: level, over: current), then: serviceScript(serviceApply))
+    }
+
+    /// The restore phases as shell scripts. Phase one is sent only when the
+    /// shield is on, and asks the service to turn the panel off while the
+    /// mirror's schedule is still in place. Phase two ends with an apply when
+    /// the user's own shield was on, as Samsung's Settings app would do.
+    static func restoreScripts(
+        from current: EyeComfortSettings,
+        to saved: EyeComfortSettings
+    ) -> (off: String?, restore: String?) {
+        let phases = restorePhases(from: current, to: saved)
+        let off = phases.off.isEmpty ? nil : script(for: phases.off, then: serviceScript(serviceOff))
+        let apply = saved.filter != 0 ? serviceScript(serviceApply) : nil
+        let restore = phases.restore.isEmpty && apply == nil
+            ? nil : script(for: phases.restore, then: apply)
+        return (off, restore)
+    }
 
     /// Writes that make the shield show `level`, in an order where the last
     /// write always triggers an apply: mode keys first, then the level, then
@@ -127,9 +167,10 @@ enum EyeComfortPlan {
         return Probe(serialNumber: serial, hasSideTab: sideTab == "1", settings: settings)
     }
 
-    /// `&&` so the shell's exit status reports a failure of any write.
-    static func script(for writes: [Write]) -> String {
-        writes.map { "settings put system \($0.key) \($0.value)" }.joined(separator: " && ")
+    /// `&&` so the shell's exit status reports a failure of any step.
+    static func script(for writes: [Write], then last: String? = nil) -> String {
+        let steps = writes.map { "settings put system \($0.key) \($0.value)" } + (last.map { [$0] } ?? [])
+        return steps.joined(separator: " && ")
     }
 
     /// Ready transports from `adb devices -l`, USB first so a tablet that is
@@ -207,8 +248,9 @@ final class NightShiftTabletFilter {
     private var drainScheduled = false
     private var lastSkipReason: String?
 
-    /// Long enough for BlueLightFilterService's observer to act on the
-    /// "off" write before the schedule keys change underneath it.
+    /// `am startservice` returns before the service runs; give it time to
+    /// read the mirror's schedule and turn the panel off before phase two
+    /// changes those keys.
     static let restorePause: TimeInterval = 0.5
 
     init(
@@ -305,9 +347,7 @@ final class NightShiftTabletFilter {
             snapshots.save(current, for: probe.serialNumber)
             debugLog("NightShift -> \(serial): saved tablet Eye comfort \(current.dictionary)")
         }
-        let writes = EyeComfortPlan.writes(toShow: target.level, over: current)
-        guard !writes.isEmpty else { return }
-        if shell(serial, EyeComfortPlan.script(for: writes)) != nil {
+        if shell(serial, EyeComfortPlan.showScript(level: target.level, over: current)) != nil {
             lastSkipReason = nil
             debugLog("NightShift -> \(serial): Eye comfort level \(target.level)/\(NightShiftTarget.maximumLevel)")
         } else {
@@ -318,16 +358,15 @@ final class NightShiftTabletFilter {
     private func restore(_ serial: String, probe: EyeComfortPlan.Probe) {
         guard let current = probe.settings,
               let saved = snapshots.snapshot(for: probe.serialNumber) else { return }
-        let phases = EyeComfortPlan.restorePhases(from: current, to: saved)
-        if !phases.off.isEmpty {
-            guard shell(serial, EyeComfortPlan.script(for: phases.off)) != nil else {
+        let scripts = EyeComfortPlan.restoreScripts(from: current, to: saved)
+        if let off = scripts.off {
+            guard shell(serial, off) != nil else {
                 debugLog("NightShift -> \(serial): restore failed, keeping saved settings")
                 return
             }
             pause(Self.restorePause)
         }
-        if !phases.restore.isEmpty,
-           shell(serial, EyeComfortPlan.script(for: phases.restore)) == nil {
+        if let restore = scripts.restore, shell(serial, restore) == nil {
             debugLog("NightShift -> \(serial): restore failed, keeping saved settings")
             return
         }

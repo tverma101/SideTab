@@ -2,9 +2,9 @@ import XCTest
 @testable import SideScreen
 
 /// Night Shift -> Samsung Eye comfort shield. The fake tablet below models
-/// what BlueLightFilterService does with each `settings put` (decompiled
-/// from SM-X800's BlueLightFilter.apk): the panel level only changes when
-/// the shield is on, "Set schedule" is on and the type is Always on (0).
+/// SM-X800's BlueLightFilterService (decompiled BlueLightFilter.apk) in its
+/// usual stopped state: settings writes alone change nothing, and the panel
+/// follows only the service starts that Samsung's Settings app also sends.
 final class NightShiftTabletFilterTests: XCTestCase {
     // MARK: - Strength mapping
 
@@ -47,6 +47,15 @@ final class NightShiftTabletFilterTests: XCTestCase {
             [EyeComfortPlan.Write(key: "blue_light_filter_opacity", value: 6)]
         )
         XCTAssertEqual(EyeComfortPlan.writes(toShow: 9, over: current), [])
+    }
+
+    func testShowAlwaysStartsTheServiceEvenWhenKeysMatch() {
+        let current = EyeComfortSettings(filter: 1, level: 9, scheduled: 1, type: 0)
+        XCTAssertEqual(
+            EyeComfortPlan.showScript(level: 9, over: current),
+            "am startservice -n com.samsung.android.bluelightfilter/.BlueLightFilterService"
+                + " --ei BLUE_LIGHT_FILTER_SERVICE_TYPE 24 >/dev/null"
+        )
     }
 
     func testRestoreTurnsOffBeforeTouchingTheSchedule() {
@@ -124,7 +133,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
         filter.show(NightShiftTarget(enabled: true, level: 4))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
         XCTAssertEqual(tablet.panelLevel, 4)
-        XCTAssertEqual(tablet.writeCount, 5, "a strength change is one write")
+        XCTAssertEqual(tablet.writeCount, 5, "4 writes to take over, then 1 per strength change")
 
         filter.show(.off)
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
@@ -244,8 +253,15 @@ private final class FakeSamsungTablet {
 
             """
         }
-        var touched: [String] = []
         for command in script.components(separatedBy: " && ") {
+            if command == EyeComfortPlan.serviceScript(EyeComfortPlan.serviceApply) {
+                startService(EyeComfortPlan.serviceApply)
+                continue
+            }
+            if command == EyeComfortPlan.serviceScript(EyeComfortPlan.serviceOff) {
+                startService(EyeComfortPlan.serviceOff)
+                continue
+            }
             let parts = command.split(separator: " ").map(String.init)
             guard parts.count == 5, parts[0] == "settings", parts[1] == "put",
                   let value = Int(parts[4]) else { return nil }
@@ -256,22 +272,22 @@ private final class FakeSamsungTablet {
             case EyeComfortPlan.keyType: settings.type = value
             default: return nil
             }
-            touched.append(parts[3])
             writeCount += 1
         }
-        observe(touched)
         return ""
     }
 
     func settle() {}
 
-    /// BlueLightFilterService.onChange, reduced to the Always-on path.
-    private func observe(_ keys: [String]) {
-        let s = settings
-        if s.filter == 0 {
-            if keys.contains(EyeComfortPlan.keyFilter), s.scheduled != 0 { panelLevel = nil }
-            return
+    /// BlueLightFilterService.onStartCommand for types 24 and 25. Both are
+    /// no-ops unless "Set schedule" is on; schedule types other than Always
+    /// on hand off to Samsung's own timer, modeled as "not warm now".
+    private func startService(_ type: Int) {
+        guard settings.scheduled != 0 else { return }
+        if type == EyeComfortPlan.serviceOff {
+            panelLevel = nil
+        } else if settings.type == EyeComfortPlan.typeAlwaysOn {
+            panelLevel = settings.level
         }
-        if s.scheduled != 0, s.type == EyeComfortPlan.typeAlwaysOn { panelLevel = s.level }
     }
 }
