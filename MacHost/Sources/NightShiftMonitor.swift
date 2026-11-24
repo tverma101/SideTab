@@ -206,7 +206,11 @@ final class NightShiftMirror {
     private let isEnabled: () -> Bool
     private let releaseGrace: TimeInterval
     private var pendingRelease: DispatchWorkItem?
+    private var restoreRetry: Timer?
     private(set) var isMirroring = false
+
+    /// How often to retry handing back a tablet the last release missed.
+    nonisolated static let restoreRetryInterval: TimeInterval = 15
 
     init(
         monitor: NightShiftMonitor? = nil,
@@ -220,12 +224,16 @@ final class NightShiftMirror {
         self.isEnabled = isEnabled
         self.releaseGrace = releaseGrace
         monitor.onChange = { [weak filter] target in filter?.show(target) }
+        // A crash or a quit that timed out can leave a tablet overridden.
+        // Retry the hand-back from launch, even with the mirror opted out.
+        scheduleRestoreRetryIfNeeded()
     }
 
     func clientConnected() {
         pendingRelease?.cancel()
         pendingRelease = nil
         guard isEnabled() else { return }
+        stopRestoreRetry()
         if !isMirroring {
             isMirroring = true
             debugLog("NightShift: mirroring to tablet Eye comfort shield")
@@ -254,6 +262,31 @@ final class NightShiftMirror {
         isMirroring = false
         monitor.stop()
         filter.release()
+        scheduleRestoreRetryIfNeeded()
+    }
+
+    /// The release finds no tablet when the cable is already out, which
+    /// would leave the tablet warm until the next session. Keep retrying
+    /// while a saved setting is waiting; each try is one `adb devices`.
+    private func scheduleRestoreRetryIfNeeded() {
+        guard restoreRetry == nil else { return }
+        let t = Timer(timeInterval: Self.restoreRetryInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard !self.isMirroring, self.filter.hasPendingRestores else {
+                    self.stopRestoreRetry()
+                    return
+                }
+                self.filter.release()
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        restoreRetry = t
+    }
+
+    private func stopRestoreRetry() {
+        restoreRetry?.invalidate()
+        restoreRetry = nil
     }
 
     /// Bounded so a wedged adb cannot hold up quitting.

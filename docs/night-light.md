@@ -46,7 +46,9 @@ Restoring turns the shield off first, while it is still in that mode, then
 puts the user's keys back. Restoring `scheduled=0` first would leave the panel
 warm. The user's settings are saved in UserDefaults
 (`SideScreen_nightShiftEyeComfortSnapshots`, by `ro.serialno`) before the
-first override, so a quit or crash cannot lose them.
+first override, so a quit or crash cannot lose them. If a release finds no
+tablet (cable already out, adb slow at quit), it is retried every 15 s and
+from the next launch until the saved settings are back on the tablet.
 
 ## Opt out
 

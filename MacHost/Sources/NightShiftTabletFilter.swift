@@ -87,15 +87,18 @@ enum EyeComfortPlan {
         return (off, restore)
     }
 
-    /// One `adb shell` round trip that reports everything a sync needs.
-    static let probeScript = [
-        "getprop ro.serialno",
-        "pm path \(sideTabPackage) >/dev/null 2>&1 && echo 1 || echo 0",
-        "settings get system \(keyFilter)",
-        "settings get system \(keyLevel)",
-        "settings get system \(keyScheduled)",
-        "settings get system \(keyType)"
-    ].joined(separator: "; ")
+    /// One `adb shell` round trip that reports everything a sync needs, as
+    /// labeled lines so stray stderr text cannot shift a field.
+    static let probeScript: String = {
+        let header = [
+            "echo serial=$(getprop ro.serialno)",
+            "pm path \(sideTabPackage) >/dev/null 2>&1 && echo sidetab=1 || echo sidetab=0"
+        ]
+        let keys = [keyFilter, keyLevel, keyScheduled, keyType].map { key in
+            "echo \(key)=$(settings get system \(key) 2>/dev/null)"
+        }
+        return (header + keys).joined(separator: "; ")
+    }()
 
     struct Probe: Equatable {
         let serialNumber: String
@@ -105,21 +108,28 @@ enum EyeComfortPlan {
     }
 
     static func parseProbe(_ output: String) -> Probe? {
-        let lines = output
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        guard lines.count >= 6, !lines[0].isEmpty else { return nil }
-        let values = lines[2...5].map { Int($0) }
+        var fields: [String: String] = [:]
+        for line in output.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            fields[String(parts[0]).trimmingCharacters(in: .whitespaces)] =
+                String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let serial = fields["serial"], !serial.isEmpty,
+              let sideTab = fields["sidetab"] else { return nil }
         var settings: EyeComfortSettings?
-        if let filter = values[0], let level = values[1],
-           let scheduled = values[2], let type = values[3] {
+        if let filter = fields[keyFilter].flatMap({ Int($0) }),
+           let level = fields[keyLevel].flatMap({ Int($0) }),
+           let scheduled = fields[keyScheduled].flatMap({ Int($0) }),
+           let type = fields[keyType].flatMap({ Int($0) }) {
             settings = EyeComfortSettings(filter: filter, level: level, scheduled: scheduled, type: type)
         }
-        return Probe(serialNumber: lines[0], hasSideTab: lines[1] == "1", settings: settings)
+        return Probe(serialNumber: serial, hasSideTab: sideTab == "1", settings: settings)
     }
 
+    /// `&&` so the shell's exit status reports a failure of any write.
     static func script(for writes: [Write]) -> String {
-        writes.map { "settings put system \($0.key) \($0.value)" }.joined(separator: "; ")
+        writes.map { "settings put system \($0.key) \($0.value)" }.joined(separator: " && ")
     }
 
     /// Ready transports from `adb devices -l`, USB first so a tablet that is
@@ -150,6 +160,8 @@ final class EyeComfortSnapshotStore {
         get { defaults.dictionary(forKey: Self.defaultsKey) as? [String: [String: Int]] ?? [:] }
         set { defaults.set(newValue, forKey: Self.defaultsKey) }
     }
+
+    var isEmpty: Bool { all.isEmpty }
 
     func snapshot(for serialNumber: String) -> EyeComfortSettings? {
         all[serialNumber].flatMap(EyeComfortSettings.init(dictionary:))
@@ -222,6 +234,12 @@ final class NightShiftTabletFilter {
         submit(.release)
     }
 
+    /// True while some tablet still carries the mirror's override, for
+    /// example because it was unplugged before the release could reach it.
+    var hasPendingRestores: Bool {
+        !snapshots.isEmpty
+    }
+
     /// Block until work submitted before this call has finished, for app
     /// termination and tests. Returns false on timeout.
     @discardableResult
@@ -250,6 +268,8 @@ final class NightShiftTabletFilter {
     }
 
     private func run(_ command: Command) {
+        // Nothing saved means nothing to restore: skip the adb round trips.
+        if case .release = command, snapshots.isEmpty { return }
         for (serial, probe) in eligibleTablets() {
             switch command {
             case .show(let target):
