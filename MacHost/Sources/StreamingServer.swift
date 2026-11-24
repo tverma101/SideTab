@@ -78,6 +78,11 @@ struct StylusEvent {
 }
 
 private extension NWEndpoint {
+    var hostString: String? {
+        guard case .hostPort(let host, _) = self else { return nil }
+        return String(describing: host)
+    }
+
     var isLoopback: Bool {
         switch self {
         case .hostPort(let host, _):
@@ -131,6 +136,16 @@ class StreamingServer {
     struct SessionEvent: Equatable {
         let serverID: ObjectIdentifier
         let sessionGeneration: UInt64
+        /// Remote peer host for the streaming connection, when it is a real
+        /// host/port endpoint. Lifecycle events that do not describe a
+        /// connected client leave this nil.
+        let clientHost: String?
+
+        init(serverID: ObjectIdentifier, sessionGeneration: UInt64, clientHost: String? = nil) {
+            self.serverID = serverID
+            self.sessionGeneration = sessionGeneration
+            self.clientHost = clientHost
+        }
     }
     var onClientConnected: ((SessionEvent) -> Void)?
     var onClientDisconnected: ((SessionEvent) -> Void)?
@@ -1340,7 +1355,11 @@ class StreamingServer {
             // with the pre-bump value a disconnect would also carry.
             let sessionGeneration = beginSessionLifetime()
             onClientConnected?(
-                SessionEvent(serverID: ObjectIdentifier(self), sessionGeneration: sessionGeneration)
+                SessionEvent(
+                    serverID: ObjectIdentifier(self),
+                    sessionGeneration: sessionGeneration,
+                    clientHost: conn.endpoint.hostString
+                )
             )
         }
     }

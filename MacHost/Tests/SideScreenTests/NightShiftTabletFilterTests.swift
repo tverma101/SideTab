@@ -22,7 +22,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
         XCTAssertEqual(NightShiftTarget.level(forStrength: .infinity), 0)
     }
 
-    func testInactiveOrUnreadableNightShiftIsOff() {
+    func testInactiveNightShiftIsOffAndUnreadableHostIsUnknown() {
         XCTAssertNil(NightShiftTarget.target(for: nil))
         let daytime = NightShiftReading(active: false, automaticScheduleEnabled: false, strength: 0.9, kelvin: 6_500)
         XCTAssertEqual(NightShiftTarget.target(for: daytime), .off)
@@ -374,6 +374,106 @@ final class NightShiftTabletFilterTests: XCTestCase {
         XCTAssertTrue(filter.needsReconciliation)
     }
 
+
+    func testFirstMacOffForcesAdaptiveUnscheduledTabletIntoServiceCompatibleOff() {
+        let original = EyeComfortSettings(filter: 1, level: 7, scheduled: 0, type: 2, adaptive: 1)
+        let tablet = FakeSamsungTablet(original)
+        let store = makeStore()
+        let filter = makeFilter(tablet, store)
+
+        filter.show(.off)
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        XCTAssertEqual(tablet.settings, EyeComfortSettings(filter: 0, level: 7, scheduled: 1, type: 0, adaptive: 0))
+        XCTAssertNil(tablet.panelLevel)
+        XCTAssertFalse(tablet.adaptiveActive)
+        XCTAssertEqual(store.snapshot(for: "R52"), original)
+    }
+
+    func testLegacySnapshotIsAugmentedWithAdaptiveBeforeFirstOverride() {
+        let live = EyeComfortSettings(filter: 1, level: 7, scheduled: 0, type: 2, adaptive: 1)
+        let tablet = FakeSamsungTablet(live)
+        let store = makeStore()
+        store.save(EyeComfortSettings(filter: 1, level: 7, scheduled: 0, type: 2), for: "R52")
+        let filter = makeFilter(tablet, store)
+
+        filter.show(.off)
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(store.snapshot(for: "R52")?.adaptive, 1)
+
+        filter.release()
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(tablet.settings, live)
+        XCTAssertTrue(tablet.adaptiveActive)
+    }
+
+    func testRestoreDoesNotRewriteUserKeysUntilPanelOffExecutionIsObserved() {
+        let original = EyeComfortSettings(filter: 1, level: 7, scheduled: 1, type: 0, adaptive: 0)
+        let tablet = FakeSamsungTablet(original)
+        tablet.autoSettle = false
+        let store = makeStore()
+        let filter = NightShiftTabletFilter(
+            listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            shell: { _, script in tablet.run(script) },
+            snapshots: store,
+            pause: { _ in }
+        )
+        filter.setClientScope(.usb)
+
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        filter.release()
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        XCTAssertTrue(filter.hasPendingRestores)
+        XCTAssertEqual(store.snapshot(for: "R52"), original)
+        XCTAssertEqual(tablet.settings.scheduled, 1)
+        XCTAssertEqual(tablet.settings.type, EyeComfortPlan.typeAlwaysOn)
+        XCTAssertEqual(tablet.settings.level, 9)
+    }
+
+
+    func testAdbWirelessSerialHostParsingIsConservative() {
+        XCTAssertEqual(EyeComfortPlan.adbSerialHost("192.168.1.8:5555"), "192.168.1.8")
+        XCTAssertEqual(EyeComfortPlan.adbSerialHost("[fe80::1%en0]:5555"), "fe80::1")
+        XCTAssertNil(EyeComfortPlan.adbSerialHost("R52X30G5TNB"))
+        XCTAssertNil(EyeComfortPlan.adbSerialHost("fe80::1:5555"))
+        XCTAssertEqual(EyeComfortPlan.normalizedHost("[FE80::1%en0]"), "fe80::1")
+    }
+
+    func testWirelessScopeDoesNotUseAUSBTransportEvenWhenModelMatches() {
+        let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        let filter = NightShiftTabletFilter(
+            listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            shell: { _, script in tablet.run(script) },
+            snapshots: makeStore(),
+            pause: { _ in }
+        )
+        filter.setClientScope(.wireless(deviceModel: "SM-X800", clientHost: "192.168.1.8"))
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(tablet.writeCount, 0)
+        XCTAssertTrue(filter.needsReconciliation)
+    }
+
+    func testRestoreKeepsSnapshotWhenVerifiedOffStateDoesNotMatch() {
+        let original = EyeComfortSettings(filter: 1, level: 7, scheduled: 1, type: 0, adaptive: 0)
+        let tablet = FakeSamsungTablet(original)
+        let store = makeStore()
+        let filter = makeFilter(tablet, store)
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        // Simulate a user racing Settings after the off intent executes:
+        // execution is observable, but the deterministic mirror state is no
+        // longer present when the pre-restore verification probes it.
+        tablet.changeScheduledToZeroAfterOff = true
+        filter.release()
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertTrue(filter.hasPendingRestores)
+        XCTAssertEqual(store.snapshot(for: "R52"), original)
+    }
+
     func testWirelessScopeMatchesOnlyTheNormalizedClientModel() {
         let matching = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
         let other = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2), serial: "R53")
@@ -389,14 +489,14 @@ final class NightShiftTabletFilterTests: XCTestCase {
             snapshots: makeStore(),
             pause: { _ in matching.settle() }
         )
-        filter.setClientScope(.wireless(deviceModel: "SM-X800"))
+        filter.setClientScope(.wireless(deviceModel: "SM-X800", clientHost: "192.168.1.8"))
         filter.show(NightShiftTarget(enabled: true, level: 9))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
         XCTAssertEqual(matching.panelLevel, 9)
         XCTAssertEqual(other.writeCount, 0)
 
         let matchingWrites = matching.writeCount
-        filter.setClientScope(.wireless(deviceModel: "SM-S911"))
+        filter.setClientScope(.wireless(deviceModel: "SM-S911", clientHost: "192.168.1.8"))
         filter.show(NightShiftTarget(enabled: true, level: 4))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
         XCTAssertEqual(matching.writeCount, matchingWrites, "a non-matching wireless client must not keep mutating the first tablet")
@@ -406,12 +506,12 @@ final class NightShiftTabletFilterTests: XCTestCase {
     func testWirelessMismatchIsNotTouched() {
         let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
         let filter = NightShiftTabletFilter(
-            listDevices: { "List of devices attached\n192.168.1.8:5555 device model:SM_T970\n" },
+            listDevices: { "List of devices attached\n192.168.1.9:5555 device model:SM_X800\n" },
             shell: { _, script in tablet.run(script) },
             snapshots: makeStore(),
             pause: { _ in }
         )
-        filter.setClientScope(.wireless(deviceModel: "SM-X800"))
+        filter.setClientScope(.wireless(deviceModel: "SM-X800", clientHost: "192.168.1.8"))
         filter.show(NightShiftTarget(enabled: true, level: 9))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
         XCTAssertEqual(tablet.writeCount, 0)
@@ -476,10 +576,12 @@ private final class FakeSamsungTablet {
     var settings: EyeComfortSettings
     var hasSideTab = true
     var autoSettle = true
+    var changeScheduledToZeroAfterOff = false
     let serial: String
     private(set) var panelLevel: Int?
     private(set) var adaptiveActive: Bool
     private(set) var writeCount = 0
+    private(set) var offExecutionCount = 0
     private var queuedServiceTypes: [Int] = []
 
     init(_ settings: EyeComfortSettings, serial: String = "R52") {
@@ -503,6 +605,9 @@ private final class FakeSamsungTablet {
             blue_light_filter_adaptive_mode=\(adaptive)
 
             """
+        }
+        if script == EyeComfortPlan.serviceOffLogCountScript {
+            return "\(offExecutionCount)\n"
         }
         for command in script.components(separatedBy: " && ") {
             if command == EyeComfortPlan.serviceScript(EyeComfortPlan.serviceApply) {
@@ -558,8 +663,10 @@ private final class FakeSamsungTablet {
     private func startService(_ type: Int) {
         guard settings.scheduled != 0 else { return }
         if type == EyeComfortPlan.serviceOff {
+            offExecutionCount += 1
             panelLevel = nil
             adaptiveActive = false
+            if changeScheduledToZeroAfterOff { settings.scheduled = 0 }
         } else if settings.type == EyeComfortPlan.typeAlwaysOn, (settings.adaptive ?? 0) == 0 {
             panelLevel = settings.level
         }

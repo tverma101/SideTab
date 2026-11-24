@@ -927,7 +927,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.nativeBrightness?.pushCurrent()
                     self.nightShiftMirror.clientConnected(
                         connectionMode: sessionMode,
-                        wirelessDeviceModel: wirelessClientModel.withLock { $0 }
+                        wirelessDeviceModel: wirelessClientModel.withLock { $0 },
+                        wirelessClientHost: event.clientHost
                     )
                     self.runtime.clientConnected = true
                 }

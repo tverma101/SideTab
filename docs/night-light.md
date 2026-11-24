@@ -34,12 +34,15 @@ streamed picture stays neutral while the Mac's panels go warm.
 Control is conservatively scoped to the streaming client rather than every
 adb-visible Samsung device. USB streaming controls exactly one eligible USB
 adb device; if none or more than one matches, control is disabled. Wireless
-streaming requires exactly one eligible adb device whose normalized adb model
-matches the client's `Build.MODEL` (for example `SM_X800` vs `SM-X800`). This
-is a deliberate single-device constraint until the stream protocol carries a
-stronger device identity. Release is broader by design: any device already
-carrying a SideTab snapshot is restored even after the client scope is gone.
-No adb transport (wireless without wireless debugging) means no mirroring.
+streaming is stricter: the adb transport must be wireless (not USB), its
+`IP:port` serial must use the same host as the authenticated streaming peer,
+its normalized adb model must match the client's `Build.MODEL` (for example
+`SM_X800` vs `SM-X800`), and exactly one eligible device may match. Hostname
+or mDNS adb serials therefore do not mirror until a stronger device identity
+exists; that is deliberate fail-closed behavior. Release is broader by
+design: any device already carrying a SideTab snapshot is restored even after
+the client scope is gone. No matching adb transport (wireless without
+wireless debugging) means no mirroring.
 
 ## Samsung Eye comfort shield keys (SM-X800, Android 14)
 
@@ -78,9 +81,16 @@ sees the complete restored state.
 `am startservice` is asynchronous. Restoring therefore always queues a
 panel-off phase (filter 0 + type 25) while the mirror's deterministic
 Custom/scheduled state is still present — even when the filter key already
-reads 0 — waits 1 s, then puts the user's keys back. A type-24 start is used
-only for a restored Custom/scheduled shield. It is not an Adaptive-mode apply
-path and is a no-op after `scheduled=0`. The user's settings are saved in UserDefaults
+reads 0. It then waits for Samsung's own `FILTER_OFF (Setting)` log count to
+increase and re-probes the deterministic off state before touching the user's
+keys. The log line itself precedes Samsung's scheduled check, so this ordering
+is essential: confirmation is evidence only because restoration has not yet
+rewritten `scheduled` or Adaptive mode. If execution cannot be confirmed
+within a bounded three-second poll, the snapshot remains pending and the
+existing release retry tries again rather than discarding restore state. A
+type-24 start is used only for a restored Custom/scheduled shield. It is not
+an Adaptive-mode apply path and is a no-op after `scheduled=0`. The user's
+settings are saved in UserDefaults
 (`SideScreen_nightShiftEyeComfortSnapshots`, by `ro.serialno`) before the
 first override, so a quit or crash cannot lose them. If a release finds no
 tablet (cable already out, adb slow at quit), it is retried every 15 s and

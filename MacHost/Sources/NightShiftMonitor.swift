@@ -252,11 +252,17 @@ final class NightShiftMirror {
         self.releaseGrace = releaseGrace
         monitor.onChange = { [weak filter] target in filter?.show(target) }
         // A crash or a quit that timed out can leave a tablet overridden.
-        // Retry the hand-back from launch, even with the mirror opted out.
+        // Try immediately from launch, even with the mirror opted out, then
+        // keep a slow retry alive until the hand-back succeeds.
+        if filter.hasPendingRestores { filter.release() }
         scheduleRestoreRetryIfNeeded()
     }
 
-    func clientConnected(connectionMode: ConnectionMode, wirelessDeviceModel: String?) {
+    func clientConnected(
+        connectionMode: ConnectionMode,
+        wirelessDeviceModel: String?,
+        wirelessClientHost: String?
+    ) {
         pendingRelease?.cancel()
         pendingRelease = nil
         let scope: NightShiftTabletFilter.ClientScope?
@@ -264,7 +270,11 @@ final class NightShiftMirror {
         case .usb:
             scope = .usb
         case .wireless:
-            scope = wirelessDeviceModel.map { .wireless(deviceModel: $0) }
+            if let wirelessDeviceModel, let wirelessClientHost {
+                scope = .wireless(deviceModel: wirelessDeviceModel, clientHost: wirelessClientHost)
+            } else {
+                scope = nil
+            }
         }
         filter.setClientScope(scope)
         guard isEnabled() else { return }

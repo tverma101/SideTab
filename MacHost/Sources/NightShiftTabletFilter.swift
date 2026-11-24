@@ -73,6 +73,13 @@ enum EyeComfortPlan {
     /// Both act only while `blue_light_filter_scheduled` is on.
     static let serviceApply = 24
     static let serviceOff = 25
+    /// Samsung logs this exact line from the type-25 `onStartCommand` path.
+    /// Counting it before/after the queued start is the only observed way adb
+    /// can distinguish execution from mere delivery; `am startservice` itself
+    /// returns after queueing.
+    static let serviceOffLogNeedle = "FILTER_OFF (Setting)"
+    static let serviceOffLogCountScript =
+        "logcat -d -s BlueLightFilterService:I 2>/dev/null | grep -c '\(serviceOffLogNeedle)' 2>/dev/null; true"
 
     static func serviceScript(_ type: Int) -> String {
         "am startservice -n \(serviceComponent) --ei BLUE_LIGHT_FILTER_SERVICE_TYPE \(type) >/dev/null"
@@ -89,18 +96,35 @@ enum EyeComfortPlan {
     /// keeps the mirror's scheduled mode and the saved user snapshot intact:
     /// while a client is connected, the Mac's off state must mean the tablet
     /// is off even if the tablet's own schedule would have been on.
+    ///
+    /// The deterministic Custom/scheduled keys are required here too, not
+    /// only on the warm path: Samsung's type-25 handler is a no-op when it
+    /// reads `scheduled=0`, which is exactly the state of an Adaptive or
+    /// unscheduled tablet when the first host sample is Mac-off.
     static func offScript(over current: EyeComfortSettings) -> String {
-        let writes = current.filter != 0 ? [Write(key: keyFilter, value: 0)] : []
-        return script(for: writes, then: serviceScript(serviceOff))
+        script(for: writes(toTurnOffOver: current), then: serviceScript(serviceOff))
+    }
+
+    static func writes(toTurnOffOver current: EyeComfortSettings) -> [Write] {
+        var out: [Write] = []
+        // Filter first gives a running service the earliest chance to drop
+        // the panel; the following mode writes make the queued type-25 intent
+        // valid even when that observer is not running.
+        if current.filter != 0 { out.append(Write(key: keyFilter, value: 0)) }
+        if let adaptive = current.adaptive, adaptive != 0 {
+            out.append(Write(key: keyAdaptive, value: 0))
+        }
+        if current.type != typeAlwaysOn { out.append(Write(key: keyType, value: typeAlwaysOn)) }
+        if current.scheduled != 1 { out.append(Write(key: keyScheduled, value: 1)) }
+        return out
     }
 
     /// The restore phases as shell scripts. Phase one always runs — even
     /// when the probed filter key is already 0 — because `am startservice`
     /// only queues work. An earlier apply/off intent can otherwise execute
     /// after the user's schedule keys have been restored and become a no-op,
-    /// leaving the panel in the mirror's last visual state. The shell pause
-    /// between the two phases gives that queued off intent time to run while
-    /// the mirror's deterministic Custom/scheduled state is still present.
+    /// leaving the panel in the mirror's last visual state. The caller must
+    /// confirm execution of this off intent before sending phase two.
     static func restoreScripts(
         from current: EyeComfortSettings,
         to saved: EyeComfortSettings
@@ -156,9 +180,9 @@ enum EyeComfortPlan {
         if current.scheduled != 1 { off.append(Write(key: keyScheduled, value: 1)) }
 
         // Snapshots written before Adaptive mode was modelled do not contain
-        // that key. The old mirror never rewrote it either, so the value still
-        // visible in `current` is the user's original mode and is the best
-        // migration source. New snapshots carry their own value.
+        // that key. The first override migrates them explicitly; this fallback
+        // also covers a stranded pre-migration snapshot because the old mirror
+        // never rewrote Adaptive, so the probed live value is still the user's.
         let effectiveAdaptive = saved.adaptive ?? current.adaptive
         var restore: [Write] = []
         if current.level != saved.level { restore.append(Write(key: keyLevel, value: saved.level)) }
@@ -238,9 +262,9 @@ enum EyeComfortPlan {
 
     /// Ready transports from `adb devices -l`, USB first so a tablet that is
     /// also paired over Wi-Fi is driven through its cable. The model metadata
-    /// (`model:SM_X800`) is retained because wireless clients identify
-    /// themselves by `Build.MODEL` (`SM-X800`); comparing normalized forms is
-    /// the narrowest scoping signal available without a wire-protocol change.
+    /// (`model:SM_X800`) is retained as a sanity check for wireless clients,
+    /// whose stronger scoping signal is the authenticated peer IP compared
+    /// with a wireless adb `IP:port` serial.
     static func readyTransports(fromDevicesOutput output: String) -> [ReadyTransport] {
         let rows = output.split(whereSeparator: \.isNewline).compactMap { line -> ReadyTransport? in
             let fields = line.split { $0 == " " || $0 == "\t" }
@@ -267,6 +291,37 @@ enum EyeComfortPlan {
         guard let value else { return nil }
         let normalized = value.lowercased().filter { $0.isLetter || $0.isNumber }
         return normalized.isEmpty ? nil : normalized
+    }
+
+    /// Lowercase IP literal text, without brackets or an interface zone. This
+    /// is intentionally not hostname resolution: a name cannot prove that an
+    /// adb transport is the already-authenticated streaming peer.
+    static func normalizedHost(_ value: String?) -> String? {
+        guard var host = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !host.isEmpty else { return nil }
+        if host.hasPrefix("[") {
+            guard let end = host.firstIndex(of: "]") else { return nil }
+            host = String(host[host.index(after: host.startIndex)..<end])
+        }
+        if let zone = host.firstIndex(of: "%") { host = String(host[..<zone]) }
+        return host.isEmpty ? nil : host
+    }
+
+    /// Host portion of an adb wireless serial. IPv4 serials are `host:port`;
+    /// bracketed IPv6 serials are `[host]:port`. Hardware USB serials and
+    /// unbracketed IPv6 return nil rather than guessing at colons.
+    static func adbSerialHost(_ serial: String) -> String? {
+        if serial.hasPrefix("[") {
+            guard let end = serial.firstIndex(of: "]") else { return nil }
+            return normalizedHost(String(serial[serial.index(after: serial.startIndex)..<end]))
+        }
+        guard let colon = serial.lastIndex(of: ":") else { return nil }
+        let host = String(serial[..<colon])
+        // IPv4/hostname serials contain exactly one colon. Anything with an
+        // earlier colon is unbracketed IPv6 or another adb form we cannot
+        // correlate safely.
+        guard !host.contains(":") else { return nil }
+        return normalizedHost(host)
     }
 }
 
@@ -320,13 +375,13 @@ final class NightShiftTabletFilter {
 
     /// Conservative identity of the streaming client. USB streaming reaches
     /// the host through adb reverse, so exactly one eligible USB adb device is
-    /// a safe control target. Wireless clients carry only Build.MODEL today;
-    /// require exactly one adb device whose normalized model matches. If the
-    /// answer is absent or ambiguous, the mirror touches nothing rather than
-    /// mutating an unrelated Samsung device.
+    /// a safe control target. Wireless streaming must correlate the
+    /// authenticated peer IP with a wireless adb IP:port serial and also match
+    /// the client model. If the answer is absent or ambiguous, the mirror
+    /// touches nothing rather than mutating an unrelated Samsung device.
     enum ClientScope: Equatable {
         case usb
-        case wireless(deviceModel: String)
+        case wireless(deviceModel: String, clientHost: String)
     }
 
     private enum Command {
@@ -347,10 +402,11 @@ final class NightShiftTabletFilter {
     private var clientScope: ClientScope?
     private var reconciliationNeeded = false
 
-    /// `am startservice` returns before the service runs; give it time to
-    /// read the mirror's schedule and turn the panel off before phase two
-    /// changes those keys.
-    static let restorePause: TimeInterval = 1.0
+    /// Poll Samsung's own execution log briefly after queueing type 25. This
+    /// is bounded, but failure is fail-safe: the user's keys are not rewritten
+    /// and the snapshot remains pending for the existing release retry.
+    static let restoreOffPollInterval: TimeInterval = 0.1
+    static let restoreOffPollAttempts = 30
 
     init(
         listDevices: @escaping () -> String? = NightShiftTabletFilter.adbDevices,
@@ -508,12 +564,25 @@ final class NightShiftTabletFilter {
         case .usb:
             candidates = transports.filter(\.isUSB)
             scopeDescription = "matching the USB streaming client"
-        case .wireless(let deviceModel):
-            let wanted = EyeComfortPlan.normalizedModel(deviceModel)
-            candidates = transports.filter {
-                EyeComfortPlan.normalizedModel($0.model) == wanted
+        case .wireless(let deviceModel, let clientHost):
+            guard let wantedModel = EyeComfortPlan.normalizedModel(deviceModel),
+                  let wantedHost = EyeComfortPlan.normalizedHost(clientHost)
+            else {
+                noteSkip("wireless client identity is incomplete")
+                return []
             }
-            scopeDescription = "matching wireless model \(deviceModel)"
+            // A wireless stream proves only its peer IP. A USB adb serial is
+            // hardware text and cannot be correlated with that peer, so it is
+            // deliberately ineligible here. Wireless adb normally uses an
+            // IP:port serial; requiring both that exact host and the model is
+            // conservative, at the cost of no mirroring for hostname/mDNS adb
+            // serials.
+            candidates = transports.filter {
+                !$0.isUSB
+                    && EyeComfortPlan.normalizedModel($0.model) == wantedModel
+                    && EyeComfortPlan.adbSerialHost($0.serial) == wantedHost
+            }
+            scopeDescription = "matching wireless client \(clientHost) model \(deviceModel)"
         }
         let tablets = probedTablets(candidates)
         guard !tablets.isEmpty else {
@@ -563,7 +632,20 @@ final class NightShiftTabletFilter {
         serialNumber: String,
         transportSerial: String
     ) {
-        guard snapshots.snapshot(for: serialNumber) == nil else { return }
+        if var saved = snapshots.snapshot(for: serialNumber) {
+            // Snapshots written before Adaptive mode was modelled lack the
+            // key. The first command under this implementation is also the
+            // first point at which Adaptive can be forced off, so the pre-write
+            // probe still carries the user's original value. Augment the
+            // snapshot before overriding anything; inferring it later from the
+            // live keys would read the mirror's own forced zero.
+            if saved.adaptive == nil, let adaptive = current.adaptive {
+                saved.adaptive = adaptive
+                snapshots.save(saved, for: serialNumber)
+                debugLog("NightShift -> \(transportSerial): migrated tablet Eye comfort snapshot \(saved.dictionary)")
+            }
+            return
+        }
         snapshots.save(current, for: serialNumber)
         debugLog("NightShift -> \(transportSerial): saved tablet Eye comfort \(current.dictionary)")
     }
@@ -571,20 +653,77 @@ final class NightShiftTabletFilter {
     private func restore(_ serial: String, probe: EyeComfortPlan.Probe) {
         guard let current = probe.settings,
               let saved = snapshots.snapshot(for: probe.serialNumber) else { return }
-        let scripts = EyeComfortPlan.restoreScripts(from: current, to: saved)
-        if let off = scripts.off {
+        guard let offCountBefore = serviceOffExecutionCount(serial) else {
+            debugLog("NightShift -> \(serial): cannot observe Samsung service execution; keeping saved settings")
+            return
+        }
+        let initialScripts = EyeComfortPlan.restoreScripts(from: current, to: saved)
+        if let off = initialScripts.off {
             guard shell(serial, off) != nil else {
                 debugLog("NightShift -> \(serial): restore failed, keeping saved settings")
                 return
             }
-            pause(Self.restorePause)
         }
+        guard waitForServiceOffExecution(serial, countBefore: offCountBefore) else {
+            // Do not write the user's scheduled/adaptive keys while the off
+            // intent is still unobserved. If it executed late after those
+            // writes it could read them as scheduled=0 and become a no-op.
+            // Leaving the snapshot in place is safe: the mirror state is still
+            // deterministic and the existing release retry can try again.
+            debugLog("NightShift -> \(serial): panel-off service execution not confirmed; keeping saved settings")
+            return
+        }
+        // The type-25 log line precedes Samsung's scheduled check, so the
+        // count is evidence only because no user keys have been written yet.
+        // Re-prove that deterministic state immediately before phase two;
+        // otherwise a failed partial write or a user racing Settings could
+        // make the observed off intent a no-op.
+        guard let verified = verifiedMirrorOffState(serial, expectedSerialNumber: probe.serialNumber) else {
+            debugLog("NightShift -> \(serial): mirror off state not verified; keeping saved settings")
+            return
+        }
+        let scripts = EyeComfortPlan.restoreScripts(from: verified, to: saved)
         if let restore = scripts.restore, shell(serial, restore) == nil {
             debugLog("NightShift -> \(serial): restore failed, keeping saved settings")
             return
         }
         snapshots.remove(probe.serialNumber)
         debugLog("NightShift -> \(serial): restored tablet Eye comfort \(saved.dictionary)")
+    }
+
+    /// Number of type-25 executions currently visible in logcat, or nil when
+    /// the shell/logcat probe is unavailable. The count is a baseline rather
+    /// than a log-clearing operation: an increase means a panel-off command
+    /// executed while the pre-restore mirror keys were still in place.
+    private func serviceOffExecutionCount(_ serial: String) -> Int? {
+        guard let output = shell(serial, EyeComfortPlan.serviceOffLogCountScript) else { return nil }
+        return output.split(whereSeparator: \.isNewline).last.flatMap {
+            Int($0.trimmingCharacters(in: .whitespaces))
+        }
+    }
+
+    private func waitForServiceOffExecution(_ serial: String, countBefore: Int) -> Bool {
+        for _ in 0..<Self.restoreOffPollAttempts {
+            pause(Self.restoreOffPollInterval)
+            if let count = serviceOffExecutionCount(serial), count > countBefore { return true }
+        }
+        return false
+    }
+
+    private func verifiedMirrorOffState(
+        _ serial: String,
+        expectedSerialNumber: String
+    ) -> EyeComfortSettings? {
+        guard let raw = shell(serial, EyeComfortPlan.probeScript),
+              let probe = EyeComfortPlan.parseProbe(raw),
+              probe.serialNumber == expectedSerialNumber,
+              let settings = probe.settings,
+              settings.filter == 0,
+              settings.type == EyeComfortPlan.typeAlwaysOn,
+              settings.scheduled == 1,
+              (settings.adaptive ?? 0) == 0
+        else { return nil }
+        return settings
     }
 
     private func noteSkip(_ reason: String) {
