@@ -94,6 +94,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
 
+        // Constructing the mirror starts its pending-restore retry even when
+        // no tablet reconnects during this launch.
+        _ = nightShiftMirror
+
         nativeBrightness = NativeBrightnessController()
         nativeBrightness?.onBrightness = { [weak self] level in
             self?.streamingServer?.sendBrightness(level)
