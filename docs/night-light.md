@@ -1,8 +1,9 @@
 # Night light (Night Shift mirroring)
 
 While a tablet is connected, its Eye comfort shield follows the Mac's Night
-Shift: on when Night Shift is active, at the same strength. When the session
-ends, or Night Shift turns off, the tablet gets its own settings back.
+Shift exactly: on when Night Shift is active, at the same strength, and off
+when Night Shift is off — even if the tablet's own schedule would have been
+on. When the session ends, the tablet gets its own settings back.
 
 ## Why the tablet has to warm itself
 
@@ -22,9 +23,10 @@ streamed picture stays neutral while the Mac's panels go warm.
   `adb shell settings`. The Android app cannot do this itself: those keys are
   outside the public settings table, and the write fails with "You cannot
   change private secure settings" even with `WRITE_SECURE_SETTINGS`.
-- `NightShiftMirror` starts on client connect. It releases 10 s after a
-  disconnect, so a Wi-Fi blip does not flash the filter, and immediately on
-  Stop or Quit.
+- `NightShiftMirror` starts on client connect. While connected, a Mac-off
+  state actively turns the tablet filter off without discarding the saved
+  tablet settings. It releases 10 s after a disconnect, so a Wi-Fi blip does
+  not flash the filter, and immediately on Stop or Quit.
 
 Only adb devices with SideTab installed and Samsung's keys present are
 touched. No adb transport (wireless without wireless debugging) means no

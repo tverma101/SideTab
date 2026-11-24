@@ -77,6 +77,15 @@ enum EyeComfortPlan {
         script(for: writes(toShow: level, over: current), then: serviceScript(serviceApply))
     }
 
+    /// Panel off while the mirror remains in control. Unlike a release, this
+    /// keeps the mirror's scheduled mode and the saved user snapshot intact:
+    /// while a client is connected, the Mac's off state must mean the tablet
+    /// is off even if the tablet's own schedule would have been on.
+    static func offScript(over current: EyeComfortSettings) -> String {
+        let writes = current.filter != 0 ? [Write(key: keyFilter, value: 0)] : []
+        return script(for: writes, then: serviceScript(serviceOff))
+    }
+
     /// The restore phases as shell scripts. Phase one is sent only when the
     /// shield is on, and asks the service to turn the panel off while the
     /// mirror's schedule is still in place. Phase two ends with an apply when
@@ -235,6 +244,7 @@ final class NightShiftTabletFilter {
 
     private enum Command {
         case show(NightShiftTarget)
+        case off
         case release
     }
 
@@ -266,9 +276,9 @@ final class NightShiftTabletFilter {
     }
 
     /// Show `target` on every eligible tablet. An `enabled=false` target
-    /// hands each tablet back to its own settings.
+    /// turns the tablet panel filter off while keeping the mirror in control.
     func show(_ target: NightShiftTarget) {
-        submit(target.enabled ? .show(target) : .release)
+        submit(target.enabled ? .show(target) : .off)
     }
 
     /// Hand every tablet back to its own Eye comfort settings.
@@ -316,6 +326,8 @@ final class NightShiftTabletFilter {
             switch command {
             case .show(let target):
                 show(target, on: serial, probe: probe)
+            case .off:
+                turnOff(on: serial, probe: probe)
             case .release:
                 restore(serial, probe: probe)
             }
@@ -343,16 +355,34 @@ final class NightShiftTabletFilter {
 
     private func show(_ target: NightShiftTarget, on serial: String, probe: EyeComfortPlan.Probe) {
         guard let current = probe.settings else { return }
-        if snapshots.snapshot(for: probe.serialNumber) == nil {
-            snapshots.save(current, for: probe.serialNumber)
-            debugLog("NightShift -> \(serial): saved tablet Eye comfort \(current.dictionary)")
-        }
+        saveSnapshotIfNeeded(current, serialNumber: probe.serialNumber, transportSerial: serial)
         if shell(serial, EyeComfortPlan.showScript(level: target.level, over: current)) != nil {
             lastSkipReason = nil
             debugLog("NightShift -> \(serial): Eye comfort level \(target.level)/\(NightShiftTarget.maximumLevel)")
         } else {
             debugLog("NightShift -> \(serial): settings write failed")
         }
+    }
+
+    private func turnOff(on serial: String, probe: EyeComfortPlan.Probe) {
+        guard let current = probe.settings else { return }
+        saveSnapshotIfNeeded(current, serialNumber: probe.serialNumber, transportSerial: serial)
+        if shell(serial, EyeComfortPlan.offScript(over: current)) != nil {
+            lastSkipReason = nil
+            debugLog("NightShift -> \(serial): Eye comfort off (Mac Night Shift off)")
+        } else {
+            debugLog("NightShift -> \(serial): settings write failed")
+        }
+    }
+
+    private func saveSnapshotIfNeeded(
+        _ current: EyeComfortSettings,
+        serialNumber: String,
+        transportSerial: String
+    ) {
+        guard snapshots.snapshot(for: serialNumber) == nil else { return }
+        snapshots.save(current, for: serialNumber)
+        debugLog("NightShift -> \(transportSerial): saved tablet Eye comfort \(current.dictionary)")
     }
 
     private func restore(_ serial: String, probe: EyeComfortPlan.Probe) {

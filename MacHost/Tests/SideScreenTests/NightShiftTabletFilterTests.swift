@@ -151,8 +151,39 @@ final class NightShiftTabletFilterTests: XCTestCase {
         filter.show(.off)
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
         XCTAssertNil(tablet.panelLevel, "panel must not stay warm")
+        XCTAssertEqual(
+            tablet.settings,
+            EyeComfortSettings(filter: 0, level: 4, scheduled: 1, type: 0),
+            "Mac-off must force the tablet off while the session remains mirrored"
+        )
+        XCTAssertNotNil(store.snapshot(for: "R52"), "off is not a release; the user settings stay saved")
+
+        filter.show(NightShiftTarget(enabled: true, level: 6))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(tablet.panelLevel, 6)
+
+        filter.release()
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
         XCTAssertEqual(tablet.settings, EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2))
         XCTAssertNil(store.snapshot(for: "R52"))
+    }
+
+    func testMacOffBeforeFirstOnStillSnapshotsAndTurnsTheUsersFilterOff() {
+        let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 1, level: 5, scheduled: 1, type: 2))
+        let store = makeStore()
+        let filter = makeFilter(tablet, store)
+
+        filter.show(.off)
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        XCTAssertNil(tablet.panelLevel)
+        XCTAssertEqual(tablet.settings.filter, 0)
+        XCTAssertEqual(store.snapshot(for: "R52"), EyeComfortSettings(filter: 1, level: 5, scheduled: 1, type: 2))
+
+        filter.release()
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(tablet.settings, EyeComfortSettings(filter: 1, level: 5, scheduled: 1, type: 2))
+        XCTAssertFalse(filter.hasPendingRestores)
     }
 
     func testSnapshotSurvivesARelaunch() {
