@@ -44,6 +44,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var virtualDisplayManager: VirtualDisplayManager?
     var brightnessMonitor: BrightnessMonitor?
     var nativeBrightness: NativeBrightnessController?
+    /// Mirrors Night Shift into the tablet's Eye comfort shield while a
+    /// client is connected (NightShiftMonitor.swift).
+    @MainActor private lazy var nightShiftMirror = NightShiftMirror()
     var idleSleepMonitor: IdleSleepMonitor?
     var settings = DisplaySettings()
     var runtime = DisplayRuntimeState()
@@ -913,6 +916,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // client has joined; StreamingServer queues it until BRIGHT
                     // capability negotiation completes.
                     self.nativeBrightness?.pushCurrent()
+                    self.nightShiftMirror.clientConnected()
                     self.runtime.clientConnected = true
                 }
             }
@@ -940,6 +944,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // a disconnect in the middle of an S Pen drag otherwise left
                     // the button logically down until the user clicked again.
                     self.releaseStylusIfNeeded()
+                    self.nightShiftMirror.clientDisconnected()
                     self.runtime.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment.
                     self.persistWirelessDeviceDisconnect()
@@ -1165,6 +1170,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard clearingSettings else { return }
         releaseStylusIfNeeded()
+        nightShiftMirror.releaseNow()
         runtime.isRunning = false
         runtime.displayCreated = false
         runtime.clientConnected = false
@@ -1762,6 +1768,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // for the whole termination sequence.
         statusRefreshTimer?.invalidate()
         statusRefreshTimer = nil
+
+        // Hand the tablet its own Eye comfort settings back before quitting.
+        nightShiftMirror.releaseForTermination()
 
         // Stop server and cleanup
         stopServer()
