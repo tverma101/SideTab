@@ -2,10 +2,14 @@ import Foundation
 
 /// One sample of the host's Night Shift state, as CoreBrightness reports it.
 struct NightShiftReading: Equatable {
-    /// True while Night Shift is actually warming the display: the status
-    /// struct's `active` bit, not `enabled`. A scheduled Night Shift during
-    /// the day is enabled but inactive, and the panel shows neutral color.
+    /// True while Night Shift is actually warming the display. This is the
+    /// status dictionary's `BlueReductionEnabled` value: CoreBrightness flips
+    /// it at the native schedule boundary and for a manual toggle.
     let active: Bool
+    /// `AutoBlueReductionEnabled`, kept for diagnostics only. It means the
+    /// automatic schedule is armed, not that the panel is warm right now;
+    /// treating it as the active state keeps the mirror on all day.
+    let automaticScheduleEnabled: Bool
     /// Night Shift warmth 0...1 (0 = "Less Warm" end of the slider).
     let strength: Float
     /// Reported color temperature in Kelvin. Diagnostics only.
@@ -52,8 +56,15 @@ struct NightShiftTarget: Equatable {
 final class BlueLightStatusProbe {
     /// Layout of the out-struct, matching the runtime type encoding
     /// `{?=BBBi{?={?=ii}{?=ii}}QB}` (40 bytes; checked with clang's sizeof).
+    /// `parseStatusDictionary:intoStruct:` maps byte one from
+    /// `AutoBlueReductionEnabled` and byte two from `BlueReductionEnabled`.
+    /// The historical header names those bytes `active` and `enabled`, but
+    /// byte one is only the armed automatic schedule. Byte two is the live
+    /// Night Shift state: verified on macOS 27.2 at a solar boundary, where
+    /// byte one stayed 1 all afternoon while byte two changed 0 -> 1 exactly
+    /// when CoreBrightness reached sunset.
     private struct CBBlueLightStatus {
-        var active: UInt8 = 0
+        var automaticScheduleEnabled: UInt8 = 0
         var enabled: UInt8 = 0
         var sunSchedulePermitted: UInt8 = 0
         var mode: Int32 = 0
@@ -103,7 +114,8 @@ final class BlueLightStatusProbe {
         }
         guard ok != 0 else { return nil }
         return NightShiftReading(
-            active: status.active != 0,
+            active: status.enabled != 0,
+            automaticScheduleEnabled: status.automaticScheduleEnabled != 0,
             strength: readFloat(strengthFn, strengthSel),
             kelvin: readFloat(cctFn, cctSel)
         )
@@ -167,8 +179,9 @@ final class NightShiftMonitor {
         if let reading, reading != lastLogged {
             lastLogged = reading
             debugLog(String(
-                format: "NightShift: active=%d strength=%.3f (~%.0fK)",
-                reading.active ? 1 : 0, reading.strength, reading.kelvin
+                format: "NightShift: active=%d autoSchedule=%d strength=%.3f (~%.0fK)",
+                reading.active ? 1 : 0, reading.automaticScheduleEnabled ? 1 : 0,
+                reading.strength, reading.kelvin
             ))
         } else if reading == nil, !reportedUnavailable {
             reportedUnavailable = true

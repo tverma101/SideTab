@@ -12,9 +12,12 @@ streamed picture stays neutral while the Mac's panels go warm.
 ## Mac side
 
 - `NightShiftMonitor` polls CoreBrightness' private `CBBlueLightClient`
-  (loaded at runtime, never linked) at 1 Hz. The status struct's `active` bit
-  decides on/off; `getStrength:` gives 0...1. An unreadable probe counts as
-  off.
+  (loaded at runtime, never linked) at 1 Hz. The status dictionary's
+  `BlueReductionEnabled` value decides on/off; CoreBrightness flips it for a
+  manual toggle and at the native custom/solar schedule boundary.
+  `AutoBlueReductionEnabled` is **not** the live state — it only means the
+  automatic schedule is armed and otherwise keeps the tablet warm all day.
+  `getStrength:` gives 0...1. An unreadable probe counts as off.
 - `NightShiftTabletFilter` writes Samsung's `blue_light_filter*` keys through
   `adb shell settings`. The Android app cannot do this itself: those keys are
   outside the public settings table, and the write fails with "You cannot

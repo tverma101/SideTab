@@ -24,10 +24,23 @@ final class NightShiftTabletFilterTests: XCTestCase {
 
     func testInactiveOrUnreadableNightShiftIsOff() {
         XCTAssertEqual(NightShiftTarget.target(for: nil), .off)
-        let daytime = NightShiftReading(active: false, strength: 0.9, kelvin: 6_500)
+        let daytime = NightShiftReading(active: false, automaticScheduleEnabled: false, strength: 0.9, kelvin: 6_500)
         XCTAssertEqual(NightShiftTarget.target(for: daytime), .off)
-        let night = NightShiftReading(active: true, strength: 0.883, kelvin: 3_028)
+        let night = NightShiftReading(active: true, automaticScheduleEnabled: true, strength: 0.883, kelvin: 3_028)
         XCTAssertEqual(NightShiftTarget.target(for: night), NightShiftTarget(enabled: true, level: 9))
+    }
+
+    func testArmedScheduleAloneDoesNotForceTheFilterOn() {
+        // Regression for the forced-on mirror: `AutoBlueReductionEnabled`
+        // stays true all day because the schedule is armed. Only
+        // `BlueReductionEnabled` (`active` here) means the Mac is warm now.
+        let armedButInactive = NightShiftReading(
+            active: false,
+            automaticScheduleEnabled: true,
+            strength: 0.883,
+            kelvin: 3_028
+        )
+        XCTAssertEqual(NightShiftTarget.target(for: armedButInactive), .off)
     }
 
     // MARK: - Planning
