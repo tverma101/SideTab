@@ -850,9 +850,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
             attempt.streamingServer = server
             server.touchEnabled = await MainActor.run { self.settings.touchEnabled }
+            let wirelessClientModel = OSAllocatedUnfairLock<String?>(initialState: nil)
             if settings.connectionMode == .wireless {
                 server.expectedAuthToken = WirelessAuth.loadOrCreate()
                 server.onWirelessClientPaired = { [weak self, weak server] deviceName in
+                    // Written synchronously before the server installs the
+                    // session, so the later client-connected callback never
+                    // depends on MainActor task ordering for this identity.
+                    wirelessClientModel.withLock { $0 = deviceName }
                     // Identity is read on the server's own queue, while the
                     // handshake that produced it is still the live session.
                     guard let server else { return }
@@ -920,7 +925,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // client has joined; StreamingServer queues it until BRIGHT
                     // capability negotiation completes.
                     self.nativeBrightness?.pushCurrent()
-                    self.nightShiftMirror.clientConnected()
+                    self.nightShiftMirror.clientConnected(
+                        connectionMode: sessionMode,
+                        wirelessDeviceModel: wirelessClientModel.withLock { $0 }
+                    )
                     self.runtime.clientConnected = true
                 }
             }

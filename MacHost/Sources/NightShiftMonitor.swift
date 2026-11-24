@@ -38,10 +38,12 @@ struct NightShiftTarget: Equatable {
         return Int((unit * Float(maximumLevel)).rounded())
     }
 
-    /// Fail closed: an unreadable probe means "off", so a broken detection
-    /// path can never strand a warm filter on the tablet.
-    static func target(for reading: NightShiftReading?) -> NightShiftTarget {
-        guard let reading, reading.active else { return .off }
+    /// nil means the host state is unknown. Unknown is deliberately not
+    /// mapped to off: the mirror must not take ownership of a tablet before
+    /// it has one successful CoreBrightness reading.
+    static func target(for reading: NightShiftReading?) -> NightShiftTarget? {
+        guard let reading else { return nil }
+        guard reading.active else { return .off }
         return NightShiftTarget(enabled: true, level: level(forStrength: reading.strength))
     }
 }
@@ -185,13 +187,19 @@ final class NightShiftMonitor {
             ))
         } else if reading == nil, !reportedUnavailable {
             reportedUnavailable = true
-            debugLog("NightShift: status unavailable, treating as off")
+            debugLog("NightShift: status unavailable; retaining last known state")
         }
 
-        let target = NightShiftTarget.target(for: reading)
-        guard target != lastEmitted else { return }
+        guard let target = NightShiftTarget.target(for: reading), target != lastEmitted else { return }
         lastEmitted = target
         onChange?(target)
+    }
+
+    /// Re-emit the current known target after an adb/control failure. If the
+    /// host probe is unavailable there is intentionally nothing to enforce.
+    func reconcile() {
+        lastEmitted = nil
+        tick()
     }
 }
 
@@ -220,10 +228,16 @@ final class NightShiftMirror {
     private let releaseGrace: TimeInterval
     private var pendingRelease: DispatchWorkItem?
     private var restoreRetry: Timer?
+    private var reconciliationTimer: Timer?
     private(set) var isMirroring = false
 
     /// How often to retry handing back a tablet the last release missed.
     nonisolated static let restoreRetryInterval: TimeInterval = 15
+
+    /// adb authorization and cold-start failures should heal without waiting
+    /// for the next macOS Night Shift transition. Successful mirroring does
+    /// not repeat writes; only a failed target is re-emitted on this cadence.
+    nonisolated static let reconciliationInterval: TimeInterval = 15
 
     init(
         monitor: NightShiftMonitor? = nil,
@@ -242,15 +256,24 @@ final class NightShiftMirror {
         scheduleRestoreRetryIfNeeded()
     }
 
-    func clientConnected() {
+    func clientConnected(connectionMode: ConnectionMode, wirelessDeviceModel: String?) {
         pendingRelease?.cancel()
         pendingRelease = nil
+        let scope: NightShiftTabletFilter.ClientScope?
+        switch connectionMode {
+        case .usb:
+            scope = .usb
+        case .wireless:
+            scope = wirelessDeviceModel.map { .wireless(deviceModel: $0) }
+        }
+        filter.setClientScope(scope)
         guard isEnabled() else { return }
         stopRestoreRetry()
         if !isMirroring {
             isMirroring = true
             debugLog("NightShift: mirroring to tablet Eye comfort shield")
         }
+        startReconciliationTimer()
         // Re-emits the current state, so a tablet that was re-plugged or
         // changed by hand while disconnected is brought back in line.
         monitor.stop()
@@ -274,7 +297,9 @@ final class NightShiftMirror {
         guard isMirroring else { return }
         isMirroring = false
         monitor.stop()
+        stopReconciliationTimer()
         filter.release()
+        filter.setClientScope(nil)
         scheduleRestoreRetryIfNeeded()
     }
 
@@ -300,6 +325,23 @@ final class NightShiftMirror {
     private func stopRestoreRetry() {
         restoreRetry?.invalidate()
         restoreRetry = nil
+    }
+
+    private func startReconciliationTimer() {
+        guard reconciliationTimer == nil else { return }
+        let t = Timer(timeInterval: Self.reconciliationInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isMirroring, self.filter.needsReconciliation else { return }
+                self.monitor.reconcile()
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        reconciliationTimer = t
+    }
+
+    private func stopReconciliationTimer() {
+        reconciliationTimer?.invalidate()
+        reconciliationTimer = nil
     }
 
     /// Bounded so a wedged adb cannot hold up quitting.

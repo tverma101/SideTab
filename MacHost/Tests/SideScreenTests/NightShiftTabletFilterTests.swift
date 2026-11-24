@@ -23,7 +23,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
     }
 
     func testInactiveOrUnreadableNightShiftIsOff() {
-        XCTAssertEqual(NightShiftTarget.target(for: nil), .off)
+        XCTAssertNil(NightShiftTarget.target(for: nil))
         let daytime = NightShiftReading(active: false, automaticScheduleEnabled: false, strength: 0.9, kelvin: 6_500)
         XCTAssertEqual(NightShiftTarget.target(for: daytime), .off)
         let night = NightShiftReading(active: true, automaticScheduleEnabled: true, strength: 0.883, kelvin: 3_028)
@@ -41,6 +41,41 @@ final class NightShiftTabletFilterTests: XCTestCase {
             kelvin: 3_028
         )
         XCTAssertEqual(NightShiftTarget.target(for: armedButInactive), .off)
+    }
+
+
+    func testMonitorDoesNotTreatAnUnreadableHostProbeAsMacOff() async {
+        await MainActor.run {
+            var reading: NightShiftReading?
+            var emissions: [NightShiftTarget] = []
+            let monitor = NightShiftMonitor(pollS: 60, probe: { reading })
+            monitor.onChange = { emissions.append($0) }
+
+            monitor.tick()
+            XCTAssertTrue(emissions.isEmpty, "unknown must not take ownership as a synthetic Mac-off state")
+
+            reading = NightShiftReading(active: true, automaticScheduleEnabled: true, strength: 0.883, kelvin: 3_028)
+            monitor.tick()
+            XCTAssertEqual(emissions, [NightShiftTarget(enabled: true, level: 9)])
+
+            reading = nil
+            monitor.tick()
+            XCTAssertEqual(emissions.count, 1, "losing the probe mid-session must not rewrite the tablet")
+        }
+    }
+
+    func testMonitorReconcileReemitsTheCurrentKnownTarget() async {
+        await MainActor.run {
+            let reading = NightShiftReading(active: false, automaticScheduleEnabled: true, strength: 0.883, kelvin: 3_028)
+            var emissions: [NightShiftTarget] = []
+            let monitor = NightShiftMonitor(pollS: 60, probe: { reading })
+            monitor.onChange = { emissions.append($0) }
+            monitor.tick()
+            monitor.tick()
+            XCTAssertEqual(emissions, [.off])
+            monitor.reconcile()
+            XCTAssertEqual(emissions, [.off, .off])
+        }
     }
 
     // MARK: - Planning
@@ -92,13 +127,14 @@ final class NightShiftTabletFilterTests: XCTestCase {
         blue_light_filter_opacity=88\r
         blue_light_filter_scheduled=0\r
         blue_light_filter_type=2\r
+        blue_light_filter_adaptive_mode=1\r
 
         """
         let probe = EyeComfortPlan.parseProbe(output)
         XCTAssertEqual(probe, EyeComfortPlan.Probe(
             serialNumber: "R52X30G5TNB",
             hasSideTab: true,
-            settings: EyeComfortSettings(filter: 1, level: 88, scheduled: 0, type: 2)
+            settings: EyeComfortSettings(filter: 1, level: 88, scheduled: 0, type: 2, adaptive: 1)
         ))
     }
 
@@ -209,11 +245,12 @@ final class NightShiftTabletFilterTests: XCTestCase {
         let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2))
         var plugged = true
         let filter = NightShiftTabletFilter(
-            listDevices: { plugged ? "List of devices attached\nR52 device usb:1-1\n" : "List of devices attached\n" },
+            listDevices: { plugged ? "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" : "List of devices attached\n" },
             shell: { _, script in tablet.run(script) },
             snapshots: makeStore(),
-            pause: { _ in }
+            pause: { _ in tablet.settle() }
         )
+        filter.setClientScope(.usb)
         filter.show(NightShiftTarget(enabled: true, level: 9))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
 
@@ -247,6 +284,165 @@ final class NightShiftTabletFilterTests: XCTestCase {
         XCTAssertEqual(tablet.writeCount, 0)
     }
 
+
+    func testShowForcesAdaptiveModeOffBeforeCustomMirroring() {
+        let current = EyeComfortSettings(filter: 1, level: 8, scheduled: 0, type: 2, adaptive: 1)
+        XCTAssertEqual(
+            EyeComfortPlan.writes(toShow: 9, over: current).map(\.key),
+            [
+                "blue_light_filter_adaptive_mode",
+                "blue_light_filter_type",
+                "blue_light_filter_opacity",
+                "blue_light_filter_scheduled"
+            ]
+        )
+    }
+
+    func testRestoreAlwaysQueuesPanelOffEvenWhenFilterKeyAlreadyReadsOff() {
+        let current = EyeComfortSettings(filter: 0, level: 9, scheduled: 1, type: 0, adaptive: 0)
+        let saved = EyeComfortSettings(filter: 1, level: 7, scheduled: 0, type: 2, adaptive: 1)
+        let phases = EyeComfortPlan.restorePhases(from: current, to: saved)
+        XCTAssertEqual(phases.off.first, EyeComfortPlan.Write(key: "blue_light_filter", value: 0))
+        XCTAssertEqual(phases.restore.map(\.key), [
+            "blue_light_filter_opacity",
+            "blue_light_filter_type",
+            "blue_light_filter_scheduled",
+            "blue_light_filter",
+            "blue_light_filter_adaptive_mode"
+        ])
+        let scripts = EyeComfortPlan.restoreScripts(from: current, to: saved)
+        XCTAssertNotNil(scripts.off)
+        XCTAssertFalse(scripts.restore?.contains("BLUE_LIGHT_FILTER_SERVICE_TYPE 24") ?? true,
+                       "Adaptive restore must not use Samsung's Custom-only type-24 apply")
+    }
+
+    func testAdaptiveUserIsForcedToCustomAndRestoredThroughAsynchronousServiceRace() {
+        let original = EyeComfortSettings(filter: 1, level: 7, scheduled: 0, type: 2, adaptive: 1)
+        let tablet = FakeSamsungTablet(original)
+        tablet.autoSettle = false
+        let store = makeStore()
+        var pauseCount = 0
+        let filter = NightShiftTabletFilter(
+            listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            shell: { _, script in tablet.run(script) },
+            snapshots: store,
+            pause: { _ in
+                pauseCount += 1
+                tablet.settle()
+            }
+        )
+        filter.setClientScope(.usb)
+
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(tablet.settings.adaptive, 0)
+        XCTAssertEqual(tablet.settings.type, EyeComfortPlan.typeAlwaysOn)
+        XCTAssertEqual(store.snapshot(for: "R52"), original)
+
+        filter.show(.off)
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        filter.release()
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        XCTAssertEqual(pauseCount, 1, "release must wait for the unconditional panel-off phase even when filter already reads 0")
+        XCTAssertEqual(tablet.settings, original)
+        XCTAssertTrue(tablet.adaptiveActive)
+        XCTAssertEqual(tablet.panelLevel, 7)
+        XCTAssertFalse(filter.hasPendingRestores)
+    }
+
+    func testMultipleMatchingUSBTabletsAreNotTouched() {
+        let first = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        let second = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2), serial: "R53")
+        let devices = """
+        List of devices attached
+        R52 device usb:1-1 model:SM_X800
+        R53 device usb:1-2 model:SM_X800
+
+        """
+        let filter = NightShiftTabletFilter(
+            listDevices: { devices },
+            shell: { serial, script in (serial == "R52" ? first : second).run(script) },
+            snapshots: makeStore(),
+            pause: { _ in }
+        )
+        filter.setClientScope(.usb)
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(first.writeCount, 0)
+        XCTAssertEqual(second.writeCount, 0)
+        XCTAssertTrue(filter.needsReconciliation)
+    }
+
+    func testWirelessScopeMatchesOnlyTheNormalizedClientModel() {
+        let matching = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        let other = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2), serial: "R53")
+        let devices = """
+        List of devices attached
+        192.168.1.8:5555 device model:SM_X800
+        192.168.1.9:5555 device model:SM_T970
+
+        """
+        let filter = NightShiftTabletFilter(
+            listDevices: { devices },
+            shell: { serial, script in serial.contains("1.8") ? matching.run(script) : other.run(script) },
+            snapshots: makeStore(),
+            pause: { _ in matching.settle() }
+        )
+        filter.setClientScope(.wireless(deviceModel: "SM-X800"))
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(matching.panelLevel, 9)
+        XCTAssertEqual(other.writeCount, 0)
+
+        let matchingWrites = matching.writeCount
+        filter.setClientScope(.wireless(deviceModel: "SM-S911"))
+        filter.show(NightShiftTarget(enabled: true, level: 4))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(matching.writeCount, matchingWrites, "a non-matching wireless client must not keep mutating the first tablet")
+        XCTAssertEqual(other.writeCount, 0)
+    }
+
+    func testWirelessMismatchIsNotTouched() {
+        let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        let filter = NightShiftTabletFilter(
+            listDevices: { "List of devices attached\n192.168.1.8:5555 device model:SM_T970\n" },
+            shell: { _, script in tablet.run(script) },
+            snapshots: makeStore(),
+            pause: { _ in }
+        )
+        filter.setClientScope(.wireless(deviceModel: "SM-X800"))
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(tablet.writeCount, 0)
+        XCTAssertTrue(filter.needsReconciliation)
+    }
+
+    func testFailedWriteMarksReconciliationAndASubsequentSuccessClearsIt() {
+        let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        var failWrites = true
+        let filter = NightShiftTabletFilter(
+            listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            shell: { _, script in
+                if script == EyeComfortPlan.probeScript { return tablet.run(script) }
+                return failWrites ? nil : tablet.run(script)
+            },
+            snapshots: makeStore(),
+            pause: { _ in tablet.settle() }
+        )
+        filter.setClientScope(.usb)
+        let target = NightShiftTarget(enabled: true, level: 9)
+        filter.show(target)
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertTrue(filter.needsReconciliation)
+
+        failWrites = false
+        filter.show(target)
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertFalse(filter.needsReconciliation)
+        XCTAssertEqual(tablet.panelLevel, 9)
+    }
+
     // MARK: - Helpers
 
     private func makeDefaults() -> UserDefaults {
@@ -261,49 +457,60 @@ final class NightShiftTabletFilterTests: XCTestCase {
     }
 
     private func makeFilter(_ tablet: FakeSamsungTablet, _ store: EyeComfortSnapshotStore) -> NightShiftTabletFilter {
-        NightShiftTabletFilter(
+        let filter = NightShiftTabletFilter(
             listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
             shell: { _, script in tablet.run(script) },
             snapshots: store,
             pause: { _ in tablet.settle() }
         )
+        filter.setClientScope(.usb)
+        return filter
     }
 }
 
 /// Settings.System plus the observer behavior that decides what the panel
-/// shows. `settle()` stands in for the observer catching up between adb
-/// calls; within one shell script the observer sees only the final values.
+/// shows. Service intents are normally settled after each adb shell round
+/// trip; tests can disable that to model Android's real asynchronous
+/// `am startservice` delivery explicitly.
 private final class FakeSamsungTablet {
     var settings: EyeComfortSettings
     var hasSideTab = true
+    var autoSettle = true
+    let serial: String
     private(set) var panelLevel: Int?
+    private(set) var adaptiveActive: Bool
     private(set) var writeCount = 0
+    private var queuedServiceTypes: [Int] = []
 
-    init(_ settings: EyeComfortSettings) {
+    init(_ settings: EyeComfortSettings, serial: String = "R52") {
         self.settings = settings
-        panelLevel = nil
+        self.serial = serial
+        adaptiveActive = (settings.adaptive ?? 0) != 0 && settings.filter != 0
+        panelLevel = adaptiveActive ? settings.level : nil
     }
 
     func run(_ script: String) -> String? {
         if script == EyeComfortPlan.probeScript {
             let s = settings
+            let adaptive = s.adaptive.map(String.init) ?? "null"
             return """
-            serial=R52
+            serial=\(serial)
             sidetab=\(hasSideTab ? 1 : 0)
             blue_light_filter=\(s.filter)
             blue_light_filter_opacity=\(s.level)
             blue_light_filter_scheduled=\(s.scheduled)
             blue_light_filter_type=\(s.type)
+            blue_light_filter_adaptive_mode=\(adaptive)
 
             """
         }
         for command in script.components(separatedBy: " && ") {
             if command == EyeComfortPlan.serviceScript(EyeComfortPlan.serviceApply) {
-                startService(EyeComfortPlan.serviceApply)
+                queueService(EyeComfortPlan.serviceApply)
                 continue
             }
             if command == EyeComfortPlan.serviceScript(EyeComfortPlan.serviceOff) {
-                startService(EyeComfortPlan.serviceOff)
+                queueService(EyeComfortPlan.serviceOff)
                 continue
             }
             let parts = command.split(separator: " ").map(String.init)
@@ -314,23 +521,46 @@ private final class FakeSamsungTablet {
             case EyeComfortPlan.keyLevel: settings.level = value
             case EyeComfortPlan.keyScheduled: settings.scheduled = value
             case EyeComfortPlan.keyType: settings.type = value
+            case EyeComfortPlan.keyAdaptive:
+                settings.adaptive = value
+                if value != 0, settings.filter != 0 {
+                    // The adaptive pipeline is separate from Samsung's Custom
+                    // schedule service. Restoring this key is the trigger that
+                    // re-arms it after the mirror forced Custom mode.
+                    adaptiveActive = true
+                    panelLevel = settings.level
+                } else if value == 0 {
+                    adaptiveActive = false
+                    if settings.filter == 0 { panelLevel = nil }
+                }
             default: return nil
             }
             writeCount += 1
         }
+        if autoSettle { settle() }
         return ""
     }
 
-    func settle() {}
+    private func queueService(_ type: Int) {
+        queuedServiceTypes.append(type)
+    }
+
+    func settle() {
+        let pending = queuedServiceTypes
+        queuedServiceTypes.removeAll()
+        for type in pending { startService(type) }
+    }
 
     /// BlueLightFilterService.onStartCommand for types 24 and 25. Both are
     /// no-ops unless "Set schedule" is on; schedule types other than Always
-    /// on hand off to Samsung's own timer, modeled as "not warm now".
+    /// on hand off to Samsung's own timer, modeled as "not warm now". Type 24
+    /// is deliberately not an Adaptive-mode apply path.
     private func startService(_ type: Int) {
         guard settings.scheduled != 0 else { return }
         if type == EyeComfortPlan.serviceOff {
             panelLevel = nil
-        } else if settings.type == EyeComfortPlan.typeAlwaysOn {
+            adaptiveActive = false
+        } else if settings.type == EyeComfortPlan.typeAlwaysOn, (settings.adaptive ?? 0) == 0 {
             panelLevel = settings.level
         }
     }
