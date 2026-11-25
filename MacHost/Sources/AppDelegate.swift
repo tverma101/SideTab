@@ -928,7 +928,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.nightShiftMirror.clientConnected(
                         connectionMode: sessionMode,
                         wirelessDeviceModel: wirelessClientModel.withLock { $0 },
-                        wirelessClientHost: event.clientHost
+                        wirelessClientHost: event.clientHost,
+                        usbVideoPort: Int(self.settings.port),
+                        usbControlPort: Int(ControlPortResolver.effective(videoPort: self.settings.port)),
+                        sessionGeneration: event.sessionGeneration
                     )
                     self.runtime.clientConnected = true
                 }
@@ -957,7 +960,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // a disconnect in the middle of an S Pen drag otherwise left
                     // the button logically down until the user clicked again.
                     self.releaseStylusIfNeeded()
-                    self.nightShiftMirror.clientDisconnected()
+                    self.nightShiftMirror.clientDisconnected(sessionGeneration: event.sessionGeneration)
                     self.runtime.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment.
                     self.persistWirelessDeviceDisconnect()

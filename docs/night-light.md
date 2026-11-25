@@ -32,19 +32,27 @@ streamed picture stays neutral while the Mac's panels go warm.
   not flash the filter, and immediately on Stop or Quit.
 
 Control is conservatively scoped to the streaming client rather than every
-adb-visible Samsung device. USB streaming requires exactly one total ready
-USB adb transport before eligibility is even considered, because eligibility
-is not identity: a non-Samsung streaming client can otherwise make an idle
-Samsung the sole Eye-comfort match. Wireless
-streaming is stricter: the adb transport must be wireless (not USB), its
-`IP:port` serial must use the same host as the authenticated streaming peer,
-its normalized adb model must match the client's `Build.MODEL` (for example
-`SM_X800` vs `SM-X800`), and exactly one eligible device may match. Hostname
-or mDNS adb serials therefore do not mirror until a stronger device identity
-exists; that is deliberate fail-closed behavior. Release is broader by
-design: any device already carrying a SideTab snapshot is restored even after
-the client scope is gone. No matching adb transport (wireless without
-wireless debugging) means no mirroring.
+adb-visible Samsung device. USB streaming reaches the Mac through adb reverse,
+so the client must be the single adb transport carrying both reverse mappings
+for the active video/control ports. That rule is transport-independent: a
+network-adb reverse tunnel can qualify, while a merely plugged-in Samsung
+cannot. Wireless streaming requires a wireless (not USB) adb `IP:port` serial
+whose host is the authenticated streaming peer, a normalized model match with
+the client's `Build.MODEL` (for example `SM_X800` vs `SM-X800`), and exactly
+one match. Hostname or mDNS adb serials fail closed.
+
+Identity is also durable. Once a client is resolved, its `ro.serialno` is
+bound for that connection; plugging in a lookalike after the original client
+drops cannot inherit control. A reconnect presents a new endpoint proof and is
+resolved again. The 10-second disconnect grace is conditional rather than
+blindly cancelled: the same physical client keeps its override without a
+flash, while snapshots belonging to a tablet left behind by a replacement
+client are handed back. Foreign snapshots keep reconciling during the
+replacement session if the old tablet is temporarily unreachable. Stop/Quit
+and launch recovery use an unconditional release: any device already carrying
+a SideTab snapshot is restored even after the client scope is gone. No
+matching adb transport (wireless without wireless debugging) means no
+mirroring.
 
 ## Samsung Eye comfort shield keys (SM-X800, Android 14)
 
@@ -88,7 +96,7 @@ increase and re-probes the deterministic off state before touching the user's
 keys. The log line itself precedes Samsung's scheduled check, so this ordering
 is essential: confirmation is evidence only because restoration has not yet
 rewritten `scheduled` or Adaptive mode. If execution cannot be confirmed
-within a bounded three-second poll, the snapshot remains pending and the
+within a bounded poll (30 attempts at a nominal 100 ms spacing), the snapshot remains pending and the
 existing release retry tries again rather than discarding restore state. A
 type-24 start is used only for a restored Custom/scheduled shield. It is not
 an Adaptive-mode apply path and is a no-op after `scheduled=0`. The user's

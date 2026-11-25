@@ -344,6 +344,8 @@ final class EyeComfortSnapshotStore {
 
     var isEmpty: Bool { all.isEmpty }
 
+    var serialNumbers: [String] { Array(all.keys) }
+
     func snapshot(for serialNumber: String) -> EyeComfortSettings? {
         all[serialNumber].flatMap(EyeComfortSettings.init(dictionary:))
     }
@@ -374,23 +376,33 @@ final class NightShiftTabletFilter {
     typealias Shell = (_ serial: String, _ script: String) -> String?
 
     /// Conservative identity of the streaming client. USB streaming reaches
-    /// the host through adb reverse, so exactly one eligible USB adb device is
-    /// a safe control target. Wireless streaming must correlate the
-    /// authenticated peer IP with a wireless adb IP:port serial and also match
-    /// the client model. If the answer is absent or ambiguous, the mirror
-    /// touches nothing rather than mutating an unrelated Samsung device.
+    /// the host through adb reverse; the client is the single adb transport
+    /// carrying both reverse mappings for the active video/control ports.
+    /// Wireless streaming must correlate the authenticated peer IP with a
+    /// wireless adb IP:port serial and also match the client model. Once
+    /// identified, the hardware serial is bound for the life of that client
+    /// connection so a later hotplug cannot be substituted for it.
     enum ClientScope: Equatable {
-        case usb
+        case usb(videoPort: Int, controlPort: Int)
         case wireless(deviceModel: String, clientHost: String)
     }
 
     private enum Command {
         case show(NightShiftTarget)
         case off
-        case release
+        case releaseAll
+        case releaseDisconnectedClient
+    }
+
+    private struct ClientIdentity {
+        let transportSerial: String
+        let probe: EyeComfortPlan.Probe
+
+        var hardwareSerial: String { probe.serialNumber }
     }
 
     private let listDevices: () -> String?
+    private let reverseList: (String) -> String?
     private let shell: Shell
     private let snapshots: EyeComfortSnapshotStore
     private let pause: (TimeInterval) -> Void
@@ -400,6 +412,7 @@ final class NightShiftTabletFilter {
     private var drainScheduled = false
     private var lastSkipReason: String?
     private var clientScope: ClientScope?
+    private var boundClientHardwareSerial: String?
     private var reconciliationNeeded = false
 
     /// Poll Samsung's own execution log briefly after queueing type 25. This
@@ -410,11 +423,13 @@ final class NightShiftTabletFilter {
 
     init(
         listDevices: @escaping () -> String? = NightShiftTabletFilter.adbDevices,
+        reverseList: @escaping (String) -> String? = NightShiftTabletFilter.adbReverseList,
         shell: @escaping Shell = NightShiftTabletFilter.adbShell,
         snapshots: EyeComfortSnapshotStore = EyeComfortSnapshotStore(),
         pause: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
     ) {
         self.listDevices = listDevices
+        self.reverseList = reverseList
         self.shell = shell
         self.snapshots = snapshots
         self.pause = pause
@@ -426,6 +441,10 @@ final class NightShiftTabletFilter {
     func setClientScope(_ scope: ClientScope?) {
         lock.lock()
         clientScope = scope
+        // Every connect event is a new endpoint identity proof. Clear the old
+        // binding so the first command can identify this client; until then a
+        // hotplugged lookalike cannot inherit the previous client's ownership.
+        boundClientHardwareSerial = nil
         lock.unlock()
     }
 
@@ -447,13 +466,29 @@ final class NightShiftTabletFilter {
 
     /// Hand every snapshotted tablet back to its own Eye comfort settings.
     func release() {
-        submit(.release)
+        submit(.releaseAll)
+    }
+
+    /// Grace-period release for a disconnect. If the same physical client has
+    /// already reconnected and can be identified, its override remains in
+    /// place; snapshots for every other device are still handed back. When no
+    /// active client scope exists this is equivalent to a full release.
+    func releaseDisconnectedClient() {
+        submit(.releaseDisconnectedClient)
     }
 
     /// True while some tablet still carries the mirror's override, for
     /// example because it was unplugged before the release could reach it.
     var hasPendingRestores: Bool {
         !snapshots.isEmpty
+    }
+
+    /// True when a saved override belongs to something other than the
+    /// currently bound physical client. The active client's own snapshot is
+    /// expected while mirroring and must not be treated as a foreign leak.
+    var hasPendingRestoresOutsideActiveClient: Bool {
+        let bound = boundHardwareSerial()
+        return snapshots.serialNumbers.contains { $0 != bound }
     }
 
     /// Block until work submitted before this call has finished, for app
@@ -497,35 +532,86 @@ final class NightShiftTabletFilter {
 
     private func run(_ command: Command) {
         // Nothing saved means nothing to restore: skip the adb round trips.
-        if case .release = command, snapshots.isEmpty { return }
+        if case .releaseAll = command, snapshots.isEmpty { return }
+        if case .releaseDisconnectedClient = command, snapshots.isEmpty { return }
         switch command {
         case .show, .off:
             guard let scope = currentClientScope() else {
                 noteSkip("no connected client transport identity")
                 return
             }
-            let tablets = eligibleTablets(controlScope: scope)
-            guard !tablets.isEmpty else {
+            guard let identity = resolveClientIdentity(scope) else {
                 setReconciliationNeeded(true)
                 return
             }
-            var succeeded = true
-            for (serial, probe) in tablets {
-                let applied = switch command {
-                case .show(let target): show(target, on: serial, probe: probe)
-                case .off: turnOff(on: serial, probe: probe)
-                case .release: true
-                }
-                succeeded = applied && succeeded
+            if let bound = boundHardwareSerial(), bound != identity.hardwareSerial {
+                // Within one connection the physical answer is not allowed to
+                // change. This is the temporal hotplug substitution guard.
+                noteSkip("adb device no longer matches the connected client's hardware serial")
+                setReconciliationNeeded(true)
+                return
             }
-            setReconciliationNeeded(!succeeded)
-        case .release:
-            // Releases are deliberately broader than control: any device with
-            // a snapshot has already been mutated and must be handed back even
+            if boundHardwareSerial() == nil {
+                // A replacement client does not inherit the session while the
+                // prior tablet is still under SideTab control. Attempt its
+                // hand-back first; unreachable snapshots remain for the retry.
+                restoreSnapshots(except: identity.hardwareSerial)
+                setBoundHardwareSerial(identity.hardwareSerial)
+            }
+            guard identity.probe.hasSideTab, identity.probe.settings != nil else {
+                noteSkip("connected client is not a Samsung tablet with SideTab and Eye comfort shield")
+                setReconciliationNeeded(true)
+                return
+            }
+            let applied = switch command {
+            case .show(let target): show(target, on: identity.transportSerial, probe: identity.probe)
+            case .off: turnOff(on: identity.transportSerial, probe: identity.probe)
+            case .releaseAll, .releaseDisconnectedClient: true
+            }
+            setReconciliationNeeded(!applied)
+        case .releaseAll:
+            // Unconditional stop/quit/startup release: any device with a
+            // snapshot has already been mutated and must be handed back even
             // if the current session scope is gone or ambiguous.
-            for (serial, probe) in eligibleTabletsForRelease() {
-                restore(serial, probe: probe)
+            restoreSnapshots(except: nil)
+        case .releaseDisconnectedClient:
+            // A non-nil scope here means the mirror believes a replacement or
+            // reconnected client is active. Identify it now; inability to do
+            // so is fail-safe and releases every outstanding snapshot.
+            let activeHardware: String?
+            if let scope = currentClientScope() {
+                // A transient adb/probe failure must not restore the tablet
+                // that is actively being mirrored. The durable binding is
+                // proof earned earlier in this same connection and is the
+                // correct fallback; without any binding, fail closed to a
+                // full hand-back.
+                activeHardware = resolveClientIdentity(scope)?.hardwareSerial ?? boundHardwareSerial()
+            } else {
+                activeHardware = nil
             }
+            restoreSnapshots(except: activeHardware)
+        }
+    }
+
+    private func boundHardwareSerial() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return boundClientHardwareSerial
+    }
+
+    private func setBoundHardwareSerial(_ value: String?) {
+        lock.lock()
+        boundClientHardwareSerial = value
+        lock.unlock()
+    }
+
+    /// Restore every visible snapshot except the active physical client. This
+    /// is used both for ownership transfer and conditional grace expiry. A
+    /// missing/unreachable device simply keeps its snapshot for the retry.
+    private func restoreSnapshots(except activeHardwareSerial: String?) {
+        for (serial, probe) in eligibleTabletsForRelease() {
+            guard probe.serialNumber != activeHardwareSerial else { continue }
+            restore(serial, probe: probe)
         }
     }
 
@@ -554,34 +640,33 @@ final class NightShiftTabletFilter {
         return EyeComfortPlan.readyTransports(fromDevicesOutput: output)
     }
 
-    private func eligibleTablets(
-        controlScope scope: ClientScope
-    ) -> [(serial: String, probe: EyeComfortPlan.Probe)] {
-        guard let transports = adbTransports() else { return [] }
+    /// Resolve the streaming endpoint to one adb transport and hardware
+    /// serial. The probe is returned even when Samsung keys are absent: that
+    /// still identifies the physical client for safe release decisions, but
+    /// the control path separately rejects it as ineligible.
+    private func resolveClientIdentity(_ scope: ClientScope) -> ClientIdentity? {
+        guard let transports = adbTransports() else { return nil }
         let candidates: [EyeComfortPlan.ReadyTransport]
         let scopeDescription: String
         switch scope {
-        case .usb:
-            let usbTransports = transports.filter(\.isUSB)
-            guard usbTransports.count == 1 else {
-                // USB streaming reaches the host through adb reverse, so the
-                // streaming device must itself be a ready USB adb transport.
-                // Eligibility is not identity: a non-Samsung client can be
-                // streaming while an idle Samsung is the only Eye-comfort
-                // device. Requiring one total ready USB transport closes that
-                // mixed-device ownership hole; extra or missing transports
-                // fail closed.
-                noteSkip("expected exactly one ready USB adb transport for the streaming client")
-                return []
+        case .usb(let videoPort, let controlPort):
+            // `adb reverse` is per-device, independent of whether that device
+            // uses a physical USB or network adb transport. The active USB-mode
+            // stream necessarily traverses both reverse mappings. Stale or
+            // manually duplicated mappings make the answer ambiguous and fail
+            // closed rather than selecting an idle Samsung device.
+            candidates = transports.filter { transport in
+                guard let output = reverseList(transport.serial) else { return false }
+                return StatusDetector.reverseMappingConfigured(in: output, port: videoPort)
+                    && StatusDetector.reverseMappingConfigured(in: output, port: controlPort)
             }
-            candidates = usbTransports
-            scopeDescription = "matching the USB streaming client"
+            scopeDescription = "carrying the active adb reverse video/control mappings"
         case .wireless(let deviceModel, let clientHost):
             guard let wantedModel = EyeComfortPlan.normalizedModel(deviceModel),
                   let wantedHost = EyeComfortPlan.normalizedHost(clientHost)
             else {
                 noteSkip("wireless client identity is incomplete")
-                return []
+                return nil
             }
             // A wireless stream proves only its peer IP. A USB adb serial is
             // hardware text and cannot be correlated with that peer, so it is
@@ -596,16 +681,20 @@ final class NightShiftTabletFilter {
             }
             scopeDescription = "matching wireless client \(clientHost) model \(deviceModel)"
         }
-        let tablets = probedTablets(candidates)
-        guard !tablets.isEmpty else {
-            noteSkip("no adb tablet \(scopeDescription) with SideTab and Eye comfort shield")
-            return []
+        guard candidates.count == 1 else {
+            noteSkip(candidates.isEmpty
+                ? "no adb transport \(scopeDescription)"
+                : "multiple adb transports \(scopeDescription); client identity ambiguous")
+            return nil
         }
-        guard tablets.count == 1 else {
-            noteSkip("multiple adb tablets \(scopeDescription); control disabled for safety")
-            return []
+        let transport = candidates[0]
+        guard let raw = shell(transport.serial, EyeComfortPlan.probeScript),
+              let probe = EyeComfortPlan.parseProbe(raw)
+        else {
+            noteSkip("could not probe the connected client's adb hardware serial")
+            return nil
         }
-        return tablets
+        return ClientIdentity(transportSerial: transport.serial, probe: probe)
     }
 
     private func eligibleTabletsForRelease() -> [(serial: String, probe: EyeComfortPlan.Probe)] {
@@ -758,6 +847,13 @@ final class NightShiftTabletFilter {
     static func adbDevices() -> String? {
         guard let adb = StatusDetector.adbExecutablePath(),
               let result = ADBCommandRunner.run(adb, arguments: ["devices", "-l"]),
+              result.succeeded else { return nil }
+        return result.output
+    }
+
+    static func adbReverseList(serial: String) -> String? {
+        guard let adb = StatusDetector.adbExecutablePath(),
+              let result = ADBCommandRunner.run(adb, arguments: ["-s", serial, "reverse", "--list"]),
               result.succeeded else { return nil }
         return result.output
     }

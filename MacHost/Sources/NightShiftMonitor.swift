@@ -229,6 +229,8 @@ final class NightShiftMirror {
     private var pendingRelease: DispatchWorkItem?
     private var restoreRetry: Timer?
     private var reconciliationTimer: Timer?
+    private var clientIsConnected = false
+    private var activeClientGeneration: UInt64?
     private(set) var isMirroring = false
 
     /// How often to retry handing back a tablet the last release missed.
@@ -261,14 +263,21 @@ final class NightShiftMirror {
     func clientConnected(
         connectionMode: ConnectionMode,
         wirelessDeviceModel: String?,
-        wirelessClientHost: String?
+        wirelessClientHost: String?,
+        usbVideoPort: Int,
+        usbControlPort: Int,
+        sessionGeneration: UInt64
     ) {
-        pendingRelease?.cancel()
-        pendingRelease = nil
+        clientIsConnected = true
+        activeClientGeneration = sessionGeneration
+        // Do not cancel a pending grace release. The filter executes it
+        // conditionally: it is a no-op for the same physical client, but is
+        // still the hand-back path for the tablet a replacement client left
+        // behind.
         let scope: NightShiftTabletFilter.ClientScope?
         switch connectionMode {
         case .usb:
-            scope = .usb
+            scope = .usb(videoPort: usbVideoPort, controlPort: usbControlPort)
         case .wireless:
             if let wirelessDeviceModel, let wirelessClientHost {
                 scope = .wireless(deviceModel: wirelessDeviceModel, clientHost: wirelessClientHost)
@@ -290,20 +299,54 @@ final class NightShiftMirror {
         monitor.start()
     }
 
-    /// Hand the tablet back after the grace period, unless it reconnects.
-    func clientDisconnected() {
+    /// Hand the tablet back after the grace period. A reconnect does not
+    /// cancel this work: identity-aware release preserves the same physical
+    /// tablet's override while still handing back a device left behind by a
+    /// replacement client.
+    func clientDisconnected(sessionGeneration: UInt64) {
+        // A replacement connection can legitimately be established before the
+        // old endpoint's close callback reaches main. Only the active
+        // generation may clear the connected flag or start its grace clock.
+        guard activeClientGeneration == sessionGeneration else { return }
+        clientIsConnected = false
+        activeClientGeneration = nil
         guard isMirroring, pendingRelease == nil else { return }
         let work = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated { self?.releaseNow() }
+            MainActor.assumeIsolated { self?.releaseAfterGrace() }
         }
         pendingRelease = work
         DispatchQueue.main.asyncAfter(deadline: .now() + releaseGrace, execute: work)
+    }
+
+    private func releaseAfterGrace() {
+        pendingRelease = nil
+        if clientIsConnected {
+            // The session is still alive for the reconnected/replacement
+            // endpoint. Keep monitor/reconciliation running and let the
+            // filter decide which physical snapshots are not that client.
+            filter.releaseDisconnectedClient()
+            scheduleRestoreRetryIfNeeded()
+            return
+        }
+        if isMirroring {
+            isMirroring = false
+            monitor.stop()
+            stopReconciliationTimer()
+        }
+        // No active endpoint means there is no client identity to preserve;
+        // clear the scope before queueing the conditional release so it is a
+        // full hand-back.
+        filter.setClientScope(nil)
+        filter.releaseDisconnectedClient()
+        scheduleRestoreRetryIfNeeded()
     }
 
     /// Server stopped or app quitting: hand the tablet back right away.
     func releaseNow() {
         pendingRelease?.cancel()
         pendingRelease = nil
+        clientIsConnected = false
+        activeClientGeneration = nil
         if isMirroring {
             isMirroring = false
             monitor.stop()
@@ -345,8 +388,14 @@ final class NightShiftMirror {
         guard reconciliationTimer == nil else { return }
         let t = Timer(timeInterval: Self.reconciliationInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.isMirroring, self.filter.needsReconciliation else { return }
-                self.monitor.reconcile()
+                guard let self, self.isMirroring else { return }
+                if self.filter.needsReconciliation { self.monitor.reconcile() }
+                // Ownership transfer can leave an unreachable prior tablet
+                // pending. Unlike the active tablet's own snapshot, foreign
+                // snapshots must keep being handed back during the session.
+                if self.filter.hasPendingRestoresOutsideActiveClient {
+                    self.filter.releaseDisconnectedClient()
+                }
             }
         }
         RunLoop.main.add(t, forMode: .common)

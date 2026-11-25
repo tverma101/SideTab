@@ -246,11 +246,12 @@ final class NightShiftTabletFilterTests: XCTestCase {
         var plugged = true
         let filter = NightShiftTabletFilter(
             listDevices: { plugged ? "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" : "List of devices attached\n" },
+            reverseList: reverseMappingForTests,
             shell: { _, script in tablet.run(script) },
             snapshots: makeStore(),
             pause: { _ in tablet.settle() }
         )
-        filter.setClientScope(.usb)
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
         filter.show(NightShiftTarget(enabled: true, level: 9))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
 
@@ -324,6 +325,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
         var pauseCount = 0
         let filter = NightShiftTabletFilter(
             listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            reverseList: reverseMappingForTests,
             shell: { _, script in tablet.run(script) },
             snapshots: store,
             pause: { _ in
@@ -331,7 +333,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
                 tablet.settle()
             }
         )
-        filter.setClientScope(.usb)
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
 
         filter.show(NightShiftTarget(enabled: true, level: 9))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
@@ -362,11 +364,12 @@ final class NightShiftTabletFilterTests: XCTestCase {
         """
         let filter = NightShiftTabletFilter(
             listDevices: { devices },
+            reverseList: reverseMappingForTests,
             shell: { serial, script in (serial == "R52" ? first : second).run(script) },
             snapshots: makeStore(),
             pause: { _ in }
         )
-        filter.setClientScope(.usb)
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
         filter.show(NightShiftTarget(enabled: true, level: 9))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
         XCTAssertEqual(first.writeCount, 0)
@@ -414,11 +417,12 @@ final class NightShiftTabletFilterTests: XCTestCase {
         let store = makeStore()
         let filter = NightShiftTabletFilter(
             listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            reverseList: reverseMappingForTests,
             shell: { _, script in tablet.run(script) },
             snapshots: store,
             pause: { _ in }
         )
-        filter.setClientScope(.usb)
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
 
         filter.show(NightShiftTarget(enabled: true, level: 9))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
@@ -445,6 +449,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
         let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
         let filter = NightShiftTabletFilter(
             listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            reverseList: reverseMappingForTests,
             shell: { _, script in tablet.run(script) },
             snapshots: makeStore(),
             pause: { _ in }
@@ -503,6 +508,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
         """
         let filter = NightShiftTabletFilter(
             listDevices: { devices },
+            reverseList: { serial in serial == "PIXEL8" ? self.reverseMappingForTests(serial) : nil },
             shell: { serial, script in
                 if serial == "PIXEL8", script == EyeComfortPlan.probeScript {
                     return """
@@ -521,11 +527,107 @@ final class NightShiftTabletFilterTests: XCTestCase {
             snapshots: makeStore(),
             pause: { _ in }
         )
-        filter.setClientScope(.usb)
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
         filter.show(NightShiftTarget(enabled: true, level: 9))
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
         XCTAssertEqual(samsung.writeCount, 0)
         XCTAssertTrue(filter.needsReconciliation)
+    }
+
+
+    func testUSBReverseIdentitySupportsANetworkADBTransport() {
+        let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        let transport = "192.168.1.8:5555"
+        let filter = NightShiftTabletFilter(
+            listDevices: { "List of devices attached\n\(transport) device model:SM_X800\n" },
+            reverseList: { serial in serial == transport ? self.reverseMappingForTests(serial) : nil },
+            shell: { _, script in tablet.run(script) },
+            snapshots: makeStore(),
+            pause: { _ in tablet.settle() }
+        )
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(tablet.panelLevel, 9)
+    }
+
+    func testUSBClientBindingRejectsTemporalHotplugSubstitution() {
+        let first = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        let substitute = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2), serial: "R53")
+        var devices = "List of devices attached\nR52 device usb:1-1 model:SM_X800\n"
+        let filter = NightShiftTabletFilter(
+            listDevices: { devices },
+            reverseList: reverseMappingForTests,
+            shell: { serial, script in (serial == "R52" ? first : substitute).run(script) },
+            snapshots: makeStore(),
+            pause: { _ in first.settle(); substitute.settle() }
+        )
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(first.panelLevel, 9)
+
+        devices = "List of devices attached\nR53 device usb:1-2 model:SM_X800\n"
+        filter.show(NightShiftTarget(enabled: true, level: 4))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(substitute.writeCount, 0, "a newly plugged tablet must not inherit the disconnected client's binding")
+        XCTAssertTrue(filter.needsReconciliation)
+    }
+
+    func testReplacementClientRestoresPreviousTabletBeforeTakingOwnership() {
+        let previousOriginal = EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2)
+        let previous = FakeSamsungTablet(previousOriginal, serial: "R52")
+        let replacement = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2), serial: "R53")
+        let devices = """
+        List of devices attached
+        R52 device usb:1-1 model:SM_X800
+        R53 device usb:1-2 model:SM_X800
+
+        """
+        var mappedSerial = "R52"
+        let store = makeStore()
+        let filter = NightShiftTabletFilter(
+            listDevices: { devices },
+            reverseList: { serial in serial == mappedSerial ? self.reverseMappingForTests(serial) : nil },
+            shell: { serial, script in (serial == "R52" ? previous : replacement).run(script) },
+            snapshots: store,
+            pause: { _ in previous.settle(); replacement.settle() }
+        )
+        let scope = NightShiftTabletFilter.ClientScope.usb(videoPort: 54321, controlPort: 54322)
+        filter.setClientScope(scope)
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        XCTAssertEqual(previous.panelLevel, 9)
+
+        mappedSerial = "R53"
+        filter.setClientScope(scope)
+        filter.show(NightShiftTarget(enabled: true, level: 4))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        XCTAssertEqual(previous.settings, previousOriginal)
+        XCTAssertNil(previous.panelLevel)
+        XCTAssertNil(store.snapshot(for: "R52"))
+        XCTAssertEqual(replacement.panelLevel, 4)
+        XCTAssertNotNil(store.snapshot(for: "R53"))
+    }
+
+    func testConditionalGraceReleasePreservesTheSamePhysicalReconnect() {
+        let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+        let store = makeStore()
+        let filter = makeFilter(tablet, store)
+        filter.show(NightShiftTarget(enabled: true, level: 9))
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        // A same-device reconnect presents a new endpoint proof, so the binding
+        // is reset; grace expiry must still recognize the hardware and skip a
+        // flash-inducing restore.
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
+        filter.releaseDisconnectedClient()
+        XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+        XCTAssertTrue(filter.hasPendingRestores)
+        XCTAssertEqual(tablet.panelLevel, 9)
+        XCTAssertNotNil(store.snapshot(for: "R52"))
     }
 
     func testWirelessScopeMatchesOnlyTheNormalizedClientModel() {
@@ -539,6 +641,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
         """
         let filter = NightShiftTabletFilter(
             listDevices: { devices },
+            reverseList: reverseMappingForTests,
             shell: { serial, script in serial.contains("1.8") ? matching.run(script) : other.run(script) },
             snapshots: makeStore(),
             pause: { _ in matching.settle() }
@@ -561,6 +664,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
         let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
         let filter = NightShiftTabletFilter(
             listDevices: { "List of devices attached\n192.168.1.9:5555 device model:SM_X800\n" },
+            reverseList: reverseMappingForTests,
             shell: { _, script in tablet.run(script) },
             snapshots: makeStore(),
             pause: { _ in }
@@ -577,6 +681,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
         var failWrites = true
         let filter = NightShiftTabletFilter(
             listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            reverseList: reverseMappingForTests,
             shell: { _, script in
                 if script == EyeComfortPlan.probeScript { return tablet.run(script) }
                 return failWrites ? nil : tablet.run(script)
@@ -584,7 +689,7 @@ final class NightShiftTabletFilterTests: XCTestCase {
             snapshots: makeStore(),
             pause: { _ in tablet.settle() }
         )
-        filter.setClientScope(.usb)
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
         let target = NightShiftTarget(enabled: true, level: 9)
         filter.show(target)
         XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
@@ -597,7 +702,101 @@ final class NightShiftTabletFilterTests: XCTestCase {
         XCTAssertEqual(tablet.panelLevel, 9)
     }
 
+
+    // MARK: - Mirror lifecycle
+
+    func testMirrorGracePreservesTheSamePhysicalReconnect() async {
+        await MainActor.run {
+            let tablet = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2), serial: "R52")
+            let store = makeStore()
+            let filter = makeFilter(tablet, store)
+            let reading = NightShiftReading(active: true, automaticScheduleEnabled: true, strength: 0.883, kelvin: 3_028)
+            let mirror = NightShiftMirror(
+                monitor: NightShiftMonitor(pollS: 60, probe: { reading }),
+                filter: filter,
+                isEnabled: { true },
+                releaseGrace: 0.02
+            )
+            connectUSB(mirror, generation: 1)
+            XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+            XCTAssertEqual(tablet.panelLevel, 9)
+
+            mirror.clientDisconnected(sessionGeneration: 1)
+            connectUSB(mirror, generation: 2)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.08))
+            XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+            XCTAssertEqual(tablet.panelLevel, 9, "same-hardware reconnect must not flash through a restore")
+            XCTAssertNotNil(store.snapshot(for: "R52"))
+            mirror.releaseNow()
+            XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        }
+    }
+
+    func testMirrorGraceHandsBackPreviousTabletWhenReplacementReconnects() async {
+        await MainActor.run {
+            let previousOriginal = EyeComfortSettings(filter: 0, level: 2, scheduled: 0, type: 2)
+            let previous = FakeSamsungTablet(previousOriginal, serial: "R52")
+            let replacement = FakeSamsungTablet(EyeComfortSettings(filter: 0, level: 3, scheduled: 0, type: 2), serial: "R53")
+            let devices = """
+            List of devices attached
+            R52 device usb:1-1 model:SM_X800
+            R53 device usb:1-2 model:SM_X800
+
+            """
+            var mappedSerial = "R52"
+            let store = makeStore()
+            let filter = NightShiftTabletFilter(
+                listDevices: { devices },
+                reverseList: { serial in serial == mappedSerial ? self.reverseMappingForTests(serial) : nil },
+                shell: { serial, script in (serial == "R52" ? previous : replacement).run(script) },
+                snapshots: store,
+                pause: { _ in previous.settle(); replacement.settle() }
+            )
+            let reading = NightShiftReading(active: true, automaticScheduleEnabled: true, strength: 0.883, kelvin: 3_028)
+            let mirror = NightShiftMirror(
+                monitor: NightShiftMonitor(pollS: 60, probe: { reading }),
+                filter: filter,
+                isEnabled: { true },
+                releaseGrace: 0.02
+            )
+            connectUSB(mirror, generation: 1)
+            XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+            XCTAssertEqual(previous.panelLevel, 9)
+
+            mirror.clientDisconnected(sessionGeneration: 1)
+            mappedSerial = "R53"
+            connectUSB(mirror, generation: 2)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.08))
+            XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+
+            XCTAssertEqual(previous.settings, previousOriginal)
+            XCTAssertNil(previous.panelLevel)
+            XCTAssertNil(store.snapshot(for: "R52"))
+            XCTAssertEqual(replacement.panelLevel, 9)
+            XCTAssertNotNil(store.snapshot(for: "R53"))
+            mirror.releaseNow()
+            XCTAssertTrue(filter.waitUntilIdle(timeout: 2))
+        }
+    }
+
+    @MainActor
+    private func connectUSB(_ mirror: NightShiftMirror, generation: UInt64) {
+        mirror.clientConnected(
+            connectionMode: .usb,
+            wirelessDeviceModel: nil,
+            wirelessClientHost: nil,
+            usbVideoPort: 54321,
+            usbControlPort: 54322,
+            sessionGeneration: generation
+        )
+    }
+
     // MARK: - Helpers
+
+    private func reverseMappingForTests(_ serial: String) -> String? {
+        "UsbFfs tcp:54321 tcp:54321\nUsbFfs tcp:54322 tcp:54322\n"
+    }
 
     private func makeDefaults() -> UserDefaults {
         let suite = "NightShiftTabletFilterTests.\(UUID().uuidString)"
@@ -613,11 +812,12 @@ final class NightShiftTabletFilterTests: XCTestCase {
     private func makeFilter(_ tablet: FakeSamsungTablet, _ store: EyeComfortSnapshotStore) -> NightShiftTabletFilter {
         let filter = NightShiftTabletFilter(
             listDevices: { "List of devices attached\nR52 device usb:1-1 model:SM_X800\n" },
+            reverseList: reverseMappingForTests,
             shell: { _, script in tablet.run(script) },
             snapshots: store,
             pause: { _ in tablet.settle() }
         )
-        filter.setClientScope(.usb)
+        filter.setClientScope(.usb(videoPort: 54321, controlPort: 54322))
         return filter
     }
 }
