@@ -47,7 +47,6 @@ class VideoDecoder(
     private var decoderThread: HandlerThread? = null
     private var decoderHandler: Handler? = null
 
-    private var frameCount = 0L
     private var droppedFrames = 0L
     private var staleOutputDrops = 0L
     private var lastStatsTime = System.currentTimeMillis()
@@ -74,7 +73,6 @@ class VideoDecoder(
     private var latencySamples: Int = 0
     private var latencyMaxNs: Long = 0
 
-    private val frameTimes = ArrayDeque<Long>(120)
 
     // Provision the decoder for the rate the host can send, not whatever
     // variable-refresh mode the panel happened to be in when this object was
@@ -113,9 +111,7 @@ class VideoDecoder(
 
     private var lastKeyframeRequestNs = 0L
 
-    var onFrameRendered: ((Long) -> Unit)? = null
-    var onFrameStats: ((fps: Double, variance: Double) -> Unit)? = null
-    var onFrameDecoded: ((ByteArray) -> Unit)? = null
+    var onFrameRendered: (() -> Unit)? = null
     var onKeyframeRequired: ((force: Boolean, reason: String) -> Unit)? = null
 
     // ByteBuffer-mode (CfL) hand-off. The sink consumes the Image on another
@@ -127,8 +123,6 @@ class VideoDecoder(
 
     /** Decoded stream color range: 1 = full, 2 = limited (video swing). */
     var onColorRange: ((Int) -> Unit)? = null
-    /** Decoder pipeline latency (avg/max ms over the last ~60 frames). */
-    var onDecodeLatency: ((avgMs: Double, maxMs: Double) -> Unit)? = null
     /** Actual decoded stream size + crop (from the codec output format — the TRUE frame
      *  geometry, which can differ from the configured size when the sender's display
      *  message carries logical dims while the SPS carries physical dims). */
@@ -531,6 +525,7 @@ class VideoDecoder(
         return chosen
     }
 
+    /** Copies borrowed compressed bytes into MediaCodec before returning. */
     fun decode(
         frameData: ByteArray,
         frameSize: Int = frameData.size,
@@ -539,7 +534,6 @@ class VideoDecoder(
     ) {
         if (!isRunning) {
             diagLog("decode called but isRunning=false")
-            onFrameDecoded?.invoke(frameData)
             return
         }
 
@@ -563,13 +557,11 @@ class VideoDecoder(
         val codec =
             decoder ?: run {
                 diagLog("decoder is null in decode()")
-                onFrameDecoded?.invoke(frameData)
                 return
             }
 
         if (needsKeyframe && !isKeyframe) {
             dropFrame(
-                frameData,
                 isKeyframe,
                 "waiting for keyframe",
                 waitForKeyframe = true,
@@ -619,7 +611,6 @@ class VideoDecoder(
             feedPressure.onFeedAttempt(watchdogNowMs())
             feedPressure.onInputWaitTimeout()
             evaluateNoOutputWatchdog()
-            onFrameDecoded?.invoke(frameData)
             return
         }
 
@@ -739,8 +730,6 @@ class VideoDecoder(
             if (e is IllegalStateException) {
                 signalFailure(DecoderRecoveryPolicy.codecErrorReason(e.message))
             }
-        } finally {
-            onFrameDecoded?.invoke(frameData)
         }
     }
 
@@ -837,7 +826,6 @@ class VideoDecoder(
     }
 
     private fun dropFrame(
-        frameData: ByteArray,
         isKeyframe: Boolean,
         reason: String,
         waitForKeyframe: Boolean,
@@ -853,7 +841,6 @@ class VideoDecoder(
         if (requestRefresh) {
             requestKeyframe(reason)
         }
-        onFrameDecoded?.invoke(frameData)
     }
 
     private fun requestKeyframe(
@@ -990,7 +977,6 @@ class VideoDecoder(
                         "inputWait avg=${"%.2f".format(inputWaitAvgMs)}ms " +
                         "max=${"%.2f".format(inputWaitMaxMs)}ms timeouts=$inputBufferWaitTimeouts",
                 )
-                onDecodeLatency?.invoke(avgMs, maxMs)
                 latencySumNs = 0
                 latencySamples = 0
                 latencyMaxNs = 0
@@ -1001,7 +987,7 @@ class VideoDecoder(
             }
 
             codec.releaseOutputBuffer(index, true)
-            trackFrameTiming(System.nanoTime())
+            onFrameRendered?.invoke()
             updateStats()
         } catch (e: Exception) {
             Log.e(TAG, "releaseOutputBuffer failed", e)
@@ -1012,28 +998,10 @@ class VideoDecoder(
         }
     }
 
-    private fun trackFrameTiming(timestamp: Long) {
-        frameTimes.addLast(timestamp)
-        if (frameTimes.size > 120) frameTimes.removeFirst()
-
-        if (frameTimes.size >= 60 && frameCount % 60L == 0L) {
-            val deltas = frameTimes.zipWithNext { a, b -> (b - a) / 1_000_000.0 }
-            if (deltas.isNotEmpty()) {
-                val avgDelta = deltas.average()
-                val variance = deltas.map { (it - avgDelta) * (it - avgDelta) }.average()
-                val stdDev = kotlin.math.sqrt(variance)
-                onFrameStats?.invoke(1000.0 / avgDelta, stdDev)
-            }
-        }
-        onFrameRendered?.invoke(timestamp)
-    }
-
     private fun updateStats() {
-        frameCount++
         val now = System.currentTimeMillis()
         val elapsed = now - lastStatsTime
         if (elapsed >= 1000) {
-            frameCount = 0
             droppedFrames = 0
             staleOutputDrops = 0
             lastStatsTime = now

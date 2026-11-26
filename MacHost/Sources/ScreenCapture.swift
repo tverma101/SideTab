@@ -335,24 +335,12 @@ class ScreenCapture {
     private let keyframeRequestLock = OSAllocatedUnfairLock(initialState: KeyframeRequestState())
     private static let keyframeRequestThrottleNs: UInt64 = 500_000_000
 
-    private static func frameStatus(_ sampleBuffer: CMSampleBuffer) -> SCFrameStatus? {
-        guard let attachments =
-            (CMSampleBufferGetSampleAttachmentsArray(
-                sampleBuffer,
-                createIfNecessary: false
-            ) as? [[SCStreamFrameInfo: Any]])?.first,
-            let rawStatus = attachments[.status]
-        else {
-            return nil
+    static func frameStatus(_ attachments: NSDictionary?) -> SCFrameStatus? {
+        let value = attachments?.object(forKey: SCStreamFrameInfo.status.rawValue)
+        if let status = value as? NSNumber {
+            return SCFrameStatus(rawValue: status.intValue)
         }
-
-        if let status = rawStatus as? SCFrameStatus {
-            return status
-        }
-        if let number = rawStatus as? NSNumber {
-            return SCFrameStatus(rawValue: number.intValue)
-        }
-        return nil
+        return value as? SCFrameStatus
     }
 
     // Main-thread-only state
@@ -794,7 +782,8 @@ class ScreenCapture {
             let pipelineSignpost = FramePipelineSignpost.captureCallback.beginInterval("frame")
             defer { FramePipelineSignpost.captureCallback.endInterval("frame", pipelineSignpost) }
             guard self.stateLock.withLock({ $0.acceptingFrames }) else { return }
-            let frameStatus = Self.frameStatus(sampleBuffer)
+            let attachments = CaptureDirtyRectGate.attachments(for: sampleBuffer)
+            let frameStatus = Self.frameStatus(attachments)
 
             // The status read is unconditional now: the `.complete` gate below
             // has to run on every transport. Only the cadence counters stay
@@ -846,14 +835,9 @@ class ScreenCapture {
                 let bufferSize = CMSampleBufferGetImageBuffer(sampleBuffer).map {
                     "\(CVPixelBufferGetWidth($0))x\(CVPixelBufferGetHeight($0))"
                 } ?? "none"
-                let frameInfo =
-                    (CMSampleBufferGetSampleAttachmentsArray(
-                        sampleBuffer,
-                        createIfNecessary: false
-                    ) as? [[SCStreamFrameInfo: Any]])?.first
-                let contentRect = frameInfo?[.contentRect] ?? "missing"
-                let contentScale = frameInfo?[.contentScale] ?? "missing"
-                let scaleFactor = frameInfo?[.scaleFactor] ?? "missing"
+                let contentRect = attachments?.object(forKey: SCStreamFrameInfo.contentRect.rawValue) ?? "missing"
+                let contentScale = attachments?.object(forKey: SCStreamFrameInfo.contentScale.rawValue) ?? "missing"
+                let scaleFactor = attachments?.object(forKey: SCStreamFrameInfo.scaleFactor.rawValue) ?? "missing"
                 debugLog(
                     "SCStream frame geometry: buffer=\(bufferSize), " +
                     "contentRect=\(contentRect), contentScale=\(contentScale), " +
@@ -887,7 +871,7 @@ class ScreenCapture {
             // presentation. Missing/unrecognized metadata encodes normally.
             // Synthetic pattern/dither experiments mutate pixels after capture,
             // so they deliberately bypass this gate.
-            let frameHasChanges = CaptureDirtyRectGate.frameHasChanges(sampleBuffer)
+            let frameHasChanges = CaptureDirtyRectGate.frameHasChanges(attachments)
             if CaptureDirtyRectGate.shouldSkip(
                 frameHasChanges: frameHasChanges,
                 mutatesCapturedPixels: sessionFlags.mutatesCapturedPixels
