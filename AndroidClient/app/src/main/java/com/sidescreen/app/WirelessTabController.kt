@@ -24,6 +24,7 @@ class WirelessTabController(
         token: ByteArray,
         deviceName: String,
         macName: String,
+        preferDiscovery: Boolean,
     ) -> Unit,
 ) {
     data class Views(
@@ -77,10 +78,8 @@ class WirelessTabController(
         }
     }
 
-    /**
-     * Called when the TCP stream goes down (user tapped Disconnect, network drop, etc).
-     * Move the UI to a clean "paired but idle" state showing the Mac info + Reconnect button.
-     */
+    /** Move the UI to a clean paired-but-idle state. MainActivity owns whether
+     * a background automatic attempt is also scheduled. */
     fun onStreamDisconnected() {
         android.util.Log.i(
             "WirelessTabController",
@@ -94,6 +93,44 @@ class WirelessTabController(
         views.idleMacName.text = entry.macName
         views.idleMacIp.text = "${entry.host}:${entry.port}"
         transition(State.PAIRED_IDLE)
+    }
+
+    fun onStreamSuspended(detail: String) {
+        val entry = storage.load() ?: run {
+            transition(State.FIRST_TIME)
+            return
+        }
+        views.idleMacName.text = entry.macName
+        views.idleMacIp.text = "Waiting for host · ${entry.host}:${entry.port}"
+        views.connectingSubtitle.text = detail
+        transition(State.PAIRED_IDLE)
+    }
+
+    fun onDiscoveryStarted() {
+        val entry = storage.load() ?: return
+        views.connectingLabel.text = "Finding ${entry.macName}"
+        views.connectingSubtitle.text = "Searching the local network…"
+        transition(State.CONNECTING)
+    }
+
+    fun onStreamFailure(detail: String) {
+        views.repairTitle.text = "⚠ Mac did not produce a stream"
+        views.repairMessage.text =
+            "$detail\n\n" +
+                "Keep SideScreen running on the Mac with the virtual display active, " +
+                "then tap Reconnect."
+        transition(State.REPAIR_NEEDED)
+    }
+
+    fun onAutoReconnectStarted(attempt: Int) {
+        val entry = storage.load() ?: run {
+            transition(State.FIRST_TIME)
+            return
+        }
+        showConnecting(
+            "Reconnecting to ${entry.macName}",
+            "Attempt $attempt · ${entry.host}:${entry.port}",
+        )
     }
 
     private fun transition(next: State) {
@@ -111,29 +148,39 @@ class WirelessTabController(
      * Called when the Wireless tab becomes visible. Decides initial state based on
      * cached host + camera permission state.
      *
-     * No auto-connect: even when a cached pairing exists, the user must press
-     * the Reconnect button to actually start a connection. Auto-connect was
-     * confusing because it could run silently while the user toggled tabs.
+     * Showing the tab is UI-only. MainActivity starts lifecycle reconnect from
+     * onStart, so switching tabs does not create a competing connection.
      */
     fun show() {
-        when {
-            cameraPerm.isPermanentlyDenied() -> transition(State.PERM_DENIED)
-            storage.load() == null -> transition(State.FIRST_TIME)
-            else -> {
-                val entry = storage.load()!!
-                views.idleMacName.text = entry.macName
-                views.idleMacIp.text = "${entry.host}:${entry.port}"
-                transition(State.PAIRED_IDLE)
-            }
+        if (cameraPerm.isPermanentlyDenied()) {
+            transition(State.PERM_DENIED)
+            return
         }
+        val entry = storage.load()
+        if (entry == null) {
+            transition(State.FIRST_TIME)
+            return
+        }
+        views.idleMacName.text = entry.macName
+        views.idleMacIp.text = "${entry.host}:${entry.port}"
+        transition(State.PAIRED_IDLE)
     }
 
     fun onScanResult(url: String) {
-        val parsed = PairingURL.parse(url) ?: return
+        val parsed =
+            PairingURL.parse(url) ?: run {
+                views.repairTitle.text = "⚠ Invalid SideScreen QR"
+                views.repairMessage.text =
+                    "This code is not a SideScreen pairing code. " +
+                        "On the Mac, start Wireless mode and scan the QR shown in the " +
+                        "SideScreen window."
+                transition(State.REPAIR_NEEDED)
+                return
+            }
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
         storage.save(PairedHostStorage.Entry(parsed.host, parsed.port, parsed.token, parsed.macName))
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
-        onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
+        onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName, false)
     }
 
     fun onConnectError(error: StreamClient.WirelessConnectError) {
@@ -218,7 +265,7 @@ class WirelessTabController(
 
     private fun attemptAutoConnect(entry: PairedHostStorage.Entry) {
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
-        onConnectRequested(entry.host, entry.port, entry.token, deviceName, entry.macName)
+        onConnectRequested(entry.host, entry.port, entry.token, deviceName, entry.macName, true)
     }
 
     companion object {

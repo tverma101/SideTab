@@ -26,7 +26,8 @@ class StreamClient(
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
-    private var isConnected = false
+    @Volatile private var isConnected = false
+    private val connectionStateLock = Any()
 
     /**
      * Dedicated out-of-band control channel (ping/pong + keyframe requests).
@@ -50,6 +51,10 @@ class StreamClient(
 
     /** Optional control health; video transport remains authoritative. */
     var onControlChannelState: ((Boolean) -> Unit)? = null
+
+    /** Host lifecycle advisory. The callback is advisory; the local session
+     * controller still invalidates the generation before closing the socket. */
+    var onHostSuspending: ((Int) -> Unit)? = null
 
     /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
     @Volatile var streamCodecIsHevc = true
@@ -153,7 +158,7 @@ class StreamClient(
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
-                isConnected = true
+                markConnected()
                 lastKeyframeReceivedNs = 0L
                 synchronized(keyframeRequestLock) {
                     lastKeyframeRequestNs = 0L
@@ -166,8 +171,13 @@ class StreamClient(
                 receiveData()
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Connection error", e)
-                onConnectionStatus?.invoke(false)
-                cleanup()
+                if (markDisconnected()) {
+                    cleanup()
+                    onConnectionStatus?.invoke(false)
+                } else {
+                    cleanup()
+                }
+                throw e
             }
         }
 
@@ -212,6 +222,10 @@ class StreamClient(
                     Log.w(TAG, "connectWireless: no WiFi route found, using default routing")
                 }
                 sock.connect(java.net.InetSocketAddress(host, port), 5000)
+                // The TCP connect timeout does not cover the authenticated
+                // response. Bound that read too so a half-open Mac listener
+                // cannot hold the Activity in Connecting forever.
+                sock.soTimeout = 5_000
                 sock
             } catch (e: java.net.SocketTimeoutException) {
                 Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port (5s)")
@@ -248,6 +262,12 @@ class StreamClient(
                 if (r <= 0) break
                 read += r
             }
+        } catch (e: java.net.SocketTimeoutException) {
+            try {
+                s.close()
+            } catch (_: IOException) {
+            }
+            throw WirelessConnectError.ProtocolError
         } catch (e: IOException) {
             try {
                 s.close()
@@ -274,6 +294,7 @@ class StreamClient(
         Log.i(TAG, "connectWireless: handshake response status=$status")
         when (status) {
             AuthHandshake.ResponseStatus.OK -> {
+                s.soTimeout = 0
                 socket = s
                 inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), WirelessTransportProfile.VIDEO_STREAM_BUFFER_BYTES))
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
@@ -285,7 +306,7 @@ class StreamClient(
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
-                isConnected = true
+                markConnected()
                 diagLog(
                     "Wireless connected to $host:$port " +
                         "profile=${WirelessTransportProfile.TARGET_FPS}fps " +
@@ -355,9 +376,10 @@ class StreamClient(
             // legacy-compatible host to finish protocol startup immediately.
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_VIDEO_CLOCK_SYNC)
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_TRACE)
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_LIFECYCLE)
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
             out.flush()
-            diagLog("Advertised frame trace/metadata support")
+            diagLog("Advertised frame trace/metadata/lifecycle support")
         }
     }
 
@@ -486,6 +508,17 @@ class StreamClient(
                             codecNegotiated = true
                             diagLog("Server selected codec: ${if (streamCodecIsHevc) "HEVC" else "H.264"}")
                             onCodecSelected?.invoke(streamCodecIsHevc)
+                        }
+
+                        MESSAGE_HOST_SUSPENDING -> {
+                            val reason = input.readUnsignedByte()
+                            diagLog("Host lifecycle suspension advisory reason=$reason")
+                            onHostSuspending?.invoke(reason)
+                            // The advisory is the terminal message for this
+                            // generation. Do not decode any queued bytes that
+                            // follow it while the Activity tears down the
+                            // old decoder/renderer.
+                            break
                         }
 
                         else -> {
@@ -754,10 +787,24 @@ class StreamClient(
     }
 
     fun disconnect() {
-        isConnected = false
+        val wasConnected = markDisconnected()
         cleanup()
-        onConnectionStatus?.invoke(false)
+        if (wasConnected) onConnectionStatus?.invoke(false)
         Log.d(TAG, "Disconnected")
+    }
+
+    private fun markConnected() {
+        synchronized(connectionStateLock) {
+            isConnected = true
+        }
+    }
+
+    private fun markDisconnected(): Boolean {
+        synchronized(connectionStateLock) {
+            val wasConnected = isConnected
+            isConnected = false
+            return wasConnected
+        }
     }
 
     private fun cleanup() {
@@ -806,6 +853,8 @@ class StreamClient(
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 12
         private const val MESSAGE_BRIGHT = 11
+        private const val MESSAGE_CLIENT_SUPPORTS_LIFECYCLE = 16
+        private const val MESSAGE_HOST_SUSPENDING = 17
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

@@ -5,10 +5,19 @@ import CGVirtualDisplayBridge
 
 /// Manages virtual display creation and lifecycle using CGVirtualDisplay API
 class VirtualDisplayManager {
+    private struct DisplayConfiguration {
+        let width: Int
+        let height: Int
+        let refreshRate: Int
+        let hiDPI: Bool
+        let name: String
+    }
+
     private var virtualDisplay: CGVirtualDisplay?
     private var displayDescriptor: CGVirtualDisplayDescriptor?
     private var displaySettings: CGVirtualDisplaySettings?
     private var screenParamsObserver: NSObjectProtocol?
+    private var lastConfiguration: DisplayConfiguration?
 
     var displayID: CGDirectDisplayID? {
         return virtualDisplay?.displayID
@@ -34,6 +43,13 @@ class VirtualDisplayManager {
     ) throws {
         // Clean up existing display if any
         destroyDisplay()
+        lastConfiguration = DisplayConfiguration(
+            width: width,
+            height: height,
+            refreshRate: refreshRate,
+            hiDPI: hiDPI,
+            name: name
+        )
 
         // Physical pixels = 2x logical when HiDPI, 1x otherwise
         let physW = hiDPI ? width * 2 : width
@@ -366,6 +382,28 @@ class VirtualDisplayManager {
         let found = onlineIDs.contains(displayID)
         debugLog("verifyDisplayRegistered: displayID \(displayID) \(found ? "FOUND" : "NOT FOUND") in online displays \(onlineIDs)")
         return found
+    }
+
+    /// Recreate the display after WindowServer drops it during a system sleep
+    /// or display-topology reset. The configuration is session-local and is
+    /// never written into permanent display preferences.
+    @discardableResult
+    func recreateDisplayIfNeeded() throws -> CGDirectDisplayID? {
+        if displayID != nil, verifyDisplayRegistered() {
+            return displayID
+        }
+        guard let configuration = lastConfiguration else {
+            throw VirtualDisplayError.displayNotCreated
+        }
+        debugLog("Virtual display missing after lifecycle wake — recreating")
+        try createDisplay(
+            width: configuration.width,
+            height: configuration.height,
+            refreshRate: configuration.refreshRate,
+            hiDPI: configuration.hiDPI,
+            name: configuration.name
+        )
+        return displayID
     }
 
     /// Destroy the virtual display

@@ -59,6 +59,7 @@ class MainActivity : AppCompatActivity() {
     private val sessionController = SessionController()
     private lateinit var wirelessController: WirelessTabController
     private val pairedHostStorage by lazy { PairedHostStorage(this) }
+    private val wirelessHostDiscovery by lazy { WirelessHostDiscovery(applicationContext) }
     private val cameraPerm by lazy { CameraPermissionManager(this) }
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: PreferencesManager
@@ -69,17 +70,48 @@ class MainActivity : AppCompatActivity() {
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
     private var decoderUsingTextureView = false
+    private var decoderDisplayWidth = 0
+    private var decoderDisplayHeight = 0
+    private var decoderMime: String? = null
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
     private var displayFlipHorizontal = false
     private var displayFlipVertical = false
     private var pingJob: kotlinx.coroutines.Job? = null
+    private var sessionReadinessWatchdogJob: Job? = null
     private lateinit var brightnessOwnership: BrightnessOwnershipController
     private lateinit var presentationController: PresentationController
     private var pendingBrightnessGeneration: Long? = null
     private var pendingBrightness: Int? = null
     private var restartChecklistAfterDisconnect = true
+    private var activityForeground = false
+    private var autoReconnectJob: Job? = null
+    private var reconnectAttempt = 0
+    private var discoveryInProgress = false
+    private var discoverOnNextAutoAttempt = false
+    private var screenLifecycleReceiverRegistered = false
+
+    private val screenLifecycleReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> {
+                        activityForeground = false
+                        suspendCurrentSession(
+                            SessionLifecyclePolicy.EndReason.APP_BACKGROUND_RECREATION,
+                            "Android display turned off",
+                        )
+                    }
+                    Intent.ACTION_SCREEN_ON,
+                    Intent.ACTION_USER_PRESENT -> {
+                        activityForeground = true
+                        sessionController.noteForegroundAvailable()
+                        scheduleAutoReconnect(resetAttempt = true)
+                    }
+                }
+            }
+        }
 
     // All callbacks from an old StreamClient become inert as soon as a newer
     // connect starts. Without this generation fence, a sender restart can
@@ -99,14 +131,7 @@ class MainActivity : AppCompatActivity() {
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
     private var checklistRunnable: Runnable? = null
-    // Auto-disconnect: if the app stays backgrounded past the configured
-    // window (default 60 s; adb-tunable via
-    //   adb shell settings put system sidescreen_auto_disconnect_secs <N>)
-    // the session tears itself down. A killed process needs no timer — its
-    // sockets die and the host's idle-sleep takes over.
-    private var backgroundedAtMs = 0L
-    private var autoDisconnectJob: Job? = null
-
+    private var restoringModeToggle = false
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -157,6 +182,23 @@ class MainActivity : AppCompatActivity() {
         binding.modeToggleGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked) return@addOnButtonCheckedListener
             val mode = if (checkedId == R.id.modeWireless) ConnectionMode.WIRELESS else ConnectionMode.USB
+            if (restoringModeToggle) return@addOnButtonCheckedListener
+            if (hasActiveSession && mode != prefs.connectionMode) {
+                // A live generation belongs to exactly one transport. Do not
+                // let the visible tab change underneath it and accidentally
+                // schedule reconnects against the other transport.
+                restoringModeToggle = true
+                binding.modeToggleGroup.check(
+                    if (prefs.connectionMode == ConnectionMode.WIRELESS) {
+                        R.id.modeWireless
+                    } else {
+                        R.id.modeUSB
+                    },
+                )
+                restoringModeToggle = false
+                showError("Disconnect the current stream before switching between USB and Wireless.")
+                return@addOnButtonCheckedListener
+            }
             prefs.connectionMode = mode
             applyModeVisibility(mode)
             if (mode == ConnectionMode.WIRELESS) {
@@ -208,8 +250,15 @@ class MainActivity : AppCompatActivity() {
                     ),
                 storage = pairedHostStorage,
                 cameraPerm = cameraPerm,
-                onConnectRequested = { host, port, token, deviceName, _ ->
-                    connectWireless(host, port, token, deviceName)
+                onConnectRequested = { host, port, token, deviceName, macName, preferDiscovery ->
+                    connectWireless(
+                        host,
+                        port,
+                        token,
+                        deviceName,
+                        macName = macName,
+                        preferDiscovery = preferDiscovery,
+                    )
                 },
             )
         wirelessController.bind()
@@ -281,6 +330,11 @@ class MainActivity : AppCompatActivity() {
                         videoDecoder = null
                         sgsrRenderer?.release()
                         sgsrRenderer = null
+                        cflRenderer?.release()
+                        cflRenderer = null
+                        decoderDisplayWidth = 0
+                        decoderDisplayHeight = 0
+                        decoderMime = null
                     }
                     currentSurfaceHolder = null
                 }
@@ -360,6 +414,16 @@ class MainActivity : AppCompatActivity() {
             // Convert localhost to 127.0.0.1 for better Android compatibility
             if (host.equals("localhost", ignoreCase = true)) {
                 host = "127.0.0.1"
+            }
+
+            if (prefs.connectionMode == ConnectionMode.USB &&
+                host != "127.0.0.1" && host != "::1"
+            ) {
+                showError(
+                    "USB mode uses the local ADB-reverse route (127.0.0.1). " +
+                        "Switch to Wireless to connect to a Mac address over the network.",
+                )
+                return@setOnClickListener
             }
 
             // Validate input
@@ -1018,12 +1082,7 @@ class MainActivity : AppCompatActivity() {
     /** Recreate the video path (decoder + optional VSR renderer) with current prefs. */
     private fun restartVideoPath() {
         if (!hasActiveSession) return
-        videoDecoder?.release()
-        videoDecoder = null
-        sgsrRenderer?.release()
-        sgsrRenderer = null
-        cflRenderer?.release()
-        cflRenderer = null
+        releaseVideoPipeline()
         applyDirectPixelMapping(displayWidth, displayHeight)
         initializeDecoderForCurrentSurface(sessionController.currentGeneration, streamClient)
     }
@@ -1326,8 +1385,22 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-        if (videoDecoder != null && decoderUsingTextureView == useTextureView && sgsrRenderer == null && cflRenderer == null) {
-            videoDecoder?.updateResolution(displayWidth, displayHeight)
+        val mime =
+            if (ownerClient?.streamCodecIsHevc == false) {
+                MediaFormat.MIMETYPE_VIDEO_AVC
+            } else {
+                MediaFormat.MIMETYPE_VIDEO_HEVC
+            }
+        if (videoDecoder != null &&
+            decoderUsingTextureView == useTextureView &&
+            decoderDisplayWidth == displayWidth &&
+            decoderDisplayHeight == displayHeight &&
+            decoderMime == mime
+        ) {
+            // Display negotiation and SurfaceView layout callbacks can arrive
+            // back-to-back for the same surface. Keep the already configured
+            // decoder/renderer instead of tearing it down and dropping the
+            // first frame that is already in flight.
             return
         }
 
@@ -1338,6 +1411,9 @@ class MainActivity : AppCompatActivity() {
         cflRenderer?.release()
         cflRenderer = null
         decoderUsingTextureView = useTextureView
+        decoderDisplayWidth = 0
+        decoderDisplayHeight = 0
+        decoderMime = null
 
         mainDiag(
             "initializeDecoder called, surface=$surface, valid=${surface.isValid}, " +
@@ -1350,12 +1426,6 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     @Suppress("DEPRECATION")
                     windowManager.defaultDisplay
-                }
-            val mime =
-                if (ownerClient?.streamCodecIsHevc == false) {
-                    MediaFormat.MIMETYPE_VIDEO_AVC
-                } else {
-                    MediaFormat.MIMETYPE_VIDEO_HEVC
                 }
             var decoderSurface = surface
             val cflOn = prefs.vsrEnabled && prefs.vsrMode.equals("cfl", true) &&
@@ -1538,6 +1608,9 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             sessionController.decoderStarted(generation)
+            decoderDisplayWidth = displayWidth
+            decoderDisplayHeight = displayHeight
+            decoderMime = mime
             ownerClient?.requestKeyframe(force = true, reason = "decoder initialized")
             mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, texture=$useTextureView")
             val effectiveDecoderRate = when {
@@ -1549,11 +1622,25 @@ class MainActivity : AppCompatActivity() {
             log("✅ Decoder initialized ${displayWidth}x$displayHeight $mime (${effectiveDecoderRate}Hz target)")
         } catch (e: Exception) {
             decoderUsingTextureView = false
+            decoderDisplayWidth = 0
+            decoderDisplayHeight = 0
+            decoderMime = null
+            val reason = "Video decoder failed: ${e.message ?: "unknown decoder error"}"
             mainDiag("Decoder init FAILED: ${e.message}")
             log("❌ Failed to initialize decoder: ${e.message}")
-            sessionController.fail(generation, "Video decoder failed: ${e.message ?: "unknown decoder error"}")
+            // A decoder constructor failure is a transport failure too. Close
+            // the matching client before returning so the host stops sending
+            // into a black session and the next tap starts from a fresh
+            // generation. The old code only published Failed, leaving the
+            // socket alive and the activity stuck receiving undisplayable
+            // frames.
+            val client = ownerClient ?: streamClient
+            if (client != null && failCurrentSession(generation, client, reason)) {
+                return
+            }
+            sessionController.fail(generation, reason)
             runOnUiThread {
-                updateStatus("Video decoder failed: ${e.message}")
+                updateStatus(reason)
             }
         }
     }
@@ -1620,15 +1707,15 @@ class MainActivity : AppCompatActivity() {
                 setStatusIndicator(R.drawable.status_indicator_amber)
                 updateStatus("Connected · negotiating display")
                 stopChecklistUpdates()
-                if (state.details.mode == ConnectionMode.WIRELESS) {
-                    val entry = pairedHostStorage.load()
-                    wirelessController.onConnectSuccess(entry?.macName ?: "Mac", entry?.host ?: "—")
-                }
             }
 
             is SessionController.State.WaitingForFirstFrame -> {
                 presentationController.release()
-                binding.settingsPanel.visibility = View.GONE
+                // Keep the setup shell actionable until a real rendered frame
+                // proves that the stream is usable. A configured socket can
+                // otherwise leave the user looking at a black surface with no
+                // way to retry or inspect the connection.
+                binding.settingsPanel.visibility = View.VISIBLE
                 binding.settingsButton.visibility = View.GONE
                 binding.statusBar.visibility = View.GONE
                 binding.connectButton.isEnabled = false
@@ -1639,6 +1726,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             is SessionController.State.Streaming -> {
+                cancelSessionReadinessWatchdog()
                 presentationController.acquire(state.details.generation)
                 binding.settingsPanel.visibility = View.GONE
                 binding.connectButton.isEnabled = false
@@ -1672,12 +1760,47 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            is SessionController.State.Reconnecting -> {
+                presentationController.release()
+                releaseVideoPipeline()
+                clearPresentationSurface()
+                binding.settingsPanel.visibility = View.VISIBLE
+                binding.settingsButton.visibility = View.GONE
+                binding.statusBar.visibility = View.GONE
+                binding.connectButton.isEnabled = false
+                binding.disconnectButton.isEnabled = true
+                setStatusIndicator(R.drawable.status_indicator_amber)
+                updateStatus("Reconnecting to paired Mac… (attempt ${state.attempt})")
+                stopChecklistUpdates()
+                if (state.mode == ConnectionMode.WIRELESS) {
+                    wirelessController.onAutoReconnectStarted(state.attempt)
+                }
+            }
+
+            is SessionController.State.SuspendedWaitingForHost -> {
+                presentationController.release()
+                releaseVideoPipeline()
+                clearPresentationSurface()
+                binding.settingsPanel.visibility = View.VISIBLE
+                binding.settingsButton.visibility = View.GONE
+                binding.statusBar.visibility = View.GONE
+                binding.connectButton.isEnabled = true
+                binding.disconnectButton.isEnabled = false
+                setStatusIndicator(R.drawable.status_indicator_amber)
+                updateStatus("Waiting for Mac host to wake…")
+                stopChecklistUpdates()
+                if (prefs.connectionMode == ConnectionMode.WIRELESS) {
+                    wirelessController.onStreamSuspended(state.detail)
+                }
+            }
+
             is SessionController.State.Disconnecting -> {
                 presentationController.release()
                 stopPingTimer()
             }
 
             is SessionController.State.Disconnected -> {
+                cancelSessionReadinessWatchdog()
                 presentationController.release()
                 releaseVideoPipeline()
                 binding.settingsPanel.visibility = View.VISIBLE
@@ -1686,8 +1809,20 @@ class MainActivity : AppCompatActivity() {
                 binding.connectButton.isEnabled = true
             binding.disconnectButton.isEnabled = false
             setStatusIndicator(R.drawable.status_indicator_amber)
-            updateStatus("Ready — tap Connect to start")
-            log("Disconnected — ${state.reason}; automatic reconnect is disabled")
+            val retryable = sessionController.lastTerminationReason?.let {
+                it == SessionLifecyclePolicy.EndReason.HOST_SUSPENDED ||
+                    it == SessionLifecyclePolicy.EndReason.VIDEO_TRANSPORT_LOST ||
+                    it == SessionLifecyclePolicy.EndReason.NETWORK_LOST ||
+                    it == SessionLifecyclePolicy.EndReason.APP_BACKGROUND_RECREATION
+            } == true
+                updateStatus(
+                    if (retryable && activityForeground) {
+                        "Reconnecting to paired Mac…"
+                    } else {
+                        "Connection ended — ${state.reason}"
+                    },
+                )
+                log("Disconnected — ${state.reason}; retryable=$retryable")
                 if (prefs.connectionMode == ConnectionMode.WIRELESS) {
                     wirelessController.onStreamDisconnected()
                 } else if (restartChecklistAfterDisconnect) {
@@ -1696,6 +1831,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             is SessionController.State.Failed -> {
+                cancelSessionReadinessWatchdog()
                 presentationController.release()
                 releaseVideoPipeline()
                 binding.settingsPanel.visibility = View.VISIBLE
@@ -1704,8 +1840,16 @@ class MainActivity : AppCompatActivity() {
                 binding.connectButton.isEnabled = true
                 binding.disconnectButton.isEnabled = false
                 setStatusIndicator(R.drawable.status_indicator_red)
-                updateStatus("Connection failed · tap Connect to retry")
-                startChecklistUpdates()
+                updateStatus("Connection failed — ${state.reason.replace('\n', ' ').take(180)}")
+                if (state.reason.contains("Mac", ignoreCase = true) ||
+                    state.reason.contains("frame", ignoreCase = true) ||
+                    state.reason.contains("stream", ignoreCase = true)
+                ) {
+                    log("Connection failed — ${state.reason}")
+                }
+                if (prefs.connectionMode == ConnectionMode.USB) {
+                    startChecklistUpdates()
+                }
             }
         }
 
@@ -1716,7 +1860,11 @@ class MainActivity : AppCompatActivity() {
 
     /** One callback route for USB and wireless. The controller owns all UI
      * truth; this method only reports transport/protocol/render evidence. */
-    private fun setupStreamClientCallbacks(client: StreamClient, generation: Long) {
+    private fun setupStreamClientCallbacks(
+        client: StreamClient,
+        generation: Long,
+        wirelessEndpoint: PairedHostStorage.Entry? = null,
+    ) {
         client.onFrameReceived = frameReceived@{ frameData, frameSize, timestamp, isKeyframe, trace ->
             if (!isCurrentConnection(client, generation)) {
                 client.releaseBuffer(frameData)
@@ -1761,6 +1909,24 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        client.onHostSuspending = hostSuspending@{ reasonCode ->
+            if (!isCurrentConnection(client, generation)) return@hostSuspending
+            val reason = "Mac host is suspending (reason=$reasonCode)"
+            // Invalidate the generation on the socket thread before any
+            // queued decoder callback can claim the old session is still live.
+            if (sessionController.suspend(
+                    generation,
+                    SessionLifecyclePolicy.EndReason.HOST_SUSPENDED,
+                    reason,
+                )
+            ) {
+                runOnUiThread {
+                    if (streamClient !== client) return@runOnUiThread
+                    finishSuspendedSession()
+                }
+            }
+        }
+
         client.onConnectionStatus = connectionStatus@{ connected ->
             if (!isCurrentConnection(client, generation)) {
                 if (connected) client.disconnect()
@@ -1768,11 +1934,34 @@ class MainActivity : AppCompatActivity() {
             }
             if (connected) {
                 sessionController.transportConnected(generation)
-                startPingTimer()
-                stopChecklistUpdates()
+                runOnUiThread {
+                    if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                    wirelessEndpoint?.let { pairedHostStorage.save(it) }
+                    if (wirelessEndpoint != null) {
+                        discoverOnNextAutoAttempt = false
+                        reconnectAttempt = 0
+                    }
+                    startPingTimer()
+                    stopChecklistUpdates()
+                    armSessionReadinessWatchdog(generation, client)
+                }
             } else {
-                stopPingTimer()
-                sessionController.transportLost(generation)
+                if (sessionController.transportLost(
+                        generation,
+                        endReason = SessionLifecyclePolicy.EndReason.VIDEO_TRANSPORT_LOST,
+                    )
+                ) {
+                    runOnUiThread {
+                        cancelSessionReadinessWatchdog()
+                        stopPingTimer()
+                        if (streamClient === client) {
+                            streamClient = null
+                            releaseVideoPipeline()
+                            clearPresentationSurface()
+                        }
+                        if (activityForeground) scheduleAutoReconnect()
+                    }
+                }
             }
         }
 
@@ -1815,31 +2004,223 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * A TCP socket and display configuration are not proof that the tablet is
+     * usable. Every transport must reach the first rendered frame within a
+     * bounded window, including USB, so a server that accepts but never
+     * streams cannot leave the app looking disconnected or black forever.
+     */
+    private fun armSessionReadinessWatchdog(
+        generation: Long,
+        client: StreamClient,
+    ) {
+        cancelSessionReadinessWatchdog()
+        sessionReadinessWatchdogJob =
+            lifecycleScope.launch {
+                delay(SESSION_READINESS_TIMEOUT_MS)
+                if (!isCurrentConnection(client, generation) ||
+                    sessionController.isStreaming(generation)
+                ) {
+                    return@launch
+                }
+                val reason =
+                    when (val current = sessionController.state) {
+                        is SessionController.State.Negotiating -> {
+                            val details = current.details
+                            when {
+                                !details.displayConfigured ->
+                                    "Mac accepted the connection but sent no display configuration."
+                                !details.decoderReady ->
+                                    "Mac sent display configuration, but the tablet decoder did not start."
+                                else ->
+                                    "Mac accepted the connection, but no video frame was rendered."
+                            }
+                        }
+                        is SessionController.State.WaitingForFirstFrame ->
+                            "Mac accepted the connection, but no video frame was rendered."
+                        else ->
+                            "Mac accepted the connection, but the stream did not become ready."
+                    }
+                mainDiag(
+                    "Session readiness timeout generation=$generation " +
+                        "state=${sessionController.state::class.simpleName}: $reason",
+                )
+                failCurrentSession(generation, client, reason)
+            }
+    }
+
+    private fun cancelSessionReadinessWatchdog() {
+        sessionReadinessWatchdogJob?.cancel()
+        sessionReadinessWatchdogJob = null
+    }
+
+    private fun failCurrentSession(
+        generation: Long,
+        client: StreamClient,
+        reason: String,
+    ): Boolean {
+        if (!isCurrentConnection(client, generation)) return false
+        val automaticReconnect =
+            when (val current = sessionController.state) {
+                is SessionController.State.Negotiating -> current.details.automaticReconnect
+                is SessionController.State.WaitingForFirstFrame -> current.details.automaticReconnect
+                else -> false
+            }
+        if (!sessionController.fail(
+                generation,
+                reason,
+                SessionLifecyclePolicy.EndReason.VIDEO_TRANSPORT_LOST,
+            )
+        ) {
+            return false
+        }
+        cancelSessionReadinessWatchdog()
+        stopPingTimer()
+        if (streamClient === client) streamClient = null
+        client.disconnect()
+        releaseVideoPipeline()
+        clearPresentationSurface()
+        resetDisplayConfiguration()
+        updateStatus("Connection failed — $reason")
+        if (prefs.connectionMode == ConnectionMode.WIRELESS) {
+            wirelessController.onStreamFailure(reason)
+        }
+        if (automaticReconnect && activityForeground) {
+            scheduleAutoReconnect()
+        }
+        return true
+    }
+
     private fun connectWireless(
         host: String,
         port: Int,
         token: ByteArray,
         deviceName: String,
+        macName: String = "Mac",
+        automatic: Boolean = false,
+        attempt: Int = 1,
+        preferDiscovery: Boolean = false,
     ) {
-        val generation = beginConnection(ConnectionMode.WIRELESS)
+        val generation = beginConnection(ConnectionMode.WIRELESS, automatic, attempt)
+        if (generation < 0L) return
+
+        if (preferDiscovery) {
+            wirelessController.onDiscoveryStarted()
+            discoveryInProgress = true
+            wirelessHostDiscovery.discover(macName) { candidate ->
+                discoveryInProgress = false
+                if (!activityForeground || prefs.autoReconnectSuppressed ||
+                    !sessionController.isCurrent(generation)
+                ) {
+                    return@discover
+                }
+                val destinationHost = candidate?.host ?: host
+                val destinationPort = candidate?.port ?: port
+                if (candidate == null) {
+                    mainDiag(
+                        "Bonjour did not resolve $macName; falling back to cached " +
+                            "$host:$port",
+                    )
+                } else {
+                    mainDiag(
+                        "Bonjour resolved $macName to " +
+                            "${candidate.host}:${candidate.port}",
+                    )
+                }
+                connectWirelessOnGeneration(
+                    generation,
+                    destinationHost,
+                    destinationPort,
+                    token,
+                    deviceName,
+                    macName,
+                    automatic,
+                )
+            }
+        } else {
+            connectWirelessOnGeneration(
+                generation,
+                host,
+                port,
+                token,
+                deviceName,
+                macName,
+                automatic,
+            )
+        }
+    }
+
+    private fun connectWirelessOnGeneration(
+        generation: Long,
+        host: String,
+        port: Int,
+        token: ByteArray,
+        deviceName: String,
+        macName: String,
+        automatic: Boolean,
+    ) {
+        if (!sessionController.isCurrent(generation)) return
         val client = StreamClient(host, port, applicationContext)
+        val wirelessEndpoint = PairedHostStorage.Entry(host, port, token, macName)
         streamClient = client
-        setupStreamClientCallbacks(client, generation)
+        setupStreamClientCallbacks(client, generation, wirelessEndpoint)
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
                 client.connectWireless(token, deviceName)
             } catch (e: StreamClient.WirelessConnectError) {
                 if (isCurrentConnection(client, generation)) {
-                    sessionController.fail(generation, e.message ?: "Wireless connection failed")
-                    runOnUiThread { wirelessController.onConnectError(e) }
+                    val reasonBeforeClose = sessionController.lastTerminationReason
+                    client.disconnect()
+                    runOnUiThread {
+                        if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                        val retryable =
+                            automatic &&
+                                (e is StreamClient.WirelessConnectError.NetworkUnreachable ||
+                                    (e is StreamClient.WirelessConnectError.ProtocolError &&
+                                        (reasonBeforeClose == SessionLifecyclePolicy.EndReason.HOST_SUSPENDED ||
+                                            reasonBeforeClose == SessionLifecyclePolicy.EndReason.NETWORK_LOST)))
+                        if (retryable) {
+                            discoverOnNextAutoAttempt = true
+                            sessionController.transportLost(
+                                generation,
+                                e.message ?: "Wireless connection failed",
+                                SessionLifecyclePolicy.EndReason.NETWORK_LOST,
+                            )
+                            scheduleAutoReconnect()
+                        } else {
+                            val endReason = when (e) {
+                                is StreamClient.WirelessConnectError.TokenRejected ->
+                                    SessionLifecyclePolicy.EndReason.AUTH_REVOKED
+                                else -> SessionLifecyclePolicy.EndReason.FATAL_PROTOCOL_ERROR
+                            }
+                            sessionController.fail(generation, e.message ?: "Wireless connection failed", endReason)
+                            wirelessController.onConnectError(e)
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 if (isCurrentConnection(client, generation)) {
-                    log("Wireless connect failed: ${e.message}")
-                    sessionController.fail(generation, e.message ?: "Wireless connection failed")
+                    client.disconnect()
                     runOnUiThread {
-                        wirelessController.onConnectError(StreamClient.WirelessConnectError.NetworkUnreachable)
+                        if (!isCurrentConnection(client, generation)) return@runOnUiThread
+                        log("Wireless connect failed: ${e.message}")
+                        if (automatic) {
+                            discoverOnNextAutoAttempt = true
+                            sessionController.transportLost(
+                                generation,
+                                e.message ?: "Wireless connection failed",
+                                SessionLifecyclePolicy.EndReason.NETWORK_LOST,
+                            )
+                            scheduleAutoReconnect()
+                        } else {
+                            sessionController.fail(
+                                generation,
+                                e.message ?: "Wireless connection failed",
+                                SessionLifecyclePolicy.EndReason.NETWORK_LOST,
+                            )
+                            wirelessController.onConnectError(StreamClient.WirelessConnectError.NetworkUnreachable)
+                        }
                     }
                 }
             }
@@ -1851,6 +2232,7 @@ class MainActivity : AppCompatActivity() {
         port: Int,
     ) {
         val generation = beginConnection(ConnectionMode.USB)
+        if (generation < 0L) return
 
         // E3 carries bulk video through 10.77.0.1:54326. Keep tiny
         // latency/control packets on their dedicated adb-reverse port
@@ -1873,6 +2255,7 @@ class MainActivity : AppCompatActivity() {
                 client.connect()
             } catch (e: Exception) {
                 if (!isCurrentConnection(client, generation)) return@launch
+                client.disconnect()
                 val errorMessage =
                     when {
                         e.message?.contains("ECONNREFUSED") == true -> {
@@ -1896,18 +2279,39 @@ class MainActivity : AppCompatActivity() {
                 }
                 runOnUiThread {
                     if (!isCurrentConnection(client, generation)) return@runOnUiThread
-                    sessionController.fail(generation, errorMessage)
+                    sessionController.fail(
+                        generation,
+                        errorMessage,
+                        SessionLifecyclePolicy.EndReason.NETWORK_LOST,
+                    )
                     showError(errorMessage)
                 }
             }
         }
     }
 
-    private fun beginConnection(mode: ConnectionMode): Long {
+    private fun beginConnection(
+        mode: ConnectionMode,
+        automatic: Boolean = false,
+        attempt: Int = 1,
+    ): Long {
+        if (automatic && (!activityForeground || prefs.connectionMode != ConnectionMode.WIRELESS)) return -1L
+        if (!automatic) {
+            autoReconnectJob?.cancel()
+            autoReconnectJob = null
+            reconnectAttempt = 0
+            discoverOnNextAutoAttempt = false
+            prefs.autoReconnectSuppressed = false
+        }
         restartChecklistAfterDisconnect = true
-        val generation = sessionController.begin(mode)
+        val generation = if (automatic) {
+            sessionController.beginAutomaticReconnect(mode, attempt) ?: return -1L
+        } else {
+            sessionController.begin(mode)
+        }
         pendingBrightnessGeneration = null
         pendingBrightness = null
+        cancelSessionReadinessWatchdog()
         streamClient?.disconnect()
         streamClient = null
         releaseVideoPipeline()
@@ -1918,6 +2322,131 @@ class MainActivity : AppCompatActivity() {
         return generation
     }
 
+    private fun suspendCurrentSession(
+        reason: SessionLifecyclePolicy.EndReason,
+        detail: String,
+    ) {
+        val generation = sessionController.currentGeneration
+        if (!sessionController.suspend(generation, reason, detail)) return
+
+        finishSuspendedSession()
+    }
+
+    /** Complete UI/resource teardown after SessionController has invalidated
+     * the old generation. This is also used by the host advisory path, which
+     * invalidates on the socket thread before posting here. Must run on main. */
+    private fun finishSuspendedSession() {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
+        wirelessHostDiscovery.stop()
+        discoveryInProgress = false
+        cancelSessionReadinessWatchdog()
+        stopPingTimer()
+        presentationController.release()
+        val client = streamClient
+        streamClient = null
+        client?.disconnect()
+        releaseVideoPipeline()
+        clearPresentationSurface()
+        resetDisplayConfiguration()
+
+        if (activityForeground && !prefs.autoReconnectSuppressed) {
+            scheduleAutoReconnect(resetAttempt = true)
+        }
+    }
+
+    private fun scheduleAutoReconnect(resetAttempt: Boolean = false) {
+        if (!activityForeground || prefs.autoReconnectSuppressed) return
+        if (prefs.connectionMode != ConnectionMode.WIRELESS) return
+        val entry = pairedHostStorage.load() ?: return
+        val endReason = sessionController.lastTerminationReason ?: run {
+            sessionController.noteForegroundAvailable()
+            sessionController.lastTerminationReason
+        } ?: return
+
+        val context =
+            SessionLifecyclePolicy.ReconnectContext(
+                pairedHostAvailable = true,
+                appForeground = activityForeground,
+                reconnectAlreadyRunning = autoReconnectJob?.isActive == true || discoveryInProgress,
+                healthySessionExists = sessionController.isStreaming(),
+                endReason = endReason,
+                explicitlySuppressed = prefs.autoReconnectSuppressed,
+            )
+        if (!SessionLifecyclePolicy.shouldAutoReconnect(context)) return
+        if (autoReconnectJob?.isActive == true) return
+
+        if (resetAttempt) reconnectAttempt = 0
+        reconnectAttempt = (reconnectAttempt + 1).coerceAtMost(8)
+        val baseDelay = SessionLifecyclePolicy.reconnectDelayMs(reconnectAttempt)
+        val jitter = if (baseDelay > 0L) {
+            kotlin.random.Random.nextLong((baseDelay / 4L) + 1L)
+        } else {
+            0L
+        }
+        val delayMs = SessionLifecyclePolicy.reconnectDelayMs(reconnectAttempt, jitter)
+        val attempt = reconnectAttempt
+        mainDiag("Auto reconnect scheduled attempt=$attempt delay=${delayMs}ms host=${entry.host}:${entry.port}")
+        autoReconnectJob =
+            lifecycleScope.launch {
+                delay(delayMs)
+                autoReconnectJob = null
+                if (!activityForeground || prefs.autoReconnectSuppressed) return@launch
+                if (prefs.connectionMode != ConnectionMode.WIRELESS) return@launch
+                val current = pairedHostStorage.load() ?: return@launch
+                if (discoverOnNextAutoAttempt) {
+                    discoveryInProgress = true
+                    wirelessHostDiscovery.discover(current.macName) { candidate ->
+                        discoveryInProgress = false
+                        if (!activityForeground || prefs.autoReconnectSuppressed) return@discover
+                        val host = candidate?.host ?: current.host
+                        val port = candidate?.port ?: current.port
+                        connectWireless(
+                            host,
+                            port,
+                            current.token,
+                            (Build.MODEL ?: "Android").take(64),
+                            macName = current.macName,
+                            automatic = true,
+                            attempt = attempt,
+                        )
+                    }
+                } else {
+                    connectWireless(
+                        current.host,
+                        current.port,
+                        current.token,
+                        (Build.MODEL ?: "Android").take(64),
+                        macName = current.macName,
+                        automatic = true,
+                        attempt = attempt,
+                    )
+                }
+            }
+    }
+
+    private fun resetDisplayConfiguration() {
+        displayWidth = 0
+        displayHeight = 0
+        displayRotation = 0
+        displayFlipHorizontal = false
+        displayFlipVertical = false
+    }
+
+    /** Remove the last decoded image before a suspend/reconnect. This avoids
+     * presenting a pre-suspend frame while the new generation negotiates. */
+    private fun clearPresentationSurface() {
+        // Do not lockCanvas here. That claims the SurfaceView buffer queue as
+        // the CPU producer (api=2), so the next MediaCodec or EGL producer
+        // cannot connect and reports "already connected". Hiding the view
+        // releases/recreates the queue and gives the next generation one
+        // uncontended presentation surface. The root/settings shell provides
+        // the idle background while the surface is gone.
+        binding.surfaceView.visibility = View.GONE
+        binding.textureView.visibility = View.GONE
+    }
+
     private fun isCurrentConnection(
         client: StreamClient,
         generation: Long,
@@ -1925,6 +2454,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun disconnect(restartChecklist: Boolean = true) {
         restartChecklistAfterDisconnect = restartChecklist
+        prefs.autoReconnectSuppressed = true
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
+        wirelessHostDiscovery.stop()
+        discoveryInProgress = false
+        cancelSessionReadinessWatchdog()
+        reconnectAttempt = 0
         stopPingTimer()
         presentationController.release()
         sessionController.disconnect("user requested disconnect")
@@ -1932,12 +2468,9 @@ class MainActivity : AppCompatActivity() {
         streamClient = null
         client?.disconnect()
         releaseVideoPipeline()
+        clearPresentationSurface()
         // Reset display config so next connect defers decoder init until config arrives
-        displayWidth = 0
-        displayHeight = 0
-        displayRotation = 0
-        displayFlipHorizontal = false
-        displayFlipVertical = false
+        resetDisplayConfiguration()
         val resetUi = {
             updateScreenPowerState(false)
             applyDirectPixelMapping(0, 0)
@@ -1954,6 +2487,9 @@ class MainActivity : AppCompatActivity() {
         sgsrRenderer = null
         cflRenderer?.release()
         cflRenderer = null
+        decoderDisplayWidth = 0
+        decoderDisplayHeight = 0
+        decoderMime = null
     }
 
     private fun startPingTimer() {
@@ -2097,13 +2633,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        // Back in the foreground — cancel any pending auto-disconnect.
-        backgroundedAtMs = 0L
-        autoDisconnectJob?.cancel()
-        autoDisconnectJob = null
+        activityForeground = true
+        registerScreenLifecycleReceiver()
         updateScreenPowerState(sessionController.isStreaming())
-        if (hasActiveSession) {
+        if (sessionController.isStreaming() && streamClient != null) {
             startPingTimer()
+        }
+        if (!hasActiveSession) {
+            sessionController.noteForegroundAvailable()
+            scheduleAutoReconnect()
         }
         if (!hasActiveSession && prefs.connectionMode == ConnectionMode.USB) {
             startChecklistUpdates()
@@ -2111,33 +2649,52 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
-        super.onStop()
+        activityForeground = false
+        unregisterScreenLifecycleReceiver()
         updateScreenPowerState(false)
         stopPingTimer()
-        // Backgrounded while streaming: arm the auto-disconnect timer.
-        if (!hasActiveSession) return
-        backgroundedAtMs = System.currentTimeMillis()
-        val secs =
-            Settings.System.getInt(contentResolver, "sidescreen_auto_disconnect_secs", DEFAULT_BACKGROUND_DISCONNECT_SECS)
-                .coerceAtLeast(10)
-        autoDisconnectJob =
-            lifecycleScope.launch {
-                delay(secs * 1000L)
-                if (
-                    sessionController.isStreaming() &&
-                    backgroundedAtMs > 0 &&
-                    System.currentTimeMillis() - backgroundedAtMs >= secs * 1000L
-                ) {
-                    DiagLog.log("MA", "auto-disconnect: backgrounded > ${secs}s — tearing down session")
-                    disconnect(restartChecklist = false)
-                }
-            }
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
+        wirelessHostDiscovery.stop()
+        discoveryInProgress = false
+        if (hasActiveSession) {
+            suspendCurrentSession(
+                SessionLifecyclePolicy.EndReason.APP_BACKGROUND_RECREATION,
+                "Android Activity moved to the background",
+            )
+        }
+        super.onStop()
     }
 
     override fun onDestroy() {
+        activityForeground = false
+        unregisterScreenLifecycleReceiver()
         super.onDestroy()
         stopChecklistUpdates()
         cleanup()
+    }
+
+    private fun registerScreenLifecycleReceiver() {
+        if (screenLifecycleReceiverRegistered) return
+        val filter =
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+        ContextCompat.registerReceiver(
+            this,
+            screenLifecycleReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        screenLifecycleReceiverRegistered = true
+    }
+
+    private fun unregisterScreenLifecycleReceiver() {
+        if (!screenLifecycleReceiverRegistered) return
+        runCatching { unregisterReceiver(screenLifecycleReceiver) }
+        screenLifecycleReceiverRegistered = false
     }
 
     // ==================== Connection Checklist ====================
@@ -2148,14 +2705,15 @@ class MainActivity : AppCompatActivity() {
             checklistHandler.removeCallbacks(it)
         }
 
-        checklistRunnable =
+        val runnable =
             object : Runnable {
                 override fun run() {
                     updateChecklist()
                     checklistHandler.postDelayed(this, CHECKLIST_INTERVAL_MS) // Local checks only; no host polling
                 }
             }
-        checklistHandler.post(checklistRunnable!!)
+        checklistRunnable = runnable
+        checklistHandler.post(runnable)
     }
 
     private fun stopChecklistUpdates() {
@@ -2228,8 +2786,8 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val DIRECT_PIXEL_MIN_SCALE = 0.97f
-        const val DEFAULT_BACKGROUND_DISCONNECT_SECS = 60
         const val LATENCY_PING_INTERVAL_MS = 2_000L
+        const val SESSION_READINESS_TIMEOUT_MS = 10_000L
         const val CHECKLIST_INTERVAL_MS = 10_000L
         const val LAB_SURFACE_CAPTURE_DELAY_MS = 250L
         const val LAB_SURFACE_CAPTURE_RETRY_DELAY_MS = 150L

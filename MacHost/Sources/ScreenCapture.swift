@@ -53,7 +53,6 @@ class ScreenCapture {
     private var labMotionTimer: DispatchSourceTimer?
     private var labMotionFrameID: UInt64 = 0
     private var restartAttempted = false
-    private var wakeObservers: [NSObjectProtocol] = []
     /// True between startStreaming and stopStreaming. Guards wake-triggered
     /// restarts from re-enabling capture after a stop.
     private var isStreaming = false
@@ -61,10 +60,15 @@ class ScreenCapture {
     /// in-flight restart Task aborts instead of resurrecting capture.
     private var streamGeneration: UInt64 = 0
 
+    /// Lifecycle suspension is independent from the no-client idle pause.
+    /// It is read by ScreenCaptureKit callbacks and encode work running off
+    /// the main thread, so it has its own lock and gate.
+    private let lifecycleStateLock = NSLock()
+    private var lifecycleSuspended = false
+
     // Display-sleep assertion held while streaming (see createDisplaySleepAssertion)
     private var displaySleepAssertionID: IOPMAssertionID = IOPMAssertionID(0)
     private var hasDisplaySleepAssertion = false
-    private var wakeRestartPending = false
 
     // Streaming parameters (saved for restart)
     private weak var currentServer: StreamingServer?
@@ -121,9 +125,25 @@ class ScreenCapture {
     }
 
     private func cachePixelBuffer(_ pixelBuffer: CVPixelBuffer?) {
+        lifecycleStateLock.lock()
+        let mayCache = !lifecycleSuspended || pixelBuffer == nil
+        lifecycleStateLock.unlock()
+        guard mayCache else { return }
         cachedPixelBufferLock.lock()
         lastPixelBuffer = pixelBuffer
         cachedPixelBufferLock.unlock()
+    }
+
+    private func isLifecycleSuspended() -> Bool {
+        lifecycleStateLock.lock()
+        defer { lifecycleStateLock.unlock() }
+        return lifecycleSuspended
+    }
+
+    private func setLifecycleSuspended(_ suspended: Bool) {
+        lifecycleStateLock.lock()
+        lifecycleSuspended = suspended
+        lifecycleStateLock.unlock()
     }
 
     /// ScreenCaptureKit's displayTime is the WindowServer presentation time,
@@ -241,6 +261,7 @@ class ScreenCapture {
     /// If the encoder hasn't been created yet (request arrived before
     /// startStreaming), the request is stored and applied at encoder init.
     func requestKeyframe() {
+        guard !isLifecycleSuspended() else { return }
         // FrameSkipper — every keyframe request also forces the next captured
         // frame through the skip gate (client connect on a static screen must
         // still receive a fresh IDR).
@@ -257,6 +278,7 @@ class ScreenCapture {
     /// idle. Without this, a client connecting during a static screen would
     /// wait up to one full GOP duration before its decoder could start.
     func requestKeyframeOrReplayCachedFrame(force: Bool = false) {
+        guard !isLifecycleSuspended() else { return }
         let now = DispatchTime.now().uptimeNanoseconds
         let shouldRequest = keyframeRequestLock.withLock { state -> Bool in
             if !force,
@@ -378,56 +400,11 @@ class ScreenCapture {
         self.frameRateCap = frameRateCap
         try await setupDisplay()
         try await setupStream()
-        await MainActor.run { registerWakeObservers() }
-    }
-
-    // MARK: - Display wake handling
-
-    /// Restart ScreenCaptureKit after a display wake. Display sleep can tear
-    /// down SCStream (SCStreamErrorDomain -3815, "no displays or windows to
-    /// capture"); a bounded restart is the only recovery path we expose.
-    private func registerWakeObservers() {
-        guard wakeObservers.isEmpty else { return }
-        let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.screensDidWakeNotification, NSWorkspace.didWakeNotification] {
-            let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                self?.handleWake()
-            }
-            wakeObservers.append(token)
-        }
-        debugLog("Wake observers registered")
-    }
-
-    private func unregisterWakeObservers() {
-        let center = NSWorkspace.shared.notificationCenter
-        wakeObservers.forEach { center.removeObserver($0) }
-        wakeObservers.removeAll()
     }
 
     deinit {
-        // Defensive: stopStreaming() already unregisters, but make sure a
-        // dropped instance never leaves observer tokens behind.
-        unregisterWakeObservers()
-    }
-
-    private func handleWake() {
-        // Only act while a capture is actually running.
-        guard stream != nil else { return }
-        // A full system wake fires both screensDidWake and didWake —
-        // coalesce them into a single restart.
-        guard !wakeRestartPending else { return }
-        wakeRestartPending = true
-        debugLog("Screens woke — scheduling capture restart")
-        // Give WindowServer a moment to settle before touching the stream.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self else { return }
-            self.wakeRestartPending = false
-            guard self.stream != nil else { return }
-            self.restartStream()
-            // A wake-triggered restart must not consume the one-shot budget
-            // the frame monitor uses for stall recovery.
-            self.restartAttempted = false
-        }
+        // Capture callbacks are weakly owned; no notification observers are
+        // retained here. AppDelegate owns the macOS lifecycle observation.
     }
 
     // MARK: - SCShareableContent with timeout
@@ -509,6 +486,10 @@ class ScreenCapture {
         let delegate = StreamDelegate()
         delegate.onStreamError = { [weak self] _ in
             guard let self = self else { return }
+            guard !self.isLifecycleSuspended() else {
+                debugLog("StreamDelegate error during host lifecycle suspension — restart suppressed")
+                return
+            }
             debugLog("StreamDelegate error callback — scheduling ScreenCaptureKit restart")
             self.restartStream()
         }
@@ -554,6 +535,7 @@ class ScreenCapture {
 
         streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
             guard let self = self else { return }
+            guard !self.isLifecycleSuspended(), self.isStreaming else { return }
 
             // Thread-safe update of frame monitor state
             let isFirst = self.stateLock.withLock { state -> Bool in
@@ -669,6 +651,10 @@ class ScreenCapture {
                 }
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
+                    guard !self.isLifecycleSuspended(), self.isStreaming else {
+                        OSAtomicDecrement32(&self.pendingEncodes)
+                        return
+                    }
                     self.encoder?.encode(
                         pixelBuffer: toEncode,
                         presentationTimeStamp: pts,
@@ -684,6 +670,10 @@ class ScreenCapture {
                 let cachedCallbackTimestampNs = DispatchTime.now().uptimeNanoseconds
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
+                    guard !self.isLifecycleSuspended(), self.isStreaming else {
+                        OSAtomicDecrement32(&self.pendingEncodes)
+                        return
+                    }
                     self.encoder?.encode(
                         pixelBuffer: cached,
                         presentationTimeStamp: pts,
@@ -698,7 +688,7 @@ class ScreenCapture {
 
     // MARK: - Start streaming
 
-    func startStreaming(to server: StreamingServer?, bitrateMbps: Int = 20, quality: String = "medium", gamingBoost: Bool = false, frameRate: Int = 60, bitrateCapMbps: Int? = nil, frameRateCap: Int? = nil) {
+    func startStreaming(to server: StreamingServer?, bitrateMbps: Int = 20, quality: String = "medium", gamingBoost: Bool = false, frameRate: Int = 60, bitrateCapMbps: Int? = nil, frameRateCap: Int? = nil, initiallySuspended: Bool = false) {
         // Save parameters for potential restart
         currentServer = server
         // The encoder must use the same effective ceiling as ScreenCaptureKit.
@@ -712,26 +702,18 @@ class ScreenCapture {
         currentBitrateCapMbps = bitrateCapMbps
         adaptiveRefreshController?.update(maxFPS: effFrameRate, gamingBoost: gamingBoost)
 
+        setLifecycleSuspended(initiallySuspended)
         isStreaming = true
         resetDisplayTimeCalibration()
 
-        // Keep the display awake for the whole streaming session so the virtual
-        // display never idle-sleeps (the sleep/wake cycle is what strands the
-        // cursor — see the wake handling above for the residual cases).
-        createDisplaySleepAssertion()
-
-        let (width, height) = encodeSize(for: codec)
-
-        // EXP-FORK: HDR mode — prepare the 10-bit converter pool + LUTs for the
-        // capture size up front (first frame would race the encode otherwise).
-        if HDRConverter.enabled {
-            HDRConverter.ensureSetup(width: width, height: height)
+        if !initiallySuspended {
+            // Keep the display awake for the whole streaming session so the
+            // virtual display never idle-sleeps. Explicit lifecycle suspension
+            // releases this assertion before quiescing capture.
+            createDisplaySleepAssertion()
         }
 
-        encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: effFrameRate, maxBitrateMbps: bitrateCapMbps)
-        encoder?.onEncodedFrame = { [weak server] frame in
-            server?.sendFrame(frame)
-        }
+        createEncoder(bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: effFrameRate, bitrateCapMbps: bitrateCapMbps)
 
         // Apply any keyframe request that arrived before the encoder existed
         let shouldForceInitialKeyframe = keyframeRequestLock.withLock { state -> Bool in
@@ -751,8 +733,14 @@ class ScreenCapture {
 
         configureFrameHandler(label: "initial")
 
+        guard !initiallySuspended else {
+            debugLog("SCStream configured but capture start deferred — host lifecycle is suspended")
+            return
+        }
+
         Task {
             do {
+                guard self.isStreaming, !self.isLifecycleSuspended() else { return }
                 try await stream?.startCapture()
                 debugLog("SCStream capture started — starting frame flow monitor (3s interval, 5s timeout)")
                 startFrameMonitor()
@@ -764,15 +752,44 @@ class ScreenCapture {
         }
     }
 
+    private func createEncoder(
+        bitrateMbps: Int,
+        quality: String,
+        gamingBoost: Bool,
+        frameRate: Int,
+        bitrateCapMbps: Int?
+    ) {
+        let (width, height) = encodeSize(for: codec)
+        if HDRConverter.enabled {
+            HDRConverter.ensureSetup(width: width, height: height)
+        }
+        let server = currentServer
+        encoder = VideoEncoder(
+            width: width,
+            height: height,
+            codec: codec,
+            bitrateMbps: bitrateMbps,
+            quality: quality,
+            gamingBoost: gamingBoost,
+            frameRate: frameRate,
+            maxBitrateMbps: bitrateCapMbps
+        )
+        encoder?.onEncodedFrame = { [weak server] frame in
+            server?.sendFrame(frame)
+        }
+    }
+
     // MARK: - Continuous frame-flow monitor
 
     private func startFrameMonitor() {
+        guard !isLifecycleSuspended() else { return }
         stopFrameMonitor()
 
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
         timer.schedule(deadline: .now() + 3.0, repeating: 3.0)
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
+            guard !self.isLifecycleSuspended(), self.isStreaming else { return }
 
             let stalled: Bool
             let lastTime = self.stateLock.withLock { $0.lastFrameTime }
@@ -847,6 +864,7 @@ class ScreenCapture {
         stopLabMotionGenerator()
         guard PatternInjector.isMotionLabActive,
               isStreaming,
+              !isLifecycleSuspended(),
               let queue = encodeQueue else { return }
         let fps = PatternInjector.motionLabFPS
         let (width, height) = encodeSize(for: codec)
@@ -861,6 +879,7 @@ class ScreenCapture {
         timer.setEventHandler { [weak self] in
             guard let self,
                   self.isStreaming,
+                  !self.isLifecycleSuspended(),
                   !self.idlePaused,
                   let encoder = self.encoder,
                   let server = self.currentServer,
@@ -898,6 +917,205 @@ class ScreenCapture {
         frameMonitorTimer = nil
     }
 
+    // MARK: - Host lifecycle suspension
+
+    private var lifecycleQuiesceInProgress = false
+    private var lifecycleCompletions: [() -> Void] = []
+
+    /// Quiesce every producer of desktop pixels for a macOS lock/sleep event.
+    /// The lifecycle gate is set before the asynchronous stop so late
+    /// ScreenCaptureKit callbacks and queued encodes cannot reach the server.
+    func suspendForLifecycle(completion: @escaping () -> Void) {
+        precondition(Thread.isMainThread, "ScreenCapture lifecycle transitions are main-thread confined")
+        lifecycleCompletions.append(completion)
+        let wasSuspended = isLifecycleSuspended()
+        if wasSuspended {
+            // A wake rebuild may have raced a new lock/sleep. If it created a
+            // partial stream/encoder after the first quiesce completed, run a
+            // second bounded drain instead of treating the gate as complete.
+            if !lifecycleQuiesceInProgress, (stream != nil || encoder != nil) {
+                quiesceCapturePipeline()
+            } else if !lifecycleQuiesceInProgress {
+                let completions = lifecycleCompletions
+                lifecycleCompletions.removeAll()
+                completions.forEach { $0() }
+            }
+            return
+        }
+
+        setLifecycleSuspended(true)
+        quiesceCapturePipeline()
+    }
+
+    private func quiesceCapturePipeline() {
+        lifecycleQuiesceInProgress = true
+        streamGeneration &+= 1
+        idleGeneration &+= 1
+        idlePaused = false
+        stopFrameMonitor()
+        stopLabMotionGenerator()
+        adaptiveRefreshController = nil
+        releaseDisplaySleepAssertion()
+        cachePixelBuffer(nil)
+
+        let oldStream = stream
+        let oldEncoder = encoder
+        let oldEncodeQueue = encodeQueue
+        stream = nil
+        streamOutput = nil
+        streamDelegate = nil
+        encoder = nil
+
+        Task { [weak self] in
+            try? await oldStream?.stopCapture()
+            oldEncodeQueue?.sync {}
+            oldEncoder?.invalidate()
+            guard let self else { return }
+            await MainActor.run {
+                self.lifecycleQuiesceInProgress = false
+                let completions = self.lifecycleCompletions
+                self.lifecycleCompletions.removeAll()
+                completions.forEach { $0() }
+                debugLog("Screen capture/encode quiesced for host lifecycle")
+            }
+        }
+    }
+
+    /// Rebuild the capture and encoder pipeline after all host suspend reasons
+    /// have cleared. Completion is delivered on the main thread and reports
+    /// whether a fresh SCStream was started.
+    func resumeFromLifecycle(displayID: CGDirectDisplayID? = nil, completion: @escaping (Bool) -> Void) {
+        precondition(Thread.isMainThread, "ScreenCapture lifecycle transitions are main-thread confined")
+        guard isStreaming else {
+            completion(false)
+            return
+        }
+
+        // The HostLifecycleController only calls this after every suspend
+        // reason has cleared. Open the capture gate before rebuilding, while
+        // the generation checks below still prevent a raced new suspension
+        // from resurrecting the pipeline.
+        setLifecycleSuspended(false)
+
+        if let displayID {
+            virtualDisplayID = displayID
+        }
+
+        // startServer can configure an SCStream before discovering that the
+        // host is already locked/asleep. Do not overwrite that configured
+        // stream or encoder while rebuilding the first post-wake generation.
+        // Normal lifecycle suspension has already cleared these references,
+        // so this is a no-op for the steady-state path.
+        let staleStream = stream
+        let staleEncoder = encoder
+        let staleEncodeQueue = encodeQueue
+        stream = nil
+        streamOutput = nil
+        streamDelegate = nil
+        encoder = nil
+
+        streamGeneration &+= 1
+        let generation = streamGeneration
+        stateLock.withLock { state in
+            state.lastFrameTime = nil
+            state.hasReceivedFirstFrame = false
+        }
+        resetDisplayTimeCalibration()
+
+        Task { [weak self] in
+            guard let self else { return }
+            try? await staleStream?.stopCapture()
+            staleEncodeQueue?.sync {}
+            staleEncoder?.invalidate()
+            guard self.isStreaming,
+                  generation == self.streamGeneration,
+                  !self.isLifecycleSuspended() else {
+                await MainActor.run { completion(false) }
+                return
+            }
+            do {
+                try await self.setupDisplay()
+                guard self.isStreaming,
+                      generation == self.streamGeneration,
+                      !self.isLifecycleSuspended() else {
+                    await MainActor.run { completion(false) }
+                    return
+                }
+                try await self.setupStream()
+                guard self.isStreaming,
+                      generation == self.streamGeneration,
+                      !self.isLifecycleSuspended() else {
+                    let abandonedStream = self.stream
+                    self.stream = nil
+                    self.streamOutput = nil
+                    self.streamDelegate = nil
+                    try? await abandonedStream?.stopCapture()
+                    await MainActor.run { completion(false) }
+                    return
+                }
+
+                self.createEncoder(
+                    bitrateMbps: self.currentBitrateMbps,
+                    quality: self.currentQuality,
+                    gamingBoost: self.currentGamingBoost,
+                    frameRate: self.currentFrameRate,
+                    bitrateCapMbps: self.currentBitrateCapMbps
+                )
+                guard self.isStreaming,
+                      generation == self.streamGeneration,
+                      !self.isLifecycleSuspended() else {
+                    self.encoder?.invalidate()
+                    self.encoder = nil
+                    await MainActor.run { completion(false) }
+                    return
+                }
+                self.configureFrameHandler(label: "lifecycle-resume")
+                guard self.isStreaming,
+                      generation == self.streamGeneration,
+                      !self.isLifecycleSuspended() else {
+                    let abandonedEncoder = self.encoder
+                    self.encoder = nil
+                    abandonedEncoder?.invalidate()
+                    let abandonedStream = self.stream
+                    self.stream = nil
+                    self.streamOutput = nil
+                    self.streamDelegate = nil
+                    try? await abandonedStream?.stopCapture()
+                    await MainActor.run { completion(false) }
+                    return
+                }
+                try await self.stream?.startCapture()
+                guard self.isStreaming,
+                      generation == self.streamGeneration,
+                      !self.isLifecycleSuspended() else {
+                    let abandonedEncoder = self.encoder
+                    self.encoder = nil
+                    self.streamOutput = nil
+                    self.streamDelegate = nil
+                    let abandonedStream = self.stream
+                    self.stream = nil
+                    abandonedEncoder?.invalidate()
+                    try? await abandonedStream?.stopCapture()
+                    await MainActor.run { completion(false) }
+                    return
+                }
+                self.createDisplaySleepAssertion()
+                self.startFrameMonitor()
+                self.startLabMotionGenerator()
+                debugLog("Screen capture resumed with fresh generation \(generation)")
+                await MainActor.run { completion(true) }
+            } catch {
+                debugLog("ScreenCaptureKit lifecycle resume failed: \(error.localizedDescription)")
+                self.stream = nil
+                self.streamOutput = nil
+                self.streamDelegate = nil
+                self.encoder?.invalidate()
+                self.encoder = nil
+                await MainActor.run { completion(false) }
+            }
+        }
+    }
+
     // MARK: - Idle sleep (no client connected)
 
     private(set) var idlePaused = false
@@ -910,19 +1128,20 @@ class ScreenCapture {
     /// The frame monitor is stopped so its stall detector does not treat the
     /// intentional pause as a dead stream.
     func pauseForIdle() {
-        guard !idlePaused, isStreaming, stream != nil else { return }
+        guard !isLifecycleSuspended(), !idlePaused, isStreaming, stream != nil else { return }
         idlePaused = true
         idleGeneration &+= 1
         let gen = idleGeneration
         stopFrameMonitor()
         debugLog("IDLE: pausing capture (no client)")
-        Task {
-            try? await stream?.stopCapture()
-            guard isStreaming, idlePaused, gen == idleGeneration else {
-                if isStreaming {
+        Task { [weak self] in
+            guard let self else { return }
+            try? await self.stream?.stopCapture()
+            guard self.isStreaming, !self.isLifecycleSuspended(), self.idlePaused, gen == self.idleGeneration else {
+                if self.isStreaming, !self.isLifecycleSuspended() {
                     // Superseded by a resume — its startCapture may have
                     // landed BEFORE our stopCapture; bring capture back.
-                    try? await stream?.startCapture()
+                    try? await self.stream?.startCapture()
                     debugLog("IDLE: pause superseded by resume — capture restored")
                 } else {
                     debugLog("IDLE: pause superseded by stop — not bringing capture back")
@@ -937,14 +1156,16 @@ class ScreenCapture {
     /// replays the cached frame right after, so the client sees pixels
     /// immediately even while the SCStream restarts underneath.
     func resumeFromIdle() {
-        guard idlePaused else { return }
+        guard !isLifecycleSuspended(), idlePaused else { return }
         idlePaused = false
         idleGeneration &+= 1
         debugLog("IDLE: resuming capture (client connected)")
-        Task {
-            try? await stream?.startCapture()
-            startFrameMonitor()
-            startLabMotionGenerator()
+        Task { [weak self] in
+            guard let self, !self.isLifecycleSuspended() else { return }
+            try? await self.stream?.startCapture()
+            guard !self.isLifecycleSuspended() else { return }
+            self.startFrameMonitor()
+            self.startLabMotionGenerator()
             debugLog("IDLE: capture resumed")
         }
     }
@@ -952,7 +1173,7 @@ class ScreenCapture {
     // MARK: - Stream restart
 
     private func restartStream() {
-        guard isStreaming else {
+        guard isStreaming, !isLifecycleSuspended() else {
             debugLog("restartStream skipped — not streaming")
             return
         }
@@ -968,7 +1189,7 @@ class ScreenCapture {
                 try? await stream?.stopCapture()
                 // A stopStreaming() or a newer restart superseded this one — do
                 // NOT bring capture back up (would resurrect a stopped stream).
-                guard isStreaming, gen == streamGeneration else {
+                guard isStreaming, !isLifecycleSuspended(), gen == streamGeneration else {
                     debugLog("restartStream(gen \(gen)) superseded after stopCapture — aborting")
                     return
                 }
@@ -982,7 +1203,7 @@ class ScreenCapture {
                 // Re-setup
                 try await setupDisplay()
                 try await setupStream()
-                guard isStreaming, gen == streamGeneration else {
+                guard isStreaming, !isLifecycleSuspended(), gen == streamGeneration else {
                     debugLog("restartStream(gen \(gen)) superseded during setup — aborting")
                     try? await stream?.stopCapture()
                     stream = nil
@@ -992,13 +1213,13 @@ class ScreenCapture {
 
                 // Re-attach encoding pipeline using shared handler
                 configureFrameHandler(label: "restart")
-                guard isStreaming, gen == streamGeneration else {
+                guard isStreaming, !isLifecycleSuspended(), gen == streamGeneration else {
                     debugLog("restartStream(gen \(gen)) superseded before start — aborting")
                     return
                 }
 
                 try await stream?.startCapture()
-                guard isStreaming, gen == streamGeneration else {
+                guard isStreaming, !isLifecycleSuspended(), gen == streamGeneration else {
                     debugLog("restartStream(gen \(gen)) superseded after startCapture — aborting")
                     try? await stream?.stopCapture()
                     adaptiveRefreshController = nil
@@ -1010,7 +1231,7 @@ class ScreenCapture {
                 startLabMotionGenerator()
             } catch {
                 debugLog("SCStream restart failed: \(error)")
-                if isStreaming, gen == streamGeneration {
+                if isStreaming, !isLifecycleSuspended(), gen == streamGeneration {
                     onCaptureMethodChanged?("Unavailable — ScreenCaptureKit restart failed: \(error.localizedDescription)")
                 } else {
                     debugLog("restartStream(gen \(gen)) superseded before failure report — aborted")
@@ -1026,9 +1247,8 @@ class ScreenCapture {
     /// displaysleep), the virtual display stops producing frames and the
     /// cursor overlay is lost on wake. Holding
     /// kIOPMAssertionTypePreventUserIdleDisplaySleep avoids the whole
-    /// sleep/wake transition; the wake observers above cover what it cannot
-    /// (manual/forced sleep, lid close, display reconnects). Released in
-    /// stopStreaming.
+    /// sleep/wake transition. HostLifecycleController owns the explicit
+    /// lock/sleep path and releases this assertion during suspension.
     private func createDisplaySleepAssertion() {
         guard !hasDisplaySleepAssertion else { return }
         let reason = "Side Screen is streaming to an external tablet display" as CFString
@@ -1114,6 +1334,7 @@ class ScreenCapture {
         // Invalidate any in-flight restart (incl. the delayed wake restart) so
         // it cannot resurrect capture after this stop.
         isStreaming = false
+        setLifecycleSuspended(false)
         streamGeneration &+= 1
         resetDisplayTimeCalibration()
 
@@ -1124,6 +1345,13 @@ class ScreenCapture {
 
         // Let the display idle-sleep normally again once we stop streaming.
         releaseDisplaySleepAssertion()
+
+        let oldEncoder = encoder
+        let oldEncodeQueue = encodeQueue
+        encoder = nil
+        oldEncodeQueue?.async {
+            oldEncoder?.invalidate()
+        }
 
         // Stop SCStream
         Task {
@@ -1140,7 +1368,6 @@ class ScreenCapture {
             state.hasReceivedFirstFrame = false
         }
         restartAttempted = false
-        unregisterWakeObservers()
     }
 }
 
