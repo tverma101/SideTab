@@ -44,6 +44,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var virtualDisplayManager: VirtualDisplayManager?
     var brightnessMonitor: BrightnessMonitor?
     var nativeBrightness: NativeBrightnessController?
+    /// Mirrors Night Shift into the tablet's Eye comfort shield while a
+    /// client is connected (NightShiftMonitor.swift).
+    @MainActor private lazy var nightShiftMirror = NightShiftMirror()
     var idleSleepMonitor: IdleSleepMonitor?
     var settings = DisplaySettings()
     var runtime = DisplayRuntimeState()
@@ -90,6 +93,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
+
+        // Constructing the mirror starts its pending-restore retry even when
+        // no tablet reconnects during this launch.
+        _ = nightShiftMirror
 
         nativeBrightness = NativeBrightnessController()
         nativeBrightness?.onBrightness = { [weak self] level in
@@ -843,9 +850,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
             attempt.streamingServer = server
             server.touchEnabled = await MainActor.run { self.settings.touchEnabled }
+            let wirelessClientModel = OSAllocatedUnfairLock<String?>(initialState: nil)
             if settings.connectionMode == .wireless {
                 server.expectedAuthToken = WirelessAuth.loadOrCreate()
                 server.onWirelessClientPaired = { [weak self, weak server] deviceName in
+                    // Written synchronously before the server installs the
+                    // session, so the later client-connected callback never
+                    // depends on MainActor task ordering for this identity.
+                    wirelessClientModel.withLock { $0 = deviceName }
                     // Identity is read on the server's own queue, while the
                     // handshake that produced it is still the live session.
                     guard let server else { return }
@@ -913,6 +925,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // client has joined; StreamingServer queues it until BRIGHT
                     // capability negotiation completes.
                     self.nativeBrightness?.pushCurrent()
+                    self.nightShiftMirror.clientConnected(
+                        connectionMode: sessionMode,
+                        wirelessDeviceModel: wirelessClientModel.withLock { $0 },
+                        wirelessClientHost: event.clientHost,
+                        usbVideoPort: Int(self.settings.port),
+                        usbControlPort: Int(ControlPortResolver.effective(videoPort: self.settings.port)),
+                        sessionGeneration: event.sessionGeneration
+                    )
                     self.runtime.clientConnected = true
                 }
             }
@@ -940,6 +960,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // a disconnect in the middle of an S Pen drag otherwise left
                     // the button logically down until the user clicked again.
                     self.releaseStylusIfNeeded()
+                    self.nightShiftMirror.clientDisconnected(sessionGeneration: event.sessionGeneration)
                     self.runtime.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment.
                     self.persistWirelessDeviceDisconnect()
@@ -1165,6 +1186,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard clearingSettings else { return }
         releaseStylusIfNeeded()
+        nightShiftMirror.releaseNow()
         runtime.isRunning = false
         runtime.displayCreated = false
         runtime.clientConnected = false
@@ -1762,6 +1784,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // for the whole termination sequence.
         statusRefreshTimer?.invalidate()
         statusRefreshTimer = nil
+
+        // Hand the tablet its own Eye comfort settings back before quitting.
+        nightShiftMirror.releaseForTermination()
 
         // Stop server and cleanup
         stopServer()
