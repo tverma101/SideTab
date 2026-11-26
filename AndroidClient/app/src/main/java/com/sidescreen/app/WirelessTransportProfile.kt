@@ -15,7 +15,7 @@ import java.net.Socket
  * or background reconnect work that would cost battery while idle.
  */
 object WirelessTransportProfile {
-    const val TARGET_FPS = 60
+    const val TARGET_FPS = WirelessFreshnessPolicy.TARGET_FPS
     const val VIDEO_SOCKET_RECEIVE_BUFFER_BYTES = 1024 * 1024
     const val VIDEO_STREAM_BUFFER_BYTES = 256 * 1024
 

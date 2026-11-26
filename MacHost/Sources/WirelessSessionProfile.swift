@@ -5,12 +5,14 @@ import Foundation
 /// Wireless is deliberately a 60 FPS session even when the panel or the USB
 /// profile is configured for 90/120 Hz. The encoder's existing 1.5x one-second
 /// data-rate ceiling turns the 40 Mbps average target into an approximately
-/// 60 Mbps peak, keeping Wi-Fi bursts bounded without making the display feel
-/// slow during normal motion.
+/// 60 Mbps peak. Freshness/backpressure limits are kept separately from the
+/// bitrate target so Wi-Fi jitter cannot turn bandwidth headroom into a stale
+/// multi-frame queue.
 enum WirelessSessionProfile {
-    static let frameRate = 60
+    static let frameRate = WirelessFreshnessPolicy.targetFrameRate
     static let averageBitrateMbps = 40
     static let peakBitrateMbps = averageBitrateMbps * 3 / 2
+    static let senderLimits = WirelessFreshnessPolicy.senderLimits
 
     static func frameRate(for mode: ConnectionMode, requested: Int) -> Int {
         mode == .wireless ? frameRate : requested
@@ -18,5 +20,9 @@ enum WirelessSessionProfile {
 
     static func bitrateCap(for mode: ConnectionMode) -> Int? {
         mode == .wireless ? averageBitrateMbps : nil
+    }
+
+    static func backpressureLimits(for mode: ConnectionMode) -> FrameBackpressureLimits {
+        mode == .wireless ? senderLimits : .default
     }
 }
