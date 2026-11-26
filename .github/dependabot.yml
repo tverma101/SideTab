@@ -1,0 +1,23 @@
+# Proposed dependency updates; only active after this file is merged.
+# Updates stay in review PRs and must pass the existing Android and macOS CI.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: gradle
+    directory: "/AndroidClient"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      gradle-minor-and-patch:
+        update-types: [minor, patch]
