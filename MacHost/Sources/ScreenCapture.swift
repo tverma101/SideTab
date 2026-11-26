@@ -331,9 +331,46 @@ class ScreenCapture {
     private struct KeyframeRequestState {
         var pendingEncoderCreationRequest = false
         var lastKeyframeOrReplayRequestNs: UInt64 = 0
+        var deferredRetryGeneration: UInt64?
     }
     private let keyframeRequestLock = OSAllocatedUnfairLock(initialState: KeyframeRequestState())
     private static let keyframeRequestThrottleNs: UInt64 = 500_000_000
+
+    private func retryDeferredFrame() {
+        let generation = streamGeneration
+        let schedule = keyframeRequestLock.withLock { state -> Bool in
+            guard state.deferredRetryGeneration != generation else { return false }
+            state.deferredRetryGeneration = generation
+            return true
+        }
+        guard schedule else { return }
+        guard let queue = encodeQueue else {
+            keyframeRequestLock.withLock {
+                if $0.deferredRetryGeneration == generation { $0.deferredRetryGeneration = nil }
+            }
+            return
+        }
+        queue.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+            guard let self else { return }
+            let ownsRetry = self.keyframeRequestLock.withLock { state -> Bool in
+                guard state.deferredRetryGeneration == generation else { return false }
+                state.deferredRetryGeneration = nil
+                return true
+            }
+            guard ownsRetry, self.isCurrentGeneration(generation),
+                  self.stateLock.withLock({ $0.acceptingFrames }),
+                  let encoder = self.encoder, let cached = self.cachedPixelBuffer() else { return }
+            if WirelessTransportPressure.shouldPauseEncoding {
+                self.retryDeferredFrame()
+                return
+            }
+            let pts = CMTime(
+                value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
+                timescale: 1_000_000
+            )
+            self.encodeCachedFrame(cached, using: encoder, presentationTimeStamp: pts)
+        }
+    }
 
     private static func frameStatus(_ sampleBuffer: CMSampleBuffer) -> SCFrameStatus? {
         guard let attachments =
@@ -393,6 +430,22 @@ class ScreenCapture {
 
     /// Callback when capture method changes (e.g. SCStream → CGDisplayStream fallback)
     var onCaptureMethodChanged: ((String) -> Void)?
+    /// A temporary runtime limit is separate from the user's saved bitrate.
+    var onSafetyBitrateChanged: ((Int?) -> Void)?
+    var safetyBitrateMbps: Int? { encoder?.safetyBitrateMbps }
+
+    func handleOversizedFrame() {
+        guard connectionMode == .usb else { return }
+        let generation = streamGeneration
+        encodeQueue?.async { [weak self] in
+            guard let self, self.isCurrentGeneration(generation),
+                  self.stateLock.withLock({ $0.acceptingFrames }),
+                  let encoder = self.encoder else { return }
+            if let target = encoder.reduceBitrateForOversizedFrame() {
+                self.onSafetyBitrateChanged?(target)
+            }
+        }
+    }
 
     /// Force the encoder to emit an IDR keyframe on the next frame.
     /// If the encoder hasn't been created yet (request arrived before
@@ -437,8 +490,15 @@ class ScreenCapture {
 
         encodeQueue?.async {
             guard self.stateLock.withLock({ $0.acceptingFrames }) else { return }
-            encoder.encode(pixelBuffer: cached, presentationTimeStamp: pts)
+            self.encodeCachedFrame(cached, using: encoder, presentationTimeStamp: pts)
         }
+    }
+
+    /// The cache holds the capture buffer, not a leased HDR conversion buffer:
+    /// a pooled output can be reused after VideoToolbox releases its lease.
+    private func encodeCachedFrame(_ cached: CVPixelBuffer, using encoder: VideoEncoder, presentationTimeStamp: CMTime) {
+        let frame = HDRConverter.enabled ? (HDRConverter.convert(cached) ?? cached) : cached
+        encoder.encode(pixelBuffer: frame, presentationTimeStamp: presentationTimeStamp)
     }
 
     /// A pixel buffer is not Sendable, so it crosses the lock inside a box —
@@ -970,8 +1030,9 @@ class ScreenCapture {
                 }
             }
             let frameToEncode = PixelBufferBox(buffer: toEncode)
+            let frameToCache = PixelBufferBox(buffer: imageBuffer)
             self.stateLock.withLock { state in
-                state.lastPixelBuffer = frameToEncode.buffer
+                state.lastPixelBuffer = frameToCache.buffer
                 if sessionFlags.wireless {
                     state.encodeSubmissions &+= 1
                 }
@@ -1048,6 +1109,7 @@ class ScreenCapture {
         encoder?.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }
+        encoder?.onDeferredFrame = { [weak self] in self?.retryDeferredFrame() }
 
         // Apply any keyframe request that arrived before the encoder existed
         let shouldForceInitialKeyframe = keyframeRequestLock.withLock { state -> Bool in
@@ -1612,7 +1674,9 @@ class ScreenCapture {
     // MARK: - Settings update
 
     func updateEncoderSettings(bitrateMbps: Int, quality: String, gamingBoost: Bool) {
-        encoder?.updateSettings(bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost)
+        if encoder?.updateSettings(bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost) == true {
+            onSafetyBitrateChanged?(nil)
+        }
     }
 
     /// Switch the wire codec. No-op when unchanged. When changed mid-stream,
@@ -1655,8 +1719,10 @@ class ScreenCapture {
         newEncoder.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }
+        newEncoder.onDeferredFrame = { [weak self] in self?.retryDeferredFrame() }
         newEncoder.requestKeyframe()
         encoder = newEncoder
+        onSafetyBitrateChanged?(nil)
 
         restartStream(reason: "codec/limit changed")
     }

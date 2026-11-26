@@ -169,6 +169,69 @@ final class VideoEncoderWireFormatTests: XCTestCase {
 
     // MARK: - Session rebuild failure keeps the working session
 
+    func testOversizedUsbFrameReducesAndResetsRuntimeBitrate() throws {
+        let width = 320, height = 192
+        try XCTSkipUnless(Self.hasHardwareEncoder(width: width, height: height), "no hardware H.264 encoder")
+        let encoder = VideoEncoder(width: width, height: height, codec: .h264, bitrateMbps: 2000, frameRate: 30)
+        XCTAssertEqual(encoder.reduceBitrateForOversizedFrame(nowNs: 10_000_000_000), 100)
+        XCTAssertEqual(encoder.safetyBitrateMbps, 100)
+        XCTAssertNil(encoder.reduceBitrateForOversizedFrame(nowNs: 10_500_000_000))
+        XCTAssertEqual(encoder.reduceBitrateForOversizedFrame(nowNs: 11_000_000_000), 50)
+        XCTAssertEqual(encoder.safetyBitrateMbps, 50)
+        VideoEncoder.failNextSessionCreation = true
+        XCTAssertFalse(encoder.updateSettings(bitrateMbps: 300, quality: "ultralow", gamingBoost: false))
+        XCTAssertEqual(encoder.safetyBitrateMbps, 50, "a failed rebuild must keep reporting the live encoder limit")
+        XCTAssertTrue(encoder.updateSettings(bitrateMbps: 300, quality: "ultralow", gamingBoost: false))
+        XCTAssertNil(encoder.safetyBitrateMbps)
+
+        let wifi = VideoEncoder(width: width, height: height, codec: .h264, bitrateMbps: 2000, frameRate: 30, wireless: true)
+        XCTAssertNil(wifi.reduceBitrateForOversizedFrame(nowNs: 10_000_000_000))
+        XCTAssertNil(wifi.safetyBitrateMbps)
+
+        let lowRate = VideoEncoder(width: width, height: height, codec: .h264, bitrateMbps: 20, frameRate: 30)
+        XCTAssertNil(lowRate.reduceBitrateForOversizedFrame(nowNs: 10_000_000_000), "recovery must never increase a low target")
+
+        VideoEncoder.failNextSessionCreation = true
+        let unavailable = VideoEncoder(width: width, height: height, codec: .h264, bitrateMbps: 2000, frameRate: 30)
+        XCTAssertFalse(unavailable.hasLiveSession)
+        XCTAssertNil(unavailable.reduceBitrateForOversizedFrame(nowNs: 10_000_000_000))
+    }
+
+    func testUsbPressureDefersAndPreservesForcedKeyframe() throws {
+        let width = 320, height = 192
+        try XCTSkipUnless(Self.hasHardwareEncoder(width: width, height: height), "no hardware H.264 encoder")
+        let generation = WirelessTransportPressure.reset(wireless: false)
+        WirelessTransportPressure.setReady(generation: generation)
+        WirelessTransportPressure.beginSend(generation: generation)
+        WirelessTransportPressure.beginSend(generation: generation)
+        defer { WirelessTransportPressure.retire(generation: generation) }
+
+        let encoder = VideoEncoder(width: width, height: height, codec: .h264, frameRate: 30)
+        let deferred = expectation(description: "routine and forced frames deferred under USB pressure")
+        deferred.expectedFulfillmentCount = 2
+        let delivered = expectation(description: "keyframe delivered after pressure clears")
+        let sync = OSAllocatedUnfairLock<Bool?>(initialState: nil)
+        encoder.onDeferredFrame = { deferred.fulfill() }
+        encoder.onEncodedFrame = { _, _, isKeyframe in
+            sync.withLock { $0 = isKeyframe }
+            delivered.fulfill()
+        }
+        let pixelBuffer = try XCTUnwrap(Self.makePixelBuffer(width: width, height: height))
+        let pts = CMTime(value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000), timescale: 1_000_000)
+        encoder.encode(pixelBuffer: pixelBuffer, presentationTimeStamp: pts)
+        encoder.requestKeyframe()
+        encoder.encode(pixelBuffer: pixelBuffer, presentationTimeStamp: pts)
+        wait(for: [deferred], timeout: 1)
+        XCTAssertNil(sync.withLock { $0 })
+
+        WirelessTransportPressure.completeSend(generation: generation)
+        encoder.encode(pixelBuffer: pixelBuffer, presentationTimeStamp: pts + CMTime(value: 1, timescale: 30))
+        wait(for: [delivered], timeout: 5)
+        XCTAssertEqual(sync.withLock { $0 }, true)
+        encoder.onEncodedFrame = nil
+        encoder.onDeferredFrame = nil
+    }
+
     /// A settings change rebuilds the compression session. When that rebuild
     /// could not be allocated, the old code published nil over the working
     /// session and then invalidated it, so every later encode took the

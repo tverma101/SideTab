@@ -102,6 +102,7 @@ class VideoEncoder {
         /// The VT output callback is documented to run on another thread, so the
         /// sink is read under the same lock that publishes it.
         var onEncodedFrame: ((Data, UInt64, Bool) -> Void)?
+        var onDeferredFrame: (() -> Void)?
     }
 
     /// The session handle is swapped by the settings thread while the encode
@@ -111,6 +112,9 @@ class VideoEncoder {
     private struct SessionHandle: @unchecked Sendable {
         let session: VTCompressionSession
         let hdrSignalled: Bool
+        var targetMbps: Int
+        var safetyBitrateMbps: Int?
+        var lastSafetyAttemptNs: UInt64?
     }
 
     private let width: Int
@@ -128,6 +132,11 @@ class VideoEncoder {
     var onEncodedFrame: ((Data, UInt64, Bool) -> Void)? {
         get { stateLock.withLock { $0.onEncodedFrame } }
         set { stateLock.withLock { $0.onEncodedFrame = newValue } }
+    }
+
+    var onDeferredFrame: (() -> Void)? {
+        get { stateLock.withLock { $0.onDeferredFrame } }
+        set { stateLock.withLock { $0.onDeferredFrame = newValue } }
     }
 
     init(width: Int, height: Int, codec: StreamCodec = .hevc, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60, maxBitrateMbps: Int? = nil, wireless: Bool = false) {
@@ -151,7 +160,8 @@ class VideoEncoder {
         sessionLock.withLock { $0 = makeConfiguredSession() }
     }
 
-    func updateSettings(bitrateMbps: Int, quality: String, gamingBoost: Bool) {
+    @discardableResult
+    func updateSettings(bitrateMbps: Int, quality: String, gamingBoost: Bool) -> Bool {
         stateLock.withLock { state in
             state.config = SessionConfig(
                 bitrateMbps: bitrateMbps,
@@ -167,7 +177,7 @@ class VideoEncoder {
         // retry path back to a live session.
         guard let created = makeConfiguredSession() else {
             debugLog("VideoToolbox session rebuild failed — keeping the current session")
-            return
+            return false
         }
         // Swap first, drain second: any encode that is already inside
         // VTCompressionSessionEncodeFrame has finished by the time this returns,
@@ -182,7 +192,58 @@ class VideoEncoder {
             VTCompressionSessionCompleteFrames(previous, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(previous)
         }
+        return true
     }
+
+    /// A frame larger than the client's limit cannot be repaired by another
+    /// equally large keyframe. Reduce the running USB encoder's target, without
+    /// changing the saved preference, and let the server request a fresh IDR.
+    /// A one-second cooldown lets already-submitted frames drain before another
+    /// reduction. A new settings/session build restores the requested target.
+    func reduceBitrateForOversizedFrame(nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Int? {
+        guard !wireless else { return nil }
+        let result = sessionLock.withLock { handle -> (Int?, OSStatus?, OSStatus?) in
+            guard var current = handle else { return (nil, nil, nil) }
+            if let last = current.lastSafetyAttemptNs,
+               nowNs < last || nowNs - last < 1_000_000_000 { return (nil, nil, nil) }
+            let next = min(100, max(6, current.targetMbps / 2))
+            guard next < current.targetMbps else { return (nil, nil, nil) }
+            current.lastSafetyAttemptNs = nowNs
+            let oldTarget = current.targetMbps
+            let avgStatus = VTSessionSetProperty(current.session, key: kVTCompressionPropertyKey_AverageBitRate, value: (next * 1_000_000) as CFNumber)
+            guard avgStatus == noErr else {
+                handle = current
+                return (nil, avgStatus, nil)
+            }
+            let peak = next + next / 2
+            let limits = [peak * 1_000_000 / 8, 1] as CFArray
+            let limitStatus = VTSessionSetProperty(current.session, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
+            guard limitStatus == noErr else {
+                let restoreStatus = VTSessionSetProperty(current.session, key: kVTCompressionPropertyKey_AverageBitRate, value: (oldTarget * 1_000_000) as CFNumber)
+                if restoreStatus != noErr {
+                    // The average target did change even though the peak limit
+                    // and rollback failed; report the value actually requested.
+                    current.targetMbps = next
+                    current.safetyBitrateMbps = next
+                }
+                handle = current
+                return (restoreStatus == noErr ? nil : next, limitStatus, restoreStatus)
+            }
+            current.targetMbps = next
+            current.safetyBitrateMbps = next
+            handle = current
+            return (next, nil, nil)
+        }
+        if let bitrate = result.0 {
+            debugLog("USB oversized-frame recovery: encoder target limited to \(bitrate)Mbps")
+        }
+        if let failure = result.1 {
+            debugLog("USB oversized-frame recovery: rate change failed (status=\(failure), restore=\(result.2.map(String.init) ?? "n/a"))")
+        }
+        return result.0
+    }
+
+    var safetyBitrateMbps: Int? { sessionLock.withLock { $0?.safetyBitrateMbps } }
 
     /// Force the next encoded frame to be an IDR (sync) frame.
     /// Used when a fresh client connects so its decoder can start immediately
@@ -213,7 +274,19 @@ class VideoEncoder {
             }
             : nil
 
-        // Consume the force request first: recovery/startup keyframes must cut
+        // On USB even forced frames must wait for the sender to drain. Keep any
+        // sync request pending and retry the latest image if capture goes idle.
+        if !wireless && WirelessTransportPressure.shouldPauseEncoding {
+            let deferred = stateLock.withLock { state -> (() -> Void)? in
+                state.pressureSkips &+= 1
+                return state.onDeferredFrame
+            }
+            if let leaseID { HDRConverter.release(leaseID: leaseID) }
+            deferred?()
+            return
+        }
+
+        // Consume the force request first: wireless recovery keyframes must cut
         // through congestion. Routine captures, however, can be skipped safely
         // BEFORE VideoToolbox sees them when the wireless sender is backed up.
         let shouldForceKeyframe = stateLock.withLock { state -> Bool in
@@ -261,6 +334,9 @@ class VideoEncoder {
 
         switch outcome {
         case .noSession:
+            if shouldForceKeyframe {
+                stateLock.withLock { $0.pendingForceKeyframe = true }
+            }
             if let leaseID { HDRConverter.release(leaseID: leaseID) }
         case let .submitted(status) where status != noErr:
             // The forced IDR that was supposed to ride this frame is still owed:
@@ -475,16 +551,11 @@ class VideoEncoder {
         let avgBps = targetMbps * 1_000_000
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: avgBps as CFNumber)
 
-        // Hard cap: bytes over a 1s window at 1.5x target — the guarantee
-        // that keeps per-frame size (and thus decoder+transport load) bounded
-        // during complex motion. This is the property pair VideoToolbox
-        // documents for live streaming, and it is effective here: encode()
-        // submits a real per-frame duration, which is what makes the rate
-        // controller (and therefore DataRateLimits) meaningful. (Passing
-        // kCMTimeInvalid for duration, as the VirtualDisplayKit reference does,
-        // gives the encoder no timeline and no rate control at all.)
-        // The property pair only works because Quality is never set on this
-        // session.
+        // Request a 1-second rate ceiling at 1.5x target. This is not an
+        // individual-frame limit: a burst or a codec that cannot honor the
+        // property can still exceed the client's frame-size limit. The sender
+        // checks that limit separately and asks USB to reduce its target when
+        // needed. encode() supplies the timing that rate control requires.
         let requestedPeakMbps = targetMbps + targetMbps / 2
         let peakCeilingMbps = isWireless
             ? WirelessFreshnessPolicy.peakBitrateMbps
@@ -550,7 +621,7 @@ class VideoEncoder {
         let mode = config.gamingBoost ? "🎮 GAMING BOOST" : config.quality.uppercased()
         let codecName = codec == .hevc ? "H.265" : "H.264"
         debugLog("VideoToolbox encoder configured (" + codecName + ", quality=" + mode + ", " + String(config.frameRate) + "fps)")
-        return SessionHandle(session: session, hdrSignalled: hdrSignalled)
+        return SessionHandle(session: session, hdrSignalled: hdrSignalled, targetMbps: targetMbps)
     }
 
     private static func clampBitrateMbps(_ value: Int?) -> Int? {

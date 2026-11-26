@@ -557,6 +557,8 @@ struct SettingsView: View {
                                             .foregroundColor(.secondary)
                                     }
 
+                                    UsbSafetyBitrateNote(runtime: runtime)
+
                                     if settings.gamingBoost {
                                         HStack(spacing: 4) {
                                             Image(systemName: "bolt.fill")
@@ -636,6 +638,19 @@ struct SettingsView: View {
 }
 
 // MARK: - Supporting Views
+
+private struct UsbSafetyBitrateNote: View {
+    @ObservedObject var runtime: DisplayRuntimeState
+
+    var body: some View {
+        if let bitrate = runtime.usbSafetyBitrateMbps {
+            Label("USB video target reduced to \(bitrate) Mbps after an oversized frame. Change the bitrate or restart streaming to retry your setting.", systemImage: "exclamationmark.triangle")
+                .font(.system(size: 10))
+                .foregroundColor(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
 
 /// A small child view keeps live port/server state out of the root settings
 /// layout while preserving immediate control updates.

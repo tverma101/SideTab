@@ -3,11 +3,12 @@ import Foundation
 /// Crosses the Network.framework -> VideoToolbox boundary without dropping
 /// already-encoded reference frames. StreamingServer records shallow local
 /// send pressure and samples TCP send-buffer headroom; VideoEncoder consults
-/// the Wi-Fi gate before submitting routine captures. Forced keyframes bypass it.
+/// the gate before submitting captures. Wireless forced keyframes bypass it;
+/// USB defers them until the queue drains so recovery cannot deepen a backlog.
 ///
 /// Despite the historical name, this type also owns the per-connection send
-/// accounting used by USBAdaptiveLoadController. USB does NOT use the binary
-/// pause gate below: it converts those same signals into 120 -> 90 -> 60 pacing.
+/// accounting used by USBAdaptiveLoadController as well as a pre-encode
+/// safety gate when either transport falls behind.
 enum WirelessTransportPressure {
     private struct State {
         var generation: UInt64 = 0
@@ -202,11 +203,9 @@ enum WirelessTransportPressure {
         }
     }
 
-    /// Routine captures are suppressed only before VideoToolbox sees them on
-    /// Wi-Fi. This keeps H.264/HEVC reference chains valid while preventing
-    /// routine encode work from outrunning either local Network.framework
-    /// submission or the TCP sender buffer during a transient Wi-Fi slowdown.
-    /// USB pressure is handled by USBAdaptiveLoadController instead.
+    /// Suppress future encodes before VideoToolbox sees them. This keeps the
+    /// reference chain valid while bounding work queued behind a slow sender.
+    /// USB also uses its adaptive FPS controller for sustained pressure.
     static var shouldPauseEncoding: Bool {
         shouldPauseEncoding(at: DispatchTime.now().uptimeNanoseconds)
     }
@@ -214,7 +213,7 @@ enum WirelessTransportPressure {
     static func shouldPauseEncoding(at nowNs: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard state.wireless, state.ready else { return false }
+        guard state.ready else { return false }
         return state.sendsInFlight >= WirelessFreshnessPolicy.maxSenderInFlightFrames ||
             state.bytesInFlight >= WirelessFreshnessPolicy.maxSenderInFlightBytes ||
             nowNs < state.pauseUntilNs

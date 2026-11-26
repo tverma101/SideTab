@@ -2,6 +2,23 @@ import Foundation
 import Network
 import os
 
+/// An omitted encoded frame breaks the receiver's reference chain. Do not
+/// resume sending dependent frames until a valid sync frame is sent.
+struct FrameSyncGate {
+    enum Decision: Equatable { case send, wait, invalid }
+    private(set) var waitingForSync = true
+
+    mutating func decide(valid: Bool, isKeyframe: Bool) -> Decision {
+        guard valid else {
+            waitingForSync = true
+            return .invalid
+        }
+        guard !waitingForSync || isKeyframe else { return .wait }
+        waitingForSync = false
+        return .send
+    }
+}
+
 enum WireMessage {
     static let legacyVideoFrame: UInt8 = 0
     static let displayConfig: UInt8 = 1
@@ -156,6 +173,7 @@ class StreamingServer {
     /// numbers of the session that replaced it.
     var onStats: ((SessionEvent, Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
+    var onOversizedFrame: (() -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
     // handled regardless. When false, incoming touch frames are dropped
     // immediately without parsing or dispatching to main queue.
@@ -231,7 +249,8 @@ class StreamingServer {
     private var framePressureGeneration: UInt64 = 0
     private var frameSendConnection: NWConnection?
     private var frameTransportReady = false
-    private var frameWaitingForSync = true
+    private var frameSyncGate = FrameSyncGate()
+    private var frameSyncRetryScheduled = false
     private var frameUsesMetadata = false
     private var frameSendsInFlight = 0
 
@@ -936,7 +955,8 @@ class StreamingServer {
             framePressureGeneration = WirelessTransportPressure.reset(wireless: transportMode == .wireless)
             frameSendConnection = newConnection
             frameTransportReady = false
-            frameWaitingForSync = true
+            frameSyncGate = FrameSyncGate()
+            frameSyncRetryScheduled = false
             frameUsesMetadata = false
             frameSendsInFlight = 0
             droppedFrames = 0
@@ -968,7 +988,8 @@ class StreamingServer {
             framePressureGeneration = 0
             frameSendConnection = nil
             frameTransportReady = false
-            frameWaitingForSync = true
+            frameSyncGate = FrameSyncGate()
+            frameSyncRetryScheduled = false
             frameUsesMetadata = false
             frameSendsInFlight = 0
             if pressureGeneration != 0 {
@@ -1841,25 +1862,22 @@ class StreamingServer {
               frameTransportReady,
               let connection = frameSendConnection else { return }
 
-        // Before the first sync frame there is no decoder reference chain yet,
-        // so ignoring P-frames is safe. Once an IDR has been sent, every encoded
-        // frame is preserved in order until the connection succeeds or fails.
-        if frameWaitingForSync {
-            guard isKeyframe else {
-                droppedFrames += 1
-                return
-            }
-            frameWaitingForSync = false
-            debugLog("First keyframe accepted for new client")
-        }
-
-        guard let wireSize = Self.wireFrameSize(data.count) else {
-            // Advertising a truncated size would desync the client's parser, so
-            // the whole frame goes instead.
+        let wireSize = Self.wireFrameSize(data.count)
+        let wasWaitingForSync = frameSyncGate.waitingForSync
+        switch frameSyncGate.decide(valid: wireSize != nil, isKeyframe: isKeyframe) {
+        case .wait:
+            droppedFrames += 1
+            return
+        case .invalid:
             droppedFrames += 1
             debugLog("Dropping \(data.count)B frame — above the client's \(Self.maxFrameBytes)B frame limit")
+            scheduleFrameSyncRetry()
             return
+        case .send:
+            if wasWaitingForSync { debugLog("Sync frame accepted for client") }
+            break
         }
+        guard let wireSize else { return }
 
         let generation = frameSendGeneration
         let pressureGeneration = framePressureGeneration
@@ -1937,6 +1955,21 @@ class StreamingServer {
         let now = DispatchTime.now().uptimeNanoseconds
         let sendAge = now >= timestamp ? now - timestamp : 0
         updateStats(bytes: data.count, frameAgeNs: sendAge)
+    }
+
+    /// Retry even on a static desktop, but bound repeated oversized keyframes
+    /// and fence the delayed request against a replacement connection.
+    private func scheduleFrameSyncRetry() {
+        guard !frameSyncRetryScheduled else { return }
+        frameSyncRetryScheduled = true
+        let generation = frameSendGeneration
+        onOversizedFrame?()
+        frameQueue.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
+            guard let self, self.frameSendGeneration == generation else { return }
+            self.frameSyncRetryScheduled = false
+            guard self.frameTransportReady, self.frameSyncGate.waitingForSync else { return }
+            self.onKeyframeRequested?(true)
+        }
     }
 
     private func makeFrameHeader(
