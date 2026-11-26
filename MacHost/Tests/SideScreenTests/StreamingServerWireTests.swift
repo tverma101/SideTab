@@ -6,6 +6,36 @@ import XCTest
 /// tag uniqueness, display-config validation, frame-size limits, and control
 /// port resolution. Nothing here opens a socket.
 final class StreamingServerWireTests: XCTestCase {
+    func testSendBudgetReusesCompletedFrameSlotsAndSignalsOverflowOnce() {
+        let budget = FrameSendBudget()
+        XCTAssertEqual(budget.reserve(bytes: 1), .inactive)
+        budget.reset(generation: 1)
+        for _ in 0..<32 {
+            XCTAssertEqual(budget.reserve(bytes: 1), .accepted(1))
+        }
+        budget.complete(generation: 1, bytes: 1)
+        XCTAssertEqual(budget.reserve(bytes: 1), .accepted(1))
+        XCTAssertEqual(budget.reserve(bytes: 1), .saturated(1))
+        budget.complete(generation: 1, bytes: 1)
+        XCTAssertEqual(budget.reserve(bytes: 1), .inactive)
+    }
+
+    func testSendBudgetLimitsBytesAndIgnoresRetiredCompletion() {
+        let budget = FrameSendBudget()
+        let frameBytes = 5 * 1024 * 1024
+        budget.reset(generation: 1)
+        XCTAssertEqual(budget.reserve(bytes: frameBytes), .accepted(1))
+        budget.reset(generation: 2)
+        for _ in 0..<6 {
+            XCTAssertEqual(budget.reserve(bytes: frameBytes), .accepted(2))
+        }
+        budget.complete(generation: 1, bytes: frameBytes)
+        XCTAssertEqual(budget.pendingFrames, 6)
+        XCTAssertEqual(budget.reserve(bytes: frameBytes), .saturated(2))
+        budget.reset()
+        XCTAssertEqual(budget.pendingFrames, 0)
+    }
+
     // MARK: - Tag table
 
     /// Two messages sharing one tag value cannot be told apart by a client that

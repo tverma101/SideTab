@@ -11,6 +11,16 @@ final class CaptureDirtyRectGateTests: XCTestCase {
         CaptureDirtyRectGate.resetTelemetry()
     }
 
+    func testReadsNumericFrameStatusFromCoreMediaAttachments() throws {
+        let sample = try makeSampleBuffer(dirtyRects: dictionaryArray([]))
+        let attachments = try XCTUnwrap(CaptureDirtyRectGate.attachments(for: sample) as? NSMutableDictionary)
+        attachments.setObject(NSNumber(value: SCFrameStatus.complete.rawValue), forKey: SCStreamFrameInfo.status.rawValue as NSString)
+        XCTAssertEqual(ScreenCapture.frameStatus(attachments), .complete)
+        attachments.setObject(NSNumber(value: SCFrameStatus.idle.rawValue), forKey: SCStreamFrameInfo.status.rawValue as NSString)
+        XCTAssertEqual(ScreenCapture.frameStatus(attachments), .idle)
+        XCTAssertNil(ScreenCapture.frameStatus(nil))
+    }
+
     func testSkipsOnlyExplicitlyCleanFrames() {
         XCTAssertTrue(
             CaptureDirtyRectGate.shouldSkip(
@@ -47,20 +57,20 @@ final class CaptureDirtyRectGateTests: XCTestCase {
     /// for EVERY frame and the dirty-rect optimization saved nothing.
     func testDecodesRealDictionaryRepresentation() throws {
         let sample = try makeSampleBuffer(dirtyRects: dictionaryArray([CGRect(x: 10, y: 20, width: 30, height: 40)]))
-        XCTAssertEqual(CaptureDirtyRectGate.frameHasChanges(sample), true)
+        XCTAssertEqual(CaptureDirtyRectGate.frameHasChanges(CaptureDirtyRectGate.attachments(for: sample)), true)
         XCTAssertEqual(CaptureDirtyRectGate.unknownRepresentationCount, 0)
     }
 
     func testEmptyDictionaryRepresentationIsAnExplicitNoChange() throws {
         let sample = try makeSampleBuffer(dirtyRects: dictionaryArray([]))
-        let verdict = CaptureDirtyRectGate.frameHasChanges(sample)
+        let verdict = CaptureDirtyRectGate.frameHasChanges(CaptureDirtyRectGate.attachments(for: sample))
         XCTAssertEqual(verdict, false)
         XCTAssertTrue(CaptureDirtyRectGate.shouldSkip(frameHasChanges: verdict, mutatesCapturedPixels: false))
     }
 
     func testDictionaryRepresentationWithNullRectIsAnExplicitNoChange() throws {
         let sample = try makeSampleBuffer(dirtyRects: dictionaryArray([CGRect.null]))
-        XCTAssertEqual(CaptureDirtyRectGate.frameHasChanges(sample), false)
+        XCTAssertEqual(CaptureDirtyRectGate.frameHasChanges(CaptureDirtyRectGate.attachments(for: sample)), false)
     }
 
     func testDictionaryRepresentationSpanningManyRectsIsAChange() throws {
@@ -68,12 +78,12 @@ final class CaptureDirtyRectGateTests: XCTestCase {
             CGRect(x: 0, y: 0, width: 1, height: 1),
             CGRect(x: 5, y: 6, width: 7, height: 8)
         ]))
-        XCTAssertEqual(CaptureDirtyRectGate.frameHasChanges(sample), true)
+        XCTAssertEqual(CaptureDirtyRectGate.frameHasChanges(CaptureDirtyRectGate.attachments(for: sample)), true)
     }
 
     func testPlainCGRectArrayStillDecodes() throws {
         let sample = try makeSampleBuffer(dirtyRects: [CGRect(x: 1, y: 2, width: 3, height: 4)] as CFArray)
-        XCTAssertEqual(CaptureDirtyRectGate.frameHasChanges(sample), true)
+        XCTAssertEqual(CaptureDirtyRectGate.frameHasChanges(CaptureDirtyRectGate.attachments(for: sample)), true)
         XCTAssertEqual(CaptureDirtyRectGate.unknownRepresentationCount, 0)
     }
 
@@ -81,7 +91,7 @@ final class CaptureDirtyRectGateTests: XCTestCase {
     /// tell" and "the gate said no" are otherwise the same silence.
     func testUnknownRepresentationIsCounted() throws {
         let sample = try makeSampleBuffer(dirtyRects: [1, 2, 3] as NSArray as CFArray)
-        XCTAssertNil(CaptureDirtyRectGate.frameHasChanges(sample))
+        XCTAssertNil(CaptureDirtyRectGate.frameHasChanges(CaptureDirtyRectGate.attachments(for: sample)))
         XCTAssertEqual(CaptureDirtyRectGate.unknownRepresentationCount, 1)
         XCTAssertNotNil(CaptureDirtyRectGate.lastUnknownRepresentation)
     }
@@ -90,13 +100,13 @@ final class CaptureDirtyRectGateTests: XCTestCase {
     func testMixedArrayIsNotTreatedAsClean() throws {
         let mixed: [Any] = ["origin.x", NSDictionary(dictionary: rectDictionary(CGRect(x: 0, y: 0, width: 4, height: 4)))]
         let sample = try makeSampleBuffer(dirtyRects: mixed as NSArray as CFArray)
-        XCTAssertNil(CaptureDirtyRectGate.frameHasChanges(sample))
+        XCTAssertNil(CaptureDirtyRectGate.frameHasChanges(CaptureDirtyRectGate.attachments(for: sample)))
         XCTAssertEqual(CaptureDirtyRectGate.unknownRepresentationCount, 1)
     }
 
     func testMissingAttachmentIsNotCountedAsUnknown() throws {
         let sample = try makeSampleBuffer(dirtyRects: nil)
-        XCTAssertNil(CaptureDirtyRectGate.frameHasChanges(sample))
+        XCTAssertNil(CaptureDirtyRectGate.frameHasChanges(CaptureDirtyRectGate.attachments(for: sample)))
         XCTAssertEqual(CaptureDirtyRectGate.unknownRepresentationCount, 0)
     }
 

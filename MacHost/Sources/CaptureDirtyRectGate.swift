@@ -29,25 +29,25 @@ enum CaptureDirtyRectGate {
         telemetryLock.unlock()
     }
 
-    static func frameHasChanges(_ sampleBuffer: CMSampleBuffer) -> Bool? {
-        guard let attachments =
-            (CMSampleBufferGetSampleAttachmentsArray(
-                sampleBuffer,
-                createIfNecessary: false
-            ) as? [[SCStreamFrameInfo: Any]])?.first,
-            let raw = attachments[.dirtyRects]
-        else {
-            return nil
-        }
+    static func attachments(for sampleBuffer: CMSampleBuffer) -> NSDictionary? {
+        guard let array = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false),
+              CFArrayGetCount(array) > 0,
+              let first = CFArrayGetValueAtIndex(array, 0) else { return nil }
+        // CoreMedia provides a dictionary for each sample. Keep the original
+        // dictionary so reading one key doesn't bridge every entry to Swift.
+        return Unmanaged<NSDictionary>.fromOpaque(first).takeUnretainedValue()
+    }
 
+    static func frameHasChanges(_ attachments: NSDictionary?) -> Bool? {
+        guard let raw = attachments?.object(forKey: SCStreamFrameInfo.dirtyRects.rawValue) else { return nil }
         // The real attachment is a CFArray of CFDictionary rects — this is how
         // Chromium's production screen_capturer_sck.mm reads it, with
         // CGRectMakeWithDictionaryRepresentation. Apple's published header text
         // is stale, and for that representation BOTH `as? [CGRect]` and
         // `as? [NSValue]` return false, which made this gate answer nil
         // (never skip) for EVERY frame.
-        if let rects = decodeDictionaryRects(raw) {
-            return rects.contains { !$0.isNull && !$0.isEmpty }
+        if let changed = dictionaryRectsHaveChanges(raw) {
+            return changed
         }
 
         if let rects = raw as? [CGRect] {
@@ -85,17 +85,16 @@ enum CaptureDirtyRectGate {
     }
 
     /// nil when the payload is not the dictionary representation.
-    private static func decodeDictionaryRects(_ raw: Any) -> [CGRect]? {
+    private static func dictionaryRectsHaveChanges(_ raw: Any) -> Bool? {
         // `as? NSArray` rather than `as? CFArray`: the latter is an
         // unconditional success for Any, so it would claim payloads that are
         // not arrays at all.
         guard let elements = raw as? NSArray else { return nil }
         let array = elements as CFArray
         let count = CFArrayGetCount(array)
-        var rects: [CGRect] = []
-        rects.reserveCapacity(count)
+        var changed = false
         for index in 0..<count {
-            guard let pointer = CFArrayGetValueAtIndex(array, index) else { continue }
+            guard let pointer = CFArrayGetValueAtIndex(array, index) else { return nil }
             let element = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
             // CGRectMakeWithDictionaryRepresentation sends objectForKey: to
             // whatever it is handed, so a non-dictionary element raises an
@@ -106,9 +105,11 @@ enum CaptureDirtyRectGate {
             var rect = CGRect.zero
             // One undecodable element must not be mistaken for "clean".
             guard CGRectMakeWithDictionaryRepresentation(dictionary, &rect) else { return nil }
-            rects.append(rect)
+            if !rect.isNull && !rect.isEmpty {
+                changed = true
+            }
         }
-        return rects
+        return changed
     }
 
     private static func recordUnknownRepresentation(_ raw: Any) {

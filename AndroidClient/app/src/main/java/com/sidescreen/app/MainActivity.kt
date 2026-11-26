@@ -1837,9 +1837,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        decoder.onDecodeLatency = { avgMs, maxMs ->
-            mainDiag("decode latency avg=" + "%.1f".format(avgMs) + "ms max=" + "%.1f".format(maxMs) + "ms")
-        }
         decoder.onDecodedFormat = { w, h, cl, cr, ct, cb ->
             mainDiag("decoder output format ${w}x$h crop=$cl,$cr,$ct,$cb")
             if (DisplayConfig.fromWire(w, h, 0) == null) {
@@ -1973,7 +1970,6 @@ class MainActivity : AppCompatActivity() {
         isKeyframe: Boolean,
     ) {
         if (!isCurrentConnection(client, generation)) {
-            client.releaseBuffer(frameData)
             return
         }
 
@@ -1983,7 +1979,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        client.releaseBuffer(frameData)
         if (displayWidth > 0 && displayHeight > 0) {
             client.requestKeyframe(reason = "decoder not ready")
         }
@@ -2136,9 +2131,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Bind a decoder to the exact client that supplied its pooled frame buffers. */
+    /** Route decoder keyframe requests to the client that owns this pipeline. */
     private fun bindDecoderCallbacks(client: StreamClient, generation: Long) {
-        videoDecoder?.onFrameDecoded = { buffer -> client.releaseBuffer(buffer) }
         videoDecoder?.onKeyframeRequired = { force, reason ->
             if (isCurrentConnection(client, generation)) {
                 client.requestKeyframe(force = force, reason = reason)

@@ -134,6 +134,7 @@ class StreamClient(
     private val controlChannel: ControlChannel
         get() = controlChannelHolder.value
 
+    /** Frame bytes are borrowed only for the duration of this synchronous callback. */
     var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
     var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
@@ -211,35 +212,6 @@ class StreamClient(
     /** Activity backgrounding pauses timeout enforcement without retiring TCP. */
     @Volatile
     private var livenessPaused = false
-
-    private val bufferPool = ArrayDeque<ByteArray>(8)
-    private val poolLock = Any()
-
-    private fun acquireBuffer(minSize: Int): ByteArray {
-        synchronized(poolLock) {
-            val iterator = bufferPool.iterator()
-            while (iterator.hasNext()) {
-                val buffer = iterator.next()
-                if (buffer.size >= minSize) {
-                    iterator.remove()
-                    return buffer
-                }
-            }
-        }
-        return ByteArray(minSize)
-    }
-
-    fun releaseBuffer(buffer: ByteArray) {
-        synchronized(poolLock) {
-            // A rare keyframe can be much larger than the steady-state frame.
-            // Do not retain several multi-megabyte arrays forever just because
-            // the pool saw one transient burst; normal frames still use the
-            // bounded pool without creating tablet memory pressure.
-            if ((!isWirelessSession || buffer.size <= MAX_POOLED_FRAME_BYTES) && bufferPool.size < 8) {
-                bufferPool.addLast(buffer)
-            }
-        }
-    }
 
     private val touchExecutor =
         Executors.newSingleThreadExecutor { runnable ->
@@ -931,6 +903,7 @@ class StreamClient(
                     if (transportGeneration != generation) null else inputStream
                 } ?: throw IOException("Missing stream input")
             val pongBuffer = ByteArray(8)
+            val videoBuffer = VideoReceiveBuffer()
 
             while (isTransportGenerationCurrent(generation) && !connectionAttemptCancelled) {
                 val type = input.readByte()
@@ -940,8 +913,8 @@ class StreamClient(
                 // between clean frames looked identical to a dead one.
                 noteVideoRead()
                 when (type.toInt()) {
-                    MESSAGE_VIDEO_FRAME -> receiveVideoFrame(input, hasMetadata = false)
-                    MESSAGE_VIDEO_FRAME_WITH_METADATA -> receiveVideoFrame(input, hasMetadata = true)
+                    MESSAGE_VIDEO_FRAME -> receiveVideoFrame(input, videoBuffer, hasMetadata = false)
+                    MESSAGE_VIDEO_FRAME_WITH_METADATA -> receiveVideoFrame(input, videoBuffer, hasMetadata = true)
 
                     MESSAGE_DISPLAY_CONFIG -> {
                         val width = input.readInt()
@@ -1446,6 +1419,7 @@ class StreamClient(
 
     private fun receiveVideoFrame(
         input: DataInputStream,
+        videoBuffer: VideoReceiveBuffer,
         hasMetadata: Boolean,
     ) {
         val frameSize = input.readInt()
@@ -1465,13 +1439,8 @@ class StreamClient(
             recordHostCaptureTiming(hostCaptureUptimeNs)
         }
 
-        val frameData = acquireBuffer(frameSize)
-        try {
-            input.readFully(frameData, 0, frameSize)
-        } catch (e: IOException) {
-            releaseBuffer(frameData)
-            throw e
-        }
+        val frameData = videoBuffer.acquire(frameSize)
+        input.readFully(frameData, 0, frameSize)
 
         if (!hasMetadata && !isKeyframe) {
             isKeyframe = isSyncFrame(frameData, frameSize, streamCodecIsHevc)
@@ -1515,12 +1484,7 @@ class StreamClient(
         }
 
         val cbStart = System.nanoTime()
-        val callback = onFrameReceived
-        if (callback != null) {
-            callback.invoke(frameData, frameSize, receiveTimestamp, isKeyframe)
-        } else {
-            releaseBuffer(frameData)
-        }
+        onFrameReceived?.invoke(frameData, frameSize, receiveTimestamp, isKeyframe)
         frameCallbackAccumNs += System.nanoTime() - cbStart
         frameCallbackSamples++
         updateStats(frameSize)
@@ -1766,7 +1730,6 @@ class StreamClient(
         private const val MESSAGE_SERVER_SUPPORTS_STYLUS = StylusProtocol.SERVER_SUPPORTS_STYLUS
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
-        private const val MAX_POOLED_FRAME_BYTES = 1 * 1024 * 1024
         private const val PAIRING_TOKEN_SIZE = 32
 
         internal fun reconnectDelayMs(attempt: Int): Long {

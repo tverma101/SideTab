@@ -77,6 +77,56 @@ struct StylusEvent {
     let buttonState: UInt32
 }
 
+/// Bounds encoded payloads from dispatch through Network.framework completion.
+/// A saturated stream is retired as a unit so dependent frames stay ordered.
+final class FrameSendBudget {
+    enum Admission: Equatable {
+        case accepted(UInt64)
+        case saturated(UInt64)
+        case inactive
+    }
+
+    private struct State {
+        let generation: UInt64
+        var accepting = true
+        var frames = 0
+        var bytes = 0
+    }
+
+    private let state = OSAllocatedUnfairLock<State?>(initialState: nil)
+    private static let maxFrames = 32
+    private static let maxBytes = 32 * 1024 * 1024
+
+    func reset(generation: UInt64? = nil) {
+        state.withLock { $0 = generation.map { State(generation: $0) } }
+    }
+
+    func reserve(bytes: Int) -> Admission {
+        state.withLock { value in
+            guard let current = value, current.accepting else { return .inactive }
+            guard current.frames < Self.maxFrames, bytes <= Self.maxBytes - current.bytes else {
+                value?.accepting = false
+                return .saturated(current.generation)
+            }
+            value?.frames += 1
+            value?.bytes += bytes
+            return .accepted(current.generation)
+        }
+    }
+
+    func complete(generation: UInt64, bytes: Int) {
+        state.withLock {
+            guard $0?.generation == generation else { return }
+            $0?.frames -= 1
+            $0?.bytes -= bytes
+        }
+    }
+
+    var pendingFrames: Int {
+        state.withLock { $0?.frames ?? 0 }
+    }
+}
+
 private extension NWEndpoint {
     var isLoopback: Bool {
         switch self {
@@ -171,6 +221,7 @@ class StreamingServer {
     var onWirelessClientPaired: ((String) -> Void)?
 
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
+    private let frameSendBudget = FrameSendBudget()
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
     private let networkQueue = DispatchQueue(label: "networkQueue", qos: .userInteractive)
 
@@ -233,7 +284,6 @@ class StreamingServer {
     private var frameTransportReady = false
     private var frameWaitingForSync = true
     private var frameUsesMetadata = false
-    private var frameSendsInFlight = 0
 
     private var bytesSent: UInt64 = 0
     private var frameCount: UInt64 = 0
@@ -933,12 +983,12 @@ class StreamingServer {
                 WirelessTransportPressure.retire(generation: framePressureGeneration)
             }
             frameSendGeneration &+= 1
+            frameSendBudget.reset()
             framePressureGeneration = WirelessTransportPressure.reset(wireless: transportMode == .wireless)
             frameSendConnection = newConnection
             frameTransportReady = false
             frameWaitingForSync = true
             frameUsesMetadata = false
-            frameSendsInFlight = 0
             droppedFrames = 0
             bytesSent = 0
             frameCount = 0
@@ -948,13 +998,15 @@ class StreamingServer {
         }
     }
 
-    private func markFrameTransportReady(_ expected: NWConnection) {
+    private func markFrameTransportReady(_ expected: NWConnection, firstPublish: Bool) {
         // Read the capability BEFORE entering frameQueue: sessionState is a leaf
         // lock and must never be taken while a queue hop is outstanding.
         let usesMetadata = sessionState.withLock { $0.clientSupportsFrameMetadata }
         frameQueue.sync {
             guard frameSendConnection === expected else { return }
             frameUsesMetadata = usesMetadata
+            guard firstPublish else { return }
+            frameSendBudget.reset(generation: frameSendGeneration)
             frameTransportReady = true
             WirelessTransportPressure.setReady(generation: framePressureGeneration)
         }
@@ -965,12 +1017,12 @@ class StreamingServer {
             if let expected, frameSendConnection !== expected { return }
             let pressureGeneration = framePressureGeneration
             frameSendGeneration &+= 1
+            frameSendBudget.reset()
             framePressureGeneration = 0
             frameSendConnection = nil
             frameTransportReady = false
             frameWaitingForSync = true
             frameUsesMetadata = false
-            frameSendsInFlight = 0
             if pressureGeneration != 0 {
                 WirelessTransportPressure.retire(generation: pressureGeneration)
             }
@@ -1329,7 +1381,7 @@ class StreamingServer {
             : "Client capability update - re-sending display config")
         sendDisplaySize()
         sessionState.withLock { $0.connectionReady = true }
-        markFrameTransportReady(conn)
+        markFrameTransportReady(conn, firstPublish: plan.firstPublish)
         if plan.firstPublish {
             let metadata = sessionState.withLock { $0.clientSupportsFrameMetadata }
             debugLog("Connection ready for frames (metadata=\(metadata ? "on" : "off"), codec=\(plan.codec))")
@@ -1821,8 +1873,24 @@ class StreamingServer {
     }
 
     func sendFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool = false) {
-        frameQueue.async { [weak self] in
-            self?.sendEncodedFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
+        guard let wireSize = Self.wireFrameSize(data.count) else {
+            debugLog("Dropping invalid video frame size \(data.count)B (limit \(Self.maxFrameBytes)B)")
+            return
+        }
+        switch frameSendBudget.reserve(bytes: data.count) {
+        case .accepted(let generation):
+            frameQueue.async { [weak self] in
+                self?.sendEncodedFrame(data, size: wireSize, generation: generation, timestamp: timestamp, isKeyframe: isKeyframe)
+            }
+        case .saturated(let generation):
+            frameQueue.async { [weak self] in
+                guard let self, self.frameSendGeneration == generation, self.frameTransportReady else { return }
+                self.frameTransportReady = false
+                debugLog("Video send backlog reached its limit — reconnecting the stream")
+                self.frameSendConnection?.cancel()
+            }
+        case .inactive:
+            break
         }
     }
 
@@ -1836,8 +1904,22 @@ class StreamingServer {
     }
     static let maxFrameBytes = 5 * 1024 * 1024
 
-    private func sendEncodedFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool) {
+    private func sendEncodedFrame(
+        _ data: Data,
+        size: UInt32,
+        generation: UInt64,
+        timestamp: UInt64,
+        isKeyframe: Bool
+    ) {
+        let byteCount = data.count
+        var submitted = false
+        defer {
+            if !submitted {
+                frameSendBudget.complete(generation: generation, bytes: byteCount)
+            }
+        }
         guard !isStopped,
+              frameSendGeneration == generation,
               frameTransportReady,
               let connection = frameSendConnection else { return }
 
@@ -1853,18 +1935,9 @@ class StreamingServer {
             debugLog("First keyframe accepted for new client")
         }
 
-        guard let wireSize = Self.wireFrameSize(data.count) else {
-            // Advertising a truncated size would desync the client's parser, so
-            // the whole frame goes instead.
-            droppedFrames += 1
-            debugLog("Dropping \(data.count)B frame — above the client's \(Self.maxFrameBytes)B frame limit")
-            return
-        }
-
-        let generation = frameSendGeneration
         let pressureGeneration = framePressureGeneration
         let header = makeFrameHeader(
-            size: wireSize,
+            size: size,
             timestamp: timestamp,
             isKeyframe: isKeyframe,
             usesMetadata: frameUsesMetadata
@@ -1874,12 +1947,11 @@ class StreamingServer {
             WirelessTransportPressure.observeSendBuffer(
                 generation: pressureGeneration,
                 availableBytes: tcpMetadata.availableSendBuffer,
-                frameBytes: data.count
+                frameBytes: byteCount
             )
         }
-        frameSendsInFlight += 1
         if pressureGeneration != 0 {
-            WirelessTransportPressure.beginSend(generation: pressureGeneration, bytes: data.count)
+            WirelessTransportPressure.beginSend(generation: pressureGeneration, bytes: byteCount)
         }
 
         // Avoid copying the entire encoded frame merely to prepend a 5/14-byte
@@ -1891,6 +1963,7 @@ class StreamingServer {
         // by updateStats, so it is not repeated as a per-frame interval name.
         let sendSignpost = FramePipelineSignpost.socketSend.beginInterval("send")
         defer { FramePipelineSignpost.socketSend.endInterval("send", sendSignpost) }
+        submitted = true
         connection.batch {
             connection.send(
                 content: header,
@@ -1908,27 +1981,27 @@ class StreamingServer {
                 contentContext: .defaultMessage,
                 isComplete: true,
                 completion: .contentProcessed { [weak self, weak connection] error in
-                    guard let self, let connection else { return }
+                    guard let self else { return }
+                    self.frameSendBudget.complete(generation: generation, bytes: byteCount)
 
                     // Pressure completion is generation-fenced independently,
                     // so an old callback can never reduce the replacement count.
                     if pressureGeneration != 0 {
-                        WirelessTransportPressure.completeSend(generation: pressureGeneration, bytes: data.count)
+                        WirelessTransportPressure.completeSend(generation: pressureGeneration, bytes: byteCount)
                     }
 
+                    guard let error, let connection else { return }
                     self.frameQueue.async {
                         guard self.frameSendGeneration == generation,
                               self.frameSendConnection === connection else {
                             return
                         }
 
-                        self.frameSendsInFlight = max(0, self.frameSendsInFlight - 1)
-                        if let error {
-                            self.droppedFrames += 1
-                            self.frameTransportReady = false
-                            debugLog("Video payload send failed: \(error) — cancelling current connection")
-                            connection.cancel()
-                        }
+                        self.droppedFrames += 1
+                        self.frameTransportReady = false
+                        self.frameSendBudget.reset()
+                        debugLog("Video payload send failed: \(error) — cancelling current connection")
+                        connection.cancel()
                     }
                 }
             )
@@ -1936,7 +2009,7 @@ class StreamingServer {
 
         let now = DispatchTime.now().uptimeNanoseconds
         let sendAge = now >= timestamp ? now - timestamp : 0
-        updateStats(bytes: data.count, frameAgeNs: sendAge)
+        updateStats(bytes: byteCount, frameAgeNs: sendAge)
     }
 
     private func makeFrameHeader(
@@ -1994,7 +2067,7 @@ class StreamingServer {
             // Log pipeline latency profile
             if profiledFrameCount > 0 {
                 let avgAgeMs = Double(totalFrameAgeNs) / Double(profiledFrameCount) / 1_000_000.0
-                debugLog("Pipeline: \(String(format: "%.1f", fps))fps, \(String(format: "%.1f", mbps))Mbps, avg frame age: \(String(format: "%.1f", avgAgeMs))ms, dropped: \(droppedFrames), sendInFlight: \(frameSendsInFlight)")
+                debugLog("Pipeline: \(String(format: "%.1f", fps))fps, \(String(format: "%.1f", mbps))Mbps, avg frame age: \(String(format: "%.1f", avgAgeMs))ms, dropped: \(droppedFrames), sendBacklog: \(frameSendBudget.pendingFrames)")
             }
 
             bytesSent = 0
