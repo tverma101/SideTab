@@ -14,7 +14,8 @@ package com.sidescreen.app
  * that a fresh connection or a user Disconnect resets.
  */
 internal class USBReconnectPolicy(
-    private val maxAttempts: Int = DEFAULT_MAX_ATTEMPTS,
+    /** Exposed so reconnect-progress UI can render "attempt n of max". */
+    val maxAttempts: Int = DEFAULT_MAX_ATTEMPTS,
     private val windowMs: Long = DEFAULT_WINDOW_MS,
 ) {
     private var attempts = 0

@@ -68,6 +68,99 @@ sidescreen_resolve_usb_serial() {
     "$adb_bin" devices -l 2>/dev/null | sidescreen_first_usb_serial
 }
 
+# Return the first ready network transport (`host:port`) from `adb devices`
+# input. A wireless-debugging or `adb tcpip` transport is reported as `device`
+# with a host:port serial instead of a `usb:` field.
+sidescreen_first_network_serial() {
+    awk '
+        NR > 1 && $2 == "device" && $1 ~ /:[0-9]+$/ {
+            print $1
+            exit
+        }
+    '
+}
+
+# Prefer a physical USB transport, then fall back to a connected network one.
+# This is what the install/backup scripts want: a username-less tablet that is
+# only reachable over Wi-Fi still counts as a target.
+sidescreen_first_ready_serial() {
+    local usb
+    usb="$(sidescreen_first_usb_serial)"
+    if [[ -n "$usb" ]]; then
+        printf '%s\n' "$usb"
+        return 0
+    fi
+    sidescreen_first_network_serial
+}
+
+# Resolve the first ready transport directly, USB first.
+sidescreen_resolve_ready_serial() {
+    local adb_bin="${1:-}"
+    [[ -n "$adb_bin" ]] || return 1
+    "$adb_bin" devices -l 2>/dev/null | sidescreen_first_ready_serial
+}
+
+# Discover a paired wireless-debugging / network ADB target and connect to it.
+#
+# Prints the ready serial on success. The tablet must already be paired with
+# this Mac once (`adb pair host:port`) or listening on a plain `adb tcpip`
+# port, because pairing is interactive and cannot run unattended here.
+#
+# Sources of candidates, in order:
+#   1. `SIDESCREEN_WIRELESS_ADB` / `SIDESCREEN_ADB_SERIAL` (host:port)
+#   2. mDNS `_adb-tls-connect._tcp` services advertised by Android wireless
+#      debugging, which is the reliable way to find the rotating port.
+#   3. A plain `adb tcpip` transport on the conventional port 5555 against a
+#      host named by `SIDESCREEN_WIRELESS_HOST`.
+sidescreen_connect_wireless_adb() {
+    local adb_bin="${1:-}"
+    [[ -n "$adb_bin" ]] || return 1
+
+    local existing
+    existing="$("$adb_bin" devices 2>/dev/null | sidescreen_first_network_serial)"
+    if [[ -n "$existing" ]]; then
+        printf '%s\n' "$existing"
+        return 0
+    fi
+
+    local -a candidates=()
+    local explicit="${SIDESCREEN_WIRELESS_ADB:-${SIDESCREEN_ADB_SERIAL:-}}"
+    if [[ -n "$explicit" && "$explicit" == *:* ]]; then
+        candidates+=("$explicit")
+    fi
+
+    local mdns_serial
+    while IFS= read -r mdns_serial; do
+        [[ -n "$mdns_serial" ]] && candidates+=("$mdns_serial")
+    done < <(
+        "$adb_bin" mdns services 2>/dev/null \
+            | awk '/_adb-tls-connect\._tcp/ { print $NF }'
+    )
+
+    local wireless_host="${SIDESCREEN_WIRELESS_HOST:-}"
+    if [[ -n "$wireless_host" ]]; then
+        candidates+=("${wireless_host%:*}:5555")
+    fi
+
+    local candidate
+    for candidate in ${candidates[@]+"${candidates[@]}"}; do
+        "$adb_bin" connect "$candidate" >/dev/null 2>&1 || true
+        # `adb connect` returns before the transport is ready; poll briefly so
+        # the caller never sees a half-established target.
+        local _attempt
+        for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if "$adb_bin" devices 2>/dev/null \
+                | awk -v serial="$candidate" '$1 == serial && $2 == "device" { found = 1 } END { exit !found }'; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+            sleep 0.3
+        done
+    done
+
+    return 1
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     sidescreen_resolve_adb
 fi

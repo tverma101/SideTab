@@ -1,5 +1,6 @@
 package com.sidescreen.app
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -100,5 +101,23 @@ class USBReconnectPolicyTest {
 
         assertFalse(policy.recordAttempt(t0))
         assertTrue(policy.shouldAttemptResume(eligible = true, nowMs = t0))
+    }
+
+    /**
+     * The reconnect-progress UI renders "attempt n of max" from the policy, so
+     * the budget size must be readable and the attempt counter must advance by
+     * exactly one per consumed resume.
+     */
+    @Test
+    fun `progress label inputs track consumed attempts and the budget size`() {
+        val policy = USBReconnectPolicy(maxAttempts = 3, windowMs = 60_000L)
+        assertEquals(3, policy.maxAttempts)
+
+        repeat(3) { round ->
+            assertTrue(policy.shouldAttemptResume(eligible = true, nowMs = t0))
+            assertTrue(policy.recordAttempt(t0))
+            assertEquals(round + 1, policy.attemptCount)
+        }
+        assertTrue(policy.spent())
     }
 }

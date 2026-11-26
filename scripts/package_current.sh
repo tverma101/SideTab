@@ -6,13 +6,22 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERSION="$(tr -d '[:space:]' < "$ROOT_DIR/VERSION")"
 APK_PATH="$ROOT_DIR/AndroidClient/app/build/outputs/apk/debug/app-debug.apk"
 APK_METADATA="$ROOT_DIR/AndroidClient/app/build/outputs/apk/debug/output-metadata.json"
+AIRPLAY_APK="$ROOT_DIR/third_party/android-airplay-server/app/build/outputs/apk/debug/app-debug.apk"
+AIRPLAY_APK_METADATA="$ROOT_DIR/third_party/android-airplay-server/app/build/outputs/apk/debug/output-metadata.json"
 MAC_APP="$ROOT_DIR/SideScreen.app"
 MAC_DMG="$ROOT_DIR/dist/current/SideScreen-${VERSION}-mac-universal.dmg"
 MAC_BUILD_MANIFEST="$ROOT_DIR/dist/current/BUILD-MANIFEST.txt"
 OUTPUT_DIR="$ROOT_DIR/artifacts/SideScreen-${VERSION}"
+# The AirPlay receiver route is discontinued and only packaged when
+# SIDESCREEN_WITH_AIRPLAY=1 explicitly opts in.
+WITH_AIRPLAY="${SIDESCREEN_WITH_AIRPLAY:-0}"
 
 if [ ! -f "$APK_PATH" ] || [ ! -f "$APK_METADATA" ]; then
     echo "Current debug APK is missing. Run ./scripts/build_android.sh first." >&2
+    exit 1
+fi
+if [ "$WITH_AIRPLAY" = "1" ] && { [ ! -f "$AIRPLAY_APK" ] || [ ! -f "$AIRPLAY_APK_METADATA" ]; }; then
+    echo "SideTab AirPlay receiver APK is missing. Run ./scripts/build_airplay_receiver.sh first." >&2
     exit 1
 fi
 if [ ! -f "$MAC_DMG" ] || [ ! -f "$MAC_BUILD_MANIFEST" ]; then
@@ -44,6 +53,28 @@ if [ "$APPLICATION_ID" != "com.sidescreen.app" ] || [ "$VERSION_NAME" != "$VERSI
     echo "APK metadata does not match this SideTab source version." >&2
     echo "  applicationId=$APPLICATION_ID versionName=$VERSION_NAME expected=$VERSION" >&2
     exit 1
+fi
+
+AIRPLAY_METADATA_VALUES=""
+AIRPLAY_APPLICATION_ID=""
+AIRPLAY_VERSION_CODE=""
+AIRPLAY_VERSION_NAME=""
+if [ "$WITH_AIRPLAY" = "1" ]; then
+    AIRPLAY_METADATA_VALUES="$(python3 - "$AIRPLAY_APK_METADATA" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    data = json.load(source)
+element = data["elements"][0]
+print(data["applicationId"], element["versionCode"], element["versionName"])
+PY
+)"
+    read -r AIRPLAY_APPLICATION_ID AIRPLAY_VERSION_CODE AIRPLAY_VERSION_NAME <<< "$AIRPLAY_METADATA_VALUES"
+    if [ "$AIRPLAY_APPLICATION_ID" != "com.sidescreen.airplayreceiver" ]; then
+        echo "AirPlay receiver APK has an unexpected application ID: $AIRPLAY_APPLICATION_ID" >&2
+        exit 1
+    fi
 fi
 
 SOURCE_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD)"
@@ -79,6 +110,31 @@ cp "$APK_PATH" "$OUTPUT_DIR/SideScreen-${VERSION}-android-debug.apk"
 cp "$MAC_DMG" "$OUTPUT_DIR/SideScreen-${VERSION}-mac-universal.dmg"
 APK_SHA="$(shasum -a 256 "$OUTPUT_DIR/SideScreen-${VERSION}-android-debug.apk" | awk '{print $1}')"
 DMG_SHA="$(shasum -a 256 "$OUTPUT_DIR/SideScreen-${VERSION}-mac-universal.dmg" | awk '{print $1}')"
+AIRPLAY_MANIFEST_SECTION=""
+AIRPLAY_ECHO_LINES=""
+if [ "$WITH_AIRPLAY" = "1" ]; then
+    cp "$AIRPLAY_APK" "$OUTPUT_DIR/SideScreen-${VERSION}-airplay-receiver-debug.apk"
+    cp "$ROOT_DIR/third_party/android-airplay-server/LICENSE" "$OUTPUT_DIR/AIRPLAY-RECEIVER-LICENSE-GPL-3.0.txt"
+    cp "$ROOT_DIR/third_party/patches/android-airplay-server-sidetab.patch" "$OUTPUT_DIR/AIRPLAY-RECEIVER-SIDETAB-PATCH.txt"
+    AIRPLAY_APK_SHA="$(shasum -a 256 "$OUTPUT_DIR/SideScreen-${VERSION}-airplay-receiver-debug.apk" | awk '{print $1}')"
+    AIRPLAY_SOURCE_COMMIT="$(git -C "$ROOT_DIR/third_party/android-airplay-server" rev-parse HEAD)"
+    AIRPLAY_PATCH_SHA="$(shasum -a 256 "$ROOT_DIR/third_party/patches/android-airplay-server-sidetab.patch" | awk '{print $1}')"
+    AIRPLAY_MANIFEST_SECTION="
+[airplay_receiver]
+file=SideScreen-${VERSION}-airplay-receiver-debug.apk
+application_id=$AIRPLAY_APPLICATION_ID
+version_code=$AIRPLAY_VERSION_CODE
+version_name=$AIRPLAY_VERSION_NAME
+source=https://github.com/jqssun/android-airplay-server/tree/v0.0.31
+source_commit=$AIRPLAY_SOURCE_COMMIT
+license=GPL-3.0
+license_file=AIRPLAY-RECEIVER-LICENSE-GPL-3.0.txt
+sidetab_patch=AIRPLAY-RECEIVER-SIDETAB-PATCH.txt
+sidetab_patch_sha256=$AIRPLAY_PATCH_SHA
+sha256=$AIRPLAY_APK_SHA
+"
+    AIRPLAY_ECHO_LINES="                      $OUTPUT_DIR/SideScreen-${VERSION}-airplay-receiver-debug.apk"
+fi
 
 cat > "$OUTPUT_DIR/MANIFEST.txt" <<EOF
 SideTab local validation package
@@ -95,7 +151,7 @@ application_id=$APPLICATION_ID
 version_code=$VERSION_CODE
 version_name=$VERSION_NAME
 sha256=$APK_SHA
-
+$AIRPLAY_MANIFEST_SECTION
 [macos]
 file=SideScreen-${VERSION}-mac-universal.dmg
 bundle_id=com.sidescreen.app
@@ -109,5 +165,8 @@ AndroidClient/app/build/outputs/apk/debug/app-debug.apk.
 EOF
 
 echo "Current Mac installer: $OUTPUT_DIR/SideScreen-${VERSION}-mac-universal.dmg"
-echo "Current Android APK:   $OUTPUT_DIR/SideScreen-${VERSION}-android-debug.apk"
+echo "Current Android APKs:  $OUTPUT_DIR/SideScreen-${VERSION}-android-debug.apk"
+if [ -n "$AIRPLAY_ECHO_LINES" ]; then
+    echo "$AIRPLAY_ECHO_LINES"
+fi
 echo "Manifest:              $OUTPUT_DIR/MANIFEST.txt"

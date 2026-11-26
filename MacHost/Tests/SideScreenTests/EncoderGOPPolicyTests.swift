@@ -51,14 +51,28 @@ final class EncoderGOPPolicyTests: XCTestCase {
         )
     }
 
-    func testWirelessKeepsExistingFiveSecondSafetyGOP() {
+    /// Wi-Fi takes its routine keyframe when motion stops, so the periodic
+    /// fallback only covers long unbroken motion. It must stay inside the
+    /// Android wireless stale-keyframe watchdog (32 s).
+    func testWirelessUsesLongSafetyGOPBehindIdleKeyframes() {
         XCTAssertEqual(
             EncoderGOPPolicy.safetySeconds(
                 isWireless: true,
                 frameRate: 60,
                 adaptiveUSBEnabled: false
             ),
-            5
+            30
         )
+        XCTAssertLessThan(
+            EncoderGOPPolicy.wirelessIdleKeyframeMinAgeNs,
+            UInt64(EncoderGOPPolicy.wirelessSafetySeconds) * 1_000_000_000
+        )
+    }
+
+    /// Every routine IDR is a 430-880 KB burst that comes out softer than the
+    /// refined still picture, so the idle keyframe stays rare: well past the
+    /// old five-second cadence, just ahead of the periodic fallback.
+    func testWirelessIdleKeyframeIsRare() {
+        XCTAssertGreaterThanOrEqual(EncoderGOPPolicy.wirelessIdleKeyframeMinAgeNs, 20_000_000_000)
     }
 }

@@ -333,6 +333,45 @@ final class VirtualDisplayManagerTests: XCTestCase {
         XCTAssertNil(VirtualDisplayPlacement.mainSlotOwner(in: []))
     }
 
+    // MARK: - Arrangement tracking
+
+    private let settled = ArrangementTracker.settleNs
+
+    /// The user drags the tablet to the left of the monitor: same displays,
+    /// new origin, long after launch. This is the move that has to survive a
+    /// rebuild.
+    func testUserMoveWithSameDisplaysIsSaved() {
+        var tracker = ArrangementTracker(physicalIDs: [3], origin: CGPoint(x: 1920, y: 0), nowNs: 0)
+        XCTAssertTrue(tracker.observe(physicalIDs: [3], origin: CGPoint(x: -1400, y: 0), nowNs: settled))
+        XCTAssertFalse(tracker.observe(physicalIDs: [3], origin: CGPoint(x: -1400, y: 0), nowNs: settled * 2))
+    }
+
+    /// A monitor waking or an AirPlay display arriving re-places displays over
+    /// several notifications. None of that is the user's arrangement.
+    func testMovesAroundATopologyChangeAreNotSaved() {
+        var tracker = ArrangementTracker(physicalIDs: [3], origin: CGPoint(x: -1400, y: 0), nowNs: 0)
+        let t = settled * 2
+        XCTAssertFalse(tracker.observe(physicalIDs: [3, 7], origin: CGPoint(x: 1920, y: 0), nowNs: t))
+        XCTAssertFalse(tracker.observe(physicalIDs: [3, 7], origin: CGPoint(x: 3840, y: 0), nowNs: t + 1))
+        XCTAssertFalse(tracker.observe(physicalIDs: [3], origin: CGPoint(x: 0, y: 1080), nowNs: t + 2))
+        XCTAssertTrue(tracker.observe(physicalIDs: [3], origin: CGPoint(x: -1400, y: 0), nowNs: t + 2 + settled))
+    }
+
+    /// The #39 guard parks the display beside the physical main. Saving that
+    /// would overwrite the user's position with the repair.
+    func testRepairIsAdoptedNotSaved() {
+        var tracker = ArrangementTracker(physicalIDs: [3], origin: CGPoint(x: -1400, y: 0), nowNs: 0)
+        tracker.adopt(origin: CGPoint(x: 1920, y: 0), nowNs: settled)
+        XCTAssertFalse(tracker.observe(physicalIDs: [3], origin: CGPoint(x: 1920, y: 0), nowNs: settled + 1))
+        XCTAssertEqual(tracker.origin, CGPoint(x: 1920, y: 0))
+    }
+
+    func testMoveRightAfterRestoreIsAdopted() {
+        var tracker = ArrangementTracker(physicalIDs: [3], origin: CGPoint(x: -1400, y: 0), nowNs: 100)
+        XCTAssertFalse(tracker.observe(physicalIDs: [3], origin: CGPoint(x: 1920, y: 0), nowNs: 101))
+        XCTAssertEqual(tracker.origin, CGPoint(x: 1920, y: 0))
+    }
+
     // MARK: - Private API shape
 
     func testRequiredAPIShapeTableIsWellFormed() {

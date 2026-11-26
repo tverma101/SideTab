@@ -41,27 +41,41 @@ Primary pressure evidence:
 
 1. Network.framework sends overlapping before `.contentProcessed`.
 2. `.contentProcessed` taking multiple target-frame intervals.
-3. Capture timestamp -> VideoToolbox output callback age staying over several target-frame intervals.
+3. VideoToolbox holding a queue of about six frames (submit -> output callback) for 250 ms.
 4. Repeated decoder recovery/keyframe pulses from the client-facing recovery path.
 
 Corroborating evidence:
 
-- TCP send-buffer headroom becoming critically small (<32 KiB).
+- A TCP send-queue backlog of more than 64 KiB beyond the frame about to be sent.
 
-A large encoded frame being larger than the currently available TCP send buffer is **not** treated as congestion. Network.framework can consume a larger application send asynchronously; completion/backlog is the stronger signal.
+`NWProtocolTCP.Metadata.availableSendBuffer` is the number of bytes still queued in the kernel send buffer, not free space. It reads 0 on the idle ADB loopback socket. Until 2026-10-06 it was read as headroom: every frame looked like "critically low headroom" pressure, which reset the healthy-completion count, so the ladder dropped at connect and never climbed back. The queue is sampled before the current frame is submitted, so a big frame still draining from the previous send is allowed for.
 
-### Host encode-age feedback
+### Host encode feedback
 
-VideoToolbox output callbacks can complete asynchronously. SideScreen already preserves the capture host-time timestamp into the encoded sample, so the encoder callback can measure how old the frame is when compression finishes without allocating per-frame timing objects.
+The encoder records when each frame is handed to VideoToolbox (a 16-entry ring keyed by presentation timestamp, no per-frame allocation). The output callback uses that to measure the encoder's own time. The age from capture is used only when no submit time is found, because it also carries ScreenCaptureKit delivery delay. That delay spiked to 50–60 ms with the encoder at 9 ms, and dropping frames after capture cannot relieve it.
 
-- at 120 FPS: pressure threshold is 25 ms (the floor is larger than three 8.33 ms frame periods only by rounding)
-- at 90 FPS: threshold is about 33.3 ms
-- at 60 FPS: threshold is 50 ms
-- encode age is mild pressure; two over-budget encoded frames are required before a downshift
-- invalid/non-host-time timestamps fail open because the existing timestamp helper substitutes the current uptime, producing near-zero age
-- the forced-IDR grace window suppresses encode-age pressure from a large recovery keyframe
+- threshold: max(25 ms, six target-frame intervals): 50 ms at 120 FPS, ~66.7 ms at 90, 100 ms at 60
+- every encoded frame must stay over it for 250 ms before a downshift
+- an under-budget frame ends the streak
+- the forced-IDR grace window suppresses encode pressure from a large recovery keyframe
 
-This catches the case where ScreenCaptureKit/VideoToolbox is slipping even though the USB/TCP sender and Android decoder still look healthy.
+The threshold is a queue, not a per-frame budget. When big motion starts after a still screen, VideoToolbox's rate control overshoots: 165–330 Mbps for about 2 s against the 112 Mbps cap. During that burst the encoder time plateaus at 37–43 ms and the output still reaches ~96 FPS. The plateau is flat, so the encoder is pipelining, not falling behind, and it was just as slow at 60 FPS. The earlier rule (three intervals, two frames) turned every motion start into seconds at 60/90. An encoder that really cannot keep up builds a queue whose latency only grows, so it crosses six intervals and stays there.
+
+This catches the case where VideoToolbox is slipping even though the USB/TCP sender and Android decoder still look healthy.
+
+### Startup grace
+
+For 3 s after a USB connection starts, no pressure moves the ladder. Connect sends a host keyframe and the decoder's own keyframe request, and often rebuilds the encoder after codec negotiation. Its first second therefore looks like both a recovery burst and encode overload on a healthy path; this alone used to take every session 120 -> 90 -> 60 within a second of connecting.
+
+### Diagnostics
+
+While the controller is active it logs one summary line about every 2 s, for example:
+
+```
+USB adaptive: target=120 frames=224 encodeAge avg=4.0ms max=17.0ms vt avg=7.1ms max=11.9ms n=223 over=0 pressure: sendBacklog=0 sendBuffer=0 slowSend=0 encodeAge=0 recoveryBurst=0 ignored=0 healthy=406 penalty=0
+```
+
+`encodeAge` is capture -> encoder output, `vt` is submit -> encoder output, `over` counts frames above the encode threshold, `pressure` counts recorded samples by kind, and `ignored` counts samples dropped by the startup or forced-IDR grace.
 
 ### Decoder-recovery burst feedback
 
@@ -79,7 +93,7 @@ This adds a downstream signal for the case where ADB/TCP itself is healthy but M
 
 ### Forced-IDR pressure grace
 
-A forced IDR is intentionally much larger than a routine P-frame. One normal startup/recovery IDR can therefore create short-lived send backlog, low send-buffer headroom, slow `.contentProcessed`, or elevated encode age even on a healthy 120-FPS path.
+A forced IDR is intentionally much larger than a routine P-frame. One normal startup/recovery IDR can therefore create short-lived send backlog, a deep send queue, slow `.contentProcessed`, or elevated encode time even on a healthy 120-FPS path.
 
 Each explicit recovery pulse creates a 250 ms grace window in which transport and encode-age pressure are ignored. Repeated recovery pulses themselves are **not** ignored: a three-pulse recovery burst still steps down the FPS ladder. This separates “the recovery IDR was large” from “the steady-state path cannot sustain 120 FPS.”
 
@@ -87,8 +101,9 @@ Each explicit recovery pulse creates a 250 ms grace window in which transport an
 
 - 3+ sends in flight: severe pressure, one-step downshift (subject to 250 ms adjustment cooldown).
 - 2 sends in flight: mild pressure; two mild strikes required.
-- critically low TCP headroom: mild pressure only.
-- encode age above max(25 ms, three target-frame intervals): mild pressure; two strikes required.
+- send queue more than 64 KiB beyond the next frame: mild pressure only.
+- encoder time above max(25 ms, six target-frame intervals) on every frame for 250 ms: severe pressure.
+- any pressure in the first 3 s of a connection: ignored.
 - 3 recovery pulses inside 1 s: severe downstream pressure.
 - healthy send completion can decay a mild strike.
 - 60 -> 90: requires 12 healthy completions and at least 2 s pressure-free.
@@ -97,6 +112,10 @@ Each explicit recovery pulse creates a 250 ms grace window in which transport an
 - long stable operation at the ceiling gradually forgives penalties.
 - source maximum changes mid-session reset the learned ladder while preserving the transport.
 - stale callbacks from an older connection generation are ignored.
+
+## Capture interval
+
+USB asks ScreenCaptureKit for twice the session rate, like Wi-Fi. SCK drops a frame that lands sooner than `minimumFrameInterval` after the one before it, so an interval equal to the display period aliases against compositor jitter: a 120 Hz session delivered ~109 FPS of steady motion, and 117–121 FPS with the 2x interval. The virtual display refresh is still the ceiling, and the pacer below still owns cadence. ScreenCaptureKit then stamps frames with the upcoming display time, so the `Pipeline` "avg frame age" diagnostic reads only a few ms on USB too; the encode signal above does not depend on it.
 
 ## 90 FPS pacing from a 120-Hz source
 
@@ -170,4 +189,15 @@ Swift tests cover static ramp-down, one-FPS deep idle, forced recovery, forced-I
 
 Android JVM tests cover version-aware refresh-rate selection. CI also builds the macOS arm64/x86_64 release binaries and Android application, which verifies the Android Surface frame-rate and codec-capability API use against the configured min/compile SDKs.
 
-Hardware validation is still required before merging to claim sustained real-device 120 FPS or to tune thresholds for a specific tablet/USB path.
+## Live validation — 2026-10-06
+
+Galaxy Tab S8+ (SM-X800) over USB at native 2800x1752, 120 Hz, 75 Mbps average. A test window scrolls text with GPU layers driven at 240 Hz, so the source is not the limit (CPU-drawn text tops out near 75 FPS).
+
+| Build | Motion FPS | Ladder |
+|---|---|---|
+| Before | ~59 | 120 -> 90 -> 60 at connect, never climbed back |
+| Queue-depth fix only | 67.6 | climbs back; every motion start dropped to 60/90 for 5–7 s |
+| Encode queue rule | 109 steady | held 120 through three motion starts |
+| Plus 2x capture interval | 117.6 steady (119–121 peaks) | held 120; first big motion of a session steps to 90 for ~5 s |
+
+Encoder time at 120 FPS averaged ~7 ms. Android decode averaged 13.3 ms, with one stale-frame drop in about 50 s of motion. Bitrate settled at 71–80 Mbps. The first heavy motion after connecting still queues VideoToolbox to ~93 ms for about 250 ms. The controller steps to 90 there, and it is back at 120 about 5 s later.

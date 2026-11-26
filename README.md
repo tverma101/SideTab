@@ -29,6 +29,7 @@ This fork currently does **not** publish binaries through GitHub Releases. Build
 | --- | --- |
 | USB display | Primary validation path; video, touch, high refresh rates, and S Pen support are implemented |
 | Wireless display | Functional, but transport/security and reconnect work remain |
+| AirPlay display | Discontinued — disabled. The companion source is retained opt-in; see [the receiver guide](docs/airplay-receiver.md) |
 | Display profile | Current fork uses a fixed 1400×876 logical HiDPI profile (2800×1752 physical) |
 | Refresh rate | 30 / 60 / 90 / 120 Hz are exposed; 60 Hz is the normal default |
 | macOS | macOS 13 Ventura or newer |
@@ -59,7 +60,9 @@ For the current implementation, release gates, and open PR map, see [project sta
 
 ### USB-C or Wireless
 
-Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — the Mac app sets up adb-reverse forwarding for video on port `54321` and control on `54322`. **Wireless** uses a one-time QR pair; after that, the tablet keeps the encrypted pairing and **Reconnect** is the recovery action. The QR carries the Mac's preferred local address plus IPv4/IPv6 fallbacks, so a home WLAN that filters one address family can still use the other (5 GHz strongly recommended). Wireless sessions use a bounded 60 FPS profile: up to 40 Mbps average, a 60 Mbps one-second peak ceiling, and freshness-aware backpressure between capture, TCP, decoding, and presentation. The auth token is generated locally and stays on your Mac; reset it any time to revoke access. See [the wireless 60 FPS path](docs/wireless-60fps.md) for the implementation contract and validation boundary.
+**USB-C** plugs in the cable for the lowest possible latency — the Mac app sets up adb-reverse forwarding for video on port `54321` and control on `54322`. **Wireless** uses a one-time QR pair; after that, the tablet keeps the encrypted pairing and **Reconnect** is the recovery action. The QR carries the Mac's preferred local address plus IPv4/IPv6 fallbacks, so a home WLAN that filters one address family can still use the other (5 GHz strongly recommended). Wireless sessions use a bounded 60 FPS profile: up to 40 Mbps average, a 60 Mbps one-second peak ceiling, and freshness-aware backpressure between capture, TCP, decoding, and presentation. The auth token is generated locally and stays on your Mac; reset it any time to revoke access. See [the wireless 60 FPS path](docs/wireless-60fps.md) for the implementation contract and validation boundary.
+
+**AirPlay (discontinued)** — the AirPlay receiver route is disabled: no UI entry point ships, and the build/install/package scripts skip the companion unless `SIDESCREEN_WITH_AIRPLAY=1` explicitly opts in. The pinned companion source is retained for archival purposes; see [the receiver guide](docs/airplay-receiver.md).
 
 ### Virtual Display
 
@@ -139,7 +142,10 @@ staging, while the installer manages the single user-facing copy at
 
 For Android, the APK built from the current checkout is always
 `AndroidClient/app/build/outputs/apk/debug/app-debug.apk`. Run
-`./scripts/install_android.sh` to rebuild and install that exact output. Files
+`./scripts/install_android.sh` to build and install it. Set
+`SIDESCREEN_ADB_SERIAL=host:port` to target a paired wireless ADB device. The
+build/install/package scripts only touch the discontinued AirPlay companion
+when `SIDESCREEN_WITH_AIRPLAY=1` is set. Files
 under `backups/apk/` are recovery snapshots and should not be selected as
 installers.
 
@@ -177,8 +183,12 @@ cd SideTab
 # Optional: install exactly one user-facing copy under ~/Applications
 ./scripts/install_mac.sh --launch
 
-# Android debug APK (JDK 17–21; Android Studio runtime or JAVA_HOME)
+# Android client APK (JDK 17–21; Android Studio runtime or JAVA_HOME)
 ./scripts/build_android.sh
+
+# Optional: build the discontinued AirPlay receiver companion
+# (SIDESCREEN_WITH_AIRPLAY=1 also folds it into the scripts above)
+./scripts/build_airplay_receiver.sh
 
 # Put the current Mac DMG and Android APK in one versioned folder
 ./scripts/package_current.sh
@@ -199,19 +209,20 @@ generated under `AndroidClient/app/build/outputs/apk/`. Use the debug
 `app-debug.apk` there for this local checkout; the installer script rebuilds
 it before installing. The raw build output directories are excluded from Git.
 
-After both platform builds, `./scripts/package_current.sh` verifies the Mac
-signature and architectures, checks the APK metadata, then copies the pair
-into `artifacts/SideScreen-<VERSION>/` with source provenance and SHA-256
-checksums in `MANIFEST.txt`. That folder contains the two installers and
-manifest; it does not include a second loose `.app` bundle.
+After the Mac and Android client builds, `./scripts/package_current.sh`
+verifies the Mac signature and architectures, checks the APK identity, then
+copies the DMG and APK into `artifacts/SideScreen-<VERSION>/` with source
+provenance and SHA-256 checksums in `MANIFEST.txt`. With
+`SIDESCREEN_WITH_AIRPLAY=1`, the receiver APK, its GPL-3.0 license text, and
+the local package patch are included alongside.
 
 The backup helper creates a non-overwriting snapshot under
-`backups/apk/<UTC-timestamp>/`. These are local recovery files and are not
-tracked in Git. Each snapshot includes the available debug and
-release APK outputs, `installed-base.apk` when a connected ADB device has Side
-Screen installed, and `MANIFEST.txt` with version, signing-certificate, source
-revision, device, and SHA-256 details. Set `SIDESCREEN_ADB_SERIAL` when more
-than one Android device is connected.
+`backups/apk/<UTC-timestamp>/`. These local recovery files are not tracked in
+Git. Each snapshot includes the available debug and release APK outputs for
+both Android packages, installed base APKs for SideTab and the receiver when
+present, and a manifest with version, signing-certificate, source revision,
+device, and SHA-256 details. Set `SIDESCREEN_ADB_SERIAL` to select a USB or
+wireless ADB device.
 
 If the Mac status says **Authorize tablet**, ADB can see the USB device but
 the tablet has not trusted this Mac yet. Unlock the tablet and accept the USB
@@ -416,6 +427,8 @@ See [`PRIVACY.md`](PRIVACY.md) for data-handling boundaries. Do not post pairing
 
 ## License and attribution
 
-SideTab is available under the [MIT License](LICENSE).
+SideTab's original application code is available under the [MIT License](LICENSE).
+The optional Android AirPlay receiver companion is a separate APK built from
+GPL-3.0-licensed upstream source; see [its source and packaging notes](docs/airplay-receiver.md).
 
 This repository is a maintained fork of the Side Screen project originally created by **Trần Vương Quốc Đạt**. Historical changelog entries and contributor credits are preserved so authorship remains clear. Fork-specific maintenance and development are tracked in this repository.

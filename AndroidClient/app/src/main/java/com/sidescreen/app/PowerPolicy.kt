@@ -23,6 +23,14 @@ internal data class PowerPolicyDecision(
      * allowed to force the mode change.
      */
     val seamlessOnly: Boolean = false,
+    /**
+     * Hold Android's low-latency Wi-Fi lock. Without it the tablet's radio
+     * stays in 802.11 power save between beacons, which measured 10-170 ms
+     * round trips on the home LAN instead of single digits. Android only
+     * honours the lock for a foreground app with the screen on, so it is
+     * requested for exactly that wireless state.
+     */
+    val wifiLowLatency: Boolean = false,
 ) {
     val requestsHighRefreshRate: Boolean
         get() = requestedRefreshRateHz >= PowerPolicy.HIGH_REFRESH_RATE_HZ
@@ -77,6 +85,7 @@ internal object PowerPolicy {
                 keepScreenOn = true,
                 reason = "wireless",
                 seamlessOnly = true,
+                wifiLowLatency = true,
             )
         }
 
