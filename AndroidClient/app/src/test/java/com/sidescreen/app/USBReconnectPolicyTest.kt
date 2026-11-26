@@ -1,5 +1,6 @@
 package com.sidescreen.app
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -100,5 +101,49 @@ class USBReconnectPolicyTest {
 
         assertFalse(policy.recordAttempt(t0))
         assertTrue(policy.shouldAttemptResume(eligible = true, nowMs = t0))
+    }
+
+    @Test
+    fun `resume waits back off and are capped`() {
+        val policy = USBReconnectPolicy(maxAttempts = 8, windowMs = 60_000L)
+        assertTrue(policy.shouldAttemptResume(eligible = true, nowMs = t0))
+
+        val delays = mutableListOf<Long>()
+        repeat(5) {
+            delays += policy.nextDelayMs()
+            assertTrue(policy.recordAttempt(t0))
+        }
+
+        assertEquals(listOf(2_500L, 5_000L, 10_000L, 10_000L, 10_000L), delays)
+    }
+
+    @Test
+    fun `the default budget outlasts a Mac app relaunch`() {
+        // While the Mac app is down every attempt fails at once, so the outage
+        // is covered only by the waits. A relaunch or reinstall takes ~30-45 s.
+        val policy = USBReconnectPolicy()
+        var now = t0
+        var lastAttemptAt = t0
+        assertTrue(policy.shouldAttemptResume(eligible = true, nowMs = now))
+        while (true) {
+            now += policy.nextDelayMs()
+            if (!policy.recordAttempt(now)) break
+            lastAttemptAt = now
+        }
+
+        assertTrue("last attempt at ${lastAttemptAt - t0} ms", lastAttemptAt - t0 >= 45_000L)
+        assertTrue(lastAttemptAt - t0 <= 60_000L)
+        assertFalse(policy.shouldAttemptResume(eligible = true, nowMs = now))
+    }
+
+    @Test
+    fun `reconnect restores the short first wait`() {
+        val policy = USBReconnectPolicy()
+        assertTrue(policy.shouldAttemptResume(eligible = true, nowMs = t0))
+        repeat(3) { assertTrue(policy.recordAttempt(t0)) }
+
+        policy.onConnected()
+
+        assertEquals(2_500L, policy.nextDelayMs())
     }
 }

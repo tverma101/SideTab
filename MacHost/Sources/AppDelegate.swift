@@ -50,6 +50,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var performance = DisplayPerformanceState()
     var settingsWindow: SettingsWindowController?
     var statusItem: NSStatusItem?
+    /// The status item's menu, kept for the open/close diagnostics.
+    private var statusMenu: NSMenu?
     let pairedDeviceStore = PairedDeviceStore()
     /// Name of the wireless device currently streaming (nil when no wireless client is active).
     /// Used to snapshot the disconnect time and identify the live paired-device row.
@@ -478,10 +480,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Items are rebuilt on every open (menuNeedsUpdate) so the menu always
         // reflects live server/connection state.
+        //
+        // Standard system presentation, like every other menu-bar app. The
+        // app runs as an accessory (main.swift), so a click opens the menu
+        // under the icon without activating SideTab or switching Spaces.
+        // Custom routes (activate + NSMenu.popUp) were tried on macOS 27 and
+        // either switched to an empty Space or had the menu cancelled.
         let menu = NSMenu()
         menu.delegate = self
         menu.autoenablesItems = false
         statusItem?.menu = menu
+        statusMenu = menu
 
         // Dim the menu bar icon while the server is stopped — at-a-glance
         // state without opening the menu.
@@ -554,7 +563,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     @objc func showSettings() {
-        settingsWindow?.showWindow(nil)
+        settingsWindow?.present()
         NSApp.activate(ignoringOtherApps: true)
         Task { @MainActor [weak self] in
             self?.refreshStatusIndicators()
@@ -1778,6 +1787,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Menu bar quick actions
 
 extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === statusMenu else { return }
+        debugLog("Status menu opened (active=\(NSApp.isActive))")
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === statusMenu else { return }
+        let event = NSApp.currentEvent
+        debugLog(
+            "Status menu closing: event=\(event.map { "\($0.type.rawValue)/\($0.subtype.rawValue)" } ?? "none") " +
+                "mouse=\(NSEvent.mouseLocation) active=\(NSApp.isActive) " +
+                "front=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "none")"
+        )
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 

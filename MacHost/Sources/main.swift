@@ -34,7 +34,10 @@ app.mainMenu = mainMenu
 
 let delegate = AppDelegate()
 
-app.setActivationPolicy(.regular)
+// A menu-bar utility, like every other status-item app: no Dock icon. On
+// macOS 27 a regular (Dock) app's status-item clicks went through app
+// activation, which switched to an empty Space and cancelled the menu.
+app.setActivationPolicy(.accessory)
 
 app.delegate = delegate
 app.run()
